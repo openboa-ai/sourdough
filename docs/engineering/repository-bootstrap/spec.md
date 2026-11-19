@@ -30,3 +30,13 @@ This change gives contributors one short-lived branch per change, a predictable 
 | Enrollment | GitHub records a successful run on the intended commit. Read back the app-bound required checks, then verify a separate PR and the resulting main commit. Record any unverified path in the issue. |
 
 License choice, release publication, production credentials, package publishing, and organization-wide membership policy are separate owner decisions.
+
+## Required tests and native auto-merge
+
+Each mandatory Python test directory must contain a runnable test. An empty suite, an import error, a failed test or any skipped test makes that suite fail. This includes class-level and subtest skips. Run the same command locally and on the pull request's merge candidate. Continue checking the final default-branch commit after a push.
+
+The required `Required CI` job runs after `Contribution names` and `Repository hygiene`, even if a prerequisite fails. Both job results must equal `success`. Qualify this additional check against a real pull request before adding it to the strict branch ruleset. Keep both existing required checks throughout rollout.
+
+Enable GitHub's repository-level **Allow auto-merge** option. A contributor with write access can select automatic squash on an individual README pull request. GitHub performs the merge after that pull request satisfies the branch rules. The option is available across the repository. Pull-request CI continues to use a read-only token. Existing code-owner reviews still apply.
+
+Verify a passing suite, a failing suite, an empty suite and skips alongside passing tests. Observe a skipped-test failure and recovery on a pull request, and read back the native setting and effective required checks on the default branch.
