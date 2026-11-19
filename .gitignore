@@ -1,0 +1,15 @@
+# Local environments and credentials
+.env
+.env.*
+!.env.example
+.secrets/
+*.key
+*.p12
+*.pfx
+
+# Machine and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+__pycache__/

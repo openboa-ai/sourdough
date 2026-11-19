@@ -1,0 +1,5 @@
+# Changes to checks and their enforcement require maintainer review.
+/.github/ @SonSangjoon
+/.gitattributes @SonSangjoon
+/.gitleaks* @SonSangjoon
+/SECURITY.md @SonSangjoon
