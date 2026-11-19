@@ -16,3 +16,21 @@ GitHub runs **Contribution names** when you open a PR, push commits, or edit its
 All changes to `main` go through a squash PR. Resolve review conversations before merging. The designated code owner reviews changes to CI, ownership, scanner policy, and security reporting. A push check validates the final subject written to `main`. GitHub Free allows the merger to edit that subject, so keep the default title in the merge dialog.
 
 The format follows [Conventional Commits 1.0](https://www.conventionalcommits.org/en/v1.0.0/). Package-specific build and test commands will be documented when the project has an application manifest.
+
+## Running checks locally
+
+From the repository root, run the naming fixtures and check whitespace before pushing a topic branch.
+
+```sh
+python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
+git diff --check origin/main...HEAD
+```
+
+With Gitleaks CLI installed, scan committed history and your current files. Both commands redact detected values.
+
+```sh
+gitleaks git --redact --log-opts="--full-history HEAD" .
+gitleaks dir --redact .
+```
+
+CI also verifies the tool versions and scanner configuration, checks workflow syntax with actionlint, and validates the current PR metadata on GitHub.
