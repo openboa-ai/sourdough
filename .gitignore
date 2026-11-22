@@ -13,3 +13,7 @@ Thumbs.db
 *.swp
 *~
 __pycache__/
+
+# Python packaging outputs
+/build/
+/src/*.egg-info/
