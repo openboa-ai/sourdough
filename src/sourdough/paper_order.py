@@ -21,6 +21,12 @@ class OrderRefused(Exception):
     """The order does not fit the paper mandate."""
 
 
+class OrderReplyUnknown(TimeoutError):
+    def __init__(self, order_id: str):
+        self.order_id = order_id
+        super().__init__("The original paper order outcome remains unknown")
+
+
 @dataclass(frozen=True)
 class OrderReceipt:
     order_id: str
@@ -166,5 +172,8 @@ def submit_paper_order(
         )
     if writer is not None:
         writer.verify_for(store, claim.company_id)
-    destination.submit(order_id, account.account_id, intent)
+    try:
+        destination.submit(order_id, account.account_id, intent)
+    except TimeoutError as error:
+        raise OrderReplyUnknown(order_id) from error
     return OrderReceipt(order_id, True)

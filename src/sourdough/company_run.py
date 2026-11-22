@@ -21,6 +21,7 @@ from .first_duty import founding_duty_due
 from .first_trade import (
     TradeRefused,
     TradeResult,
+    _apply_paper_order,
     resume_opening_research,
     run_first_trade,
 )
@@ -31,7 +32,6 @@ from .paper_books import (
     Posting,
     PostingRefused,
     capture_position,
-    post_confirmed_fill,
     read_book_observation,
     read_booked_no_fill,
     read_captured_position,
@@ -45,7 +45,7 @@ from .paper_decision import (
     settle_paper_decision,
 )
 from .paper_execution import PaperExecution, PaperIntent, observe_bound_position
-from .paper_order import reserved_exposure, submit_paper_order
+from .paper_order import reserved_exposure
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
 from .paper_review import bind_review_quote, observe_review_quote
@@ -184,7 +184,7 @@ def _operate(
                 research.decided_at,
             )
             finish_first_duty(store, first.claim, result, due_at=research.next_due_at)
-        else:
+        elif first.order is None:
             return CompanyRun(
                 first,
                 None,
@@ -192,30 +192,39 @@ def _operate(
                 blocked_work=(*blocked, first.claim.duty_id),
                 fenced_runs=fenced_runs,
             )
+        else:
+            reconciliation, blocked = _refresh_recovery(
+                writer, venue, next_purpose, reconciliation
+            )
 
     review = None
     trades = _resume_later_decisions(
-        writer, venue, allow_buy=repeat_paper and not reconciliation.unresolved
+        writer,
+        venue,
+        allow_buy=repeat_paper and not (reconciliation.unresolved or blocked),
     )
     if trades and trades[-1].next_duty is None:
-        return CompanyRun(
-            first, review, tuple(trades), reconciliation, blocked, fenced_runs
+        reconciliation, blocked = _refresh_recovery(
+            writer, venue, next_purpose, reconciliation
         )
     while turn_budget or reconciliation.next_query_at is not None:
         if (
             reconciliation.next_query_at is not None
             and reconciliation.next_query_at <= int(time())
         ):
-            reconciliation, blocked = _recover(writer, venue, next_purpose)
-            trades.extend(
-                _resume_later_decisions(
-                    writer,
-                    venue,
-                    allow_buy=repeat_paper and not reconciliation.unresolved,
-                )
+            reconciliation, blocked = _refresh_recovery(
+                writer, venue, next_purpose, reconciliation
             )
-            if trades and trades[-1].next_duty is None:
-                break
+            resumed = _resume_later_decisions(
+                writer,
+                venue,
+                allow_buy=repeat_paper and not (reconciliation.unresolved or blocked),
+            )
+            trades.extend(resumed)
+            if resumed and resumed[-1].next_duty is None:
+                reconciliation, blocked = _refresh_recovery(
+                    writer, venue, next_purpose, reconciliation
+                )
         writer.verify()
         follow_up = None
         if turn_budget:
@@ -224,7 +233,8 @@ def _operate(
                 company_id,
                 runtime.profile,
                 now=int(time()),
-                allow_paper_execution=repeat_paper and not reconciliation.unresolved,
+                allow_paper_execution=repeat_paper
+                and not (reconciliation.unresolved or blocked),
             )
         if follow_up is None:
             if not turn_budget and reconciliation.next_query_at is None:
@@ -241,7 +251,9 @@ def _operate(
             trade = _trade(writer, follow_up, venue, runtime)
             trades.append(trade)
             if trade.next_duty is None:
-                break
+                reconciliation, blocked = _refresh_recovery(
+                    writer, venue, next_purpose, reconciliation
+                )
     return CompanyRun(
         first, review, tuple(trades), reconciliation, blocked, fenced_runs
     )
@@ -310,7 +322,6 @@ def _retry_reconciliation(
     blocked: tuple[str, ...],
     deadline: float,
 ) -> tuple[PaperReconciliation, tuple[str, ...]]:
-    recovered = list(recovery.recovered)
     while recovery.next_query_at is not None and not blocked:
         remaining = deadline - monotonic()
         delay = max(0, recovery.next_query_at - time())
@@ -318,9 +329,18 @@ def _retry_reconciliation(
             break
         if delay:
             sleep(delay)
-        recovery, blocked = _recover(writer, venue, purpose)
-        recovered.extend(recovery.recovered)
-    return replace(recovery, recovered=tuple(recovered)), blocked
+        recovery, blocked = _refresh_recovery(writer, venue, purpose, recovery)
+    return recovery, blocked
+
+
+def _refresh_recovery(
+    writer: WriterLease,
+    venue: PaperExecution,
+    purpose: str,
+    previous: PaperReconciliation,
+) -> tuple[PaperReconciliation, tuple[str, ...]]:
+    recovery, blocked = _recover(writer, venue, purpose)
+    return replace(recovery, recovered=previous.recovered + recovery.recovered), blocked
 
 
 def _book_reference(
@@ -498,7 +518,7 @@ def _apply_later_decision(
         next_duty = settle_paper_decision(store, follow_up, receipt, follow_up.result)
         return LaterPaperTrade(claim, receipt, None, None, next_duty)
     account = reopen_binding(store, claim.company_id).account
-    order = submit_paper_order(
+    order = _apply_paper_order(
         store,
         claim,
         PaperIntent(
@@ -508,14 +528,13 @@ def _apply_later_decision(
             decision.limit_minor_units,
         ),
         venue,
-        writer=writer,
+        writer,
     )
-    posting = post_confirmed_fill(
-        store, claim.company_id, order.order_id, venue, writer=writer
+    result = _order_reference(
+        store, claim.company_id, order.order_id, order.posting, venue
     )
-    result = _order_reference(store, claim.company_id, order.order_id, posting, venue)
     if result is None:
-        return LaterPaperTrade(claim, receipt, order.order_id, posting, None)
+        return LaterPaperTrade(claim, receipt, order.order_id, order.posting, None)
     writer.verify()
     next_duty = settle_paper_decision(store, follow_up, receipt, result)
-    return LaterPaperTrade(claim, receipt, order.order_id, posting, next_duty)
+    return LaterPaperTrade(claim, receipt, order.order_id, order.posting, next_duty)

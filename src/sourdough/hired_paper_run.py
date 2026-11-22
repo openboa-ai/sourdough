@@ -12,6 +12,7 @@ from .company_run import (
     PositionReview,
     _order_reference,
     _recover,
+    _refresh_recovery,
     _retry_reconciliation,
     _review,
 )
@@ -64,14 +65,14 @@ def _settle_opening(
     venue: PaperExecution,
     posting: Posting | None = None,
     order_id: str | None = None,
-) -> None:
+) -> bool:
     writer.verify_for(writer.store, claim.company_id)
     if order_id is not None:
         result = _order_reference(
             writer.store, claim.company_id, order_id, posting, venue
         )
         if result is None:
-            return
+            return False
     elif receipt.decision.action != "buy":
         result = ResultReference(
             "research_finding",
@@ -80,8 +81,9 @@ def _settle_opening(
             receipt.decided_at,
         )
     else:
-        return
+        return False
     finish_first_duty(writer.store, claim, result, due_at=receipt.next_due_at)
+    return True
 
 
 def _hired_research(
@@ -89,7 +91,7 @@ def _hired_research(
     claim: DutyClaim,
     venue: PaperExecution,
     employee: EmployeeProcess,
-) -> ResearchDecisionReceipt:
+) -> tuple[ResearchDecisionReceipt, bool]:
     binding = reopen_binding(writer.store, claim.company_id)
     account = binding.account
     research = ResearchTools(
@@ -130,7 +132,7 @@ def _hired_research(
         )
     if receipt.decision.action != "buy":
         _settle_opening(writer, claim, receipt, venue)
-        return receipt
+        return receipt, False
     decision = receipt.decision
     with closing(_connect(writer.store, "ro")) as connection:
         requested = allows_hired_research_order(
@@ -143,7 +145,7 @@ def _hired_research(
     if not requested:
         if interrupted is not None:
             raise interrupted
-        return receipt
+        return receipt, False
     intent = PaperIntent(
         receipt.decision_id,
         account.instrument_rules_digest,
@@ -151,8 +153,22 @@ def _hired_research(
         decision.limit_minor_units,
     )
     order = _apply_paper_order(writer.store, claim, intent, venue, writer)
-    _settle_opening(writer, claim, receipt, venue, order.posting, order.order_id)
-    return receipt
+    settled = _settle_opening(
+        writer, claim, receipt, venue, order.posting, order.order_id
+    )
+    return receipt, not settled
+
+
+def _recover_hired_submission(
+    writer: WriterLease,
+    venue: PaperExecution,
+    previous: PaperReconciliation,
+    deadline: float,
+) -> tuple[PaperReconciliation, tuple[str, ...]]:
+    reconciled, blocked = _refresh_recovery(writer, venue, POSITION_REVIEW, previous)
+    return _retry_reconciliation(
+        writer, venue, POSITION_REVIEW, reconciled, blocked, deadline
+    )
 
 
 def run_hired_paper_company(
@@ -193,7 +209,15 @@ def run_hired_paper_company(
         if opening is not None and research is not None:
             posting = opening.order.posting if opening.order is not None else None
             order_id = opening.order.order_id if opening.order is not None else None
-            _settle_opening(writer, opening.claim, research, venue, posting, order_id)
+            settled = _settle_opening(
+                writer, opening.claim, research, venue, posting, order_id
+            )
+            if order_id is not None and not settled:
+                reconciled, blocked = _recover_hired_submission(
+                    writer, venue, reconciled, deadline
+                )
+                if reconciled.unresolved or blocked:
+                    return HiredPaperRun(None, research, reconciled, None, blocked)
         if not remaining:
             return HiredPaperRun(None, research, reconciled, None)
         employee = runtime()
@@ -212,8 +236,14 @@ def run_hired_paper_company(
             claim = hiring.hire_claim
             if claim is None:
                 return HiredPaperRun(hiring, None, reconciled, None)
-            research = _hired_research(writer, claim, venue, employee)
+            research, pending = _hired_research(writer, claim, venue, employee)
             hiring = replace(hiring, accepted=True)
+            if pending:
+                reconciled, blocked = _recover_hired_submission(
+                    writer, venue, reconciled, deadline
+                )
+                if reconciled.unresolved or blocked:
+                    return HiredPaperRun(hiring, research, reconciled, None, blocked)
             agent_id = owed_hired_follow_up_owner(
                 store, company_id, employee.profile, POSITION_REVIEW
             )

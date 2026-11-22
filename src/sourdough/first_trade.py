@@ -16,7 +16,7 @@ from .paper_execution import (
     PaperOrderSizing,
     observe_bound_position,
 )
-from .paper_order import submit_paper_order
+from .paper_order import OrderReplyUnknown, submit_paper_order
 from .paper_research import (
     ResearchDecisionReceipt,
     ResearchTools,
@@ -191,8 +191,14 @@ def _apply_paper_order(
     venue: PaperExecution,
     writer: WriterLease | None,
 ) -> ToolResult:
-    receipt = submit_paper_order(store, claim, intent, venue, writer=writer)
-    posting = post_confirmed_fill(
-        store, claim.company_id, receipt.order_id, venue, writer=writer
-    )
+    try:
+        receipt = submit_paper_order(store, claim, intent, venue, writer=writer)
+    except OrderReplyUnknown as error:
+        return ToolResult(error.order_id, None)
+    try:
+        posting = post_confirmed_fill(
+            store, claim.company_id, receipt.order_id, venue, writer=writer
+        )
+    except TimeoutError:
+        posting = None
     return ToolResult(receipt.order_id, posting)
