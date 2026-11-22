@@ -179,7 +179,12 @@ def _require_slot_cut(
 
 
 def capture_window_sample(
-    writer: WriterLease, engine_directory: Path, window_id: str, slot: int
+    writer: WriterLease,
+    engine_directory: Path,
+    window_id: str,
+    slot: int,
+    *,
+    through_ns: int | None = None,
 ) -> WindowValuation:
     writer.verify()
     window = read_window(writer.store, writer.company_id, window_id)
@@ -189,6 +194,8 @@ def capture_window_sample(
 
     def admit(cut):
         quote = cut["observation"]
+        if through_ns is not None and quote["observed_ns"] > through_ns:
+            raise ValuationRefused("Valuation observation is after the segment cutoff")
         if slot == _last_slot(window) and not current_quote_times(
             quote["quote_event_ns"], quote["quote_received_ns"], window.plan.closes_ns
         ):

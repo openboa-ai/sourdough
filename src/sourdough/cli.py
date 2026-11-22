@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from time import time_ns
 
 from sourdough.assessment_run import run_assessment_company
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
@@ -95,9 +96,19 @@ def _start_supervisor(args):
         command.append("--repeat-paper")
     if getattr(args, "managed_engine", False):
         command.append("--managed-engine")
-    if args.command == "supervise-paper" and args.observe_window is not None:
-        _paper_sampler(args, args.journal, managed=args.managed_engine)
-        command.extend(("--observe-window", args.observe_window))
+    if args.command == "supervise-paper":
+        sampler = _paper_sampler(args, args.journal, managed=args.managed_engine)
+        if sampler is not None:
+            command.extend(("--observe-window", sampler.window_id))
+            if sampler.observe_through_ns is not None:
+                remaining = sampler.observe_through_ns - time_ns()
+                if not 0 < remaining < (args.max_seconds - 1) * 10**9:
+                    raise WindowRefused(
+                        "Observation cutoff does not fit the supervisor deadline"
+                    )
+                command.extend(
+                    ("--observe-through-ns", str(sampler.observe_through_ns))
+                )
     return supervise_worker(
         command,
         args.store,
@@ -116,13 +127,16 @@ def _paper_destination(args):
 
 
 def _paper_sampler(args, directory: Path, *, managed: bool) -> WindowSampler | None:
+    through = getattr(args, "observe_through_ns", None)
     if args.observe_window is None:
+        if through is not None:
+            raise WindowRefused("Observation cutoff requires a sealed window")
         return None
     if not managed:
         raise WindowRefused(
             "Only a managed current-market activation can sample a window"
         )
-    return WindowSampler(directory, args.observe_window)
+    return WindowSampler(directory, args.observe_window, through)
 
 
 def _managed_destination_flag(command):
@@ -285,10 +299,12 @@ def main() -> int:
             running.add_argument("--idle-seconds", type=int, default=0)
             running.add_argument("--observe-window")
         if command == "supervise-paper":
+            running.add_argument("--observe-through-ns", type=int)
             running.add_argument("--max-restarts", type=int, default=2)
             running.add_argument("--startup-seconds", type=int, default=60)
             running.add_argument("--max-seconds", type=int, default=180)
         if command == "_paper-worker":
+            running.add_argument("--observe-through-ns", type=int)
             running.add_argument("--ready-fd", type=int, required=True)
             running.add_argument("--store-key", type=_store_key, required=True)
             running.add_argument("--budget-from", type=int, required=True)

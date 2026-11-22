@@ -464,6 +464,50 @@ class PaperValuationTests(unittest.TestCase):
             employee.assert_called_once()
             self.assertEqual(count_company_runs(self.store, self.company_id), 1)
 
+    def test_bounded_observation_continues_after_the_turn_allowance_is_exhausted(self):
+        second = 10**9
+        opens = time_ns() + second // 2
+        closes = opens + 2 * second - 1
+        plan = replace(self.plan(opens, closes, cadence=second), agent_turn_limit=0)
+        with hold_company_writer(self.store, self.company_id) as writer:
+            register_managed_window(writer, self.engine, plan)
+            with self.assertRaisesRegex(WindowRefused, "outside the bounded window"):
+                with WindowSampler(self.engine, plan.window_id, closes + 1).activate(
+                    writer, self.venue
+                ):
+                    self.fail("Started after the declared window")
+
+        stop = Event()
+
+        def quote_source():
+            while not stop.is_set():
+                stamp = time_ns()
+                self.venue.publish_quote(
+                    "venue", 60_000_000, stamp, stamp, bid_atoms_per_lot=59_999_990
+                )
+                stop.wait(0.05)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            source = pool.submit(quote_source)
+            try:
+                with patch("sourdough.company_run.run_first_trade") as employee:
+                    result = run_paper_company(
+                        self.store,
+                        self.company_id,
+                        self.venue,
+                        Mock(profile="profile"),
+                        sampler=WindowSampler(self.engine, plan.window_id, closes),
+                    )
+                self.assertIsNone(result.first_trade)
+                employee.assert_not_called()
+            finally:
+                stop.set()
+                source.result(timeout=2)
+        samples = read_window_samples(self.store, self.company_id, plan.window_id)
+        self.assertEqual([slot for slot, _ in samples.captures], [0, 1])
+        self.assertEqual(samples.missing_ranges, ())
+        self.assertEqual(count_company_runs(self.store, self.company_id), 0)
+
     def test_closed_statement_uses_original_cash_and_deducts_only_operating_costs(self):
         day = date(2027, 1, 15)
         day_ns = 86_400 * 10**9
