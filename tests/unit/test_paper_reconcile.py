@@ -149,6 +149,14 @@ class ReconcilePaper(unittest.TestCase):
         )
 
     def test_reopened_company_assigns_same_agent_a_review_after_zero_fill(self):
+        self._assert_zero_fill_continues(repeat_paper=False)
+
+    def test_reopened_company_persists_the_same_agents_next_trading_decision_after_zero_fill(
+        self,
+    ):
+        self._assert_zero_fill_continues(repeat_paper=True)
+
+    def _assert_zero_fill_continues(self, *, repeat_paper):
         store = self.store.with_name("cancelled-company.sqlite")
         journal = self.journal.with_name("cancelled-venue.sqlite")
         company = found(
@@ -178,11 +186,13 @@ class ReconcilePaper(unittest.TestCase):
         )
         observed = []
 
-        def review(read_result):
+        def decide(read_result):
             result = read_result()
             observed.append(result)
             return {
-                "tool": "record_review_decision",
+                "tool": "record_paper_decision"
+                if repeat_paper
+                else "record_review_decision",
                 "call_id": "next",
                 "observation_revision": result["revision"],
                 "action": "hold",
@@ -195,13 +205,23 @@ class ReconcilePaper(unittest.TestCase):
             store,
             company.company_id,
             replaced_venue,
-            SimpleNamespace(profile="runtime", review=review),
+            SimpleNamespace(profile="runtime", trade=decide, review=decide),
+            repeat_paper=repeat_paper,
             turn_budget=1,
         )
         self.assertEqual(result.blocked_work, ())
-        self.assertEqual(result.review.claim.founder_id, claim.founder_id)
-        self.assertNotEqual(result.review.claim.run_id, claim.run_id)
-        self.assertEqual(result.review.next_duty.result.kind, "paper_no_fill")
+        if repeat_paper:
+            [follow_up] = result.later_trades
+            self.assertIsNone(follow_up.order_id)
+            self.assertEqual(
+                self.rows(store, "SELECT account_id,action FROM paper_decision"),
+                [(account.account_id, "hold")],
+            )
+        else:
+            follow_up = result.review
+        self.assertEqual(follow_up.claim.founder_id, claim.founder_id)
+        self.assertNotEqual(follow_up.claim.run_id, claim.run_id)
+        self.assertEqual(follow_up.next_duty.result.kind, "paper_no_fill")
         [receipt] = observed
         self.assertEqual(
             (

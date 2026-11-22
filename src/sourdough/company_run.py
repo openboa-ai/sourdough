@@ -32,9 +32,8 @@ from .paper_books import (
     PostingRefused,
     capture_position,
     post_confirmed_fill,
+    read_book_observation,
     read_booked_no_fill,
-    read_no_fill,
-    read_position,
 )
 from .paper_decision import (
     PaperDecision,
@@ -355,14 +354,9 @@ def _read_paper_observation(
     if reference.kind == "research_finding":
         return read_research_result(connection, company_id, reference.resource_id)
     try:
-        if reference.kind == "paper_position":
-            observation = read_position(connection, company_id, reference.resource_id)
-        elif reference.kind == "paper_no_fill":
-            observation = read_no_fill(connection, company_id, reference.resource_id)
-            if observation is None:
-                raise PostingRefused("No booked cancellation for this order")
-        else:
-            raise DutyRefused("This duty does not reference a paper result")
+        observation = read_book_observation(
+            connection, company_id, reference.kind, reference.resource_id
+        )
     except PostingRefused as error:
         raise DutyRefused("Committed paper observation is unavailable") from error
     return asdict(observation) | {"revision": observation.revision}

@@ -278,6 +278,18 @@ def read_booked_no_fill(
         return read_no_fill(db, company_id, order_id)
 
 
+def read_book_observation(
+    connection: sqlite3.Connection, company_id: str, kind: str, resource_id: str
+) -> PositionObservation | NoFillObservation:
+    if kind == "paper_position":
+        return read_position(connection, company_id, resource_id)
+    if kind == "paper_no_fill":
+        no_fill = read_no_fill(connection, company_id, resource_id)
+        if no_fill is not None:
+            return no_fill
+    raise PostingRefused("Requested book observation does not exist")
+
+
 def resolved_order_sql(db: sqlite3.Connection) -> str:
     filled = f"{FILLED_QUANTITY}=o.quantity" if _has_table(db, "paper_fill") else "0"
     if not _has_table(db, "paper_cancellation"):

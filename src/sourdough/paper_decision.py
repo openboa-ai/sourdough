@@ -9,7 +9,12 @@ from uuid import uuid4
 from .company import _connect
 from .duty_run import PAPER_EXECUTION, DutyClaim, DutyRefused
 from .first_duty import FIRST_DUTY_SCOPE
-from .paper_books import read_no_fill, read_position, resolved_order_sql
+from .paper_books import (
+    read_book_observation,
+    read_no_fill,
+    read_position,
+    resolved_order_sql,
+)
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -128,8 +133,11 @@ def persist_paper_decision(
         if state != "running":
             raise DutyRefused("Duty cannot record a paper decision")
         require_result_read(connection, follow_up, decision.observation_revision, now)
-        observation = read_position(
-            connection, claim.company_id, follow_up.result.resource_id
+        observation = read_book_observation(
+            connection,
+            claim.company_id,
+            follow_up.result.kind,
+            follow_up.result.resource_id,
         )
         if observation.revision != decision.observation_revision:
             raise DutyRefused(
