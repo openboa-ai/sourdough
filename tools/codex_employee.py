@@ -227,15 +227,20 @@ def scoped_call(address, name, args, outbox, tools, terminal_tool):
     if name == "record_research_decision":
         data = json.dumps(args, sort_keys=True, separators=(",", ":")).encode()
         args = args | {"call_id": sha256(data).hexdigest()}
-    try:
-        with socket.socket(socket.AF_UNIX) as client:
-            client.settimeout(5)
-            client.connect(address)
-            message = json.dumps({"name": name, "arguments": args}).encode()
-            client.sendall(message + b"\n")
-            with client.makefile() as stream:
-                result = json.load(stream)
-    except (OSError, ValueError):
+    message = json.dumps({"name": name, "arguments": args}).encode() + b"\n"
+    for _ in range(2 if name == "request_hire" else 1):
+        try:
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(5)
+                client.connect(address)
+                client.sendall(message)
+                with client.makefile() as stream:
+                    result = json.load(stream)
+            if isinstance(result, dict):
+                break
+        except (OSError, ValueError):
+            continue
+    else:
         return tool_output("Scoped service is unavailable.", denied=True)
     if "error" in result:
         return tool_output(result["error"], denied=True)

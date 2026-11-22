@@ -6,6 +6,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
 from sqlite3 import Connection
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from .company import _connect
@@ -74,6 +75,14 @@ def _status(connection: Connection, agent_id: str) -> OnboardingStatus:
     )
 
 
+def probe_desk_scratch() -> bool:
+    try:
+        with TemporaryDirectory(prefix="sd-desk-"):
+            return True
+    except OSError:
+        return False
+
+
 def provision_hire(
     writer: WriterLease,
     agent_id: str,
@@ -107,7 +116,11 @@ def provision_hire(
                 return current
             if current.retry_at is not None and current.retry_at > now:
                 return current
-        available = ready(profile)
+        unavailable = None
+        if not ready(profile):
+            unavailable = "runtime_unavailable"
+        elif not probe_desk_scratch():
+            unavailable = "workspace_unavailable"
         writer.verify()
         with connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -127,15 +140,16 @@ def provision_hire(
             ).fetchone()
             if attempts >= MAX_PROVISIONING_ATTEMPTS:
                 return current
-            if not available:
+            if unavailable is not None:
                 connection.execute(
                     """UPDATE hire_onboarding SET state = 'blocked', attempts = ?,
-                           retry_at = ?, reason = 'runtime_unavailable' WHERE agent_id = ?""",
+                           retry_at = ?, reason = ? WHERE agent_id = ?""",
                     (
                         attempts + 1,
                         now + PROVISIONING_RETRY_SECONDS
                         if attempts + 1 < MAX_PROVISIONING_ATTEMPTS
                         else None,
+                        unavailable,
                         agent_id,
                     ),
                 )

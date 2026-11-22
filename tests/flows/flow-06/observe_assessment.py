@@ -69,7 +69,7 @@ def store_json(path, body):
     path.write_text(json.dumps(body, sort_keys=True))
 
 
-def prepare(output, employee):
+def prepare(output, employee, *, hiring_only=False):
     root = Path(__file__).resolve().parents[3]
     installed = Path(find_spec("sourdough").origin).parent
     for source in (root / "src/sourdough").glob("*.py"):
@@ -148,21 +148,25 @@ def prepare(output, employee):
         ],
     )
     startup = cli("stage-staffing", company, envelope, *identity)
-    sealed_source = cli("stage-assessment-source", company, source, *identity)
+    sealed_source = (
+        None
+        if hiring_only
+        else cli("stage-assessment-source", company, source, *identity)
+    )
     initial_roster = rows(company, "SELECT id,execution_profile FROM agent")
     assert initial_roster == [(starter["founder_id"], profile)]
     trial = {
         "revision": head,
         "tree": tree,
         "client": False,
-        "environment": "company-only",
+        "environment": "hiring-only" if hiring_only else "company-only",
         "founding": starter,
         "profile": profile,
         "staffing": startup,
         "source": sealed_source,
-        "turn_budget": 3,
-        "wall_seconds": 360,
-        "max_restarts": 1,
+        "turn_budget": 2 if hiring_only else 3,
+        "wall_seconds": 240 if hiring_only else 360,
+        "max_restarts": 0 if hiring_only else 1,
     }
     store_json(output / "trial.json", trial)
     return company, identity, trial
