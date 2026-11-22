@@ -12,6 +12,7 @@ from sourdough.paper_books import (
     capture_position,
     position_quantity,
     post_confirmed_fill,
+    read_fill_accounting_source,
 )
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
@@ -28,7 +29,7 @@ class PaperBooksTests(unittest.TestCase):
         self.company_id = founder.company_id
         self.venue = FixedQuoteVenue(self.journal)
         account = PaperAccount("account", "local-v1", "rules", "USD", 5000, "paper")
-        account = self.venue.provision(account, 100)
+        account = self.venue.provision(account, 100, fee_bps=100)
         bind(
             self.store,
             PaperMandate("mandate", self.company_id, "charter", account, 1000),
@@ -74,6 +75,81 @@ class PaperBooksTests(unittest.TestCase):
             self.assertEqual(
                 book.execute("SELECT reserved_minor_units FROM paper_order").fetchone(),
                 (200,),
+            )
+
+    def test_accounting_source_reopens_with_the_original_fee_and_binding(self):
+        order_id = self.submit(110)
+        witness = self.venue.observe_execution(order_id)
+        self.assertIsNone(
+            read_fill_accounting_source(self.store, self.company_id, witness.fill_id)
+        )
+        posting = self.post(order_id)
+        source = read_fill_accounting_source(
+            self.store, self.company_id, posting.fill_id
+        )
+        self.assertIsNotNone(source)
+        self.assertEqual(
+            (source.destination_id, source.account_id, source.fill_id, source.order_id),
+            (
+                self.venue.observe_account("account").destination_id,
+                "account",
+                witness.fill_id,
+                order_id,
+            ),
+        )
+        self.assertEqual(
+            (source.binding_revision, source.currency, source.mapping_revision),
+            ("mandate", "USD", "paper-quote-fee-v1"),
+        )
+        self.assertEqual(source.fee_minor_units, 2)
+        self.assertEqual(source.fee_minor_units, witness.fee_minor_units)
+        self.assertGreater(source.recorded_at_ns, 0)
+        self.assertEqual(self.post(order_id), posting)
+        self.assertEqual(
+            read_fill_accounting_source(self.store, self.company_id, posting.fill_id),
+            source,
+        )
+        with self.assertRaisesRegex(PostingRefused, "identity mismatch"):
+            read_fill_accounting_source(self.store, "other-company", posting.fill_id)
+        with closing(sqlite3.connect(self.store)) as book, book:
+            book.execute("DROP TABLE paper_fill_accounting_source")
+        self.assertEqual(self.post(order_id), posting)
+        self.assertIsNone(
+            read_fill_accounting_source(self.store, self.company_id, posting.fill_id)
+        )
+
+    def test_accounting_source_failure_rolls_back_the_new_fill_not_the_venue(self):
+        order_id = self.submit(110)
+        with closing(sqlite3.connect(self.store)) as book, book:
+            book.execute(
+                """CREATE TRIGGER refuse_reservation_update
+                   BEFORE UPDATE OF reserved_minor_units ON paper_order
+                   BEGIN SELECT RAISE(ABORT, 'source transaction interrupted'); END"""
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "transaction interrupted"):
+            self.post(order_id)
+        with closing(sqlite3.connect(self.store)) as book, book:
+            self.assertEqual(
+                book.execute(
+                    """SELECT name FROM sqlite_schema
+                       WHERE name IN ('paper_fill', 'paper_fill_fee', 'paper_fill_accounting_source')"""
+                ).fetchall(),
+                [],
+            )
+            self.assertEqual(
+                book.execute("SELECT reserved_minor_units FROM paper_order").fetchone(),
+                (220,),
+            )
+            book.execute("DROP TRIGGER refuse_reservation_update")
+        self.assertEqual(self.venue.observe_execution(order_id).fee_minor_units, 2)
+        result = self.post(order_id)
+        self.assertIsNotNone(
+            read_fill_accounting_source(self.store, self.company_id, result.fill_id)
+        )
+        with closing(sqlite3.connect(self.journal)) as venue:
+            self.assertEqual(
+                venue.execute("SELECT count(*) FROM venue_execution").fetchone(),
+                (1,),
             )
 
     def test_unfilled_and_unattributed_orders_do_not_book_a_position(self):
