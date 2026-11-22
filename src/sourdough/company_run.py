@@ -26,7 +26,7 @@ from .first_trade import (
     run_first_trade,
 )
 from .onboarding import is_hired_first_duty
-from .paper_account import reopen_binding
+from .paper_account import has_pending_binding_change, reopen_binding
 from .paper_books import (
     NoFillObservation,
     Posting,
@@ -142,18 +142,24 @@ def _operate(
             )
         turn_budget = max(0, turn_budget - consumed)
     idle_deadline = monotonic() + idle_seconds
+    with closing(_connect(store, "ro")) as connection:
+        switching = has_pending_binding_change(connection)
+    repeat_paper = repeat_paper and not switching
     next_purpose = PAPER_EXECUTION if repeat_paper else POSITION_REVIEW
     reconciliation, blocked = _recover(writer, venue, next_purpose)
     fenced_runs = requeue_uncommitted_work(writer)
     if on_ready is not None:
         on_ready(writer)
     first = (
-        None if reconciliation.unresolved else resume_opening_research(writer, venue)
+        None
+        if reconciliation.unresolved or switching
+        else resume_opening_research(writer, venue)
     )
     if (
         first is None
         and turn_budget
         and not reconciliation.unresolved
+        and not switching
         and founding_duty_due(store, company_id)
     ):
         first = run_first_trade(store, company_id, venue, runtime, writer=writer)

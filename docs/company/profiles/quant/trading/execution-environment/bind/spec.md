@@ -30,3 +30,11 @@ Input contracts: [connector registration](../../../../../systems/connectors/conn
 | Missing capability | An adapter cannot establish historical order coverage or delayed-send fencing. The affected absence stays unknown and dependent new risk remains blocked; an adapter registration or simulator result cannot upgrade that capability. |
 
 This spec defines a shared core and binding contract, not authorization to execute a live order.
+
+### Managed paper changeover
+
+Select a separately prepared paper destination by naming the current and new revisions. Persist a single pending request under the company writer lease. It fences new sends but does not change the effective binding: original lookups, reservation settlement and follow-up review remain on the old destination. The company does not infer flatness from the absence of local orders. Activation requires independently witnessed zero positions and no unresolved venue effects at both destinations, no remaining company exposure, and settlement of outstanding original order duties. If these conditions are not met, retry the same selection; do not copy any reservation, order or position to the new account.
+
+An applied request records both sets of binding terms and the effective time in the same transaction as the active pointer change. Replay returns its historical receipt without sending anything. Different terms under a used revision, stale source revisions and reuse of retired account identities are refused. Old observations remain historical evidence; they must not authorize an order on the new binding.
+
+Use `switch-nautilus-paper STORE NEW_DIRECTORY --previous-directory OLD_DIRECTORY --previous-revision OLD --revision NEW --company-id ID --charter-revision CHARTER --exposure-atoms LIMIT` through the local company control path. Both runtime directories must already be prepared. `effective_at_ns: null` means the requested binding has not taken effect. Keep operating recovery against the previous directory while pending; retry the same revision explicitly after confirming drain. A request does not authorize a live endpoint or migrate any holdings.

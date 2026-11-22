@@ -262,6 +262,28 @@ class NautilusPaperVenue:
                 units.quote_atoms(Decimal(terms.minimum_notional)),
             )
 
+    def observe_drained_account(self, account_id: str) -> PaperAccount | None:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            account = self._account(connection, account_id)
+            baseline = connection.execute(
+                "SELECT 1 FROM sandbox_activation WHERE position_lots=0 AND cash_atoms=? LIMIT 1",
+                (account.starting_minor_units,),
+            ).fetchone()
+            if (
+                baseline is None
+                or connection.execute(
+                    """SELECT 1 FROM sandbox_order orders WHERE NOT EXISTS (
+                       SELECT 1 FROM sandbox_account_observation observed
+                       WHERE observed.order_id=orders.order_id
+                         AND observed.position_lots=0 AND observed.cash_atoms=?
+                   ) LIMIT 1""",
+                    (account.starting_minor_units,),
+                ).fetchone()
+            ):
+                return None
+        return account
+
     def observe_fee_bps(self, account_id: str) -> int:
         with self._connect("ro") as connection:
             _, plan = self._configuration(connection)
