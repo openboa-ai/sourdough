@@ -62,6 +62,7 @@ def capture_fill(venue, generation: str, units: SpotCashUnits, event) -> str:
         units.lots(event.last_qty.as_decimal()),
         units.price_per_lot(event.last_px.as_decimal()),
         units.quote_atoms(event.commission.as_decimal()),
+        effective_ns=event.ts_event,
     )
     return order_id
 
@@ -164,13 +165,15 @@ async def serve(
                     event_ns, received_ns, time_ns()
                 ):
                     return
-                if self.quote is not None and (event_ns, received_ns) <= self.quote[1:]:
+                if (
+                    self.quote is not None
+                    and (event_ns, received_ns) <= self.quote[1:3]
+                ):
                     return
-                self.quote = (
-                    units.price_per_lot(quote.ask_price.as_decimal()),
-                    event_ns,
-                    received_ns,
-                )
+                ask = units.price_per_lot(quote.ask_price.as_decimal())
+                bid = units.price_per_lot(quote.bid_price.as_decimal())
+                if bid <= ask:
+                    self.quote = (ask, event_ns, received_ns, bid)
             except Exception as error:
                 if not failure.done():
                     failure.set_result(error)
@@ -307,7 +310,7 @@ async def serve(
             now = time_ns()
             if (
                 quote is not None
-                and current_quote_times(*quote[1:], now)
+                and current_quote_times(*quote[1:3], now)
                 and 0 <= now - strategy.trade_ns <= 15 * 10**9
             ):
                 if not ready:
@@ -315,9 +318,14 @@ async def serve(
                     venue.prove_account(generation, account_id, currency, balance)
                 observation = (*quote, strategy.trade_ns)
                 if observation != last_quote:
-                    atoms, event_ns, received_ns, trade_ns = observation
+                    ask, event_ns, received_ns, bid, trade_ns = observation
                     venue.publish_quote(
-                        generation, atoms, received_ns, trade_ns, event_ns=event_ns
+                        generation,
+                        ask,
+                        received_ns,
+                        trade_ns,
+                        event_ns=event_ns,
+                        bid_atoms_per_lot=bid,
                     )
                     last_quote = observation
                 if not ready:

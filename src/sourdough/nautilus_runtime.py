@@ -1,16 +1,18 @@
 """Prepare, start, and bind an independently supervised Nautilus paper venue."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from .market_worker import SpotInstrumentTerms, journal_key, read_spot_terms, reopen
-from .nautilus_paper import NautilusPaperVenue, SandboxPlan
+from .nautilus_paper import NautilusPaperVenue, SandboxPlan, SandboxValuationCut
 from .paper_account import (
     BindingChange,
     PaperAccount,
     PaperMandate,
     bind,
     change_paper_binding,
+    reopen_binding,
 )
 from .paper_execution import VenueRefused
 from .replay_tape import ReplayTape
@@ -23,6 +25,14 @@ _WORKER = """import importlib, sys
 sys.path.insert(0, sys.argv.pop(1))
 importlib.import_module(sys.argv.pop(1)).main()
 """
+VALUATION_SOURCE_REVISION = "binance-public-spot-quote-v1"
+
+
+@dataclass(frozen=True)
+class BoundValuationCut:
+    binding_revision: str
+    observation: SandboxValuationCut
+    source_revision: str
 
 
 def paper_venue(
@@ -34,6 +44,22 @@ def paper_venue(
     )
     venue.require_independent_from(store)
     return venue
+
+
+def observe_bound_valuation(
+    store: Path, company_id: str, directory: Path
+) -> BoundValuationCut:
+    binding = reopen_binding(store, company_id)
+    venue = paper_venue(store, directory)
+    _, plan = venue.configuration()
+    cut = venue.observe_valuation_cut(binding.account.account_id)
+    if (
+        plan.company_id != company_id
+        or cut.account != binding.account
+        or reopen_binding(store, company_id) != binding
+    ):
+        raise VenueRefused("Valuation cut does not match the current company binding")
+    return BoundValuationCut(binding.revision, cut, VALUATION_SOURCE_REVISION)
 
 
 def _prepared(

@@ -16,6 +16,8 @@ The first operating-cost join binds the company, window ID, currency, dated cut,
 
 For costs joined to a valuation amount, the sealed inventory also binds the accounting scale. Convert covered amounts only to an exact integral count in the requested scale of the same currency. Unknown scale, nonintegral conversion, and different currencies are unavailable, not zero or an assumed exchange rate.
 
+For the managed buy-only cash-spot sandbox, freeze a count and digest of the original venue fill prefix in the same read snapshot as the balance and quote. Between two ordered, eligible cuts for the same sealed window, read those original prefixes again from the bound venue, excluding later entries. Match source IDs and exact signed cash and lot movements, including each fee once. Reject altered prefixes, missing event times, fills outside the cut interval, or unexplained movements. The scope has no venue funding or capital-movement route after provisioning; this contract does not impute zero for other environments. Retain both cut revisions and original fill identities. A reconciled interval is not full-window coverage and does not establish company-net return without the other sources.
+
 ## Independent cases
 
 | Case | Evidence and expected result |

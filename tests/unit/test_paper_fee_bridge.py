@@ -1,18 +1,28 @@
 import sqlite3
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import monotonic, sleep, time_ns
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
 from sourdough.first_duty import claim_first_duty
 from sourdough.general_ledger import JournalRefused
+from sourdough.market_worker import SpotInstrumentTerms
+from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import post_confirmed_fill
-from sourdough.paper_fee_bridge import FeeChart, VerifiedFee, deliver_paper_fee
+from sourdough.paper_execution import VenueRefused
+from sourdough.paper_fee_bridge import (
+    FeeChart,
+    VerifiedFee,
+    deliver_managed_paper_fee,
+    deliver_paper_fee,
+)
 from sourdough.paper_order import PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.writer_lease import hold_company_writer
@@ -147,4 +157,77 @@ class PaperFeeBridge(unittest.TestCase):
                 self.store, "SELECT acknowledged,journal_id FROM paper_fee_delivery"
             ),
             [(1, None)],
+        )
+
+    def test_managed_fee_uses_original_fill_day_and_atoms(self):
+        terms = SpotInstrumentTerms(
+            "BTCUSDT", "BTC", "USDT", "0.01", "0.00001", "0.00001", "5"
+        )
+        venue = NautilusPaperVenue(self.root / "sandbox.sqlite")
+        venue.provision(SandboxPlan(self.company, "paper", terms, 100_000_000_000, 0))
+        venue.prove_account("original", "BINANCE-001", "USDT", venue.start_generation())
+        account = venue.observe_account("paper")
+        bind(
+            self.store,
+            PaperMandate("scope", self.company, "charter", account, 10_000_000_000),
+            venue,
+        )
+        claim = claim_first_duty(self.store, self.company, "employee")
+        price = 59_000_000
+        quote_ns = time_ns()
+        venue.publish_quote("original", price, quote_ns, quote_ns)
+        effective_ns = int(datetime(2026, 11, 22, tzinfo=UTC).timestamp()) * 10**9 - 1
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            submission = pool.submit(
+                submit_paper_order,
+                self.store,
+                claim,
+                PaperIntent("managed", terms.revision, 20, price),
+                venue,
+            )
+            command = None
+            deadline = monotonic() + 3
+            while command is None and monotonic() < deadline:
+                command = venue.claim_command("original")
+                sleep(0.01)
+            self.assertIsNotNone(command)
+            order_id = command.order_id
+            venue.record_fill("original", order_id, "legacy", 8, price, 0)
+            fill = ("original", order_id, "timed", 12, price, 4)
+            venue.record_fill(*fill, effective_ns=effective_ns)
+            venue.record_fill(*fill, effective_ns=effective_ns)
+            with self.assertRaisesRegex(VenueRefused, "changed"):
+                venue.record_fill(*fill, effective_ns=effective_ns + 1)
+            self.assertEqual(submission.result(timeout=2).order_id, order_id)
+        post_confirmed_fill(self.store, self.company, order_id, venue)
+        reopened = NautilusPaperVenue(venue.journal)
+        chart = replace(self.chart, currency="USDT", units_per_whole=100_000_000)
+        with hold_company_writer(self.store, self.company) as writer:
+            with self.assertRaisesRegex(JournalRefused, "independently timed"):
+                deliver_managed_paper_fee(writer, reopened, "paper", "legacy", chart)
+            with self.assertRaisesRegex(JournalRefused, "matching chart units"):
+                deliver_managed_paper_fee(
+                    writer,
+                    reopened,
+                    "paper",
+                    "timed",
+                    replace(chart, units_per_whole=100),
+                )
+            receipt = deliver_managed_paper_fee(
+                writer, reopened, "paper", "timed", chart
+            )
+            self.assertEqual(
+                deliver_managed_paper_fee(writer, reopened, "paper", "timed", chart),
+                receipt,
+            )
+        self.assertEqual(receipt.amount_minor, 4)
+        self.assertEqual(
+            self.rows(self.store, "SELECT effective_date,currency FROM journal_entry"),
+            [("2026-11-21", "USDT")],
+        )
+        self.assertEqual(
+            self.rows(
+                reopened.journal, "SELECT fill_id,effective_ns FROM sandbox_fill_time"
+            ),
+            [("timed", effective_ns)],
         )

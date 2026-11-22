@@ -6,6 +6,7 @@ import sqlite3
 from contextlib import closing
 from dataclasses import asdict, astuple, dataclass
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from time import monotonic, sleep, time_ns
 from uuid import uuid4
@@ -35,9 +36,13 @@ _CANCELLATION_SCHEMA = """CREATE TABLE IF NOT EXISTS sandbox_cancellation (
     generation TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL,
     outcome TEXT NOT NULL DEFAULT 'cancelled'
 )"""
+_FILL_TIME_SCHEMA = """CREATE TABLE IF NOT EXISTS sandbox_fill_time (
+    fill_id TEXT PRIMARY KEY NOT NULL REFERENCES sandbox_fill_observation(fill_id),
+    effective_ns INTEGER NOT NULL CHECK(effective_ns>0)
+)"""
 _STORE_QUOTE = """INSERT OR REPLACE INTO sandbox_quote
-    (singleton,generation,price_atoms_per_lot,received_ns,exchange_trade_ns,event_ns)
-    VALUES (1, ?, ?, ?, ?, ?)"""
+    (singleton,generation,price_atoms_per_lot,received_ns,exchange_trade_ns,event_ns,bid_atoms_per_lot)
+    VALUES (1, ?, ?, ?, ?, ?, ?)"""
 
 
 def current_quote_times(event_ns: int, received_ns: int, now_ns: int) -> bool:
@@ -49,10 +54,11 @@ def current_quote_times(event_ns: int, received_ns: int, now_ns: int) -> bool:
     )
 
 
-def _ensure_quote_time(connection: sqlite3.Connection) -> None:
+def _ensure_quote_witness(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(sandbox_quote)")}
-    if "event_ns" not in columns:
-        connection.execute("ALTER TABLE sandbox_quote ADD COLUMN event_ns INTEGER")
+    for column in ("event_ns", "bid_atoms_per_lot"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE sandbox_quote ADD COLUMN {column} INTEGER")
 
 
 def _ensure_terminal_outcome(connection: sqlite3.Connection) -> None:
@@ -119,6 +125,96 @@ class SandboxBalance:
     cash_atoms: int
 
 
+@dataclass(frozen=True)
+class SandboxFillFact:
+    fill_id: str
+    order_id: str
+    generation: str
+    quantity: int
+    price_atoms: int
+    fee_atoms: int
+    effective_ns: int | None
+
+
+@dataclass(frozen=True)
+class SandboxFillFence:
+    count: int
+    revision: str
+
+
+@dataclass(frozen=True)
+class SandboxValuationCut:
+    account: PaperAccount
+    balance: SandboxBalance
+    quote_generation: str
+    observed_ns: int
+    quote_event_ns: int
+    quote_received_ns: int
+    supporting_trade_ns: int
+    quote_units_per_whole: int
+    base_units_per_lot: str
+    bid_atoms_per_lot: int
+    ask_atoms_per_lot: int
+    fill_fence: SandboxFillFence
+
+
+@dataclass(frozen=True)
+class SandboxFeeEvidence:
+    destination_id: str
+    account_id: str
+    order_id: str
+    fill_id: str
+    effective_ns: int
+    currency: str
+    units_per_whole: int
+    fee_atoms: int
+
+
+def _has_fill_times(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sandbox_fill_time'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _fill_event_time(connection: sqlite3.Connection, fill_id: str) -> int | None:
+    if not _has_fill_times(connection):
+        return None
+    row = connection.execute(
+        "SELECT effective_ns FROM sandbox_fill_time WHERE fill_id=?", (fill_id,)
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def _fill_facts(
+    connection: sqlite3.Connection, maximum: int
+) -> tuple[SandboxFillFact, ...]:
+    if _has_fill_times(connection):
+        rows = connection.execute(
+            """SELECT fill.fill_id,order_id,generation,quantity,price_atoms,fee_atoms,effective_ns
+               FROM sandbox_fill_observation fill LEFT JOIN sandbox_fill_time time
+               ON fill.fill_id=time.fill_id ORDER BY fill.rowid LIMIT ?""",
+            (maximum,),
+        )
+    else:
+        rows = connection.execute(
+            """SELECT fill_id,order_id,generation,quantity,price_atoms,fee_atoms,NULL
+               FROM sandbox_fill_observation ORDER BY rowid LIMIT ?""",
+            (maximum,),
+        )
+    return tuple(SandboxFillFact(*row) for row in rows)
+
+
+def _fill_fence(fills: tuple[SandboxFillFact, ...]) -> SandboxFillFence:
+    digest = sha256()
+    for fill in fills:
+        digest.update(json.dumps(astuple(fill), separators=(",", ":")).encode())
+        digest.update(b"\n")
+    return SandboxFillFence(len(fills), digest.hexdigest())
+
+
 class NautilusPaperVenue:
     def __init__(self, journal: Path):
         self.journal = journal.resolve()
@@ -162,10 +258,10 @@ class NautilusPaperVenue:
                        singleton INTEGER PRIMARY KEY CHECK (singleton=1),
                        generation TEXT NOT NULL, price_atoms_per_lot INTEGER NOT NULL,
                        received_ns INTEGER NOT NULL, exchange_trade_ns INTEGER NOT NULL,
-                       event_ns INTEGER
+                       event_ns INTEGER, bid_atoms_per_lot INTEGER
                    )"""
             )
-            _ensure_quote_time(connection)
+            _ensure_quote_witness(connection)
             if plan.tape_revision is not None:
                 connection.execute(
                     """CREATE TABLE IF NOT EXISTS replay_decision_cut (
@@ -257,8 +353,12 @@ class NautilusPaperVenue:
         )
 
     def _quote_observation(
-        self, connection: sqlite3.Connection, generation: str | None = None
-    ) -> tuple[int, ReplayAvailability | None]:
+        self,
+        connection: sqlite3.Connection,
+        generation: str | None = None,
+        *,
+        now_ns: int | None = None,
+    ) -> tuple[dict, ReplayAvailability | None]:
         cursor = connection.execute("SELECT * FROM sandbox_quote")
         values = cursor.fetchone()
         row = (
@@ -266,7 +366,7 @@ class NautilusPaperVenue:
             if values is not None
             else {}
         )
-        now = time_ns()
+        now = time_ns() if now_ns is None else now_ns
         _, plan = self._configuration(connection)
         if (
             not row
@@ -283,7 +383,7 @@ class NautilusPaperVenue:
                 "Sandbox has no fresh quote and supporting exchange trade"
             )
         if plan.tape_revision is None:
-            return row["price_atoms_per_lot"], None
+            return row, None
         cut = connection.execute(
             """SELECT event_ns,available_ns FROM replay_decision_cut
                WHERE generation=? AND price_atoms_per_lot=? AND event_ns=?""",
@@ -291,7 +391,7 @@ class NautilusPaperVenue:
         ).fetchone()
         if cut is None or not 0 < cut[0] <= cut[1]:
             raise VenueRefused("Replay requires the current sealed availability cut")
-        return row["price_atoms_per_lot"], ReplayAvailability(plan.tape_revision, *cut)
+        return row, ReplayAvailability(plan.tape_revision, *cut)
 
     def observe_account(self, account_id: str) -> PaperAccount:
         with self._connect("ro") as connection:
@@ -322,7 +422,80 @@ class NautilusPaperVenue:
         with self._connect("ro") as connection:
             connection.execute("BEGIN")
             self._account(connection, account_id)
-            return self._quote_observation(connection)
+            quote, cut = self._quote_observation(connection)
+            return quote["price_atoms_per_lot"], cut
+
+    def observe_valuation_cut(self, account_id: str) -> SandboxValuationCut:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            account = self._account(connection, account_id)
+            if account.connector_revision != CONNECTOR:
+                raise VenueRefused("Historical replay is not a current valuation cut")
+            _, plan = self._configuration(connection)
+            observed_ns = time_ns()
+            quote, _ = self._quote_observation(connection, now_ns=observed_ns)
+            bid, ask = quote.get("bid_atoms_per_lot"), quote["price_atoms_per_lot"]
+            if type(bid) is not int or not 0 < bid <= ask:
+                raise VenueRefused("Current valuation requires an observed bid and ask")
+            if not connection.execute(
+                "SELECT 1 FROM sandbox_activation WHERE generation=?",
+                (quote["generation"],),
+            ).fetchone():
+                raise VenueRefused("Valuation has no corroborated account activation")
+            return SandboxValuationCut(
+                account,
+                self._checkpoint(connection, plan),
+                quote["generation"],
+                observed_ns,
+                quote["event_ns"],
+                quote["received_ns"],
+                quote["exchange_trade_ns"],
+                QUOTE_SCALE,
+                plan.terms.quantity_increment,
+                bid,
+                ask,
+                _fill_fence(_fill_facts(connection, -1)),
+            )
+
+    def read_fills_between(
+        self, account: PaperAccount, start: SandboxFillFence, end: SandboxFillFence
+    ) -> tuple[SandboxFillFact, ...]:
+        if (
+            type(start.count) is not int
+            or type(end.count) is not int
+            or not 0 <= start.count <= end.count < 2**63
+        ):
+            raise VenueRefused("Sandbox fill fences do not identify an ordered range")
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            if (
+                self._account(connection, account.account_id) != account
+                or account.connector_revision != CONNECTOR
+            ):
+                raise VenueRefused("Fill evidence did not come from the bound account")
+            observed = _fill_facts(connection, end.count)
+            if (
+                _fill_fence(observed[: start.count]) != start
+                or _fill_fence(observed) != end
+            ):
+                raise VenueRefused(
+                    "Original venue fill evidence no longer matches the cut"
+                )
+            return observed[start.count :]
+
+    def read_fenced_balance(
+        self, account: PaperAccount, fence: SandboxFillFence
+    ) -> SandboxBalance:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            if (
+                self._account(connection, account.account_id) != account
+                or account.connector_revision != CONNECTOR
+                or _fill_fence(_fill_facts(connection, -1)) != fence
+            ):
+                raise VenueRefused("Venue balance is not at the final valuation fence")
+            _, plan = self._configuration(connection)
+            return self._checkpoint(connection, plan)
 
     def observe_drained_account(self, account_id: str) -> PaperAccount | None:
         with self._connect("ro") as connection:
@@ -386,7 +559,7 @@ class NautilusPaperVenue:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             _ensure_terminal_outcome(connection)
-            _ensure_quote_time(connection)
+            _ensure_quote_witness(connection)
             connection.execute("DELETE FROM sandbox_quote")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS sandbox_activation (
@@ -514,6 +687,35 @@ class NautilusPaperVenue:
                 )
             )
 
+    def read_fill_fee(self, account_id: str, fill_id: str) -> SandboxFeeEvidence | None:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            account = self._account(connection, account_id)
+            if account.connector_revision != CONNECTOR:
+                return None
+            effective_ns = _fill_event_time(connection, fill_id)
+            if effective_ns is None:
+                return None
+            row = connection.execute(
+                """SELECT f.order_id,f.fee_atoms
+                   FROM sandbox_fill_observation f JOIN sandbox_order o USING(order_id)
+                   WHERE f.fill_id=? AND f.generation=o.generation""",
+                (fill_id,),
+            ).fetchone()
+            if row is None:
+                raise VenueRefused("Fee evidence has no original sandbox fill")
+            order_id, fee = row
+            return SandboxFeeEvidence(
+                account.destination_id,
+                account_id,
+                order_id,
+                fill_id,
+                effective_ns,
+                account.currency,
+                QUOTE_SCALE,
+                fee,
+            )
+
     def read_cancellation(
         self, account_id: str, order_id: str, *, account_sync: bool = False
     ) -> VenueCancellation | None:
@@ -620,7 +822,12 @@ class NautilusPaperVenue:
         trade_ns: int,
         *,
         event_ns: int | None = None,
+        bid_atoms_per_lot: int | None = None,
     ) -> None:
+        if bid_atoms_per_lot is not None and (
+            type(bid_atoms_per_lot) is not int or not 0 < bid_atoms_per_lot <= atoms
+        ):
+            raise VenueRefused("Sandbox quote has an invalid bid")
         with self._connect("rw") as connection, connection:
             connection.execute(
                 _STORE_QUOTE,
@@ -630,6 +837,7 @@ class NautilusPaperVenue:
                     received_ns,
                     trade_ns,
                     received_ns if event_ns is None else event_ns,
+                    bid_atoms_per_lot,
                 ),
             )
 
@@ -647,7 +855,7 @@ class NautilusPaperVenue:
             )
             connection.execute(
                 _STORE_QUOTE,
-                (generation, atoms, available_ns, event_ns, event_ns),
+                (generation, atoms, available_ns, event_ns, event_ns, None),
             )
 
     def invalidate_quote(self) -> None:
@@ -678,7 +886,13 @@ class NautilusPaperVenue:
         lots: int,
         price: int,
         fee: int,
+        *,
+        effective_ns: int | None = None,
     ) -> None:
+        if effective_ns is not None and (
+            type(effective_ns) is not int or not 0 < effective_ns < 2**63
+        ):
+            raise VenueRefused("Sandbox fill event time is invalid")
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -695,7 +909,10 @@ class NautilusPaperVenue:
                 (fill_id,),
             ).fetchone()
             if prior is not None:
-                if prior != observed:
+                if (
+                    prior != observed
+                    or _fill_event_time(connection, fill_id) != effective_ns
+                ):
                     raise VenueRefused("Sandbox fill replay changed its terms")
                 return
             if (
@@ -724,6 +941,12 @@ class NautilusPaperVenue:
                 "INSERT INTO sandbox_fill_observation VALUES (?, ?, ?, ?, ?, ?)",
                 (fill_id, *observed),
             )
+            if effective_ns is not None:
+                connection.execute(_FILL_TIME_SCHEMA)
+                connection.execute(
+                    "INSERT INTO sandbox_fill_time VALUES (?,?)",
+                    (fill_id, effective_ns),
+                )
             if booked + lots != row[0]:
                 return
             connection.execute(
