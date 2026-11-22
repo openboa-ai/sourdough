@@ -377,6 +377,46 @@ class PaperValuationTests(unittest.TestCase):
                 [call.args[-1] for call in capture.call_args_list], [0, 0, 2]
             )
 
+    def test_sampler_waits_until_the_final_slot_can_cover_the_close(self):
+        now = time_ns()
+        second = 10**9
+        opens = now + second
+        closes = opens + 120 * second - 1
+        plan = self.plan(opens, closes, cadence=60 * second)
+        sampler = WindowSampler(self.engine, plan.window_id)
+        with (
+            patch("sourdough.paper_window.time_ns", return_value=now),
+            hold_company_writer(self.store, self.company_id) as writer,
+        ):
+            window = register_managed_window(writer, self.engine, plan)
+            stop = Mock(spec=Event)
+            stop.is_set.return_value = False
+            with (
+                patch(
+                    "sourdough.window_sampler.time_ns",
+                    side_effect=(
+                        opens,
+                        opens + 60 * second,
+                        closes - 15 * second,
+                        closes - 1,
+                        closes + 1,
+                    ),
+                ),
+                patch(
+                    "sourdough.window_sampler.capture_window_sample",
+                    side_effect=(
+                        None,
+                        ValuationRefused("late quote unavailable"),
+                        None,
+                    ),
+                ) as capture,
+            ):
+                sampler._collect(writer, window, stop)
+            self.assertEqual(
+                [call.args[-1] for call in capture.call_args_list], [0, 1, 1]
+            )
+            self.assertEqual(stop.wait.call_args_list[1].args, (1,))
+
     def test_closed_statement_uses_original_cash_and_deducts_only_operating_costs(self):
         day = date(2027, 1, 15)
         day_ns = 86_400 * 10**9

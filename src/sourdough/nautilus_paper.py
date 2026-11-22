@@ -30,7 +30,7 @@ from .spot_cash import MAX_ATOMS, QUOTE_SCALE, SpotCashUnits
 
 CONNECTOR = "nautilus-spot-sandbox-v1"
 REPLAY_CONNECTOR = "nautilus-offline-spot-replay-v1"
-_STALE_NS = 15 * 10**9
+QUOTE_MAX_AGE_NS = 15 * 10**9
 _CANCELLATION_SCHEMA = """CREATE TABLE IF NOT EXISTS sandbox_cancellation (
     order_id TEXT PRIMARY KEY NOT NULL REFERENCES sandbox_order(order_id),
     generation TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL,
@@ -50,7 +50,7 @@ def current_quote_times(event_ns: int, received_ns: int, now_ns: int) -> bool:
         type(event_ns) is int
         and type(received_ns) is int
         and 0 < event_ns <= received_ns <= now_ns
-        and now_ns - event_ns <= _STALE_NS
+        and now_ns - event_ns <= QUOTE_MAX_AGE_NS
     )
 
 
@@ -375,7 +375,7 @@ class NautilusPaperVenue:
                 plan.tape_revision is None
                 and not (
                     current_quote_times(row.get("event_ns"), row["received_ns"], now)
-                    and 0 <= now - row["exchange_trade_ns"] <= _STALE_NS
+                    and 0 <= now - row["exchange_trade_ns"] <= QUOTE_MAX_AGE_NS
                 )
             )
         ):

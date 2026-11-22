@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .company import _connect, _identity
+from .nautilus_paper import QUOTE_MAX_AGE_NS, current_quote_times
 from .nautilus_runtime import observe_bound_valuation
 from .paper_window import RegisteredWindow, read_window
 from .spot_cash import MAX_ATOMS
@@ -155,6 +156,14 @@ def _slot_request(window: RegisteredWindow, slot: int) -> ValuationRequest:
     )
 
 
+def earliest_sample_ns(window: RegisteredWindow, slot: int) -> int:
+    plan = window.plan
+    start = plan.opens_ns + slot * plan.cadence_ns
+    if slot == _last_slot(window):
+        return max(start, plan.closes_ns - QUOTE_MAX_AGE_NS)
+    return start
+
+
 def _require_slot_cut(
     window: RegisteredWindow, slot: int, request: ValuationRequest, cut: dict
 ) -> None:
@@ -177,11 +186,22 @@ def capture_window_sample(
     if window is None:
         raise ValuationRefused("Operating window has no registered receipt")
     request = _slot_request(window, slot)
+
+    def admit(cut):
+        quote = cut["observation"]
+        if slot == _last_slot(window) and not current_quote_times(
+            quote["quote_event_ns"], quote["quote_received_ns"], window.plan.closes_ns
+        ):
+            raise ValuationRefused(
+                "Quote cannot support the registered closing instant"
+            )
+
     saved = _capture(
         writer,
         engine_directory,
         request,
         lambda cut: _require_slot_cut(window, slot, request, cut),
+        admit=admit,
     )
     return WindowValuation(window.revision, saved)
 
@@ -244,6 +264,8 @@ def _capture(
     engine_directory: Path,
     request: ValuationRequest,
     validate: Callable[[dict], None] | None = None,
+    *,
+    admit: Callable[[dict], None] | None = None,
 ) -> PaperValuation:
     writer.verify()
     saved = read_paper_valuation(writer.store, writer.company_id, request)
@@ -264,6 +286,8 @@ def _capture(
     values = asdict(cut)
     if validate is not None:
         validate(values)
+    if admit is not None:
+        admit(values)
     evidence = json.dumps(values, sort_keys=True, separators=(",", ":"))
     revision = _revision(request, evidence, nav)
     with closing(_connect(writer.store, "rw")) as database, database:
