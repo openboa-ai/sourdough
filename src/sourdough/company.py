@@ -117,15 +117,56 @@ def _connect(store: Path, mode: str) -> sqlite3.Connection:
     connection = sqlite3.connect(
         f"{store.absolute().as_uri()}?mode={mode}", uri=True, timeout=3
     )
-    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        if mode != "ro":
+            _require_writable_store(connection)
+    except BaseException:
+        connection.close()
+        raise
     return connection
+
+
+_RETIRED_SCHEMA_REVISION = -1
+
+
+@dataclass(frozen=True)
+class StoreRetirement:
+    request_revision: str
+    original_schema: int
+
+
+def _retired_store(connection: sqlite3.Connection) -> StoreRetirement | None:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='company_store_retired'"
+    ).fetchone():
+        return None
+    result = connection.execute(
+        "SELECT request_revision,original_schema FROM company_store_retired WHERE singleton=1"
+    ).fetchone()
+    if result is None or not result[0]:
+        raise FoundingRefused("Company store retirement receipt is invalid")
+    return StoreRetirement(*result)
+
+
+def _require_writable_store(connection: sqlite3.Connection) -> None:
+    if _retired_store(connection) is not None:
+        raise FoundingRefused("The original company store is retired")
 
 
 def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
     row = connection.execute(
         "SELECT id, schema_revision FROM company WHERE singleton = 1"
     ).fetchone()
-    if row is None or row[1] not in (
+    if row is None:
+        raise FoundingRefused("Unsupported company store schema")
+    company_id, schema = row
+    if schema == _RETIRED_SCHEMA_REVISION:
+        retirement = _retired_store(connection)
+        if retirement is None:
+            raise FoundingRefused("Company store retirement receipt is missing")
+        schema = retirement.original_schema
+    if schema not in (
         LEGACY_SCHEMA_REVISION,
         CONTINUATION_SCHEMA_REVISION,
         RUN_SCHEMA_REVISION,
@@ -134,7 +175,7 @@ def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
         SCHEMA_REVISION,
     ):
         raise FoundingRefused("Unsupported company store schema")
-    return row
+    return company_id, schema
 
 
 def _identity(connection: sqlite3.Connection) -> str:

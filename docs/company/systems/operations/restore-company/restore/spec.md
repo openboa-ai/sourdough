@@ -18,6 +18,12 @@ The first local checkpoint command requires the original company writer lease. I
 
 Inspection copies the single expected database member into a private temporary scope, verifies size and digest against the manifest, then independently reopens it read-only. It does not establish event replay, fence an external sender, create an active store, or promote the archive. Those steps require separate known evidence and remain restore prerequisites.
 
+For the initial core-company restore, the internal recovery operation admits a replacement only while it holds the original store lease, can verify the original against the checkpoint, and observes no installed paper binding or order history. A later source event refuses this exact-cut path; it must use independently reconciled replay instead. This operation has no direct Client or CLI control; it does not authorize a separate replacement when the original is missing or when an external sender must be reconciled.
+
+Stage the verified copy on the replacement volume and stamp its restore receipt before retiring the original. Persist retirement on the original store before publishing the replacement. An active original lease prevents retirement. A retired original remains readable but cannot acquire a normal writer lease or open any standard write connection. If publication is interrupted after retirement, only the exact source, checkpoint and replacement request can resume publication; never reactivate the old writer. An existing replacement is accepted on retry only if its own durable receipt matches. These checks do not fence a separately running external venue; quantified restoration still requires its profile-specific sender proof.
+
+Commit the retirement receipt and a reserved, unsupported schema marker in the same transaction. This also refuses startup by earlier product builds that only check their supported schema set. The retirement-aware reader obtains the original schema from the authenticated local store's receipt for inspection; the marker is not a migration of company records. Manual SQLite writes or independently copied files outside the managed service are not covered by this fence.
+
 **Concern for the responsible component:** Pin checkpoint retention, recovery objectives and fencing method before the drill. If lost local authority or obligations cannot be reconstructed, remain isolated.
 
 ## Functional and quality requirements
@@ -35,6 +41,7 @@ Inspection copies the single expected database member into a private temporary s
 | Normal | Restore a checkpoint predating a shared-asset handoff. Compare company, grants, custody and next duty to independent receipts. In the quant case additionally restore across a fill and verify position and fees. |
 | Failure or contention | Withhold a journal segment, corrupt the checkpoint, or leave the old sender active. Do not promote the candidate; retain the surviving copy and a scoped incident. A venue balance alone cannot reconstruct a lost grant. |
 | Local checkpoint boundary | Hold the original company writer lease and verify checkpoint creation is refused. After release, acquire one snapshot, retain an independent copy of the source history, and verify a scoped read-only reopen. Later original changes must not modify the archive; corruption, wrong company and accidental overwrite must be refused. |
+| Exact-cut core replacement | Start a separate caller holding the original lease. Refuse replacement while it is active. After it exits, interrupt the first restore after durable retirement, verify the old process cannot regain write access, then retry the exact request to publish one replacement. Reopen the same Agent, grant and due work under the new writer. Later source events or trading obligations refuse this path without retiring the source. |
 
 ## Operations and change review
 
