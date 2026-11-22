@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sys
 from dataclasses import asdict
 from hashlib import file_digest
 from pathlib import Path
@@ -26,7 +27,7 @@ class EmployeeProcess:
                 timeout=60,
                 check=True,
                 cwd="/",
-                env={"PATH": os.defpath},
+                env={"PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.defpath}"},
             )
             response = json.loads(result.stdout)
         except (OSError, subprocess.SubprocessError, ValueError) as error:
