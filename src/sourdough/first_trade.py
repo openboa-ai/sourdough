@@ -10,7 +10,7 @@ from .company import _connect, founding_execution_profile
 from .first_duty import DutyClaim, claim_first_duty
 from .paper_account import reopen_binding
 from .paper_books import Posting, position_quantity, post_confirmed_fill
-from .paper_execution import PaperExecution, PaperIntent
+from .paper_execution import PaperExecution, PaperIntent, PaperOrderSizing
 from .paper_order import submit_paper_order
 from .paper_research import (
     ResearchDecisionReceipt,
@@ -33,6 +33,7 @@ class TradingContext:
     instrument_rules_digest: str
     quote_minor_units: int
     exposure_limit_minor_units: int
+    order_sizing: PaperOrderSizing | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ def run_first_trade(
     if venue.observe_account(account.account_id) != account:
         raise TradeRefused("Paper destination does not match the bound account")
     quote = venue.observe_quote(account.account_id)
+    sizing = venue.observe_order_sizing(account.account_id)
     with closing(_connect(store, "ro")) as db:
         configured = founding_execution_profile(db, company_id)
         research_required = requires_research(db, company_id)
@@ -91,6 +93,7 @@ def run_first_trade(
         account.instrument_rules_digest,
         quote,
         binding.exposure_limit_minor_units,
+        sizing,
     )
     called = False
     result = None

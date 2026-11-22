@@ -5,6 +5,7 @@ import os
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict, astuple, dataclass
+from decimal import Decimal
 from pathlib import Path
 from time import monotonic, sleep, time_ns
 from uuid import uuid4
@@ -13,11 +14,12 @@ from .market_worker import SpotInstrumentTerms, journal_key
 from .paper_account import PaperAccount
 from .paper_execution import (
     PaperIntent,
+    PaperOrderSizing,
     VenueExecution,
     VenueRefused,
     require_separate_journal,
 )
-from .spot_cash import MAX_ATOMS, SpotCashUnits
+from .spot_cash import MAX_ATOMS, QUOTE_SCALE, SpotCashUnits
 
 
 CONNECTOR = "nautilus-spot-sandbox-v1"
@@ -204,6 +206,22 @@ class NautilusPaperVenue:
         with self._connect("ro") as connection:
             self._account(connection, account_id)
             return self._fresh_quote(connection)
+
+    def observe_order_sizing(self, account_id: str) -> PaperOrderSizing:
+        with self._connect("ro") as connection:
+            self._account(connection, account_id)
+            _, plan = self._configuration(connection)
+            terms = plan.terms
+            units = SpotCashUnits(terms)
+            return PaperOrderSizing(
+                terms.symbol,
+                terms.quantity_increment,
+                terms.quote_currency,
+                QUOTE_SCALE,
+                units.price_per_lot(Decimal(terms.price_increment)),
+                units.lots(Decimal(terms.minimum_quantity)),
+                units.quote_atoms(Decimal(terms.minimum_notional)),
+            )
 
     def observe_fee_bps(self, account_id: str) -> int:
         with self._connect("ro") as connection:
