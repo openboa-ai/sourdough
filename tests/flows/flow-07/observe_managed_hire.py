@@ -7,6 +7,7 @@ import runpy
 import signal
 import subprocess
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from time import sleep, time
 
@@ -106,32 +107,61 @@ def verify(store, journal, market, cut, result, trial, samples, units):
     )
     assert agent != trial["founding"]["founder_id"] and profile == trial["profile"]
     assert recovered["original_claim"]["run_id"] == first_run
-    [(finding_json, decision_json, decision_time, published)] = rows(
+    [
+        (
+            finding_json,
+            decision_json,
+            decision_time,
+            published,
+            finding_revision,
+            snapshot_json,
+            snapshot_revision,
+            limit,
+        )
+    ] = rows(
         store,
-        """SELECT finding.content,decision.content,decision.decided_at,finding.published_at
+        """SELECT finding.content,decision.content,decision.decided_at,finding.published_at,
+                  finding.revision,snapshot.inputs,snapshot.revision,paper.limit_minor_units
            FROM paper_research_finding finding JOIN paper_research_decision decision
-           ON decision.finding_id=finding.finding_id AND decision.observation_revision=finding.revision
+           ON decision.finding_id=finding.finding_id
+           JOIN paper_research_snapshot snapshot ON snapshot.run_id=finding.run_id
            JOIN paper_order paper ON paper.action_id=decision.decision_id AND paper.run_id=decision.run_id""",
     )
     finding, decision = json.loads(finding_json), json.loads(decision_json)
+    snapshot = json.loads(snapshot_json)
     assert (
-        published <= decision_time
+        snapshot["cut_at"] <= published <= decision_time
+        and sha256(snapshot_json.encode()).hexdigest()
+        == snapshot_revision
+        == finding["snapshot_revision"]
+        and sha256(finding_json.encode()).hexdigest()
+        == finding_revision
+        == decision["observation_revision"]
         and decision["action"] == "buy"
         and decision["quantity"] == booking[2]
+        and decision["limit_minor_units"] == limit
+        and booking[3] <= limit
     )
+    increment = Decimal(units.terms.quantity_increment)
     original = {
-        identity: (units.price_per_lot(Decimal(price)), event, received)
+        identity: (Decimal(price) * increment * 100_000_000, event, received)
         for identity, price, event, received in rows(
             market, "SELECT trade_id,price,event_ns,received_ns FROM market_trade"
         )
     }
     normalized = {sample["observation_id"]: sample for sample in samples}
+    visible = {sample["observation_id"]: sample for sample in snapshot["observations"]}
     for label in (finding["start_id"], finding["end_id"]):
         price, event, received = original[label]
         sample = normalized[label]
+        assert visible[label] == sample
         assert sample["price_minor_units"] == price
         assert sample["observed_at"] == event // 10**9
-        assert sample["available_at"] == (received + 10**9 - 1) // 10**9 <= published
+        assert (
+            sample["available_at"]
+            == (received + 10**9 - 1) // 10**9
+            <= snapshot["cut_at"]
+        )
     gross = original[finding["end_id"]][0] - original[finding["start_id"]][0]
     assert (
         finding["gross_change_minor_units"],
