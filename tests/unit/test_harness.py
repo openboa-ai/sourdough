@@ -212,3 +212,8 @@ class ScopedHarness(unittest.TestCase):
             json.loads((workspace / "drafts/index.json").read_bytes()),
             {"comparison": draft.revision},
         )
+        prompt = runpy.run_path(str(ADAPTER))["scoped_work_prompt"]
+        self.assertIn("Do not use the shell", prompt(original))
+        original_data = prompt(original).split("\n")[-1]
+        self.assertEqual(json.loads(original_data), original["drafts"])
+        self.assertNotIn(draft.content, prompt(outsider))
