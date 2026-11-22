@@ -14,6 +14,7 @@ from threading import Thread
 
 from .first_duty import DutyRefused
 from .first_trade import OrderTool, TradeRefused, TradingContext
+from .writer_lease import WriterRefused
 
 
 class _ReadWorkResult(socketserver.BaseRequestHandler):
@@ -30,6 +31,30 @@ class _ResultEndpoint(socketserver.UnixStreamServer):
     def __init__(self, address: str, read_result: Callable[[], dict]):
         self.read_result = read_result
         super().__init__(address, _ReadWorkResult)
+
+
+class _ResearchTool(socketserver.StreamRequestHandler):
+    def handle(self) -> None:
+        self.request.settimeout(2)
+        try:
+            line = self.rfile.readline(8193)
+            if not line.endswith(b"\n") or len(line) > 8192:
+                raise DutyRefused("Invalid research tool request")
+            request = json.loads(line)
+            if not isinstance(request, dict) or set(request) != {"name", "arguments"}:
+                raise DutyRefused("Invalid research tool envelope")
+            result = self.server.invoke(request["name"], request["arguments"])
+        except (DutyRefused, WriterRefused) as error:
+            result = {"error": str(error)}
+        except (OSError, ValueError):
+            result = {"error": "Research tool exchange failed"}
+        self.wfile.write(json.dumps(result).encode())
+
+
+class _ResearchEndpoint(socketserver.UnixStreamServer):
+    def __init__(self, address: str, invoke: Callable[[str, dict], dict]):
+        self.invoke = invoke
+        super().__init__(address, _ResearchTool)
 
 
 class EmployeeProcess:
@@ -55,7 +80,7 @@ class EmployeeProcess:
                 input=json.dumps(request),
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=100 if request["operation"] == "research_duty" else 60,
                 check=True,
                 cwd="/",
                 env={"PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.defpath}"},
@@ -101,12 +126,18 @@ class EmployeeProcess:
     def trade(self, read_result: Callable[[], dict]) -> dict:
         return self._follow_up("trade_duty", read_result)
 
+    def research(self, invoke: Callable[[str, dict], dict]) -> dict:
+        return self._scoped_exchange("research_duty", _ResearchEndpoint, invoke)
+
     def _follow_up(self, operation: str, read_result: Callable[[], dict]) -> dict:
+        return self._scoped_exchange(operation, _ResultEndpoint, read_result)
+
+    def _scoped_exchange(self, operation: str, endpoint_type, callback) -> dict:
         if self._profile() != self.profile:
             raise TradeRefused("Employee model binding changed")
         with TemporaryDirectory(prefix="sd-") as directory:
             address = str(Path(directory) / "result.sock")
-            with _ResultEndpoint(address, read_result) as endpoint:
+            with endpoint_type(address, callback) as endpoint:
                 thread = Thread(
                     target=endpoint.serve_forever, kwargs={"poll_interval": 0.05}
                 )

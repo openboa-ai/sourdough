@@ -157,6 +157,15 @@ class FixedQuoteVenue:
             raise VenueRefused("Unknown destination account")
         return row[0]
 
+    def observe_fee_bps(self, account_id: str) -> int:
+        with self._open("ro") as db:
+            db.execute("BEGIN")
+            if not db.execute(
+                "SELECT 1 FROM venue_account WHERE account_id = ?", (account_id,)
+            ).fetchone():
+                raise VenueRefused("Unknown destination account for fee terms")
+            return self._fee_rate(db)
+
     def observe_execution(self, order_id: str) -> VenueExecution | None:
         with self._open("ro") as db:
             db.execute("BEGIN")

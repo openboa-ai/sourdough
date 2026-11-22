@@ -11,6 +11,12 @@ from .first_duty import DutyClaim, claim_first_duty
 from .paper_account import reopen_binding
 from .paper_books import Posting, position_quantity, post_confirmed_fill
 from .paper_order import PaperIntent, submit_paper_order
+from .paper_research import (
+    ResearchDecisionReceipt,
+    ResearchTools,
+    reopen_research_decision,
+    requires_research,
+)
 from .paper_venue import FixedQuoteVenue
 from .writer_lease import WriterLease
 
@@ -44,12 +50,15 @@ class EmployeeRuntime(Protocol):
 
     def run(self, context: TradingContext, order_tool: OrderTool) -> None: ...
 
+    def research(self, invoke: Callable[[str, dict], dict]) -> dict: ...
+
 
 @dataclass(frozen=True)
 class TradeResult:
     claim: DutyClaim
     order: ToolResult | None
     position_quantity: int
+    research: ResearchDecisionReceipt | None = None
 
 
 def run_first_trade(
@@ -73,6 +82,7 @@ def run_first_trade(
         configured = db.execute(
             "SELECT execution_profile FROM founder WHERE company_id = ?", (company_id,)
         ).fetchone()
+        research_required = requires_research(db, company_id)
     if configured != (runtime.profile,):
         raise TradeRefused("Employee process does not match the configured profile")
     runtime.check_ready()
@@ -104,5 +114,28 @@ def run_first_trade(
         result = ToolResult(receipt.order_id, posting)
         return result
 
-    runtime.run(context, order_tool)
-    return TradeResult(claim, result, position_quantity(store, company_id))
+    research = None
+    if research_required:
+        tools = ResearchTools(
+            store,
+            claim,
+            quote,
+            venue.observe_fee_bps(account.account_id),
+            binding.exposure_limit_minor_units,
+            writer,
+        )
+        response = runtime.research(tools.invoke)
+        research = reopen_research_decision(store, claim)
+        if research is None or response != {"decision_id": research.decision_id}:
+            raise TradeRefused(
+                "Employee did not acknowledge its committed research decision"
+            )
+        if research.decision.action == "buy":
+            order_tool(
+                research.decision_id,
+                research.decision.quantity,
+                research.decision.limit_minor_units,
+            )
+    else:
+        runtime.run(context, order_tool)
+    return TradeResult(claim, result, position_quantity(store, company_id), research)
