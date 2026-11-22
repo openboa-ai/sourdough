@@ -197,6 +197,7 @@ def run_hired_paper_company(
                 employee,
                 first_purpose=PAPER_EXECUTION,
                 allow_staffing=remaining >= 2,
+                resume_accepted=True,
             )
             claim = hiring.hire_claim
             if claim is None:
