@@ -10,7 +10,7 @@ Earn positive long-term net return on invested capital within the mandate's risk
 
 | Question | Evidence that answers it | What it cannot establish |
 | --- | --- | --- |
-| Can it operate unattended? | [Founder shift](acceptance/first-shift/spec.md) and a separate [hired-Agent paper run](acceptance/hired-agent-continuity/spec.md): own research, fill, service loss, reconciliation, next judgment. | Good judgment on every occasion or positive return. |
+| Can it trade, then operate unattended over time? | First observe the [Agent's paper fill](engineering/flow-delivery/goal-01-04.md); later qualify the  [Founder shift](acceptance/first-shift/spec.md) and a separate [hired-Agent paper run](acceptance/hired-agent-continuity/spec.md): own research, fill, service loss, reconciliation, next judgment. | Good judgment on every occasion or positive return. |
 | Does the company get better at improving its work? | [Recursive learning comparison](acceptance/recursive-learning/spec.md): compare a revised improvement procedure with a frozen one on new problems at matched budgets. | A better model, a lucky trade or a larger memory is not evidence of RSI. |
 | Does the fund earn money, and is the proposed change better? | [Net-return comparison](acceptance/net-return/spec.md): report absolute company-net results; compare the candidate with the frozen incumbent under the same risk constraints. Cash is an opportunity-cost reference. | A profitable incumbent need not be replaced; a smaller loss is not a profit. Paper is not realized live performance. |
 
@@ -20,11 +20,11 @@ Sourdough operates a company under a standing mandate. [Company](company/README.
 
 On returning, the board should be able to ask who accepted a duty, what evidence they had, what changed or was deliberately left alone, and who acts next. For the fund specifically: It should be able to find the market evidence an Agent had at decision time, why the company traded or waited, what the venue actually filled, the resulting exposure and costs, and who or what will act next. If an order is still unresolved, the board should see the uncertainty, its effect on available risk and the company's next reconciliation attempt.
 
-## The first proof: one operating day at the fund
+## The first proof: one Agent paper trade
 
-One company starts with one founding Agent. Its charter grants access to a synthetic BTC futures market, bounded simulated trading and limited hiring authority. On first activation the Agent reads the mandate and the company's books, identifies work, and chooses an action. A decision to wait includes a reason and a condition that will bring the Agent back. Ordinary work, order submission within the mandate, recovery and subsequent shifts proceed with zero board messages.
+One company starts with one founding Agent, a due duty and bounded paper authority. Supply a usable paper price; a fixed quote is sufficient. The Agent uses its own scoped tool to submit an order. Both its grant and the paper destination are checked at the point of use.
 
-The first demonstrable result is one uninterrupted observation: the real founder identifies a question and publishes its own as-of research, uses the result to decide and submit a paper order, and makes a fresh decision on a later shift after a post-fill company crash and automatic reconciliation. A valid decision to wait does not demonstrate the trading branch. Neither a profitable fixture nor a convincing explanation proves economic performance.
+The first demonstrable result is a linked Agent request, paper order, confirmed fill and booked position from the connected system. Stop there. A hold does not demonstrate the trading path. Current-market data, further decisions, recovery, strategy quality and positive returns are separate later claims. See the [first Goal](engineering/flow-delivery/goal-01-04.md).
 
 ## What belongs to the company
 
@@ -34,7 +34,7 @@ The company decides whether a need calls for research, reassignment, a program o
 
 ## Scope of the first proof
 
-- Run one company locally against one independently observable simulated instrument. Exercise the normal product entry point, real Agent Runtime, risk check, order execution, recovery and board view together.
+- Run one company locally against one independently observable simulated instrument. Exercise the normal product entry point, real Agent Runtime, risk check, paper execution and booked position together.
 - Preserve the Agent across sessions only on its original execution profile. Another runtime means another Agent; company records and outstanding obligations survive a handoff. Define the same authority and record boundaries for a later server deployment.
 - Record enough evidence now to evaluate later strategy, skill and memory changes. The local MVP subsequently runs company programs against synthetic funds. A dedicated physical computer per Agent, live-money deployment and model-weight training are extensions.
 - Binance BTC futures is the target market. Product and account selection, live risk limits, credentials and live activation require a subsequent decision. The first environment has synthetic funds and an isolated simulated venue.

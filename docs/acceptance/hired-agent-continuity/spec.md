@@ -10,7 +10,7 @@ A company hires an Agent to meet an observed need. The new Agent accepts work, u
 
 A duty can produce an assessment, a recommendation, a shared artifact or an authorized change to another system. A decision to take no external action can itself be the work product. No department, financial account, connector write, research report format or second hire is a prerequisite of the common contract. A role describes responsibility; it does not grant permissions.
 
-This spec does **not** change the [founder's first integration (G1–G5)](../first-shift/spec.md#first-integration-run) or the [hiring episode (H1)](../episodes.md#h1-hiring). H1 stops at first-duty acceptance; G1 starts with an existing founder. Neither, nor their concatenation, establishes this claim.
+This spec does **not** change the [founder's separate resilience qualification (G1–G5)](../first-shift/spec.md#first-integration-run) or the [hiring episode (H1)](../episodes.md#h1-hiring). H1 stops at first-duty acceptance; G1 starts with an existing founder. Neither, nor their concatenation, establishes this claim.
 
 ## Contract between Work and the domain
 

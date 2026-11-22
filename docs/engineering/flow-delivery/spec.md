@@ -1,14 +1,14 @@
-# 개발 단위 PR과 흐름 통합
+# Unit PRs and flow integration
 
-소유자: 저장소 CI. [기존 저장소 명세](../repository-bootstrap/spec.md)의 후속 변경이며, 제품 기준선 v1.1의 동작이나 체크섬을 변경하지 않는다. 목표는 단위 변경을 빨리 검토하되 연결되지 않은 제품을 `main`에 합격시키지 않는 것이다.
+Owner: repository CI. This extends the [repository bootstrap](../repository-bootstrap/spec.md). It separates fast review of small changes from acceptance of a working product flow.
 
-| 변경 경로 | PR 병합 후보에서 요구할 관찰값 |
+| Route | Required observation |
 | --- | --- |
-| 작업 브랜치 → `feat/flow-<slug>` | 기존 이름·저장소 검사와 제품 포맷·린트·빠른 제품 시험. 누적된 경로까지 로컬에서 재실행하되 매번 macOS 장애·실제 모델·장시간 시장 시험을 돌리지 않는다. |
-| 같은 저장소의 `feat/flow-<slug>` → `main` | 같은 빠른 검사에 더해 macOS에서 해당 묶음의 통합 시험을 실행한다. 다른 묶음의 성공, 시험 미구현, `test_flow.ConnectedFlow.test_end_to_end` 누락, 빈 시험, skip 또는 실패는 통과가 아니다. |
-| 일반 브랜치 → `main` | 문서·저장소 관리만 직접 제안할 수 있다. 제품 코드·시험·의존성의 추가, 변경, 이동, 삭제는 통합 PR로 보낸다. 새 제품 경로도 기본적으로 이 규칙을 따른다. |
-| `main` push | 기존 최종 squash 제목과 저장소 위생 검사를 유지한다. 제품 시연 증거는 머지된 PR 후보에 연결한다. |
+| Topic → `feat/flow-<slug>` | Naming, hygiene, package formatting, lint and fast product behavior on the merge candidate. Do not run paid models or long operating trials on every PR. |
+| Same-repository `feat/flow-<slug>` → `main` | Run the fast checks and that flow's macOS suite. Require `test_flow.ConnectedFlow.test_end_to_end` in `tests/flows/flow-<slug>`. An unrelated pass, missing case, empty suite, skip or failure cannot pass. The integration owner also checks the Goal's actual-run evidence against this candidate before merging; hosted CI alone does not prove an actual Agent trade. |
+| Other topic → `main` | Documentation and repository maintenance only. Route product additions, edits, renames and deletions through the flow branch. |
+| Push to `main` | Check the resulting squash subject and repository hygiene. Keep the product evidence linked to the merged candidate. |
 
-`Required CI`가 필요한 작업의 성공을 확인한다. PR 이벤트는 읽기 전용이며, 제품 시험의 계정·거래·모델 자격증명은 없다. 브랜치/제목을 셸 코드로 사용하지 않는다. 이 변경은 호스팅 권한이나 ruleset을 바꾸지 않는다. 단위 PR도 필수 결과와 해당 소유자 리뷰를 확인한 뒤에만 합친다. GitHub의 강제 보호와 팀의 운영 규칙은 구분한다.
+`Required CI` checks all applicable results. PR jobs have read-only access, no trading or model credentials, and no permission to change hosting rules. Treat branch names and PR titles as data. Check the unit PR's results and applicable owner reviews before squash; a workflow trigger is not itself branch protection.
 
-검증: 단위·통합·문서 PR, 직접 제품 PR, 다른 저장소의 통합 브랜치, 모호한 흐름 이름, 누락/빈/skip/실패 시험을 구분한다. CI 라우팅의 성공은 제품 시연 성공이 아니다. 되돌릴 때는 개발 단위 머지를 멈추고 미완성 흐름을 `main` 밖에 보존한 채 별도의 보호된 PR로 정책을 복원한다.
+Verification covers direct and aggregate routes, forks, malformed branch names, missing and skipped tests, failures and unrelated passing tests. To revert the policy, pause new unit merges, preserve incomplete flows outside `main` and restore the previous policy through a protected PR.

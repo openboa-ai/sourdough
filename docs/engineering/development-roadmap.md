@@ -1,57 +1,38 @@
-# Sourdough 개발 실행계획 · 기준선 v1.1
+# Sourdough development roadmap · baseline v1.2
 
-2026-11-22 · **계획 고정 / 제품 시험 UNRUN** · [전체 책임도](../company-agent-quant.md) · [기능별 목적·성공 기준](feature-boundaries.md) · [개발 단위 색인](work-packages.md)
+Design for review; product evidence **NOT_RUN**. [System boundaries](../company-agent-quant.md) · [Feature outcomes](feature-boundaries.md) · [Owning specs](work-packages.md)
 
-**첫 산출물은 영리한 Agent가 아니라, 회사가 한 근무의 결과를 보존하고 다음 근무를 스스로 시작하는 실행 경로다.** 손실이 나거나 후속 판단이 보류여도 운영 흐름은 합격할 수 있다. 반대로 수익이 나도 원주문을 중복 전송하거나 사람이 재기동해야 하면 운영은 불합격이다. 이것은 개발 순서이지 회사 조직도나 Agent의 고정 업무 순서가 아니다.
+**First deliverable: a working Sourdough system in which an employee Agent makes its first paper trade.** Build the minimum real implementation at each boundary, not a script that sends a broker order. Stop the first Goal at a confirmed fill and the corresponding booked position. Long-term company-net return is the business objective; neither profitability nor the quality of the Agent's strategy is this milestone's acceptance test.
 
-## 1. 범위와 실행 단위
+## Operating slice
 
-| 한 흐름 | 확인할 사실 |
-| --- | --- |
-| 회사 설립 → 근무 → 관측·연구 → 판단 | 같은 회사와 Agent에서 근거와 결정, 다음 기동 조건을 다시 읽을 수 있다. |
-| 모의 주문 → 체결 → 회사 중단 → 복구 | 원주문과 예약은 전송 전에 남는다. 회사가 수신하기 전에 확정된 모의 체결은 회사 밖의 독립 기록에서 다시 조회된다. |
-| 포지션 대사 → 다음 근무 → 새 판단 | 원장 반영은 한 번이고, 다른 근무 ID의 같은 Agent가 복구된 수량을 읽는다. Client와 시험기는 운영 명령을 보내지 않는다. |
+Company founding and mandate → due work → Agent on its pinned runtime → scoped order request → paper-account/risk admission and reservation → execution destination → confirmed fill → booked position. The Client may be closed. A fixed paper quote is sufficient. Do not confuse a fixture for a market price with a fixture making the Agent's decision. An inconclusive submission is not a fill; do not send a second order to make the test pass.
 
-로컬 첫 구현은 **회사 서비스 하나와 영속 저장소 하나**를 기본으로 한다. 별도 장애 경계가 필요한 회사 감독자와 모의 체결 원본만 분리한다. 작업용 기본안은 Python 패키지와 SQLite 트랜잭션, macOS 로컬 감독이며, 첫 변경에서 설치된 호환 버전·실행 진입점·저장소 위치·감독 방식을 기록한다. 컴포넌트별 서버, 범용 메시지 버스, 새 매칭 엔진, 종합 대시보드는 선행조건이 아니다. 거래 기능에는 회사 관리형 NautilusTrader를 사용한다. 정확한 배포판과 버전은 실제 호환성·권한 확인 뒤 고정하며 현 시점에 설치·입증된 것으로 간주하지 않는다.
+Start with one Python company service and SQLite transactions. Keep the Agent provider and execution venue behind their respective adapters. Sourdough configures and runs its selected trading runtime, NautilusTrader; an independently observable local paper venue can demonstrate the first connected trade without qualifying a specific external binding. Record the actual runtime, versions and mode. Do not build a new production matching engine, a message bus or a service per component. Independent macOS supervision and post-fill crash qualification belong to the follow-up reliability work. No live order credentials or capital are authorized.
 
-첫 연결 시험에서만 **테스트용 고정 응답 작업자와 독립 모의 체결 자료**를 사용할 수 있다. 제품의 권한 검사·근무 저장·예약·전송·원장·복구 코드를 그대로 통과해야 하며, 시험기가 업무 선택·재기동·재예약을 대신하지 않는다. 이 증거는 연결 시험일 뿐 창업 Agent 합격, 런타임 적격성, 시장 수익의 증거가 아니다. 실제 Agent는 같은 회사 도구에 연결한다. 실거래 주문 자격증명과 주문 전송은 전체 실행계획 밖이다.
+## Implementation order
 
-## 2. 실행 순서와 완료 판정
+| ID | Outcome | Evidence / dependencies |
+| --- | --- | --- |
+| 01 | Found the company, create its founder, grant and first duty. | Verify their identifiers through the normal company entry; distinguish initial setup from opening an existing store. |
+| 02 | Run the first duty through the founder's real harness. | Link a scoped tool request to the authenticated Agent and duty. Local fixtures help wire the port; they do not qualify an actual Agent. |
+| 03 | Connect one paper account and instrument to the fund path. | Link an authorized order, reservation, venue fill and position. Deny excessive exposure; duplicate notifications do not double-post. No live-market feed required. |
+| 04 | Demonstrate the [first Agent paper trade](flow-delivery/goal-01-04.md) through the combined system. | One same-candidate trace from actual Agent to paper fill and resulting books. No forced second decision, market research benchmark, crash, or manual order. Stop here for Goal 01–04. |
+| 05 | Extend trading into unattended shifts; qualify founder continuity separately. | Observe the next actual decision with the prior position. For the [founder resilience test](../acceptance/first-shift/spec.md), cut the company after a confirmed fill but before receipt; fence the former writer, reconcile once and resume without the board. Do not require this test for 04. |
+| 06 | Hire a distinct Agent on demonstrated need and provision its scope, budget and desk. | [Hired-Agent continuity](../acceptance/hired-agent-continuity/spec.md) starts before the hire and follows that Agent's own research, paper fill, recovery and next duty; keep the non-trading case separate. |
+| 07 | Qualify trading environments on the same company interface. | [Parity test](../acceptance/execution-parity/spec.md): historical replay, current-market paper and separately authorized external functional tests. Verify market source, execution destination and fill durability per binding. Testnet is not a performance reference. |
+| 08 | Measure the first operating revision, including all company costs. | Register risk limits, dates, revision and current-market paper binding first. [Close the books](../acceptance/net-return/spec.md) against fees, funding, flows, marks and operating costs. A loss is measurable; missing coverage is unknown. |
+| 09 | Test a candidate against the recorded incumbent. | Only after 08, compare isolated accounts in a new matched forward period with the same risk and accounting perimeter. Retain the incumbent if improvement is not demonstrated. |
+| 10 | Complete the employee lifecycle. | [H1, W1, O1](../acceptance/episodes.md): personal work, selective sharing, accountable handoff and revocation. A message alone never transfers custody. |
+| 11 | Add human projection/control and operational restore. | Read-only views do not operate the company. Suspension blocks new risk, not reconciliation of existing obligations. Restoring a store must not create a second sender. |
+| 12 | Extend company tools and maintain the installed system. | Independently verify an asset before activation. Distinguish issue closure, release publication, local adoption, original defect retest and notification. |
+| 13 | Evaluate Agent decisions and learning. | [L1](../acceptance/episodes.md) checks later use and rollback. Test [RSI](../acceptance/recursive-learning/spec.md) separately on unseen tasks at matched budgets. One profit or a model change is not proof. |
 
-번호는 작은 변경을 묶는 **시연 단위**다. 한 번호 안에서도 색인의 소유 명세를 하나씩 구현·검증한다. 아래의 연결·시연 결과와 개별 명세 전체의 합격을 구분한다. 후속 번호가 이미 만든 기능을 확장할 때 새 경로나 원장을 만들지 않는다.
+Later work is not a checklist for the first trade. Start recording authority, account isolation, order identity and price/cost basis when first used. Do not claim full qualification of any untested branch.
 
-| ID | 선행 | 작업 · 산출물 | 다음 단계로 넘어갈 관찰값 |
-| --- | --- | --- | --- |
-| 01 | 없음 | **회사 기동.** 정상 제품 진입점, 단일 작성자 저장소, 창업 헌장·Agent 프로필·위임·최초 근무를 원자적으로 생성한다. 초기화와 기존 회사 열기를 구분한다. | 커밋 직후 응답을 잃고 재시작해도 회사·창업자·근무 ID가 하나씩 동일하다. 누락된 기존 저장소를 빈 회사로 대체하지 않는다. |
-| 02 | 01 | **한 근무.** 하나의 회사 작업공간, 기동 조건, Harness의 최소 도구, 시점이 있는 관측 하나를 연결한다. 테스트 작업자가 자료를 읽고 결과·다음 조건을 남긴다. | Client를 닫아도 첫 근무가 실행된다. 재조회한 결과에는 행위자·근무·근거가 있고, 중복 기동이 두 번째 실행 권한을 만들지 않는다. |
-| 03 | 02 | **첫 모의 체결.** 한 상품·한 모의 계좌에서 판단 → 위험 검사 → 원주문·예약 → 허용된 목적지 → 체결 → 포지션을 연결한다. 고정 가격은 시험 입력일 뿐이다. | 정상 제품 경로의 주문 한 건이 원장 한 건으로 연결된다. 중복 체결 통지에도 수량·비용은 한 번만 반영되고 한도 초과는 전송되지 않는다. |
-| 04 | 03 | **장애를 포함한 전체 흐름.** 회사 감독자, 기존 송신자 차단, 원본 조회, 자동 다음 근무를 연결한다. 체결 확정 뒤 회사에 응답·통지를 전달하기 전에 프로세스를 종료한다. | 독립 관찰로 전송 1·체결 1·금융 반영 1, 수동 재시작 0. 새 근무에서 복구된 수량을 읽는다. 원본 불확실 시 재전송하지 않고 관련 위험만 보류한다. **첫 개발 시연 완료.** |
-| 05 | 04 | **실제 창업 Agent.** 승인된 런타임 하나·모델 하나와 제한된 비용을 설정한다. 테스트 응답을 제거하고 Agent가 스스로 연구 질문·결과·판단을 생성한다. 최소 읽기 전용 Client 추적을 연결한다. | [창업 시험 G1–G5](../acceptance/first-shift/spec.md#first-integration-run)를 단일 시도로 충족한다. 고정 응답·사후 연구 연결·시험기 운영 명령은 불합격이다. 정당한 보류는 유효한 판단이지만 체결 분기는 미검증이다. |
-| 06 | 05 | **신규 채용 Agent.** 인력 필요 판단, 채용 위임, 신원·예산·개인 공간 생성, 첫 업무 수락을 기존 경로에 연결한다. | [채용 시험](../acceptance/hired-agent-continuity/spec.md)을 채용 전부터 재현한다. 새 직원 자신의 연구→체결→장애→같은 직원의 다음 판단을 한 번에 관찰한다. 비거래 업무 시험도 별도로 기록한다. |
-| 07 | 03; 전체 장애 적격성은 04 | **거래 런타임·환경 일치.** 03부터 NautilusTrader의 허용된 패키지 준비·설정·실행·재시작 경로를 먼저 시도한다. 여기서 과거 재생, 현재 시장 기반 모의 및 외부 테스트 연결을 같은 회사 계약으로 검증한다. | [환경 시험](../acceptance/execution-parity/spec.md)에서 시장 조회와 주문 목적지를 독립 확인한다. 모의 모드의 실거래 전송은 0. 체결 원본이 중단 후 남는지 실제 바인딩별로 확인한다. 시험용 체결 소스로 대신한 경우 그 바인딩의 합격을 주장하지 않는다. |
-| 08 | 05, 06, 현재 시장 모의에 필요한 07 | **첫 회사 순수익 측정.** 첫 운용판·위험 한도·관찰 기간을 사전 등록한다. 계좌 원장, 평가가격, 수수료·펀딩, 외부 자금 흐름, 모델·자료·인프라 비용을 같은 기준 시점에 대사한다. | [순수익 시험](../acceptance/net-return/spec.md)에서 첫 운용판 단독 명세서를 재구성한다. 이익·손실 모두 유효한 측정이다. 누락은 0이 아니라 미확정이며 후보 비교의 완료된 기준선으로 쓰지 않는다. |
-| 09 | 08 | **후보 운용판 비교.** 회사 소유 전략 후보 등록·과거 실험·포트폴리오 목표·별도 실행 권한을 연결한다. 동일한 미래 관찰 기간과 조건, 격리된 모의 계좌로 기존판과 후보판을 비교한다. | 중복 비용이나 계좌 혼용 없이 두 순수익과 위험을 독립 대사한다. 개선이 입증되지 않으면 기존판을 유지한다. 직접 주문 경로에 프로그램 활성화를 강제하지 않는다. |
-| 10 | 06 | **직원 업무 전주기.** 개인 자료의 선별 공유, 협업 대화, 업무 인수, 자원 요청·할당, 권한 회수, 퇴직·자산 인계를 연결한다. | [H1·W1·O1](../acceptance/episodes.md)에서 대화만으로 권한이나 업무가 넘어가지 않고, 전임자 접근이 종료된 뒤 후임자가 같은 회사 자산과 미결 업무를 인수한다. |
-| 11 | 04; 비용·성과 표시는 08 | **사람의 조회·통제 및 운영 복원.** 상태·결정·비용·성과를 원본 기반으로 표시한다. Client 명령을 소관 서비스에 전달하고 장애 감지, 취소·늦은 체결, 계좌 외부 효과, 저장소 복원을 확인한다. | 조회의 운영 부작용은 0. 중단 명령은 신규 위험만 막고 기존 효과는 대사한다. 저장소 복원 뒤 중복 작성자가 없고, 자금 전망은 미결 의무를 이중 계상하지 않는다. |
-| 12 | 10, 11 | **회사의 기능 확장과 유지보수.** 회사 소유 도구·커넥터는 독립 검증 뒤 적용한다. 제품 기반 결함은 외부 Issue로 요청하고 릴리스 확인→로컬 적용→원 결함 검증→현 담당자 통지로 닫는다. | 작성자 퇴직 후에도 도구를 사용할 수 있다. Issue 종료만으로 적용 완료가 되지 않으며 실패한 업데이트가 권한을 늘리거나 미결 효과를 잃지 않는다. |
-| 13 | 05, 10; 운용판 비교와 독립 | **Agent 품질과 학습.** 실제 근무 기록을 바탕으로 판단 평가, 메모리·방법 후보의 채택·복귀, 이후 별도 RSI 시험을 수행한다. 추가 런타임은 별도 Agent로 적격성을 검증한다. | [L1](../acceptance/episodes.md)에서 채택 후 실제 사용·복귀를 관찰한다. [RSI](../acceptance/recursive-learning/spec.md)는 미공개 새 과제와 동일 예산에서 별도 판정한다. 모델 교체나 수익 한 번으로 합격시키지 않는다. |
+## Terra handoff
 
-기본 진행은 **01→04 한 흐름 → 05 창업 → 06 채용 → 07 거래 환경 마무리 → 08 최초 측정**이다. 10–13을 완성하느라 첫 흐름이나 첫 측정을 늦추지 않는다. 단, 비용 기록·신원·권한·격리·복구처럼 앞 단계의 결과를 믿기 위해 필요한 부분은 첫 사용 시부터 적용한다. 외부 테스트넷 시험은 별도 승인하에 기능만 검증하며 모의 성과 측정의 선행조건이 아니다.
-
-## 3. Terra가 한 단위씩 개발하는 방식
-
-**개발에 사용하는 Terra와 회사 안의 직원 Agent는 다른 주체다.** Terra는 제품 코드를 개발한다. 자동 근무 시험의 연구·주문·재기동을 Terra가 대신하면 합격하지 않는다.
-
-1. [기준본 해시](baseline-v1.1.sha256)를 저장소 루트에서 `shasum -a 256 -c docs/engineering/baseline-v1.1.sha256`으로 확인한다. 별도 구현 작업공간에도 동일한 문서가 있어야 한다. 누락·불일치가 있으면 이전 버전이나 추측으로 대체하지 않는다.
-2. [작업별 소유 명세](work-packages.md)에서 **현재 ID 하나와 첫 변경 하나**를 고른다. 소유 명세의 해시·리뷰 수용 범위·선행 결과를 기존 작업 기록에 남긴다. 기준선은 요구사항의 버전을 고정하며, 미검증 기술이나 비용·자격증명·외부 공개 권한을 승인하지 않는다.
-3. 먼저 해당 동작이 없으면 실패할 **관찰 가능한 시험**을 정한다. 정상 제품 진입점에서 입력→소유 기록→다음 소비자가 이어지도록 최소 변경만 한다. 필요한 실패 분기와 지금까지의 전체 흐름을 다시 실행한다. 실패한 내부 유닛을 테스트 전용 우회 경로로 덮지 않는다.
-4. 인계에는 **ID/명세 해시 · 코드 리비전 · 실행 명령 · 예상/실제 관찰값 · 증거 위치 · 판정 · 다음 한 작업**을 남긴다. 테스트 대역/실제 런타임/현재 시장 자료를 표시한다. 계획 체크 표시만으로 완료 처리하지 않는다. 아직 실행하지 않은 시험은 UNRUN, 시도했으나 필수 외부 조건이 없으면 BLOCKED로 기록한다.
-5. 후보 개선은 **현재 흐름의 실패를 고치거나 현재 합격 증거에 필요한가?** 아니면 후속 ID로 남기고 진행한다. 외부 권한·비용 확대, 독립 체결 원본 미확인, 회복 불가능한 전환은 해당 경계에서 멈춘다. 변경이 필요하면 영향 ID와 시험을 검토한 새 기준본을 만든다. v1.1 해시를 통과시키기 위해 조용히 갱신하지 않는다.
-
-**최초 Terra 인계:** `01 / found-company/bootstrap`. 빈 로컬 환경에서 창업 기록을 생성하고, 커밋 직후 응답을 유실시킨 뒤 같은 요청을 재시도한다. 독립적으로 조회한 회사·창업자·위임·최초 근무 ID가 모두 원본과 같아야 한다. 다른 헌장으로 같은 요청을 재사용하면 충돌해야 한다. **여기서는 모델 호출, 거래 패키지 설치, 전략 개발을 하지 않는다.** 다음 변경은 02의 첫 근무 기동이다.
-
-### 새 Terra 개발 세션의 시작 지시
-
-> Sourdough v1.1 개발 실행계획을 기준으로 작업한다. 처음이면 01, 이후에는 마지막 인계에서 통과 증거가 없는 첫 변경부터 시작한다. 소유 명세의 기준본과 현재 작업공간을 대조하고, 첫 실패 시험을 확인한 다음 그 시험을 통과시키는 최소 제품 경로를 구현한다. 수정한 단위와 직전까지의 전체 흐름을 다시 검증한다. 통과한 범위, 아직 대역인 부분, 다음 한 작업을 구분해 인계한다. Agent의 수익률·프롬프트·역할 구성은 이 작업의 성공 조건이 아니다.
-
-기준본은 구현 전 저장소의 Markdown 원문(미추적 설계 초안 포함)을 고정한다. 체크섬은 파일 변경을 탐지하지만 원문을 복원하지는 못하므로 구현 공간으로 옮길 때 문서와 체크섬을 함께 전달한다. 작업 기록과 실제 시험 결과는 기준본 밖에 둔다. 예약된 외부 연동을 사용할 수 없을 때는 그 적격성만 보류하고, 통제·원장·복구 경로는 로컬에서 계속 검증한다.
+1. Verify this revision with `shasum -a 256 -c docs/engineering/baseline-v1.2.sha256` from the repository root. The retained v1.1 manifest describes the historical tree at `b6d7b53`, not this revision.
+2. Start with `01 / found-company/bootstrap`. Use the [first Goal](flow-delivery/goal-01-04.md), [work packages](work-packages.md) and [implementation conventions](flow-delivery/guide.md). Verify scope and accepted spec before product changes.
+3. Implement a change that one consumer can observe. Run the affected case and the connected path available so far. Use one unit PR per reviewable behavior, not per file. Record the candidate revision, environment, expected/observed result, next action and owner in the flow Issue.
+4. If something does not block the first trade or invalidate its evidence, leave it for its owning milestone. Report unavailable conditions honestly. No plugin, per-trade board approval, benchmark or live account is a prerequisite. Requirements revisions receive new manifests; never overwrite a historical manifest to make it pass.

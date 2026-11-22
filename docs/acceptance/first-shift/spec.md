@@ -1,10 +1,10 @@
-# Autonomous company and first trading shift
+# Founder resilience after the first paper trade
 
 Status: Design draft for review, 2026-11-20. [Product intent](../../intent.md) · [Full MVP map and acceptance](../../README.md) · [Development lifecycle](../../engineering/lifecycle.md). Product tests are unrun.
 
-## First integrated outcome
+## Founder continuity outcome
 
-**First integration gate, not full MVP acceptance:** Without board intervention the founder must discover a question, publish its own decision-time research, use that finding to choose and submit an authorized simulated order, then survive the loss of the company service after the venue commits the fill. The product must reconcile the original order and the same Agent must make a new decision in a distinct next shift. The [five-step run](#first-integration-run) requires one ordered observation on one company, store and account; later episodes cannot supply missing steps.
+**Later resilience gate, not the [first-trade Goal](../../engineering/flow-delivery/goal-01-04.md):** Without board intervention the founder must discover a question, publish its own decision-time research, use that finding to choose and submit an authorized simulated order, then survive the loss of the company service after the venue commits the fill. The product must reconcile the original order and the same Agent must make a new decision in a distinct next shift. The [five-step run](#first-integration-run) requires one ordered observation on one company, store and account; later episodes cannot supply missing steps.
 
 The integration owner is responsible for demonstrating this whole shift from the normal local entry point. The Agent Runtime, trading and board-view contributors can develop against recorded examples in parallel. The demonstration must use their connected implementations and the same company records. A blocked adapter gets an owner, a last observed step and a resumption condition. Independent work continues.
 
@@ -167,7 +167,9 @@ The observer computes expected position from signed venue fills and fees from th
 
 <a id="mandatory-mvp-run"></a>
 
-### First integration run
+<a id="first-integration-run"></a>
+
+### Founder recovery run
 
 1. **Seal the run.** Pin build, founder agent_id and execution profile (actual runtime/model), synthetic input stream, [paper binding](../../company/profiles/quant/trading/paper-account/bind/spec.md), budgets and deadlines. Begin with a company and founder, independently bound synthetic account, and a due duty to inspect the company; no prewritten research, trade signal, direction or result. Disconnect the board before the wake. Only the product scheduler may claim the due work and invoke the Agent Harness. The external test driver supplies market inputs, injects the declared fault and observes; human/driver operational commands must total zero.
 2. **Witness research become an order.** The actual founder chooses its own question, calls ordinary research tools against the sealed as-of observations, and publishes a [finding](../../company/profiles/quant/investments/research/decision-note/spec.md) during this run. Independently reproduce its calculation and compare its conclusion/uncertainty with the rationale, side, size and cost constraints of the later decision. Persist author/work/generation, snapshot cut, finding ID/digest, action ID and next condition before dispatch. The founder calls the ordinary paper-order tool with that decision; admission checks finding lineage, active grant, bound account and headroom. No seeded report, test-driver-selected trade or unrelated ID qualifies. A legitimate hold is retained as a judgment observation with incomplete trade coverage.
