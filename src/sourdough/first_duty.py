@@ -10,7 +10,10 @@ from .company import _connect, _identity
 
 
 class DutyRefused(Exception):
-    """No eligible first duty or paper authority exists."""
+    """No eligible duty or required authority exists."""
+
+
+FIRST_DUTY_SCOPE = "paper"
 
 
 @dataclass(frozen=True)
@@ -34,8 +37,8 @@ def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> Du
                JOIN founder f ON r.founder_id = f.id AND r.company_id = f.company_id
                JOIN standing_grant g ON r.grant_id = g.id AND g.founder_id = f.id
                JOIN duty d ON r.due_work_id = d.id AND d.founder_id = f.id
-               WHERE r.company_id = ? AND d.state = 'due' AND g.scope = 'paper'""",
-            (company_id,),
+               WHERE r.company_id = ? AND d.state = 'due' AND g.scope = ?""",
+            (company_id, FIRST_DUTY_SCOPE),
         ).fetchone()
         if row is None or not execution_profile or row[3] != execution_profile:
             raise DutyRefused("No authorized paper duty for this execution profile")
@@ -55,7 +58,9 @@ def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> Du
         return claim
 
 
-def _resolve_claim(connection: sqlite3.Connection, claim: DutyClaim) -> tuple:
+def first_claim_state(
+    connection: sqlite3.Connection, claim: DutyClaim
+) -> tuple[str, str]:
     row = connection.execute(
         """SELECT g.scope, d.state
            FROM first_duty_claim q
@@ -80,9 +85,9 @@ def _resolve_claim(connection: sqlite3.Connection, claim: DutyClaim) -> tuple:
 
 
 def require_historical_claim(connection: sqlite3.Connection, claim: DutyClaim) -> None:
-    _resolve_claim(connection, claim)
+    first_claim_state(connection, claim)
 
 
 def require_paper_authority(connection: sqlite3.Connection, claim: DutyClaim) -> None:
-    if _resolve_claim(connection, claim) != ("paper", "running"):
+    if first_claim_state(connection, claim) != (FIRST_DUTY_SCOPE, "running"):
         raise DutyRefused("Current duty lacks paper authority")

@@ -8,7 +8,14 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 
-TABLES = ("company", "founder", "standing_grant", "duty", "founding_receipt")
+TABLES = (
+    "company",
+    "founder",
+    "standing_grant",
+    "duty",
+    "founding_receipt",
+    "work_follow_up",
+)
 
 
 class Founding(unittest.TestCase):
@@ -62,7 +69,7 @@ class Founding(unittest.TestCase):
         original = self.inventory()
         [[setup, company, founder, grant, duty]] = original["founding_receipt"]
         self.assertEqual(setup, "board-setup")
-        self.assertEqual(original["company"], [(1, company, 1, "charter-v1")])
+        self.assertEqual(original["company"], [(1, company, 2, "charter-v1")])
         self.assertEqual(original["founder"], [(founder, company, "profile-v1")])
         self.assertEqual(
             original["standing_grant"], [(grant, founder, "manage-company")]
@@ -100,7 +107,7 @@ class Founding(unittest.TestCase):
         self.assertEqual(self.store.read_bytes(), original)
 
         with closing(sqlite3.connect(self.store)) as db, db:
-            db.execute("UPDATE company SET schema_revision = 2")
+            db.execute("UPDATE company SET schema_revision = 999")
         incompatible = self.store.read_bytes()
         self.refusal(
             self.command("reopen", **{"company-id": receipt["company_id"]}),
@@ -117,5 +124,5 @@ class Founding(unittest.TestCase):
         first, second = [self.success(attempt.result()) for attempt in attempts]
         self.assertEqual(first, second)
         self.assertEqual(
-            [len(rows) for rows in self.inventory().values()], [1] * len(TABLES)
+            [len(rows) for rows in self.inventory().values()], [1, 1, 1, 1, 1, 0]
         )

@@ -7,7 +7,24 @@ from pathlib import Path
 from uuid import uuid4
 
 
-SCHEMA_REVISION = 1
+LEGACY_SCHEMA_REVISION = 1
+SCHEMA_REVISION = 2
+DUTY_SCHEMA = """CREATE TABLE duty (
+    id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL REFERENCES founder(id),
+    state TEXT NOT NULL
+)"""
+FOLLOW_UP_SCHEMA = """CREATE TABLE work_follow_up (
+    previous_duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
+    duty_id TEXT NOT NULL UNIQUE REFERENCES duty(id),
+    grant_id TEXT NOT NULL REFERENCES standing_grant(id),
+    grant_scope TEXT NOT NULL,
+    due_at INTEGER NOT NULL,
+    result_kind TEXT NOT NULL,
+    result_id TEXT NOT NULL,
+    result_revision TEXT NOT NULL,
+    available_at INTEGER NOT NULL,
+    run_id TEXT UNIQUE
+)"""
 SCHEMA = (
     """CREATE TABLE company (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -22,10 +39,7 @@ SCHEMA = (
         id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL UNIQUE REFERENCES founder(id),
         scope TEXT NOT NULL
     )""",
-    """CREATE TABLE duty (
-        id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL UNIQUE REFERENCES founder(id),
-        state TEXT NOT NULL
-    )""",
+    DUTY_SCHEMA,
     """CREATE TABLE founding_receipt (
         setup_identity TEXT PRIMARY KEY NOT NULL,
         company_id TEXT NOT NULL UNIQUE REFERENCES company(id),
@@ -33,6 +47,7 @@ SCHEMA = (
         grant_id TEXT NOT NULL UNIQUE REFERENCES standing_grant(id),
         due_work_id TEXT NOT NULL UNIQUE REFERENCES duty(id)
     )""",
+    FOLLOW_UP_SCHEMA,
 )
 
 
@@ -82,13 +97,44 @@ def _connect(store: Path, mode: str) -> sqlite3.Connection:
     return connection
 
 
-def _identity(connection: sqlite3.Connection) -> str:
+def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
     row = connection.execute(
         "SELECT id, schema_revision FROM company WHERE singleton = 1"
     ).fetchone()
-    if row is None or row[1] != SCHEMA_REVISION:
+    if row is None or row[1] not in (LEGACY_SCHEMA_REVISION, SCHEMA_REVISION):
         raise FoundingRefused("Unsupported company store schema")
-    return row[0]
+    return row
+
+
+def _identity(connection: sqlite3.Connection) -> str:
+    return _company_version(connection)[0]
+
+
+def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
+    with closing(_connect(store, "rw")) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            company_id, revision = _company_version(connection)
+            if company_id != expected_company_id:
+                raise FoundingRefused("Company identity mismatch")
+            if revision == SCHEMA_REVISION:
+                return
+            connection.execute(
+                DUTY_SCHEMA.replace("CREATE TABLE duty", "CREATE TABLE duty_next", 1)
+            )
+            connection.execute(
+                "INSERT INTO duty_next SELECT id, founder_id, state FROM duty"
+            )
+            connection.execute("DROP TABLE duty")
+            connection.execute("ALTER TABLE duty_next RENAME TO duty")
+            connection.execute(FOLLOW_UP_SCHEMA)
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise FoundingRefused("Company store failed foreign-key validation")
+            connection.execute(
+                "UPDATE company SET schema_revision = ? WHERE singleton = 1",
+                (SCHEMA_REVISION,),
+            )
 
 
 def found(store: Path, terms: FoundingTerms) -> FoundingReceipt:
