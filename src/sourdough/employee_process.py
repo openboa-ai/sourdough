@@ -134,6 +134,9 @@ class EmployeeProcess:
     def staffing(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("staffing_duty", _ToolEndpoint, invoke)
 
+    def onboarding(self, invoke: Callable[[str, dict], dict]) -> dict:
+        return self._scoped_exchange("onboarding_duty", _ToolEndpoint, invoke)
+
     def _follow_up(self, operation: str, read_result: Callable[[], dict]) -> dict:
         return self._scoped_exchange(operation, _ResultEndpoint, read_result)
 

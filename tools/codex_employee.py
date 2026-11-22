@@ -168,6 +168,19 @@ STAFFING_TOOLS = [
         },
     ),
 ]
+ONBOARDING_TOOLS = [
+    scoped_tool(
+        "read_first_duty", "Read your assignment and authorized private desk.", {}
+    ),
+    scoped_tool(
+        "accept_first_duty",
+        "Explicitly accept your first duty.",
+        {
+            "revision": {"type": "string"},
+            "rationale": {"type": "string", "maxLength": 2000},
+        },
+    ),
+]
 
 
 def tool_output(value, *, denied=False):
@@ -201,7 +214,11 @@ def scoped_call(address, name, args, outbox, tools):
         return tool_output("Scoped service is unavailable.", denied=True)
     if "error" in result:
         return tool_output(result["error"], denied=True)
-    if name in ("record_research_decision", "record_staffing_choice"):
+    if name in (
+        "record_research_decision",
+        "record_staffing_choice",
+        "accept_first_duty",
+    ):
         try:
             with outbox.open("x") as stream:
                 json.dump(result, stream)
@@ -323,6 +340,7 @@ def main():
         "--mcp-trade",
         "--mcp-research",
         "--mcp-staffing",
+        "--mcp-onboarding",
     ):
         serve(
             Path(sys.argv[3]),
@@ -331,6 +349,7 @@ def main():
             scoped_tools={
                 "--mcp-research": RESEARCH_TOOLS,
                 "--mcp-staffing": STAFFING_TOOLS,
+                "--mcp-onboarding": ONBOARDING_TOOLS,
             }.get(sys.argv[1]),
         )
         return
@@ -392,6 +411,7 @@ def main():
             "trade_duty",
             "research_duty",
             "staffing_duty",
+            "onboarding_duty",
         )
         or not ready
     ):
@@ -400,7 +420,16 @@ def main():
         outbox = Path(directory) / "proposal.json"
         decision = Path(directory) / "decision.txt"
         tool_args = [str(Path(__file__).resolve())]
-        if operation == "staffing_duty":
+        if operation == "onboarding_duty":
+            tool_args += ["--mcp-onboarding", request["read_endpoint"], str(outbox)]
+            tool_names = [tool["name"] for tool in ONBOARDING_TOOLS]
+            prompt = (
+                "You are a newly hired Sourdough Agent. Use read_first_duty to read your "
+                "company mandate, private desk and assigned first duty. If you accept responsibility, "
+                "use accept_first_duty with the returned revision and a reason grounded in that assignment. "
+                "Do not perform another Agent's duty or invent a grant. No shell or external access."
+            )
+        elif operation == "staffing_duty":
             tool_args += ["--mcp-staffing", request["read_endpoint"], str(outbox)]
             tool_names = [tool["name"] for tool in STAFFING_TOOLS]
             prompt = (

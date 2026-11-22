@@ -263,3 +263,31 @@ def accept_first_duty(
                 (claim.duty_id,),
             )
     return claim.duty_id
+
+
+def first_duty_accepted(writer: WriterLease, claim: DutyClaim) -> bool:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "ro")) as connection:
+        connection.execute("BEGIN")
+        _desk(connection, claim)
+        return (
+            connection.execute(
+                "SELECT 1 FROM onboarding_acceptance WHERE duty_id = ? AND run_id = ?",
+                (claim.duty_id, claim.run_id),
+            ).fetchone()
+            is not None
+        )
+
+
+def invoke_onboarding(
+    writer: WriterLease, claim: DutyClaim, name: str, arguments: dict
+) -> dict:
+    if name == "read_first_duty" and arguments == {}:
+        return read_first_duty(writer, claim)
+    if (
+        name == "accept_first_duty"
+        and isinstance(arguments, dict)
+        and set(arguments) == {"revision", "rationale"}
+    ):
+        return {"duty_id": accept_first_duty(writer, claim, **arguments)}
+    raise DutyRefused("Tool is unavailable for this onboarding duty")

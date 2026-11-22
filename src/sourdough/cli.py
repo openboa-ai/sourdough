@@ -13,11 +13,13 @@ from sourdough.duty_run import count_company_runs
 from sourdough.employee_process import EmployeeProcess
 from sourdough.first_duty import DutyRefused
 from sourdough.first_trade import TradeRefused, run_first_trade
+from sourdough.hiring_run import run_hiring
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
 from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
+from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 from sourdough.work_projection import read_local_board_timeline
@@ -103,6 +105,17 @@ def main() -> int:
     inputs.add_argument("store", type=Path)
     inputs.add_argument("observations", type=Path)
     inputs.add_argument("--company-id", required=True)
+    staffing = commands.add_parser("stage-staffing")
+    staffing.add_argument("store", type=Path)
+    staffing.add_argument("envelope", type=Path)
+    staffing.add_argument("--company-id", required=True)
+    hiring = commands.add_parser("operate-hiring")
+    hiring.add_argument("store", type=Path)
+    hiring.add_argument("--company-id", required=True)
+    hiring.add_argument("--employee", type=Path, required=True)
+    hiring.add_argument(
+        "--first-purpose", required=True, choices=("assessment", "paper_execution")
+    )
     for command in ("first-duty", "operate-paper", "supervise-paper", "_paper-worker"):
         running = commands.add_parser(command)
         running.add_argument("store", type=Path)
@@ -199,6 +212,28 @@ def main() -> int:
             result = _start_supervisor(args)
             print(json.dumps(asdict(result)))
             return 0 if result.completed else 1
+        elif args.command == "stage-staffing":
+            with args.envelope.open("rb") as source:
+                content = source.read(8193)
+            if len(content) > 8192:
+                raise DutyRefused("Staffing envelope exceeds its size limit")
+            try:
+                data = json.loads(content)
+                authority = StaffingAuthority(**data["authority"])
+                need = StaffingNeed(**data["need"])
+            except (ValueError, TypeError, KeyError) as error:
+                raise DutyRefused("Invalid staffing envelope") from error
+            with hold_company_writer(args.store, args.company_id) as writer:
+                revision = stage_staffing(writer, authority, need)
+            print(json.dumps({"evidence_revision": revision}))
+            return 0
+        elif args.command == "operate-hiring":
+            result = run_hiring(
+                args.store,
+                args.company_id,
+                EmployeeProcess(args.employee),
+                first_purpose=args.first_purpose,
+            )
         else:
             inputs = (
                 args.store,
