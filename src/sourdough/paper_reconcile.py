@@ -8,7 +8,13 @@ from sqlite3 import Connection
 from .company import _connect, _identity
 from .duty_run import DutyClaim
 from .paper_account import reopen_binding
-from .paper_books import Posting, PostingRefused, post_confirmed_fill, read_booked_fill
+from .paper_books import (
+    FILLED_QUANTITY,
+    Posting,
+    PostingRefused,
+    post_confirmed_fill,
+    read_booked_fill,
+)
 from .paper_execution import PaperExecution
 from .writer_lease import WriterLease
 
@@ -76,7 +82,7 @@ def _open_recovery(
 
 def _missing_fill(connection: Connection) -> str:
     if _has_table(connection, "paper_fill"):
-        return "NOT EXISTS (SELECT 1 FROM paper_fill WHERE order_id = o.order_id)"
+        return f"{FILLED_QUANTITY} != o.quantity"
     return "1"
 
 
