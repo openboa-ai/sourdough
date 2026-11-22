@@ -298,6 +298,17 @@ def resolved_order_sql(db: sqlite3.Connection) -> str:
     return f"({filled} OR EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id AND c.released=1))"
 
 
+def pending_no_fill_observation_sql(db: sqlite3.Connection) -> str:
+    if "available_at" not in _cancellation_columns(db):
+        return "0"
+    return """EXISTS (
+        SELECT 1 FROM paper_cancellation c JOIN duty_run r ON r.run_id=o.run_id
+        JOIN duty d ON d.id=r.duty_id
+        WHERE c.order_id=o.order_id AND c.released=1 AND c.filled_quantity=0
+          AND c.available_at IS NULL AND d.state='running'
+    )"""
+
+
 def post_confirmed_fill(
     store: Path,
     company_id: str,
@@ -451,8 +462,27 @@ def capture_position(
 def read_position(
     connection: sqlite3.Connection, company_id: str, fill_id: str
 ) -> PositionObservation:
+    observation = _lookup_position(connection, company_id, fill_id)
+    if observation is None:
+        raise PostingRefused("Requested book observation does not exist")
+    return observation
+
+
+def read_captured_position(
+    store: Path, company_id: str, fill_id: str
+) -> PositionObservation | None:
+    with closing(_connect(store, "ro")) as db:
+        db.execute("BEGIN")
+        return _lookup_position(db, company_id, fill_id)
+
+
+def _lookup_position(
+    connection: sqlite3.Connection, company_id: str, fill_id: str
+) -> PositionObservation | None:
     if _identity(connection) != company_id:
         raise PostingRefused("Company identity mismatch")
+    if not _has_table(connection, "paper_position_observation"):
+        return None
     row = connection.execute(
         """SELECT fill.fill_id, fill.order_id, source.account_id,
                   source.instrument_rules_digest, fill.quantity,
@@ -463,6 +493,4 @@ def read_position(
            WHERE snapshot.fill_id = ?""",
         (fill_id,),
     ).fetchone()
-    if row is None:
-        raise PostingRefused("Requested book observation does not exist")
-    return PositionObservation(*row)
+    return PositionObservation(*row) if row else None

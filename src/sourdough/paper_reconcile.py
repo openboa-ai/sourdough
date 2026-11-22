@@ -13,6 +13,7 @@ from .paper_books import (
     NoFillObservation,
     Posting,
     PostingRefused,
+    pending_no_fill_observation_sql,
     post_confirmed_fill,
     read_booked_fill,
     read_booked_no_fill,
@@ -76,16 +77,16 @@ def _open_recovery(
                 JOIN agent f ON f.id = d.agent_id
                 LEFT JOIN paper_reconciliation j ON j.order_id = o.order_id
                 WHERE o.account_id = ? AND f.company_id = ?
-                  AND ({_missing_fill(db)} OR d.state = 'running')
+                  AND ({_pending_recovery(db)} OR d.state = 'running')
                   AND (j.order_id IS NULL OR j.fill_id IS NOT NULL OR j.next_query_at <= ?
-                       OR NOT ({_missing_fill(db)}))
+                       OR NOT ({_pending_recovery(db)}))
                 ORDER BY COALESCE(j.next_query_at, 0), o.order_id LIMIT ?""",
             (account_id, company_id, now, limit),
         ).fetchall()
 
 
-def _missing_fill(connection: Connection) -> str:
-    return f"NOT ({resolved_order_sql(connection)})"
+def _pending_recovery(connection: Connection) -> str:
+    return f"(NOT ({resolved_order_sql(connection)}) OR {pending_no_fill_observation_sql(connection)})"
 
 
 def _has_booked_fill(connection: Connection) -> str:
@@ -113,7 +114,7 @@ def _record_lookup(
                 else "0"
             )
             unresolved, has_evidence = db.execute(
-                f"""SELECT {_missing_fill(db)}, ({_has_booked_fill(db)} OR {pending_cancellation})
+                f"""SELECT {_pending_recovery(db)}, ({_has_booked_fill(db)} OR {pending_cancellation})
                     FROM paper_order o WHERE o.order_id=?""",
                 (order_id,),
             ).fetchone()
@@ -214,7 +215,7 @@ def reconcile_paper_orders(
             f"""SELECT count(*), min(CASE WHEN j.order_id IS NULL THEN ? ELSE j.next_query_at END)
                 FROM paper_order o
                 LEFT JOIN paper_reconciliation j ON j.order_id = o.order_id
-                WHERE o.account_id = ? AND {_missing_fill(db)}""",
+                WHERE o.account_id = ? AND {_pending_recovery(db)}""",
             (now, account.account_id),
         ).fetchone()
     return PaperReconciliation(tuple(recovered), unresolved, next_query)

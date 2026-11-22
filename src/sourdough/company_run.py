@@ -34,6 +34,7 @@ from .paper_books import (
     post_confirmed_fill,
     read_book_observation,
     read_booked_no_fill,
+    read_captured_position,
 )
 from .paper_decision import (
     PaperDecision,
@@ -325,13 +326,18 @@ def _retry_reconciliation(
 def _book_reference(
     store: Path, company_id: str, posting: Posting, venue: PaperExecution
 ) -> ResultReference | None:
-    account = reopen_binding(store, company_id).account
-    source = observe_bound_position(venue, account, posting.order_id)
-    if source is None:
-        return None
-    observation = capture_position(
-        store, company_id, posting.fill_id, source, now=int(time())
-    )
+    observation = read_captured_position(store, company_id, posting.fill_id)
+    if observation is None:
+        account = reopen_binding(store, company_id).account
+        try:
+            source = observe_bound_position(venue, account, posting.order_id)
+        except TimeoutError:
+            return None
+        if source is None:
+            return None
+        observation = capture_position(
+            store, company_id, posting.fill_id, source, now=int(time())
+        )
     return ResultReference(
         "paper_position",
         observation.fill_id,

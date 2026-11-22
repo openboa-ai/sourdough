@@ -4,7 +4,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sourdough.company import FoundingTerms, found
 from sourdough.company_run import run_paper_company
@@ -102,6 +102,7 @@ class ExecutionPort(unittest.TestCase):
     def test_unavailable_position_does_not_finish_the_duty_or_resubmit(self):
         class PendingPosition(FixedQuoteVenue):
             position_available = False
+            position_offline = False
             sends = 0
 
             def submit(self, order_id, account_id, intent):
@@ -109,6 +110,8 @@ class ExecutionPort(unittest.TestCase):
                 super().submit(order_id, account_id, intent)
 
             def read_order_position(self, account_id, order_id):
+                if self.position_offline:
+                    raise TimeoutError("Destination position lookup is offline")
                 if self.position_available:
                     return super().read_order_position(account_id, order_id)
                 return None
@@ -136,6 +139,15 @@ class ExecutionPort(unittest.TestCase):
         employee.review.assert_not_called()
 
         venue.position_available = True
+        with (
+            patch(
+                "sourdough.company_run.finish_first_duty",
+                side_effect=OSError("cut before settlement"),
+            ),
+            self.assertRaisesRegex(OSError, "cut before settlement"),
+        ):
+            run_paper_company(self.store, company_id, venue, employee, turn_budget=1)
+        venue.position_offline = True
 
         def review(read):
             observation = read()

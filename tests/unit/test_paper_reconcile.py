@@ -156,7 +156,10 @@ class ReconcilePaper(unittest.TestCase):
     ):
         self._assert_zero_fill_continues(repeat_paper=True)
 
-    def _assert_zero_fill_continues(self, *, repeat_paper):
+    def test_zero_fill_retries_the_position_in_the_same_activation(self):
+        self._assert_zero_fill_continues(repeat_paper=False, delay_position=True)
+
+    def _assert_zero_fill_continues(self, *, repeat_paper, delay_position=False):
         store = self.store.with_name("cancelled-company.sqlite")
         journal = self.journal.with_name("cancelled-venue.sqlite")
         company = found(
@@ -175,10 +178,18 @@ class ReconcilePaper(unittest.TestCase):
         ).order_id
 
         class TerminalView(RecoveryView):
+            position_reads = 0
+
             def read_cancellation(self, account_id, order_id, *, account_sync=False):
                 return VenueCancellation(
                     order_id, account_id, "rules", "original-cancel", 0
                 )
+
+            def read_order_position(self, account_id, order_id):
+                self.position_reads += 1
+                if delay_position and self.position_reads <= 2:
+                    return None
+                return super().read_order_position(account_id, order_id)
 
         post_confirmed_fill(store, company.company_id, order_id, TerminalView(journal))
         self.assertEqual(
@@ -208,6 +219,7 @@ class ReconcilePaper(unittest.TestCase):
             SimpleNamespace(profile="runtime", trade=decide, review=decide),
             repeat_paper=repeat_paper,
             turn_budget=1,
+            idle_seconds=5 if delay_position else 0,
         )
         self.assertEqual(result.blocked_work, ())
         if repeat_paper:
@@ -233,7 +245,10 @@ class ReconcilePaper(unittest.TestCase):
             ),
             (order_id, "original-cancel", 0, 0, "cancelled"),
         )
-        self.assertEqual(replaced_venue.reads, [])
+        if delay_position:
+            self.assertGreater(replaced_venue.position_reads, 2)
+        else:
+            self.assertEqual(replaced_venue.reads, [])
         self.assertEqual(
             self.rows(journal, "SELECT order_id,fill_id FROM venue_execution"),
             [(order_id, None)],
