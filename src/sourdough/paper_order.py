@@ -12,7 +12,7 @@ from .first_duty import require_historical_claim, require_paper_authority
 from .onboarding import is_hired_first_duty
 from .paper_account import reopen_binding
 from .paper_decision import has_matching_paper_decision
-from .paper_execution import PaperDestination, PaperIntent
+from .paper_execution import PaperDestination, PaperIntent, VenueRefused
 from .paper_research import allows_hired_research_order, allows_research_order
 from .writer_lease import WriterLease
 
@@ -85,7 +85,11 @@ def submit_paper_order(
             return receipt
     observed_binding = reopen_binding(store, claim.company_id)
     account = observed_binding.account
-    if destination.observe_account(account.account_id) != account:
+    try:
+        checked_account = destination.check_order_terms(account.account_id, intent)
+    except VenueRefused as error:
+        raise OrderRefused("Paper destination refused the order terms") from error
+    if checked_account != account:
         raise OrderRefused("Paper destination mismatch")
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")

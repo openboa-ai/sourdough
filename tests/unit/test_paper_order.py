@@ -21,6 +21,9 @@ class ObservingDestination:
     def observe_account(self, account_id):
         return self.account
 
+    def check_order_terms(self, account_id, intent):
+        return self.observe_account(account_id)
+
     def submit(self, order_id, account_id, intent):
         with closing(sqlite3.connect(f"{self.store.as_uri()}?mode=ro", uri=True)) as db:
             reservation = db.execute(
@@ -75,6 +78,18 @@ class PaperOrderTests(unittest.TestCase):
         with self.assertRaises(DutyRefused):
             self.submit(self.intent)
         self.assertEqual(self.destination.submissions, [])
+
+    def test_preflight_cannot_substitute_a_different_environment(self):
+        self.destination.account = replace(self.destination.account, environment="live")
+        with self.assertRaisesRegex(OrderRefused, "destination mismatch"):
+            self.submit(self.intent)
+        self.assertEqual(self.destination.submissions, [])
+        with closing(sqlite3.connect(f"{self.store.as_uri()}?mode=ro", uri=True)) as db:
+            self.assertIsNone(
+                db.execute(
+                    "SELECT 1 FROM sqlite_schema WHERE name='paper_order'"
+                ).fetchone()
+            )
 
     def test_revoked_grant_replays_only_the_original_receipt(self):
         self.destination.lose_reply = True
