@@ -5,11 +5,11 @@ import os
 import pwd
 import stat
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .company import reopen
+from .company import _connect, _require_writable_store, reopen
 
 
 class WriterRefused(Exception):
@@ -75,6 +75,26 @@ class WriterLease:
 
 @contextmanager
 def hold_company_writer(
+    store: Path,
+    company_id: str,
+    *,
+    lease_directory: Path | None = None,
+    expected_store_key: tuple[int, int] | None = None,
+) -> Iterator[WriterLease]:
+    with _hold_company_store(
+        store,
+        company_id,
+        lease_directory=lease_directory,
+        expected_store_key=expected_store_key,
+    ) as lease:
+        with closing(_connect(lease.store, "ro")) as connection:
+            _require_writable_store(connection)
+        lease.verify()
+        yield lease
+
+
+@contextmanager
+def _hold_company_store(
     store: Path,
     company_id: str,
     *,

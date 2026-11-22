@@ -69,6 +69,34 @@ def _hash(path: Path) -> str:
         return file_digest(reader, "sha256").hexdigest()
 
 
+def _snapshot(store: Path, database: Path) -> None:
+    deadline = monotonic() + 15
+
+    def progress(status, remaining, total):
+        if monotonic() >= deadline:
+            raise CheckpointRefused("Company checkpoint exceeded its backup deadline")
+
+    with (
+        closing(_connect(store, "ro")) as source,
+        closing(sqlite3.connect(database)) as snapshot,
+    ):
+        source.backup(snapshot, pages=128, progress=progress, sleep=0.05)
+
+
+def _publish(candidate: Path, target: Path) -> None:
+    with candidate.open("rb") as stored:
+        os.fsync(stored.fileno())
+    try:
+        os.link(candidate, target)
+    except FileExistsError as error:
+        raise CheckpointRefused("Checkpoint destination already exists") from error
+    parent = os.open(target.parent, os.O_DIRECTORY | os.O_RDONLY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
 def checkpoint_company(
     store: Path, company_id: str, archive: Path
 ) -> CheckpointManifest:
@@ -79,19 +107,7 @@ def checkpoint_company(
         if os.path.lexists(archive):
             raise CheckpointRefused("Checkpoint destination already exists")
         database = Path(directory) / _STORE
-        deadline = monotonic() + 15
-
-        def progress(status, remaining, total):
-            if monotonic() >= deadline:
-                raise CheckpointRefused(
-                    "Company checkpoint exceeded its backup deadline"
-                )
-
-        with (
-            closing(_connect(store, "ro")) as source,
-            closing(sqlite3.connect(database)) as snapshot,
-        ):
-            source.backup(snapshot, pages=128, progress=progress, sleep=0.05)
+        _snapshot(store, database)
         manifest = CheckpointManifest(
             _FORMAT,
             company_id,
@@ -106,22 +122,19 @@ def checkpoint_company(
             with ZipFile(handle, "w", compression=ZIP_STORED) as output:
                 output.writestr(_MANIFEST, json.dumps(asdict(manifest), sort_keys=True))
                 output.write(database, _STORE)
-            handle.flush()
-            os.fsync(handle.fileno())
         writer.verify()
-        try:
-            os.link(candidate, archive)
-        except FileExistsError as error:
-            raise CheckpointRefused("Checkpoint destination already exists") from error
-        parent = os.open(archive.parent, os.O_DIRECTORY | os.O_RDONLY)
-        try:
-            os.fsync(parent)
-        finally:
-            os.close(parent)
+        _publish(candidate, archive)
     return manifest
 
 
 def inspect_company_checkpoint(archive: Path, company_id: str) -> CheckpointManifest:
+    with TemporaryDirectory(prefix="sd-checkpoint-") as directory:
+        return _extract_checkpoint(archive, company_id, Path(directory) / _STORE)
+
+
+def _extract_checkpoint(
+    archive: Path, company_id: str, database: Path
+) -> CheckpointManifest:
     try:
         descriptor = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as handle:
@@ -129,13 +142,13 @@ def inspect_company_checkpoint(archive: Path, company_id: str) -> CheckpointMani
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
                 raise CheckpointRefused("Expected a regular local owner checkpoint")
             with ZipFile(handle) as source:
-                return _inspect_archive(source, company_id, info.st_size)
+                return _inspect_archive(source, company_id, info.st_size, database)
     except (BadZipFile, OSError, ValueError, TypeError, sqlite3.Error) as error:
         raise CheckpointRefused("Cannot verify the company checkpoint") from error
 
 
 def _inspect_archive(
-    source: ZipFile, company_id: str, archive_size: int
+    source: ZipFile, company_id: str, archive_size: int, database: Path
 ) -> CheckpointManifest:
     entries = source.infolist()
     if (
@@ -152,15 +165,10 @@ def _inspect_archive(
         or manifest.size > archive_size
     ):
         raise CheckpointRefused("Checkpoint size does not match its manifest")
-    with TemporaryDirectory(prefix="sd-checkpoint-") as directory:
-        database = Path(directory) / _STORE
-        with source.open(_STORE) as member, database.open("xb") as output:
-            shutil.copyfileobj(member, output)
-        if (
-            database.stat().st_size != manifest.size
-            or _hash(database) != manifest.sha256
-        ):
-            raise CheckpointRefused("Checkpoint digest does not match its manifest")
-        if _database_revision(database, company_id) != manifest.schema_revision:
-            raise CheckpointRefused("Checkpoint schema does not match its manifest")
+    with source.open(_STORE) as member, database.open("xb") as output:
+        shutil.copyfileobj(member, output)
+    if database.stat().st_size != manifest.size or _hash(database) != manifest.sha256:
+        raise CheckpointRefused("Checkpoint digest does not match its manifest")
+    if _database_revision(database, company_id) != manifest.schema_revision:
+        raise CheckpointRefused("Checkpoint schema does not match its manifest")
     return manifest
