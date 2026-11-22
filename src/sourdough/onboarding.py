@@ -165,6 +165,10 @@ def claim_hired_first(
     writer.verify()
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
+        if not connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'hire_onboarding' AND type = 'table'"
+        ).fetchone():
+            return None
         profile, grant_id = _active_hire(connection, writer.company_id, agent_id)
         row = connection.execute(
             """SELECT d.id, o.purpose, g.scope

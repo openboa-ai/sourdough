@@ -193,6 +193,7 @@ class Staffing(unittest.TestCase):
             manager,
             HireRequest("hire", choice_id, "reviewer", "profile", "assessment", 4),
         )
+        self.assertIsNone(claim_hired_first(self.writer, receipt.agent_id, "profile"))
         probes = []
 
         def blocked(profile):
