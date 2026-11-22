@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .agent_desk import draft_at_revision, require_desk
 from .company import _connect
-from .duty_run import DutyClaim, DutyRefused
+from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused
 from .writer_lease import WriterLease
 
 
@@ -63,6 +63,20 @@ def _active_member(database: Connection, company: str, agent: str) -> bool:
     )
 
 
+def _current_project_manager(
+    database: Connection, company_id: str, grant_id: str
+) -> bool:
+    return (
+        database.execute(
+            """SELECT 1 FROM founding_receipt f JOIN standing_grant g
+           ON g.id=f.grant_id AND g.agent_id=f.founder_id
+           WHERE f.company_id=? AND g.id=? AND g.scope='manage-company'""",
+            (company_id, grant_id),
+        ).fetchone()
+        is not None
+    )
+
+
 def assign_project(
     writer: WriterLease,
     manager_grant: str,
@@ -87,13 +101,9 @@ def assign_project(
     writer.verify()
     with closing(_connect(writer.store, "rw")) as database, database:
         database.execute("BEGIN IMMEDIATE")
-        manager = database.execute(
-            """SELECT 1 FROM founding_receipt f JOIN standing_grant g
-               ON g.id=f.grant_id AND g.agent_id=f.founder_id
-               WHERE f.company_id=? AND g.id=? AND g.scope='manage-company'""",
-            (writer.company_id, manager_grant),
-        ).fetchone()
-        if manager is None or not all(
+        if not _current_project_manager(
+            database, writer.company_id, manager_grant
+        ) or not all(
             _active_member(database, writer.company_id, member) for member in members
         ):
             raise DutyRefused("Project membership requires existing company authority")
@@ -118,6 +128,91 @@ def assign_project(
         )
         writer.verify()
         return revision
+
+
+def seal_project_review(
+    writer: WriterLease,
+    manager_grant: str,
+    duty_id: str,
+    project_id: str,
+    deliverable: str,
+) -> None:
+    if (
+        not _label(duty_id)
+        or not _label(project_id)
+        or not isinstance(deliverable, str)
+        or not deliverable.strip()
+        or len(deliverable.encode()) > 800
+    ):
+        raise DutyRefused("Project review requires a bounded deliverable")
+    writer.verify()
+    with closing(_connect(writer.store, "rw")) as database, database:
+        database.execute("BEGIN IMMEDIATE")
+        if not _current_project_manager(database, writer.company_id, manager_grant):
+            raise DutyRefused("Project review requires current company management")
+        duty = database.execute(
+            """SELECT d.agent_id,d.state FROM duty d JOIN work_follow_up w ON w.duty_id=d.id
+               JOIN agent a ON a.id=d.agent_id WHERE d.id=? AND w.purpose=? AND a.company_id=?""",
+            (duty_id, ASSESSMENT_REVIEW, writer.company_id),
+        ).fetchone()
+        _, members, _ = project_membership(database, project_id)
+        if (
+            duty is None
+            or duty[0] not in members
+            or not _active_member(database, writer.company_id, duty[0])
+        ):
+            raise DutyRefused("Project review is outside the assigned membership")
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS project_review_brief (
+               duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
+               agent_id TEXT NOT NULL REFERENCES agent(id),
+               project_id TEXT NOT NULL REFERENCES shared_project(project_id),
+               manager_grant TEXT NOT NULL REFERENCES standing_grant(id),
+               deliverable TEXT NOT NULL
+            )"""
+        )
+        terms = (duty[0], project_id, manager_grant, deliverable)
+        prior = database.execute(
+            """SELECT agent_id,project_id,manager_grant,deliverable
+               FROM project_review_brief WHERE duty_id=?""",
+            (duty_id,),
+        ).fetchone()
+        if prior == terms:
+            return
+        if prior is not None or duty[1] != "scheduled":
+            raise DutyRefused("Project review already has a brief or has been claimed")
+        database.execute(
+            "INSERT INTO project_review_brief VALUES (?,?,?,?,?)", (duty_id, *terms)
+        )
+        writer.verify()
+
+
+def project_review_instruction(writer: WriterLease, claim: DutyClaim) -> str | None:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "ro")) as database:
+        database.execute("BEGIN")
+        require_desk(database, claim, ASSESSMENT_REVIEW)
+        if (
+            database.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='project_review_brief'"
+            ).fetchone()
+            is None
+        ):
+            return None
+        row = database.execute(
+            """SELECT project_id,manager_grant,deliverable FROM project_review_brief
+               WHERE duty_id=? AND agent_id=?""",
+            (claim.duty_id, claim.founder_id),
+        ).fetchone()
+        if row is None or not _current_project_manager(
+            database, claim.company_id, row[1]
+        ):
+            return None
+        project_id, _, deliverable = row
+        _, members, _ = project_membership(database, project_id)
+        if claim.founder_id not in members:
+            return None
+        return f"Assigned company deliverable for project {project_id}: {deliverable}"
 
 
 @dataclass(frozen=True)

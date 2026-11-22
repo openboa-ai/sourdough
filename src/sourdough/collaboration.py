@@ -7,6 +7,7 @@ from .company_assets import (
     Selection,
     discover_shared_assets,
     project_access,
+    project_review_instruction,
     publish_selection,
     read_shared_asset,
 )
@@ -101,6 +102,12 @@ def company_work_run(
     clock: Callable[[], int] | None = None,
 ) -> ScopedRun:
     projects = project_access(writer, claim, workflow.purpose)
+    if workflow.purpose == ASSESSMENT_REVIEW:
+        instruction = project_review_instruction(writer, claim)
+        if instruction is not None:
+            workflow = replace(
+                workflow, instruction=f"{instruction} {workflow.instruction}"
+            )
     additional = (
         (
             PROJECTS,
