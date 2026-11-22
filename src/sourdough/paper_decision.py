@@ -206,7 +206,7 @@ def reopen_unsubmitted_decisions(
                FROM paper_decision decision
                JOIN duty_run r ON r.run_id = decision.run_id AND r.is_current = 1
                JOIN duty d ON d.id = decision.duty_id AND d.id = r.duty_id AND d.state = 'running'
-               JOIN founder a ON a.id = d.founder_id AND a.company_id = ?
+               JOIN agent a ON a.id = d.agent_id AND a.company_id = ?
                WHERE (? OR decision.action != 'buy')
                  AND NOT EXISTS (
                      SELECT 1 FROM paper_order o JOIN duty_run original ON original.run_id = o.run_id

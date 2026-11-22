@@ -39,7 +39,7 @@ def requeue_uncommitted_work(writer: WriterLease) -> tuple[str, ...]:
             f"""SELECT d.id, run.run_id,
                        CASE WHEN founding.due_work_id IS NOT NULL THEN 'due' ELSE 'scheduled' END
                 FROM duty d JOIN duty_run run ON run.duty_id = d.id AND run.is_current = 1
-                JOIN founder actor ON actor.id = d.founder_id AND actor.company_id = ?
+                JOIN agent actor ON actor.id = d.agent_id AND actor.company_id = ?
                 LEFT JOIN founding_receipt founding ON founding.due_work_id = d.id
                 LEFT JOIN work_follow_up follow_up ON follow_up.duty_id = d.id
                 WHERE d.state = 'running'

@@ -75,8 +75,8 @@ def resolve_run(connection: sqlite3.Connection, claim: DutyClaim) -> RunAuthorit
         """SELECT r.purpose, r.grant_scope, g.scope, d.state, r.is_current
            FROM duty_run r
            JOIN duty d ON r.duty_id = d.id
-           JOIN founder f ON d.founder_id = f.id
-           JOIN standing_grant g ON g.id = r.grant_id AND g.founder_id = f.id
+           JOIN agent f ON d.agent_id = f.id
+           JOIN standing_grant g ON g.id = r.grant_id AND g.agent_id = f.id
            WHERE d.id = ? AND r.run_id = ?
              AND f.company_id = ? AND f.id = ? AND g.id = ?
              AND f.execution_profile = ?""",

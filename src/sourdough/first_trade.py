@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .company import _connect
+from .company import _connect, founding_execution_profile
 from .first_duty import DutyClaim, claim_first_duty
 from .paper_account import reopen_binding
 from .paper_books import Posting, position_quantity, post_confirmed_fill
@@ -80,11 +80,9 @@ def run_first_trade(
         raise TradeRefused("Paper destination does not match the bound account")
     quote = venue.observe_quote(account.account_id)
     with closing(_connect(store, "ro")) as db:
-        configured = db.execute(
-            "SELECT execution_profile FROM founder WHERE company_id = ?", (company_id,)
-        ).fetchone()
+        configured = founding_execution_profile(db, company_id)
         research_required = requires_research(db, company_id)
-    if configured != (runtime.profile,):
+    if configured != runtime.profile:
         raise TradeRefused("Employee process does not match the configured profile")
     runtime.check_ready()
     if writer is not None:

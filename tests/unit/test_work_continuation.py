@@ -5,9 +5,7 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
 
-from sourdough import company
 from sourdough.company import (
     FoundingRefused,
     FoundingTerms,
@@ -39,39 +37,33 @@ class WorkContinuation(unittest.TestCase):
         self.terms = FoundingTerms("setup", "charter", "paper", "runtime")
 
     def founder(self, *, legacy=0):
-        if legacy:
-            schema = [
-                statement
-                for statement in company.SCHEMA
-                if statement
-                not in (
-                    company.FOLLOW_UP_SCHEMA,
-                    company.DUTY_RUN_SCHEMA,
-                    company.CURRENT_RUN_INDEX,
-                )
-            ]
-            if legacy == 1:
-                schema[schema.index(company.DUTY_SCHEMA)] = company.DUTY_SCHEMA.replace(
-                    "founder_id TEXT NOT NULL REFERENCES",
-                    "founder_id TEXT NOT NULL UNIQUE REFERENCES",
-                )
-            else:
-                schema.append(
-                    company.FOLLOW_UP_SCHEMA.replace(
-                        "purpose TEXT NOT NULL DEFAULT 'position_review'",
-                        "run_id TEXT UNIQUE",
-                    )
-                )
-            with (
-                patch.object(company, "SCHEMA", schema),
-                patch.object(company, "SCHEMA_REVISION", legacy),
-            ):
-                self.founding = found(self.store, self.terms)
-        else:
-            self.founding = found(self.store, self.terms)
+        self.founding = found(self.store, self.terms)
         self.company_id = self.founding.company_id
         if legacy:
             with closing(sqlite3.connect(self.store)) as connection, connection:
+                connection.execute("ALTER TABLE agent RENAME TO founder")
+                connection.execute(
+                    "CREATE UNIQUE INDEX initial_company ON founder(company_id)"
+                )
+                for table in ("standing_grant", "duty"):
+                    connection.execute(
+                        f"ALTER TABLE {table} RENAME COLUMN agent_id TO founder_id"
+                    )
+                connection.execute("DROP TABLE duty_run")
+                if legacy == 1:
+                    connection.execute("DROP TABLE work_follow_up")
+                    connection.execute(
+                        "CREATE UNIQUE INDEX first_owner ON duty(founder_id)"
+                    )
+                else:
+                    connection.execute("ALTER TABLE work_follow_up DROP COLUMN purpose")
+                    connection.execute(
+                        "ALTER TABLE work_follow_up ADD COLUMN run_id TEXT"
+                    )
+                    connection.execute(
+                        "CREATE UNIQUE INDEX follow_up_run ON work_follow_up(run_id)"
+                    )
+                connection.execute("UPDATE company SET schema_revision = ?", (legacy,))
                 connection.execute(
                     """CREATE TABLE first_duty_claim (
                         duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
@@ -101,6 +93,28 @@ class WorkContinuation(unittest.TestCase):
 
     def claim(self, now, profile="runtime"):
         return claim_follow_up(self.store, self.company_id, profile, now=now)
+
+    def test_shared_profile_does_not_make_a_second_agent_the_founder(self):
+        self.founding = found(self.store, self.terms)
+        self.company_id = self.founding.company_id
+        with closing(sqlite3.connect(self.store)) as connection, connection:
+            connection.execute(
+                "INSERT INTO agent VALUES ('colleague', ?, 'runtime')",
+                (self.company_id,),
+            )
+            connection.execute(
+                "INSERT INTO standing_grant VALUES ('second-grant', 'colleague', 'paper')"
+            )
+        claim = claim_first_duty(self.store, self.company_id, "runtime")
+        self.assertEqual(claim.founder_id, self.founding.founder_id)
+        self.assertEqual(claim.duty_id, self.founding.due_work_id)
+        self.assertEqual(found(self.store, self.terms), self.founding)
+        with closing(sqlite3.connect(self.store)) as connection:
+            with self.assertRaisesRegex(DutyRefused, "identity mismatch"):
+                require_paper_authority(
+                    connection,
+                    replace(claim, founder_id="colleague", grant_id="second-grant"),
+                )
 
     def test_migrate_populated_v1_without_changing_external_effects(self):
         original = self.founder(legacy=1)
@@ -143,7 +157,7 @@ class WorkContinuation(unittest.TestCase):
         before = [self.rows(query) for query in queries]
         upgrade_work_schema(self.store, self.company_id)
         upgrade_work_schema(self.store, self.company_id)
-        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(5,)])
+        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(6,)])
         self.assertEqual(
             self.rows("SELECT duty_id, run_id FROM duty_run"),
             [(original.duty_id, original.run_id)],

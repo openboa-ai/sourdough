@@ -27,9 +27,9 @@ def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> Du
         row = connection.execute(
             """SELECT f.id, g.id, d.id, f.execution_profile
                FROM founding_receipt r
-               JOIN founder f ON r.founder_id = f.id AND r.company_id = f.company_id
-               JOIN standing_grant g ON r.grant_id = g.id AND g.founder_id = f.id
-               JOIN duty d ON r.due_work_id = d.id AND d.founder_id = f.id
+               JOIN agent f ON r.founder_id = f.id AND r.company_id = f.company_id
+               JOIN standing_grant g ON r.grant_id = g.id AND g.agent_id = f.id
+               JOIN duty d ON r.due_work_id = d.id AND d.agent_id = f.id
                WHERE r.company_id = ? AND d.state = 'due' AND g.scope = ?""",
             (company_id, FIRST_DUTY_SCOPE),
         ).fetchone()
