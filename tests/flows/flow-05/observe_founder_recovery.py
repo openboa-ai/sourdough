@@ -325,6 +325,17 @@ def observe(output: Path, employee: Path):
         == research_receipt["decided_at"] + decision["next_check_seconds"]
     )
     assert observed[5] == quantity
+    independent_quote = one(
+        venue, "SELECT account_id, connector_revision, quote FROM venue_account"
+    )
+    current_quote = one(
+        store,
+        """SELECT account_id, connector_revision, quote_minor_units, observed_at
+           FROM paper_review_quote WHERE run_id = ?""",
+        (claim["run_id"],),
+    )
+    assert current_quote[:3] == independent_quote
+    assert observed[4] <= current_quote[3] <= observed[3]
     assert read(store, "SELECT count(*) FROM duty_run") == [(2,)]
     assert read(store, "SELECT count(*) FROM work_review_decision") == [(1,)]
     assert read(store, "PRAGMA foreign_key_check") == []
@@ -362,6 +373,7 @@ def observe(output: Path, employee: Path):
         "finding": finding,
         "decision": decision,
         "review": review,
+        "current_quote": current_quote,
         "supervisor": supervisory,
         "order": order_id,
         "fill": fill_id,

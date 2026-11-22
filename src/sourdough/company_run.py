@@ -41,6 +41,7 @@ from .paper_decision import (
 from .paper_order import PaperIntent, reserved_exposure, submit_paper_order
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
+from .paper_review import bind_review_quote, observe_review_quote
 from .paper_venue import FixedQuoteVenue
 from .writer_lease import WriterLease, hold_company_writer
 from .work import (
@@ -207,7 +208,7 @@ def _operate(
             continue
         turn_budget -= 1
         if follow_up.purpose == POSITION_REVIEW:
-            review = _review(writer, follow_up, runtime, next_purpose)
+            review = _review(writer, follow_up, venue, runtime, next_purpose)
         else:
             trade = _trade(writer, follow_up, venue, runtime)
             trades.append(trade)
@@ -283,6 +284,7 @@ def _read_paper_observation(
 def _review(
     writer: WriterLease,
     follow_up: FollowUpClaim,
+    venue: FixedQuoteVenue,
     runtime: EmployeeProcess,
     next_purpose: str,
 ) -> PositionReview:
@@ -290,13 +292,25 @@ def _review(
 
     def read_result():
         writer.verify()
+        quote = (
+            observe_review_quote(store, follow_up.claim.company_id, venue)
+            if follow_up.result.kind == "paper_position"
+            else None
+        )
+
+        def project(connection, reference):
+            result = _read_paper_observation(
+                connection, reference, follow_up.claim.company_id
+            )
+            if quote is None:
+                return result
+            return bind_review_quote(connection, follow_up.claim.run_id, result, quote)
+
         return read_follow_up_result(
             store,
             follow_up,
             now=int(time()),
-            read=lambda db, ref: _read_paper_observation(
-                db, ref, follow_up.claim.company_id
-            ),
+            read=project,
         )
 
     try:
