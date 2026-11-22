@@ -1,0 +1,28 @@
+<import src="yogurt/items/button.native"/>
+<column padding="24" gap="16" background="background">
+  <row cross="center" gap="16">
+    <text grow="1" size="heading">Company work</text>
+    <use template="yg-button" label="Refresh"/>
+  </row>
+  <column gap="5">
+    <text>{status}</text>
+    <if test="{available}">
+      <text size="sm" foreground="text_muted">Observed {observed}</text>
+      <text size="sm" foreground="text_muted">Revision {revision}</text>
+    </if>
+  </column>
+  <scroll grow="1" label="Company timeline">
+    <column gap="12">
+      <for each="duties" key="duty_id" as="duty">
+        <column padding="16" radius="lg" gap="4" background="surface">
+          <text>Duty {duty.duty_id}</text>
+          <text size="sm">State: {duty.state}</text>
+          <text size="sm">Owner: {duty.owner_id}</text>
+          <text size="sm">Next due: {duty.due}</text>
+          <text size="sm">Decision: {duty.decision}</text>
+        </column>
+      </for>
+    </column>
+  </scroll>
+  <if test="{available}"><text size="sm" foreground="text_muted">{investment}</text></if>
+</column>

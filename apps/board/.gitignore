@@ -1,0 +1,5 @@
+.native/
+.zig-cache/
+zig-out/
+src/yogurt/
+assets/

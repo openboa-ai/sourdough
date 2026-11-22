@@ -14,6 +14,8 @@ Input contracts: [Authorized work timeline](../../../company/systems/operations/
 
 Keep local selection, sorting and intended control changes separate from observed company facts. Closing the client stops only its presentation.
 
+The first macOS work screen starts an asynchronous `inspect-work` query using the configured absolute service executable and explicit company scope. Refresh repeats that query only. Clear the last response while revalidating access or after a declined, incomplete, incompatible, or timed-out reply. Display the observation time returned by the service; a missing investment projection is not a zero balance.
+
 **Concern for the responsible component:** A cached response is not proof of present access. Clear private state on sign-out or principal change; never show sensitive cached contents after access loss.
 
 ## Functional and quality requirements
