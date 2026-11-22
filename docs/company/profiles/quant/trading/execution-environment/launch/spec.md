@@ -43,6 +43,8 @@ Credential values stay in the company secret facility. Configuration stores scop
 
 This is a development-unit design. Runtime version, package source, installation policy, deployment host and provider credentials are not selected or installed by this document. See [engine qualification](../qualify-engine/spec.md) and the founder/new-hire acceptance contracts for stronger runtime, independent-venue and Agent evidence.
 
+For the managed company-process cut, pause the company at its first read of the original SDK fill before the company books it. The observer independently checks the venue journal and the absence of a company posting before issuing the cut. A submission acknowledgement, timeout, or cancellation without a fill is not the cut point.
+
 ## Preparing the runtime package
 
 The local deployment service can run `sourdough prepare-trading-engine STORE ENGINE_DIRECTORY --company-id ID` before activating a trading configuration. Use a private, company-owned directory. The command installs the packaged wheel lock in an isolated environment on supported Apple Silicon hosts, probes the required entry points, and reopens the same verified installation receipt on an identical request. An operator-provided `--wheelhouse` selects offline, hash-checked artifacts with no index fallback. The trading runtime is an external dependency installed separately from the Sourdough package.

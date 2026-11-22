@@ -25,15 +25,17 @@ from sourdough import cli
 from sourdough.nautilus_paper import NautilusPaperVenue
 
 barrier = Path(sys.argv.pop(1))
-submit = NautilusPaperVenue.submit
-def withhold(self, order_id, account_id, intent):
-    submit(self, order_id, account_id, intent)
-    payload = barrier.with_suffix(".new")
-    with payload.open("x") as stream:
-        json.dump({"pid": os.getpid(), "order_id": order_id}, stream)
-    payload.rename(barrier)
-    signal.pause()
-NautilusPaperVenue.submit = withhold
+read_fills = NautilusPaperVenue.read_fills
+def withhold(self, account_id, order_id, *, account_sync=False):
+    fills = read_fills(self, account_id, order_id, account_sync=account_sync)
+    if fills and not barrier.exists():
+        payload = barrier.with_suffix(".new")
+        with payload.open("x") as stream:
+            json.dump({"pid": os.getpid(), "order_id": order_id}, stream)
+        payload.rename(barrier)
+        signal.pause()
+    return fills
+NautilusPaperVenue.read_fills = withhold
 raise SystemExit(cli.main())
 """
 
