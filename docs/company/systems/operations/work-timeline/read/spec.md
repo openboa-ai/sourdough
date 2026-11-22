@@ -1,0 +1,33 @@
+# Project a read-only work timeline
+
+Design draft · Verification **UNRUN** · Responsible component: Company work projection service
+
+[Feature intent](../intent.md) · [MVP map](../../../../../README.md) · [SDLC handoff](../../../../../engineering/lifecycle.md)
+
+## Boundary and dependencies
+
+Input contracts: founded company, current work state and [authorize-actor/check](../../../authority/authorize-actor/check/spec.md). A [decision](../../../work/discover-work/decide/spec.md) is projected when it exists; an initial due duty without a decision is a valid state, not an error or fabricated decision.
+
+## Design decision and review
+
+Project company, work, decision, allowed evidence, owner, next condition and as-of time. Optional profile links do not introduce mandatory quant fields.
+
+**Concern for the responsible component:** Authorize every read at current access scope. Do not expose restricted evidence through titles, aggregates or stale cached projections.
+
+## Functional and quality requirements
+
+- **FR.** Project the as-of work timeline, accountable actor and next condition while suppressing unauthorized evidence.
+- **NFR.** Missing evidence remains missing; a restricted reference is not a channel for revealing private content. No reads can emit an operational command.
+
+## Acceptance and independent evidence
+
+| Case | Setup, action and expected observation |
+| --- | --- |
+| Normal | With no client and no investment profile, query the timeline for a document-review duty and compare the owner and next condition against independent work receipts. |
+| Failure or contention | Delay the projection and withdraw access to an attachment. Show as-of time and limited access; refreshing does not wake the worker or alter work. |
+
+## Operations and change review
+
+**Oracle:** Compare each field to work history and command-origin logs. Rebuild a disposable projection without modifying the source records.
+
+For delivery, attach the normal and adverse observations to the tested revision and keep unresolved evidence visible.
