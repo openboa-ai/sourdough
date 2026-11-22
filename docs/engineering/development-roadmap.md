@@ -1,4 +1,4 @@
-# Sourdough development roadmap · baseline v1.3
+# Sourdough development roadmap · baseline v1.4
 
 Design for review; product evidence **NOT_RUN**. [System boundaries](../company-agent-quant.md) · [Feature outcomes](feature-boundaries.md) · [Owning specs](work-packages.md)
 
@@ -30,9 +30,11 @@ Start with one Python company service and SQLite transactions. Keep the Agent pr
 
 Later work is not a checklist for the first trade. Start recording authority, account isolation, order identity and price/cost basis when first used. Do not claim full qualification of any untested branch.
 
-## Terra handoff
+## Development handoff
 
-1. Verify this design with `shasum -a 256 -c docs/engineering/baseline-v1.3.sha256` from the repository root. This revision adds [implementation boundaries](implementation-architecture.md) without changing the first-trade finish line. Retained manifests describe their historical trees: v1.2 at `c19ed62`, v1.1 at `b6d7b53`.
+Sol is the development model for Goal 01–04. This does not select or authorize the employee Agent's runtime.
+
+1. Verify this design with `shasum -a 256 -c docs/engineering/baseline-v1.4.sha256` from the repository root. This revision updates the development handoff only. Retained manifests describe their historical trees: v1.3 at `9e602d0`, v1.2 at `c19ed62`, v1.1 at `b6d7b53`.
 2. Start with `01 / found-company/bootstrap`. Use the [first Goal](flow-delivery/goal-01-04.md), [work packages](work-packages.md) and [implementation conventions](flow-delivery/guide.md). Verify scope and accepted spec before product changes.
 3. Implement a change that one consumer can observe. Run the affected case and the connected path available so far. Use one unit PR per reviewable behavior, not per file. Record the candidate revision, environment, expected/observed result, next action and owner in the flow Issue.
 4. If something does not block the first trade or invalidate its evidence, leave it for its owning milestone. Report unavailable conditions honestly. No plugin, per-trade board approval, benchmark or live account is a prerequisite. Requirements revisions receive new manifests; never overwrite a historical manifest to make it pass.

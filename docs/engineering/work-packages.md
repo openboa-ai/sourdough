@@ -1,4 +1,4 @@
-# Terra work packages and owning specifications
+# Development work packages and owning specifications
 
 [Roadmap and handoff](development-roadmap.md) · [Feature boundaries](feature-boundaries.md)
 
