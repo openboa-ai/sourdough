@@ -24,12 +24,18 @@ def handle(database, request):
     operation = request["op"]
     if operation == "initialize":
         database.execute(
-            "CREATE TABLE fixture (withhold INTEGER NOT NULL, partial INTEGER NOT NULL, delay INTEGER NOT NULL)"
+            "CREATE TABLE fixture (withhold INTEGER NOT NULL, partial INTEGER NOT NULL, delay INTEGER NOT NULL, profile_fields TEXT NOT NULL)"
         )
         database.execute(
-            "INSERT INTO fixture VALUES (?,?,?)",
-            (request["withhold"], request["partial"], request["delay"]),
+            "INSERT INTO fixture VALUES (?,?,?,?)",
+            (
+                request["withhold"],
+                request["partial"],
+                request["delay"],
+                json.dumps(request.get("profile_fields", {})),
+            ),
         )
+        database.execute("CREATE TABLE remote_attempt (operation TEXT NOT NULL)")
         database.execute(
             """CREATE TABLE remote_order (
                    client_id TEXT PRIMARY KEY NOT NULL,
@@ -51,10 +57,12 @@ def handle(database, request):
             "CREATE TABLE deferred_send (client_id TEXT PRIMARY KEY, request TEXT NOT NULL)"
         )
         return {}
-    withheld, partial, delay = database.execute(
-        "SELECT withhold,partial,delay FROM fixture"
+    withheld, partial, delay, profile_fields = database.execute(
+        "SELECT withhold,partial,delay,profile_fields FROM fixture"
     ).fetchone()
-    profile = PROFILE | ({"takerBps": 0} if partial else {})
+    profile = (
+        PROFILE | ({"takerBps": 0} if partial else {}) | json.loads(profile_fields)
+    )
     if operation == "account":
         return profile
     if operation == "publish":
@@ -158,6 +166,13 @@ def handle(database, request):
 
 if __name__ == "__main__":
     journal = Path(sys.argv[1])
-    with closing(sqlite3.connect(journal)) as database, database:
-        result = handle(database, json.load(sys.stdin))
+    request = json.load(sys.stdin)
+    with closing(sqlite3.connect(journal)) as database:
+        if request["op"] in {"send", "history", "accountSync", "terminal", "position"}:
+            with database:
+                database.execute(
+                    "INSERT INTO remote_attempt VALUES (?)", (request["op"],)
+                )
+        with database:
+            result = handle(database, request)
     print(json.dumps(result))

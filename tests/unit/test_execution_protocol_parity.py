@@ -15,7 +15,14 @@ from sourdough.company import FoundingTerms, found
 from sourdough.first_duty import DutyRefused, claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
+from sourdough.paper_account import (
+    BindingRefused,
+    PaperAccount,
+    PaperMandate,
+    bind,
+    reopen_binding,
+)
+from sourdough.paper_books import PostingRefused
 from sourdough.paper_execution import (
     PaperIntent,
     VenueCancellation,
@@ -34,10 +41,18 @@ FIXTURE = Path(__file__).resolve().parents[1] / "flows/flow-07/protocol_emulator
 
 
 class WireVenue:
-    def __init__(self, journal, withhold=None, *, partial=False, delay=False):
+    def __init__(
+        self, journal, withhold=None, *, partial=False, delay=False, profile_fields=None
+    ):
         self.journal = journal
         if withhold is not None:
-            self.call("initialize", withhold=withhold, partial=partial, delay=delay)
+            self.call(
+                "initialize",
+                withhold=withhold,
+                partial=partial,
+                delay=delay,
+                profile_fields=profile_fields or {},
+            )
 
     def call(self, operation, **fields):
         response = subprocess.run(
@@ -182,6 +197,68 @@ def rows(store, sql):
 
 
 class ExecutionProtocolParity(unittest.TestCase):
+    def test_substituted_destination_receives_no_send_or_original_lookup(self):
+        root = Path(self.enterContext(TemporaryDirectory()))
+        store = root / "company.sqlite"
+        original = WireVenue(root / "original.sqlite", True)
+        account = original.observe_account("shadow-cash")
+        company_id = found(
+            store, FoundingTerms("isolation", "charter", "paper", "employee")
+        ).company_id
+        mandate = PaperMandate("mandate", company_id, "charter", account, 300)
+        bind(store, mandate, original)
+        claim = claim_first_duty(store, company_id, "employee")
+        intent = PaperIntent("original", account.instrument_rules_digest, 2, 110)
+        live = WireVenue(
+            root / "live-marker.sqlite", False, profile_fields={"mode": "live"}
+        )
+        substitute = WireVenue(
+            root / "different-endpoint.sqlite",
+            False,
+            profile_fields={"endpointId": "other"},
+        )
+        for wrong in (live, substitute):
+            with self.subTest(destination=wrong.journal.name):
+                with self.assertRaises(BindingRefused):
+                    bind(store, mandate, wrong)
+                with self.assertRaisesRegex(OrderRefused, "destination mismatch"):
+                    submit_paper_order(store, claim, intent, wrong)
+        self.assertEqual(
+            rows(store, "SELECT name FROM sqlite_schema WHERE name='paper_order'"), []
+        )
+
+        with self.assertRaises(TimeoutError):
+            submit_paper_order(store, claim, intent, original)
+        [(order_id,)] = rows(original.journal, "SELECT client_id FROM remote_order")
+        for wrong in (live, substitute):
+            with self.subTest(recovery=wrong.journal.name):
+                with self.assertRaisesRegex(
+                    PostingRefused, "original paper destination"
+                ):
+                    reconcile_paper_orders(store, company_id, wrong, now=100)
+                self.assertEqual(
+                    rows(wrong.journal, "SELECT * FROM remote_attempt"), []
+                )
+        self.assertEqual(reopen_binding(store, company_id), mandate)
+        self.assertEqual(
+            rows(
+                store,
+                "SELECT account_id,mandate_revision,reserved_minor_units FROM paper_order",
+            ),
+            [(account.account_id, mandate.revision, 220)],
+        )
+
+        original.publish()
+        result = reconcile_paper_orders(store, company_id, original, now=100)
+        self.assertEqual(result.unresolved, 0)
+        self.assertEqual(result.recovered[0].posting.order_id, order_id)
+        self.assertEqual(
+            rows(
+                original.journal, "SELECT * FROM remote_attempt WHERE operation='send'"
+            ),
+            [("send",)],
+        )
+
     def test_empty_ledger_cannot_seal_a_delayed_original_submission(self):
         for delivers in (False, True):
             with self.subTest(delivers=delivers), TemporaryDirectory() as directory:
