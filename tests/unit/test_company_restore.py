@@ -129,3 +129,52 @@ company_restore.restore_core_checkpoint(Path(sys.argv[1]), sys.argv[2], Path(sys
         self.assertFalse(self.target.exists())
         with hold_company_writer(self.source, company_id):
             self.assertEqual(reopen(self.source, company_id).company_id, company_id)
+
+    def test_exact_retry_releases_only_its_publication_alias(self):
+        company_id = self.company.company_id
+        checkpoint_company(self.source, company_id, self.archive)
+        cut = subprocess.run(
+            [
+                sys.executable,
+                "-IB",
+                "-c",
+                """
+import os, sys
+from pathlib import Path
+from sourdough import company_restore
+
+original = company_restore._publish
+def interrupted(candidate, target):
+    original(candidate, target)
+    os._exit(74)
+company_restore._publish = interrupted
+company_restore.restore_core_checkpoint(Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]))
+""",
+                str(self.source),
+                company_id,
+                str(self.archive),
+                str(self.target),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        self.assertEqual(cut.returncode, 74, cut.stderr)
+        self.assertEqual(self.target.stat().st_nlink, 2)
+        with self.assertRaisesRegex(FoundingRefused, "retired"):
+            with hold_company_writer(self.source, company_id):
+                self.fail("Retired source could write after publication")
+        unrelated = self.target.with_name("unrecognized-alias.sqlite")
+        unrelated.hardlink_to(self.target)
+        with self.assertRaisesRegex(CheckpointRefused, "unexpected file alias"):
+            self.restore()
+        self.assertTrue(unrelated.exists())
+        unrelated.unlink()
+        receipt = self.restore()
+        self.assertEqual(self.restore(), receipt)
+        self.assertEqual(self.target.stat().st_nlink, 1)
+        with hold_company_writer(self.target, company_id):
+            self.assertEqual(
+                reopen(self.target, company_id).due_work_ids,
+                (self.company.due_work_id,),
+            )

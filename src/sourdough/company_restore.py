@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
@@ -42,8 +43,13 @@ def _require_core(connection) -> None:
         )
 
 
-def _replacement_matches(target: Path, receipt: CoreRestore) -> None:
-    if target.is_symlink() or not target.is_file() or target.stat().st_nlink != 1:
+def _replacement_matches(target: Path, receipt: CoreRestore) -> os.stat_result:
+    info = target.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o077
+    ):
         raise CheckpointRefused("Replacement path is not the original independent file")
     with closing(_connect(target, "ro")) as database:
         database.execute("BEGIN")
@@ -60,6 +66,26 @@ def _replacement_matches(target: Path, receipt: CoreRestore) -> None:
             != (receipt.checkpoint_sha256,)
         ):
             raise CheckpointRefused("Replacement has no matching restore receipt")
+    return info
+
+
+def _finish_publication(target: Path, staging: Path, receipt: CoreRestore) -> None:
+    info = _replacement_matches(target, receipt)
+    if info.st_nlink == 1:
+        return
+    if info.st_nlink != 2 or not os.path.lexists(staging):
+        raise CheckpointRefused("Replacement has an unexpected file alias")
+    alias = staging.stat(follow_symlinks=False)
+    if (alias.st_dev, alias.st_ino) != (info.st_dev, info.st_ino):
+        raise CheckpointRefused("Replacement has an unexpected file alias")
+    staging.unlink()
+    parent = os.open(target.parent, os.O_DIRECTORY | os.O_RDONLY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    if target.stat(follow_symlinks=False).st_nlink != 1:
+        raise CheckpointRefused("Replacement still has an unexpected file alias")
 
 
 def restore_core_checkpoint(
@@ -85,6 +111,7 @@ def restore_core_checkpoint(
             ).encode()
         ).hexdigest()
         receipt = CoreRestore(company_id, revision, manifest.sha256)
+        staging = target.with_name(f".sourdough-restore-{revision}.sqlite")
         with closing(_connect(lease.store, "ro")) as original:
             original.execute("BEGIN")
             retired = _retired_store(original)
@@ -96,8 +123,15 @@ def restore_core_checkpoint(
         if os.path.lexists(target):
             if retired is None:
                 raise CheckpointRefused("Replacement destination already exists")
-            _replacement_matches(target, receipt)
+            _finish_publication(target, staging, receipt)
             return receipt
+
+        if os.path.lexists(staging) and (
+            retired is None or _replacement_matches(staging, receipt).st_nlink != 1
+        ):
+            raise CheckpointRefused(
+                "Restore staging is not the original independent file"
+            )
 
         if retired is None:
             current = Path(work) / "original-cut.sqlite"
@@ -142,5 +176,7 @@ def restore_core_checkpoint(
                     (_RETIRED_SCHEMA_REVISION,),
                 )
         lease.verify()
-        _publish(shadow, target)
+        shadow.replace(staging)
+        _publish(staging, target)
+        _finish_publication(target, staging, receipt)
     return receipt
