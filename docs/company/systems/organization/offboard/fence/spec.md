@@ -14,6 +14,8 @@ Input contracts: [revoke-access/retire](../../../authority/revoke-access/retire/
 
 Enforce the employment fence at each new claim, turn, grant and tool admission; do not wait for every distributed revocation acknowledgment to block new effects.
 
+The local cutoff consumes a distinct existing termination grant. It verifies the active employment revision and retains the existing company continuity authority; replacing the accountable founder is not supported by this cutoff. In one store transaction, record the retiring Agent and its cutoff sequence, preserve the affected grant and duty records for custody, revoke the grants, fence current runs, and place outstanding duties on hold. Existing action receipts keep their original Agent and run IDs. A held duty is not settled custody or proof that an external session stopped.
+
 **Concern for the responsible component:** Do not erase historical receipts or hide effects already admitted. Human employment, personal data deletion and production account administration are outside scope.
 
 ## Functional and quality requirements
