@@ -57,8 +57,8 @@ def run(*arguments):
     return [sys.executable, "-IB", "-m", "sourdough.cli", *map(str, arguments)]
 
 
-def cut_original_worker(service, marker, store, journal, events_path):
-    deadline = monotonic() + 75
+def cut_original_worker(service, marker, store, journal, events_path, *, timeout=75):
+    deadline = monotonic() + timeout
     while service.poll() is None and monotonic() < deadline:
         if marker.exists():
             cut = json.loads(marker.read_text())

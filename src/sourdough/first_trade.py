@@ -123,6 +123,7 @@ def run_first_trade(
             venue.observe_fee_bps(account.account_id),
             binding.exposure_limit_minor_units,
             writer,
+            sizing=sizing,
         )
         try:
             runtime.research(tools.invoke)

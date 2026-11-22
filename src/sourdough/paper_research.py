@@ -16,6 +16,7 @@ from .first_duty import require_historical_claim, require_paper_authority
 from .onboarding import has_hired_acceptance
 from .paper_account import reopen_binding
 from .paper_decision import PaperDecision
+from .paper_execution import PaperOrderSizing
 from .writer_lease import WriterLease
 
 
@@ -147,6 +148,7 @@ class ResearchTools:
     fee_bps: int
     exposure_limit_minor_units: int
     writer: WriterLease | None = None
+    sizing: PaperOrderSizing | None = None
 
     def invoke(self, name: str, arguments: dict, *, now: int | None = None) -> dict:
         if self.writer is not None:
@@ -197,6 +199,8 @@ class ResearchTools:
             fee_bps=self.fee_bps,
             exposure_limit_minor_units=self.exposure_limit_minor_units,
         )
+        if self.sizing is not None:
+            inputs["order_sizing"] = asdict(self.sizing)
         body = _json(inputs)
         revision = _digest(body)
         connection.execute(
