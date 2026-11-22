@@ -78,7 +78,10 @@ class TradingEngineSetup(unittest.TestCase):
 
     def test_engine_receipt_rejects_modified_files_before_import(self):
         self.engine.mkdir(mode=0o700)
-        installed = self.engine / f"nautilus-{VERSION}"
+        installed = self.engine.resolve() / f"nautilus-{VERSION}"
+        path_alias = self.engine.parent / "alias"
+        path_alias.symlink_to(self.engine.parent.resolve(), target_is_directory=True)
+        requested = path_alias / self.engine.name
         installed.mkdir(mode=0o700)
         (installed / "home").mkdir(mode=0o700)
         runtime = installed / "runtime"
@@ -107,9 +110,9 @@ class TradingEngineSetup(unittest.TestCase):
         ):
             receipt = _inspect_installation(installed, self.writer.company_id, lock)
             (installed / "installation.json").write_text(json.dumps(asdict(receipt)))
-            self.assertEqual(prepare_engine(self.writer, self.engine), receipt)
+            self.assertEqual(prepare_engine(self.writer, requested), receipt)
             module.write_text("ORIGINAL = False")
             invoke.reset_mock()
             with self.assertRaisesRegex(EngineRefused, "files differ"):
-                prepare_engine(self.writer, self.engine)
+                prepare_engine(self.writer, requested)
             invoke.assert_not_called()
