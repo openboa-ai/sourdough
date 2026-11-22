@@ -155,7 +155,11 @@ def _inspect_installation(
 
 
 def prepare_engine(
-    writer: WriterLease, directory: Path, *, wheelhouse: Path | None = None
+    writer: WriterLease,
+    directory: Path,
+    *,
+    wheelhouse: Path | None = None,
+    allow_install: bool = True,
 ) -> EngineInstallation:
     writer.verify()
     _require_supported_platform()
@@ -164,7 +168,10 @@ def prepare_engine(
         if not wheelhouse.is_dir():
             raise EngineRefused("Expected an offline wheel directory")
     directory = directory.absolute()
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if allow_install:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    elif not directory.is_dir():
+        raise EngineRefused("Prepare the pinned engine before launching it")
     _check_private_directory(directory)
     directory = directory.resolve()
     selected = directory / f"nautilus-{VERSION}"
@@ -199,6 +206,8 @@ def prepare_engine(
         if saved != asdict(checked):
             raise EngineRefused("Existing engine installation differs from its receipt")
         return checked
+    if not allow_install:
+        raise EngineRefused("Prepare the pinned engine before launching it")
 
     with TemporaryDirectory(prefix=".engine-stage-", dir=directory) as scratch:
         candidate = Path(scratch) / "candidate"

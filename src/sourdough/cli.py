@@ -17,6 +17,8 @@ from sourdough.first_duty import DutyRefused
 from sourdough.first_trade import TradeRefused, run_first_trade
 from sourdough.hired_paper_run import run_hired_paper_company
 from sourdough.hiring_run import run_hiring
+from sourdough.market_runtime import observe_market
+from sourdough.market_worker import MarketRefused
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
 from sourdough.paper_execution import VenueRefused
@@ -116,6 +118,13 @@ def main() -> int:
     engine.add_argument("directory", type=Path)
     engine.add_argument("--company-id", required=True)
     engine.add_argument("--wheelhouse", type=Path)
+    market = commands.add_parser("observe-trading-market")
+    market.add_argument("store", type=Path)
+    market.add_argument("directory", type=Path)
+    market.add_argument("--company-id", required=True)
+    market.add_argument("--symbol", required=True)
+    market.add_argument("--max-age-seconds", type=int, default=15)
+    market.add_argument("--samples", type=int, default=3)
     paper = commands.add_parser("bind-paper")
     paper.add_argument("store", type=Path)
     paper.add_argument("journal", type=Path)
@@ -213,6 +222,20 @@ def main() -> int:
                 result = prepare_engine(
                     writer, args.directory, wheelhouse=args.wheelhouse
                 )
+        elif args.command == "observe-trading-market":
+            result = observe_market(
+                args.store,
+                args.company_id,
+                args.directory,
+                symbol=args.symbol,
+                max_age_seconds=args.max_age_seconds,
+                samples=args.samples,
+                emit=lambda event: print(
+                    json.dumps(event), file=sys.stderr, flush=True
+                ),
+            )
+            print(json.dumps(asdict(result)))
+            return 0 if result.completed else 1
         elif args.command == "bind-paper":
             venue = FixedQuoteVenue(args.journal)
             venue.require_independent_from(args.store)
@@ -358,6 +381,7 @@ def main() -> int:
         DutyRefused,
         TradeRefused,
         EngineRefused,
+        MarketRefused,
         OrderRefused,
         PostingRefused,
         VenueRefused,
