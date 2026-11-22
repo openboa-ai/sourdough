@@ -237,10 +237,16 @@ def read_need(writer: WriterLease, claim: DutyClaim) -> dict:
         if prior is not None:
             return json.loads(prior[0]) | {"revision": prior[1]}
         slots, turns = _remaining(connection, claim.grant_id)
+        permitted_profile, permitted_scope = connection.execute(
+            "SELECT execution_profile, allowed_scope FROM staffing_authority WHERE grant_id = ?",
+            (claim.grant_id,),
+        ).fetchone()
         snapshot = json.loads(body) | {
             "need_revision": revision,
             "available_slots": slots,
             "available_turns": turns,
+            "profile": permitted_profile,
+            "scope": permitted_scope,
         }
         saved = _canonical(snapshot)
         observed = sha256(saved.encode()).hexdigest()
@@ -346,6 +352,39 @@ class HireReceipt:
     agent_id: str
     grant_id: str
     allocated_turns: int
+
+
+@dataclass(frozen=True)
+class StaffingOutcome:
+    choice_id: str
+    action: str
+    next_due_at: int
+    hire: HireReceipt | None
+
+
+def read_staffing_outcome(
+    writer: WriterLease, claim: DutyClaim
+) -> StaffingOutcome | None:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "ro")) as connection:
+        connection.execute("BEGIN")
+        _staffing_run(connection, claim)
+        row = connection.execute(
+            """SELECT c.choice_id, c.terms, c.decided_at, h.agent_id, h.grant_id, h.allocated_turns
+               FROM staffing_choice c LEFT JOIN hire_receipt h ON h.choice_id = c.choice_id
+               WHERE c.duty_id = ? AND c.run_id = ?""",
+            (claim.duty_id, claim.run_id),
+        ).fetchone()
+    if row is None:
+        return None
+    choice_id, terms, decided_at, *hire = row
+    choice = json.loads(terms)
+    return StaffingOutcome(
+        choice_id,
+        choice["action"],
+        decided_at + choice["next_check_seconds"],
+        HireReceipt(*hire) if hire[0] is not None else None,
+    )
 
 
 def admit_hire(

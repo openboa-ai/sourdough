@@ -16,7 +16,7 @@ from .first_duty import DutyRefused
 from .first_trade import OrderTool, TradeRefused, TradingContext
 from .writer_lease import WriterRefused
 
-MAX_RESEARCH_REQUEST = 64 * 1024
+MAX_TOOL_REQUEST_BYTES = 64 * 1024
 
 
 class _ReadWorkResult(socketserver.BaseRequestHandler):
@@ -35,28 +35,28 @@ class _ResultEndpoint(socketserver.UnixStreamServer):
         super().__init__(address, _ReadWorkResult)
 
 
-class _ResearchTool(socketserver.StreamRequestHandler):
+class _ToolRequest(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         self.request.settimeout(2)
         try:
-            line = self.rfile.readline(MAX_RESEARCH_REQUEST + 1)
-            if not line.endswith(b"\n") or len(line) > MAX_RESEARCH_REQUEST:
-                raise DutyRefused("Invalid research tool request")
+            line = self.rfile.readline(MAX_TOOL_REQUEST_BYTES + 1)
+            if not line.endswith(b"\n") or len(line) > MAX_TOOL_REQUEST_BYTES:
+                raise DutyRefused("Invalid scoped tool request")
             request = json.loads(line)
             if not isinstance(request, dict) or set(request) != {"name", "arguments"}:
-                raise DutyRefused("Invalid research tool envelope")
+                raise DutyRefused("Invalid scoped tool envelope")
             result = self.server.invoke(request["name"], request["arguments"])
         except (DutyRefused, WriterRefused) as error:
             result = {"error": str(error)}
         except (OSError, ValueError):
-            result = {"error": "Research tool exchange failed"}
+            result = {"error": "Scoped tool exchange failed"}
         self.wfile.write(json.dumps(result).encode())
 
 
-class _ResearchEndpoint(socketserver.UnixStreamServer):
+class _ToolEndpoint(socketserver.UnixStreamServer):
     def __init__(self, address: str, invoke: Callable[[str, dict], dict]):
         self.invoke = invoke
-        super().__init__(address, _ResearchTool)
+        super().__init__(address, _ToolRequest)
 
 
 class EmployeeProcess:
@@ -129,7 +129,13 @@ class EmployeeProcess:
         return self._follow_up("trade_duty", read_result)
 
     def research(self, invoke: Callable[[str, dict], dict]) -> dict:
-        return self._scoped_exchange("research_duty", _ResearchEndpoint, invoke)
+        return self._scoped_exchange("research_duty", _ToolEndpoint, invoke)
+
+    def staffing(self, invoke: Callable[[str, dict], dict]) -> dict:
+        return self._scoped_exchange("staffing_duty", _ToolEndpoint, invoke)
+
+    def onboarding(self, invoke: Callable[[str, dict], dict]) -> dict:
+        return self._scoped_exchange("onboarding_duty", _ToolEndpoint, invoke)
 
     def _follow_up(self, operation: str, read_result: Callable[[], dict]) -> dict:
         return self._scoped_exchange(operation, _ResultEndpoint, read_result)

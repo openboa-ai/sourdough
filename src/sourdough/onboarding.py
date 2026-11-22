@@ -197,15 +197,19 @@ def claim_hired_first(
 def _desk(connection: Connection, claim: DutyClaim) -> dict:
     authority = resolve_run(connection, claim)
     row = connection.execute(
-        """SELECT o.purpose, desk.manifest_revision, c.charter_revision
+        """SELECT o.purpose, desk.manifest_revision, c.charter_revision,
+                  json_extract(assignment.evidence, '$.summary')
            FROM hire_onboarding o JOIN private_desk desk ON desk.agent_id = o.agent_id
            JOIN agent a ON a.id = o.agent_id JOIN company c ON c.id = a.company_id
+           JOIN hire_receipt hire ON hire.agent_id = o.agent_id
+           JOIN staffing_choice choice ON choice.choice_id = hire.choice_id
+           JOIN staffing_assignment assignment ON assignment.duty_id = choice.duty_id
            WHERE o.first_duty_id = ? AND o.agent_id = ? AND o.state IN ('ready', 'accepted')""",
         (claim.duty_id, claim.founder_id),
     ).fetchone()
     if row is None or authority.duty_state != "running":
         raise DutyRefused("This claim has no active first-duty desk")
-    purpose, manifest, charter = row
+    purpose, manifest, charter, assignment = row
     authority.require_current(purpose)
     snapshot = {
         "duty_id": claim.duty_id,
@@ -213,6 +217,8 @@ def _desk(connection: Connection, claim: DutyClaim) -> dict:
         "purpose": purpose,
         "private_desk_revision": manifest,
         "charter_revision": charter,
+        "assignment_summary": assignment,
+        "granted_scope": authority.current_scope,
     }
     revision = sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
     return snapshot | {"revision": revision}
@@ -263,3 +269,31 @@ def accept_first_duty(
                 (claim.duty_id,),
             )
     return claim.duty_id
+
+
+def first_duty_accepted(writer: WriterLease, claim: DutyClaim) -> bool:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "ro")) as connection:
+        connection.execute("BEGIN")
+        _desk(connection, claim)
+        return (
+            connection.execute(
+                "SELECT 1 FROM onboarding_acceptance WHERE duty_id = ? AND run_id = ?",
+                (claim.duty_id, claim.run_id),
+            ).fetchone()
+            is not None
+        )
+
+
+def invoke_onboarding(
+    writer: WriterLease, claim: DutyClaim, name: str, arguments: dict
+) -> dict:
+    if name == "read_first_duty" and arguments == {}:
+        return read_first_duty(writer, claim)
+    if (
+        name == "accept_first_duty"
+        and isinstance(arguments, dict)
+        and set(arguments) == {"revision", "rationale"}
+    ):
+        return {"duty_id": accept_first_duty(writer, claim, **arguments)}
+    raise DutyRefused("Tool is unavailable for this onboarding duty")
