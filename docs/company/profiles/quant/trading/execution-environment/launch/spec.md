@@ -47,3 +47,9 @@ The local deployment service can run `sourdough prepare-trading-engine STORE ENG
 An existing receipt is accepted only if the installed files still match its content fingerprint. Changes to installed files fail before importing the runtime, even if the distribution metadata is unchanged.
 
 The setup receipt establishes package identity and importability only. It authorizes no market access or submission and is not a running worker, active trading configuration, or verified fill.
+
+## Read-only market activation
+
+`sourdough observe-trading-market STORE ENGINE_DIRECTORY --company-id ID --symbol BTCUSDT` opens an already prepared engine and directs the public spot data client to an immutable, company-owned market journal separate from the company database. The readiness receipt follows a fresh source event committed to the original journal; repeated or excessive-age events do not count as readiness. The run is bounded, the worker receives no inherited provider credentials, and no execution client is configured.
+
+This observation uses exchange trade IDs and exchange trade times at the provider's millisecond precision, correcting only the pinned SDK's bounded float-conversion error. It is not a quote or order-book continuity guarantee, paper execution, testnet qualification, or evidence of any financial result.
