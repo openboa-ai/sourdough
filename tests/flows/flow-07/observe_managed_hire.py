@@ -1,4 +1,4 @@
-"""Observe a subscribed hire, original managed paper fill, and recovered duty."""
+"""Observe a subscribed hire from original research through the next paper duty."""
 
 import argparse
 import json
@@ -81,7 +81,9 @@ def verify(store, journal, market, cut, result, trial, samples, units):
         journal,
         "SELECT order_id,fill_id,quantity,price_atoms FROM sandbox_fill_observation",
     )
-    assert booking == witness and booking[:2] == (cut["order_id"], cut["fill_id"])
+    assert booking == witness
+    if cut is not None:
+        assert booking[:2] == (cut["order_id"], cut["fill_id"])
     [(position, cash)] = rows(
         journal, "SELECT position_lots,cash_atoms FROM sandbox_account_observation"
     )
@@ -92,8 +94,6 @@ def verify(store, journal, market, cut, result, trial, samples, units):
     )
     assert rows(journal, "SELECT count(*) FROM sandbox_order") == [(1,)]
     assert rows(store, "SELECT fee_minor_units FROM paper_fill_fee") == [(fee,)]
-    [recovered] = result["reconciliation"]["recovered"]
-    assert recovered["sources"] == ["history", "account_sync"]
     assert not result["reconciliation"]["unresolved"]
     [(agent, profile, first_duty, first_run)] = rows(
         store,
@@ -106,7 +106,12 @@ def verify(store, journal, market, cut, result, trial, samples, units):
            JOIN paper_order paper ON paper.action_id=request.decision_id AND paper.run_id=request.run_id""",
     )
     assert agent != trial["founding"]["founder_id"] and profile == trial["profile"]
-    assert recovered["original_claim"]["run_id"] == first_run
+    if cut is not None:
+        [recovered] = result["reconciliation"]["recovered"]
+        assert recovered["sources"] == ["history", "account_sync"]
+        assert recovered["original_claim"]["run_id"] == first_run
+    else:
+        assert result["hiring"]["hire_claim"]["run_id"] == first_run
     [
         (
             finding_json,
@@ -193,7 +198,7 @@ def verify(store, journal, market, cut, result, trial, samples, units):
     }
 
 
-def observe(output, employee):
+def observe(output, employee, *, company_cut=True):
     output.mkdir(mode=0o700)
     store, scope, trial = PREPARE(output, employee, scenario="paper")
     engine = output / "engine"
@@ -212,6 +217,7 @@ def observe(output, employee):
     original = engine / ("nautilus-" + installation["distribution_version"])
     journal = original / "sandbox.sqlite"
     venue_log = output / "venue.log"
+    cut = None
     with venue_log.open("w") as errors, (output / "venue.stdout").open("w") as stdout:
         venue = subprocess.Popen(
             run("serve-nautilus-paper", store, engine, *scope, "--seconds", 350),
@@ -257,27 +263,30 @@ def observe(output, employee):
                 "--max-seconds",
                 325,
             )
+            if company_cut:
+                command = [
+                    *command[:2],
+                    "-c",
+                    FAULT_SUPERVISOR,
+                    str(marker),
+                    WITHHELD,
+                    *command[4:],
+                ]
             with (
                 events.open("w") as errors,
                 (output / "company.stdout").open("w") as stdout,
             ):
                 service = subprocess.Popen(
-                    [
-                        *command[:2],
-                        "-c",
-                        FAULT_SUPERVISOR,
-                        str(marker),
-                        WITHHELD,
-                        *command[4:],
-                    ],
+                    command,
                     stdout=stdout,
                     stderr=errors,
                     start_new_session=True,
                 )
                 try:
-                    cut = cut_original_worker(
-                        service, marker, store, journal, events, timeout=155
-                    )
+                    if company_cut:
+                        cut = cut_original_worker(
+                            service, marker, store, journal, events, timeout=155
+                        )
                     assert service.wait(timeout=330) == 0, events.read_text()
                 finally:
                     if service.poll() is None:
@@ -293,12 +302,16 @@ def observe(output, employee):
         json.loads, (output / "company.stdout").read_text().splitlines()
     )
     assert supervision["completed"]
-    killed, replacement = supervision["attempts"]
-    assert (killed["pid"], killed["returncode"]) == (cut["pid"], -signal.SIGKILL)
-    assert (
-        killed["exited_at_ns"] < replacement["ready_at_ns"]
-        and replacement["returncode"] == 0
-    )
+    if cut is not None:
+        killed, replacement = supervision["attempts"]
+        assert (killed["pid"], killed["returncode"]) == (cut["pid"], -signal.SIGKILL)
+        assert (
+            killed["exited_at_ns"] < replacement["ready_at_ns"]
+            and replacement["returncode"] == 0
+        )
+    else:
+        [original_worker] = supervision["attempts"]
+        assert original_worker["returncode"] == 0
     receipt = verify(
         store, journal, original / "market.sqlite", cut, result, trial, samples, units
     )
@@ -315,8 +328,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--employee", required=True, type=Path)
+    parser.add_argument("--uninterrupted", action="store_true")
     options = parser.parse_args()
     os.umask(0o077)
-    observed = observe(options.output.absolute(), options.employee.absolute())
+    observed = observe(
+        options.output.absolute(),
+        options.employee.absolute(),
+        company_cut=not options.uninterrupted,
+    )
     (options.output / "observer.json").write_text(json.dumps(observed))
     print(json.dumps(observed))
