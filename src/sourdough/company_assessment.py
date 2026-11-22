@@ -59,6 +59,31 @@ ASSESSMENT_WORKFLOW = ScopedWorkflow(
     ),
     "publish_assessment",
 )
+
+ASSESSMENT_REVIEW_WORKFLOW = ScopedWorkflow(
+    ASSESSMENT_REVIEW,
+    "Inspect the preceding company result. Decide whether to hold, investigate, or recommend "
+    "a change. Cite the observation, record the reason, and choose the next check. "
+    "A review does not change the source records.",
+    (
+        tool("read_work_result", "Read the authorized result and current records.", {}),
+        tool(
+            "record_review_decision",
+            "Record the reviewed decision and next responsibility.",
+            {
+                "observation_revision": {"type": "string"},
+                "action": {"enum": ["hold", "investigate", "recommend_change"]},
+                "rationale": {"type": "string", "maxLength": 2000},
+                "next_check_seconds": {
+                    "type": "integer",
+                    "minimum": 60,
+                    "maximum": 86400,
+                },
+            },
+        ),
+    ),
+    "record_review_decision",
+)
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS assessment_source (
         company_id TEXT PRIMARY KEY NOT NULL REFERENCES company(id),
