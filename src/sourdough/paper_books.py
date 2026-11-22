@@ -1,7 +1,10 @@
 """Post a confirmed full fill from the first-trade paper destination."""
 
+import json
+import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from .company import _connect, _identity
@@ -19,6 +22,23 @@ class Posting:
     order_id: str
     quantity: int
     price_minor_units: int
+
+
+@dataclass(frozen=True)
+class PositionObservation:
+    fill_id: str
+    order_id: str
+    account_id: str
+    instrument_rules_digest: str
+    fill_quantity: int
+    position_quantity: int
+    available_at: int
+    position_units: str = "instrument_units"
+
+    @property
+    def revision(self) -> str:
+        encoded = json.dumps(asdict(self), sort_keys=True).encode()
+        return sha256(encoded).hexdigest()
 
 
 def post_confirmed_fill(
@@ -87,3 +107,53 @@ def position_quantity(store: Path, company_id: str) -> int:
         return db.execute(
             "SELECT COALESCE(SUM(quantity), 0) FROM paper_fill"
         ).fetchone()[0]
+
+
+def capture_position(
+    store: Path, company_id: str, fill_id: str, *, now: int
+) -> PositionObservation:
+    with closing(_connect(store, "rw")) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        if _identity(db) != company_id:
+            raise PostingRefused("Company identity mismatch")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS paper_position_observation (
+                fill_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_fill(fill_id),
+                position_quantity INTEGER NOT NULL,
+                available_at INTEGER NOT NULL
+            )"""
+        )
+        db.execute(
+            """INSERT INTO paper_position_observation
+               SELECT target.fill_id, SUM(booked.quantity), ?
+               FROM paper_fill target
+               JOIN paper_order source ON source.order_id = target.order_id
+               JOIN paper_order related ON related.account_id = source.account_id
+                   AND related.instrument_rules_digest = source.instrument_rules_digest
+               JOIN paper_fill booked ON booked.order_id = related.order_id
+               WHERE target.fill_id = ?
+               GROUP BY target.fill_id
+               ON CONFLICT(fill_id) DO NOTHING""",
+            (now, fill_id),
+        )
+        return read_position(db, company_id, fill_id)
+
+
+def read_position(
+    connection: sqlite3.Connection, company_id: str, fill_id: str
+) -> PositionObservation:
+    if _identity(connection) != company_id:
+        raise PostingRefused("Company identity mismatch")
+    row = connection.execute(
+        """SELECT fill.fill_id, fill.order_id, source.account_id,
+                  source.instrument_rules_digest, fill.quantity,
+                  snapshot.position_quantity, snapshot.available_at
+           FROM paper_position_observation snapshot
+           JOIN paper_fill fill ON fill.fill_id = snapshot.fill_id
+           JOIN paper_order source ON source.order_id = fill.order_id
+           WHERE snapshot.fill_id = ?""",
+        (fill_id,),
+    ).fetchone()
+    if row is None:
+        raise PostingRefused("Requested book observation does not exist")
+    return PositionObservation(*row)
