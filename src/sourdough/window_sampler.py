@@ -82,7 +82,7 @@ class WindowSampler:
         ) as pool:
             sampler = pool.submit(self._collect, writer, window, stop)
             try:
-                yield
+                yield window
             finally:
                 stop.set()
                 sampler.result()

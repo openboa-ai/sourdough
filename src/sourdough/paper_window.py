@@ -9,6 +9,7 @@ from sqlite3 import Connection
 from time import time_ns
 
 from .company import _connect, _identity
+from .duty_run import count_company_runs
 from .paper_account import PaperAccount, reopen_binding
 from .writer_lease import WriterLease
 
@@ -37,6 +38,7 @@ class WindowPlan:
     max_spend_minor: int
     max_drawdown_bps: int
     hurdle_bps: int
+    agent_turn_limit: int | None = None
 
     def __post_init__(self) -> None:
         pins = (
@@ -76,6 +78,13 @@ class WindowPlan:
             <= 1 + (self.closes_ns - self.opens_ns) // self.cadence_ns
             or not 0 < self.max_drawdown_bps <= 10_000
             or not self.max_exposure_minor
+            or (
+                self.agent_turn_limit is not None
+                and (
+                    type(self.agent_turn_limit) is not int
+                    or not 0 <= self.agent_turn_limit < 2**31
+                )
+            )
         ):
             raise WindowRefused("Window has inconsistent timing, limits or coverage")
 
@@ -87,6 +96,7 @@ class RegisteredWindow:
     account: PaperAccount
     registered_ns: int
     revision: str
+    run_count_at_seal: int | None = None
 
     def admits_availability(self, available_ns: int) -> bool:
         return (
@@ -106,6 +116,12 @@ def _decode(contract: str, committed_ns: int, revision: str) -> RegisteredWindow
     fields = json.loads(contract)
     fields["plan"] = WindowPlan(**fields["plan"])
     fields["account"] = PaperAccount(**fields["account"])
+    count = fields.get("run_count_at_seal")
+    if (fields["plan"].agent_turn_limit is None and count is not None) or (
+        fields["plan"].agent_turn_limit is not None
+        and (type(count) is not int or count < 0)
+    ):
+        raise WindowRefused("Window has no valid sealed turn baseline")
     if not 0 < committed_ns < fields["plan"].opens_ns:
         raise WindowRefused("Window seal does not precede its opening")
     return RegisteredWindow(**fields, registered_ns=committed_ns, revision=revision)
@@ -169,15 +185,19 @@ def register_window(writer: WriterLease, plan: WindowPlan) -> RegisteredWindow:
                 CHECK ((committed_ns IS NULL) = (revision IS NULL))
             )"""
         )
-        contract = json.dumps(
-            {
-                "company_id": writer.company_id,
-                "plan": asdict(plan),
-                "account": asdict(binding.account),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        plan_values = asdict(plan)
+        fields = {
+            "company_id": writer.company_id,
+            "plan": plan_values,
+            "account": asdict(binding.account),
+        }
+        if plan.agent_turn_limit is None:
+            del plan_values["agent_turn_limit"]
+        else:
+            fields["run_count_at_seal"] = count_company_runs(
+                writer.store, writer.company_id
+            )
+        contract = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         database.execute(
             """INSERT INTO paper_operating_window (window_id,contract) VALUES (?,?)
                ON CONFLICT(window_id) DO NOTHING""",
@@ -218,6 +238,4 @@ def register_window(writer: WriterLease, plan: WindowPlan) -> RegisteredWindow:
             (committed_ns, revision, plan.window_id),
         )
         writer.verify()
-    return RegisteredWindow(
-        writer.company_id, plan, binding.account, committed_ns, revision
-    )
+    return _decode(contract, committed_ns, revision)
