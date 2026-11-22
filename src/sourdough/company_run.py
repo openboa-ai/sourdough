@@ -7,6 +7,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from time import monotonic, sleep, time
 
+from .abandoned_work import requeue_uncommitted_work
 from .company import _connect, reopen, upgrade_work_schema
 from .duty_run import (
     PAPER_EXECUTION,
@@ -79,6 +80,7 @@ class CompanyRun:
     later_trades: tuple[LaterPaperTrade, ...] = ()
     reconciliation: PaperReconciliation | None = None
     blocked_work: tuple[str, ...] = ()
+    fenced_runs: tuple[str, ...] = ()
 
 
 def run_paper_company(
@@ -134,6 +136,7 @@ def _operate(
     idle_deadline = monotonic() + idle_seconds
     next_purpose = PAPER_EXECUTION if repeat_paper else POSITION_REVIEW
     reconciliation, blocked = _recover(writer, venue, next_purpose)
+    fenced_runs = requeue_uncommitted_work(writer)
     if on_ready is not None:
         on_ready(writer)
     first = (
@@ -169,7 +172,11 @@ def _operate(
             finish_first_duty(store, first.claim, result, due_at=research.next_due_at)
         else:
             return CompanyRun(
-                first, None, reconciliation=reconciliation, blocked_work=blocked
+                first,
+                None,
+                reconciliation=reconciliation,
+                blocked_work=blocked,
+                fenced_runs=fenced_runs,
             )
 
     review = None
@@ -206,7 +213,9 @@ def _operate(
             trades.append(trade)
             if trade.next_duty is None:
                 break
-    return CompanyRun(first, review, tuple(trades), reconciliation, blocked)
+    return CompanyRun(
+        first, review, tuple(trades), reconciliation, blocked, fenced_runs
+    )
 
 
 def _recover(
