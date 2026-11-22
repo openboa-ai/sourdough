@@ -126,3 +126,52 @@ class Staffing(unittest.TestCase):
         self.assertEqual(sum(result is not None for result in results), 1)
         self.assertEqual(self.rows("SELECT count(*) FROM agent"), [(2,)])
         self.assertEqual(self.rows("SELECT count(*) FROM hire_receipt"), [(1,)])
+
+    def test_revocation_before_claim_does_not_reissue_staffing_authority(self):
+        self.stage("due-before-revocation")
+        self.revoke_manager()
+        self.assertIsNone(claim_staffing(self.writer, "profile", now=self.now))
+        self.assertEqual(self.rows("SELECT count(*) FROM duty_run"), [(0,)])
+        self.assertEqual(self.rows("SELECT count(*) FROM agent"), [(1,)])
+
+    def test_historical_receipt_reopens_after_revocation_without_new_admission(self):
+        first, first_choice = self.ready("first")
+        later, later_choice = self.ready("later")
+        first_id = record_choice(
+            self.writer,
+            first,
+            replace(
+                first_choice,
+                evidence_revision=read_need(self.writer, first)["revision"],
+            ),
+        )
+        later_id = record_choice(
+            self.writer,
+            later,
+            replace(
+                later_choice,
+                evidence_revision=read_need(self.writer, later)["revision"],
+            ),
+        )
+        request = HireRequest(
+            "original", first_id, "reviewer", "profile", "assessment", 4
+        )
+        original = admit_hire(self.writer, first, request)
+        self.revoke_manager()
+        self.assertEqual(admit_hire(self.writer, first, request), original)
+        with self.assertRaisesRegex(DutyRefused, "replay conflicts"):
+            admit_hire(self.writer, first, replace(request, turns=3))
+        with self.assertRaisesRegex(DutyRefused, "no longer current"):
+            admit_hire(
+                self.writer,
+                later,
+                replace(request, request_id="second", choice_id=later_id),
+            )
+        self.assertEqual(self.rows("SELECT count(*) FROM hire_receipt"), [(1,)])
+
+    def revoke_manager(self):
+        with closing(sqlite3.connect(self.store)) as db, db:
+            db.execute(
+                "UPDATE standing_grant SET scope='revoked' WHERE id=?",
+                (self.founding.grant_id,),
+            )

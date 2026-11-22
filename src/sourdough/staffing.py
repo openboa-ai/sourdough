@@ -9,7 +9,7 @@ from time import time
 from uuid import uuid4
 
 from .company import _connect, upgrade_work_schema
-from .duty_run import DutyClaim, DutyRefused, resolve_run, start_run
+from .duty_run import DutyClaim, DutyRefused, RunAuthority, resolve_run, start_run
 from .writer_lease import WriterLease
 
 
@@ -20,7 +20,8 @@ SCHEMA = (
         grant_id TEXT PRIMARY KEY NOT NULL REFERENCES standing_grant(id),
         execution_profile TEXT NOT NULL, allowed_scope TEXT NOT NULL,
         slots INTEGER NOT NULL CHECK (slots > 0),
-        turns INTEGER NOT NULL CHECK (turns > 0)
+        turns INTEGER NOT NULL CHECK (turns > 0),
+        manager_scope TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS staffing_assignment (
         duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
@@ -120,18 +121,18 @@ def stage_staffing(
         for statement in SCHEMA:
             connection.execute(statement)
         row = connection.execute(
-            """SELECT g.agent_id FROM standing_grant g JOIN agent a ON a.id = g.agent_id
-               WHERE g.id = ? AND a.company_id = ?""",
+            """SELECT g.agent_id, g.scope FROM standing_grant g JOIN agent a ON a.id = g.agent_id
+               WHERE g.id = ? AND a.company_id = ? AND g.scope != 'revoked'""",
             (authority.manager_grant_id, writer.company_id),
         ).fetchone()
         if row is None:
             raise DutyRefused(
                 "Staffing authority has no active manager in this company"
             )
-        manager_id = row[0]
-        terms = tuple(asdict(authority).values())
+        manager_id, manager_scope = row
+        terms = (*asdict(authority).values(), manager_scope)
         connection.execute(
-            "INSERT OR IGNORE INTO staffing_authority VALUES (?, ?, ?, ?, ?)", terms
+            "INSERT OR IGNORE INTO staffing_authority VALUES (?, ?, ?, ?, ?, ?)", terms
         )
         existing = connection.execute(
             "SELECT * FROM staffing_authority WHERE grant_id = ?", (terms[0],)
@@ -179,6 +180,8 @@ def claim_staffing(
                JOIN duty d ON d.id = s.duty_id AND d.state = 'due'
                JOIN agent a ON a.id = d.agent_id
                JOIN standing_grant g ON g.id = s.manager_grant_id AND g.agent_id = a.id
+               JOIN staffing_authority delegation ON delegation.grant_id = g.id
+                    AND delegation.manager_scope = g.scope
                WHERE a.company_id = ? AND a.execution_profile = ? AND s.available_at <= ?
                ORDER BY s.available_at, d.id LIMIT 1""",
             (writer.company_id, execution_profile, now),
@@ -194,23 +197,31 @@ def claim_staffing(
         )
 
 
-def _assignment(
-    connection: Connection, claim: DutyClaim, *, replay: bool = False
-) -> tuple[str, str]:
+def _staffing_run(
+    connection: Connection, claim: DutyClaim
+) -> tuple[str, str, RunAuthority]:
     grant = resolve_run(connection, claim)
-    grant.require_current(STAFFING_REVIEW)
     row = connection.execute(
-        """SELECT evidence, evidence_revision FROM staffing_assignment
-           WHERE duty_id = ? AND manager_grant_id = ?""",
+        """SELECT s.evidence, s.evidence_revision, a.manager_scope
+           FROM staffing_assignment s JOIN staffing_authority a ON a.grant_id = s.manager_grant_id
+           WHERE s.duty_id = ? AND s.manager_grant_id = ?""",
         (claim.duty_id, claim.grant_id),
     ).fetchone()
-    if row is None or (
-        grant.duty_state != "running" and not (replay and grant.duty_state == "settled")
-    ):
-        raise DutyRefused("Staffing decision requires an active assigned manager")
-    body, revision = row
+    if row is None or grant.purpose != STAFFING_REVIEW or row[2] != grant.issued_scope:
+        raise DutyRefused(
+            "Staffing claim does not match the original delegated assignment"
+        )
+    body, revision, _ = row
     if sha256(body.encode()).hexdigest() != revision:
         raise DutyRefused("Staffing evidence does not match its sealed revision")
+    return body, revision, grant
+
+
+def _assignment(connection: Connection, claim: DutyClaim) -> tuple[str, str]:
+    body, revision, grant = _staffing_run(connection, claim)
+    grant.require_current(STAFFING_REVIEW)
+    if grant.duty_state != "running":
+        raise DutyRefused("Staffing decision requires an active assigned manager")
     return body, revision
 
 
@@ -343,7 +354,7 @@ def admit_hire(
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        _assignment(connection, claim, replay=True)
+        _staffing_run(connection, claim)
         choice = connection.execute(
             """SELECT terms FROM staffing_choice
                WHERE choice_id = ? AND duty_id = ? AND run_id = ?""",
