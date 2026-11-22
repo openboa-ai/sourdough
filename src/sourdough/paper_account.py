@@ -250,6 +250,20 @@ def read_applied_binding(
     return PaperAccount(*terms[4:]), saved[4]
 
 
+def is_retired_account_scope(
+    connection, company_id: str, account_id: str, instrument_revision: str
+) -> bool:
+    if not _has_table(connection, "paper_binding_change"):
+        return False
+    return any(
+        (terms[1], terms[4], terms[6]) == (company_id, account_id, instrument_revision)
+        for (stored,) in connection.execute(
+            "SELECT old_terms FROM paper_binding_change WHERE effective_at_ns IS NOT NULL"
+        )
+        for terms in (json.loads(stored),)
+    )
+
+
 def _require_new_identity(connection, mandate: PaperMandate) -> None:
     for revision, old_terms in connection.execute(
         "SELECT previous_revision,old_terms FROM paper_binding_change"

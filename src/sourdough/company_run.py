@@ -26,7 +26,11 @@ from .first_trade import (
     run_first_trade,
 )
 from .onboarding import is_hired_first_duty
-from .paper_account import has_pending_binding_change, reopen_binding
+from .paper_account import (
+    has_pending_binding_change,
+    is_retired_account_scope,
+    reopen_binding,
+)
 from .paper_books import (
     NoFillObservation,
     Posting,
@@ -146,7 +150,8 @@ def _operate(
             )
         turn_budget = max(0, turn_budget - consumed)
     idle_deadline = monotonic() + idle_seconds
-    active_account = reopen_binding(store, company_id).account
+    binding = reopen_binding(store, company_id)
+    active_scope = (binding.account.account_id, binding.account.instrument_rules_digest)
     with closing(_connect(store, "ro")) as connection:
         switching = has_pending_binding_change(connection)
     repeat_paper = repeat_paper and not switching
@@ -219,13 +224,18 @@ def _operate(
             writer, venue, next_purpose, reconciliation
         )
 
+    def scope_of(connection, reference):
+        evidence = _read_paper_observation(connection, reference, company_id)
+        return evidence["account_id"], evidence["instrument_rules_digest"]
+
     def eligible(connection, reference):
         if reference.kind not in _PAPER_RESULTS:
             return False
-        evidence = _read_paper_observation(connection, reference, company_id)
-        return (evidence["account_id"], evidence["instrument_rules_digest"]) == (
-            active_account.account_id,
-            active_account.instrument_rules_digest,
+        scope = scope_of(connection, reference)
+        return scope == active_scope or (
+            is_retired_account_scope(connection, company_id, *scope)
+            and read_binding_position(connection, company_id, binding.revision)
+            is not None
         )
 
     while turn_budget or reconciliation.next_query_at is not None:
@@ -267,7 +277,13 @@ def _operate(
             sleep(min(remaining, 0.5))
             continue
         turn_budget -= 1
-        if follow_up.purpose == POSITION_REVIEW:
+        historical_execution = False
+        if follow_up.purpose == PAPER_EXECUTION:
+            with closing(_connect(store, "ro")) as connection:
+                historical_execution = (
+                    scope_of(connection, follow_up.result) != active_scope
+                )
+        if follow_up.purpose == POSITION_REVIEW or historical_execution:
             review = _review(writer, follow_up, venue, runtime, next_purpose)
         else:
             trade = _trade(writer, follow_up, venue, runtime)
@@ -451,6 +467,7 @@ def _review(
             follow_up,
             now=int(time()),
             read=project,
+            purpose=follow_up.purpose,
         )
 
     try:
@@ -466,7 +483,10 @@ def _review(
                 prior = _read_paper_observation(
                     connection, follow_up.result, writer.company_id
                 )
-                if prior["account_id"] != binding.account.account_id:
+                if (prior["account_id"], prior["instrument_rules_digest"]) != (
+                    binding.account.account_id,
+                    binding.account.instrument_rules_digest,
+                ):
                     baseline = read_binding_position(
                         connection, writer.company_id, binding.revision
                     )
@@ -486,6 +506,7 @@ def _review(
             now=int(time()),
             successor_purpose=purpose,
             successor_result=successor,
+            historical_paper=follow_up.purpose == PAPER_EXECUTION,
         )
     except (DutyRefused, TradeRefused):
         try:
@@ -523,7 +544,10 @@ def _trade(
 
     def project(connection, reference):
         observation = _read_paper_observation(connection, reference, claim.company_id)
-        if observation["account_id"] != account.account_id:
+        if (observation["account_id"], observation["instrument_rules_digest"]) != (
+            account.account_id,
+            account.instrument_rules_digest,
+        ):
             raise DutyRefused("The position belongs to a different account")
         available = binding.exposure_limit_minor_units - reserved_exposure(
             connection, account.account_id

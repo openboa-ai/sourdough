@@ -8,9 +8,10 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import monotonic, sleep, time_ns
+from time import monotonic, sleep, time, time_ns
 
 from sourdough.company import FoundingTerms, found
+from sourdough.duty_run import PAPER_EXECUTION
 from sourdough.first_duty import claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
@@ -22,6 +23,7 @@ from sourdough.paper_account import (
     has_pending_binding_change,
     reopen_binding,
 )
+from sourdough.paper_books import post_confirmed_fill, read_booked_no_fill
 from sourdough.paper_execution import PaperIntent, VenueRefused
 from sourdough.paper_order import OrderRefused, submit_paper_order
 from sourdough.paper_research import (
@@ -30,6 +32,7 @@ from sourdough.paper_research import (
     stage_research_inputs,
 )
 from sourdough.writer_lease import hold_company_writer
+from sourdough.work import ResultReference, finish_first_duty
 
 
 REOPEN = """
@@ -274,6 +277,60 @@ class ManagedPaperChangeover(unittest.TestCase):
                 "SELECT order_id,account_id,mandate_revision FROM paper_order",
             ),
             [(new_id, "new", "revision-b")],
+        )
+
+    def test_switch_keeps_a_recurring_no_fill_duty_as_review_before_the_new_account(
+        self,
+    ):
+        claim = claim_first_duty(self.store, self.company_id, "employee")
+        order_id = self.accept(
+            claim,
+            PaperIntent("original", self.terms.revision, 2, 110),
+            self.old,
+            "old",
+            withhold=True,
+        )
+        self.old.record_cancellation("old", order_id, "terminal", 0)
+        self.assertTrue(self.old.record_account("old", order_id, 0, 1000))
+        self.assertIsNone(
+            post_confirmed_fill(self.store, self.company_id, order_id, self.old)
+        )
+        observation = read_booked_no_fill(self.store, self.company_id, order_id)
+        reference = ResultReference(
+            "paper_no_fill", order_id, observation.revision, observation.available_at
+        )
+        due_at = int(time()) + 300
+        planned = finish_first_duty(
+            self.store, claim, reference, due_at=due_at, purpose=PAPER_EXECUTION
+        )
+        self.assertIsNotNone(self.switch().effective_at_ns)
+        inactive = self.reopen_process(self.new, repeat=True)
+        self.assertIsNone(inactive["review"])
+        self.assertEqual(inactive["later_trades"], [])
+        historical = self.reopen_process(self.new, offset=350, repeat=True)
+        self.assertEqual(historical["later_trades"], [])
+        review = historical["review"]
+        self.assertEqual(review["claim"]["duty_id"], planned.duty_id)
+        self.assertEqual(review["claim"]["founder_id"], claim.founder_id)
+        self.assertEqual(
+            review["decision"]["observation_revision"], observation.revision
+        )
+        self.assertEqual(review["next_duty"]["result"]["resource_id"], "revision-b")
+        self.assertEqual(
+            finish_first_duty(
+                self.store, claim, reference, due_at=due_at, purpose=PAPER_EXECUTION
+            ),
+            planned,
+        )
+        active = self.reopen_process(self.new, offset=900, repeat=True)
+        [new_duty] = active["later_trades"]
+        self.assertEqual(new_duty["claim"]["duty_id"], review["next_duty"]["duty_id"])
+        self.assertEqual(new_duty["decision"]["decision"]["action"], "hold")
+        self.assertEqual(
+            rows(self.new.journal, "SELECT count(*) FROM sandbox_order"), [(0,)]
+        )
+        self.assertEqual(
+            rows(self.old.journal, "SELECT count(*) FROM sandbox_order"), [(1,)]
         )
 
     def test_drained_evidence_is_not_inferred_without_the_original_venue(self):
