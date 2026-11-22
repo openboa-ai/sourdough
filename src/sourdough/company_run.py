@@ -54,6 +54,7 @@ from .paper_order import reserved_exposure
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
 from .paper_review import bind_review_quote, observe_review_quote
+from .paper_window import RegisteredWindow
 from .window_sampler import WindowSampler
 from .writer_lease import WriterLease, hold_company_writer
 from .work import (
@@ -119,7 +120,10 @@ def run_paper_company(
     with hold_company_writer(
         store, company_id, expected_store_key=expected_store_key
     ) as writer:
-        with sampler.activate(writer, venue) if sampler is not None else nullcontext():
+        sampling = (
+            sampler.activate(writer, venue) if sampler is not None else nullcontext()
+        )
+        with sampling as window:
             return _operate(
                 writer,
                 venue,
@@ -129,6 +133,7 @@ def run_paper_company(
                 idle_seconds,
                 budget_from,
                 on_ready,
+                window,
             )
 
 
@@ -141,17 +146,28 @@ def _operate(
     idle_seconds: int,
     budget_from: int | None,
     on_ready: Callable[[WriterLease], None] | None,
+    window: RegisteredWindow | None,
 ) -> CompanyRun:
     store, company_id = writer.store, writer.company_id
     writer.verify()
     upgrade_work_schema(store, company_id)
-    if budget_from is not None:
-        consumed = count_company_runs(store, company_id) - budget_from
-        if consumed < 0:
-            raise TradeRefused(
-                "Company run history is behind the activation budget baseline"
-            )
-        turn_budget = max(0, turn_budget - consumed)
+    window_limit = window.plan.agent_turn_limit if window is not None else None
+    if budget_from is not None or window_limit is not None:
+        current = count_company_runs(store, company_id)
+        if budget_from is not None:
+            if current < budget_from:
+                raise TradeRefused(
+                    "Company run history is behind the activation budget baseline"
+                )
+            turn_budget -= current - budget_from
+        if window_limit is not None:
+            sealed_count = window.run_count_at_seal
+            if sealed_count is None or current < sealed_count:
+                raise TradeRefused(
+                    "Company run history is behind the sealed window baseline"
+                )
+            turn_budget = min(turn_budget, window_limit - (current - sealed_count))
+        turn_budget = max(0, turn_budget)
     idle_deadline = monotonic() + idle_seconds
     binding = reopen_binding(store, company_id)
     active_scope = (binding.account.account_id, binding.account.instrument_rules_digest)

@@ -14,7 +14,10 @@ from unittest.mock import Mock, patch
 
 from sourdough.accounting_close import CloseRequest, ExpectedCost, close_period
 from sourdough.company import FoundingTerms, found
+from sourdough.company_run import run_paper_company
+from sourdough.duty_run import count_company_runs
 from sourdough.first_duty import claim_first_duty
+from sourdough.first_trade import TradeRefused
 from sourdough.general_ledger import JournalEntry, JournalLine, post_journal
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
@@ -416,6 +419,50 @@ class PaperValuationTests(unittest.TestCase):
                 [call.args[-1] for call in capture.call_args_list], [0, 1, 1]
             )
             self.assertEqual(stop.wait.call_args_list[1].args, (1,))
+
+    def test_new_activations_do_not_reset_the_window_turn_ceiling(self):
+        now = time_ns()
+        plan = replace(self.plan(now + 100, now + 198), agent_turn_limit=1)
+        sampler = WindowSampler(self.engine, plan.window_id)
+        with (
+            patch("sourdough.paper_window.time_ns", return_value=now),
+            hold_company_writer(self.store, self.company_id) as writer,
+        ):
+            window = register_managed_window(writer, self.engine, plan)
+        self.assertEqual(window.run_count_at_seal, 0)
+
+        def interrupted_turn(*args, **kwargs):
+            claim_first_duty(self.store, self.company_id, "profile")
+            raise TradeRefused("Employee stopped before its decision")
+
+        def activate():
+            return run_paper_company(
+                self.store,
+                self.company_id,
+                self.venue,
+                Mock(profile="profile"),
+                turn_budget=2,
+                budget_from=count_company_runs(self.store, self.company_id),
+                sampler=sampler,
+            )
+
+        with (
+            patch.object(WindowSampler, "_collect"),
+            patch(
+                "sourdough.company_run.run_first_trade", side_effect=interrupted_turn
+            ) as employee,
+        ):
+            with self.assertRaisesRegex(TradeRefused, "stopped before its decision"):
+                activate()
+            self.assertEqual(count_company_runs(self.store, self.company_id), 1)
+            with hold_company_writer(self.store, self.company_id) as writer:
+                self.assertEqual(
+                    register_managed_window(writer, self.engine, plan), window
+                )
+            replacement = activate()
+            self.assertIsNone(replacement.first_trade)
+            employee.assert_called_once()
+            self.assertEqual(count_company_runs(self.store, self.company_id), 1)
 
     def test_closed_statement_uses_original_cash_and_deducts_only_operating_costs(self):
         day = date(2027, 1, 15)
