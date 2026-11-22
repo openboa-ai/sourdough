@@ -1,7 +1,9 @@
+import json
 import sqlite3
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -37,6 +39,19 @@ class NautilusPaperPort(unittest.TestCase):
             self.units.limit_order(1, ask)
         with self.assertRaisesRegex(VenueRefused, "integer units"):
             self.units.lots(Decimal("0.00001001"))
+
+    def test_pre_replay_plan_recognizes_same_live_paper_account(self):
+        destination = self.venue.provision(self.plan)
+        with closing(sqlite3.connect(self.venue.journal)) as database, database:
+            (body,) = database.execute("SELECT plan FROM sandbox_config").fetchone()
+            legacy = json.loads(body)
+            del legacy["tape_revision"]
+            database.execute("UPDATE sandbox_config SET plan=?", (json.dumps(legacy),))
+        reopened = NautilusPaperVenue(self.venue.journal)
+        self.assertEqual(reopened.provision(self.plan), destination)
+        self.assertEqual(reopened.configuration(), (destination, self.plan))
+        with self.assertRaisesRegex(VenueRefused, "original account"):
+            reopened.provision(replace(self.plan, tape_revision="1" * 64))
 
     def test_fill_replays_once_and_survives_the_sender(self):
         destination = self.venue.provision(self.plan)

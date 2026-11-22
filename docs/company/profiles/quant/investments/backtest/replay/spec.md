@@ -21,3 +21,9 @@ Design draft · Verification **UNRUN** · Responsible component: quant replay ru
 | Revision and windows | Evaluate a separately registered candidate without using its already observed tuning period as new holdout evidence. Retain the incumbent, all failed variants and the original observation period. |
 
 Replay is historical, not prospective. A passing replay cannot satisfy a current-market paper observation or independently establish investment returns.
+
+## First executable slice
+
+The managed runtime can bind an isolated replay account to a supplied quote tape by its exact content digest. The tape specifies instrument terms, quote event times and later availability times; missing, unordered or off-increment observations are refused rather than corrected. NautilusTrader's offline backtest engine drives the replay clock and executes the same company-admitted order contract as the forward sandbox. The replay receipt preserves the observed event and decision availability cut, original fill and independent virtual account totals.
+
+The first bounded observation uses one decision, one spot instrument, a full fill and an explicit zero-fee test policy. It does not qualify a complete evaluation window, operating costs or an economic result.

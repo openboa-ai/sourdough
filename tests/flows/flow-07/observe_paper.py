@@ -1,4 +1,4 @@
-"""Observe one Sourdough-admitted virtual order against current public spot data."""
+"""Observe one company-admitted virtual order against public data or a sealed replay."""
 
 import argparse
 import json
@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -34,11 +35,12 @@ print(json.dumps(reply))
 def cli(*args, timeout=40):
     run = subprocess.run(
         [sys.executable, "-IB", "-m", "sourdough.cli", *map(str, args)],
-        check=True,
         capture_output=True,
         text=True,
         timeout=timeout,
     )
+    if run.returncode != 0:
+        raise RuntimeError(f"{args[0]} exited {run.returncode}: {run.stderr}")
     return json.loads(run.stdout)
 
 
@@ -57,7 +59,7 @@ def wait_ready(worker, log, seconds=36):
     raise RuntimeError(f"Sandbox did not become ready: {log.read_text()}")
 
 
-def observe(output: Path, wheelhouse: Path | None) -> dict:
+def observe(output: Path, wheelhouse: Path | None, tape: Path | None = None) -> dict:
     output.mkdir(mode=0o700)
     employee = output / "employee"
     employee.write_text(f"#!{sys.executable}\n" + EMPLOYEE)
@@ -79,8 +81,14 @@ def observe(output: Path, wheelhouse: Path | None) -> dict:
     scope = ["--company-id", company["company_id"]]
     wheel = [] if wheelhouse is None else ["--wheelhouse", wheelhouse]
     cli("prepare-trading-engine", store, engine, *scope, *wheel, timeout=420)
-    market = cli("observe-trading-market", store, engine, *scope, "--symbol", "BTCUSDT")
-    assert market["completed"]
+    market = None
+    if tape is None:
+        market = cli(
+            "observe-trading-market", store, engine, *scope, "--symbol", "BTCUSDT"
+        )
+        assert market["completed"]
+    source = [] if tape is None else ["--replay-tape", str(tape)]
+    replay = [] if tape is None else ["--replay"]
     prepared = cli(
         "prepare-nautilus-paper",
         store,
@@ -90,8 +98,13 @@ def observe(output: Path, wheelhouse: Path | None) -> dict:
         "paper-check",
         "--starting-atoms",
         1000 * 10**8,
+        *source,
     )
-    venue = engine / "nautilus-1.231.0" / "sandbox.sqlite"
+    venue = (
+        engine
+        / "nautilus-1.231.0"
+        / ("sandbox.sqlite" if tape is None else "replay.sqlite")
+    )
     runtime_log = output / "engine.stderr"
     with (
         runtime_log.open("w") as events,
@@ -109,6 +122,7 @@ def observe(output: Path, wheelhouse: Path | None) -> dict:
                 *scope,
                 "--seconds",
                 "22",
+                *source,
             ],
             stdout=stdout,
             stderr=events,
@@ -126,13 +140,21 @@ def observe(output: Path, wheelhouse: Path | None) -> dict:
                 "synthetic",
                 "--exposure-atoms",
                 100 * 10**8,
+                *replay,
             )
             assert binding["account"]["environment"] == "paper"
             assert binding["account"]["destination_id"] == prepared["destination_id"]
             result = cli(
-                "operate-nautilus-paper", store, engine, *scope, "--employee", employee
+                "operate-nautilus-paper",
+                store,
+                engine,
+                *scope,
+                "--employee",
+                employee,
+                *replay,
             )
-            assert worker.poll() is None
+            if tape is None:
+                assert worker.poll() is None
             assert worker.wait(timeout=40) == 0
         finally:
             if worker.poll() is None:
@@ -160,9 +182,29 @@ def observe(output: Path, wheelhouse: Path | None) -> dict:
     assert (position, cash) == (20, 1000 * 10**8 - 20 * posting["price_minor_units"])
     assert rows(venue, "SELECT count(*) FROM sandbox_order") == [(1,)]
     assert rows(store, "SELECT count(*) FROM paper_order") == [(1,)]
+    replay_cut = None
+    if tape is not None:
+        (cut,) = rows(
+            venue,
+            """SELECT cut.price_atoms_per_lot,cut.event_ns,cut.available_ns
+               FROM replay_decision_cut AS cut
+               JOIN sandbox_order AS request ON request.generation=cut.generation""",
+        )
+        (config,) = rows(venue, "SELECT plan FROM sandbox_config")
+        revision = json.loads(config[0])["tape_revision"]
+        assert revision == sha256(tape.read_bytes()).hexdigest()
+        assert not (venue.parent / "market.sqlite").exists()
+        replay_cut = {
+            "tape_revision": revision,
+            "price_atoms_per_lot": cut[0],
+            "event_ns": cut[1],
+            "available_ns": cut[2],
+        }
     return {
-        "market_activation": market["activation_id"],
-        "instrument_revision": market["instrument_revision"],
+        "market_activation": market["activation_id"] if market is not None else None,
+        "instrument_revision": binding["account"]["instrument_rules_digest"],
+        "connector": binding["account"]["connector_revision"],
+        "replay_cut": replay_cut,
         "engine_worker_pid": ready["pid"],
         "scope": "virtual cash; zero test fee; one full fill",
         "posting": posting,
@@ -175,6 +217,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--wheelhouse", type=Path)
+    parser.add_argument("--replay-tape", type=Path)
     args = parser.parse_args()
     os.umask(0o077)
-    print(json.dumps(observe(args.output.absolute(), args.wheelhouse)))
+    print(
+        json.dumps(observe(args.output.absolute(), args.wheelhouse, args.replay_tape))
+    )

@@ -140,16 +140,20 @@ def main() -> int:
         if command == "prepare-nautilus-paper":
             sandbox.add_argument("--account-id", required=True)
             sandbox.add_argument("--starting-atoms", required=True, type=int)
+            sandbox.add_argument("--replay-tape", type=Path)
         elif command == "bind-nautilus-paper":
             sandbox.add_argument("--revision", required=True)
             sandbox.add_argument("--charter-revision", required=True)
             sandbox.add_argument("--exposure-atoms", required=True, type=int)
+            sandbox.add_argument("--replay", action="store_true")
         elif command == "serve-nautilus-paper":
             sandbox.add_argument("--seconds", type=int, default=60)
+            sandbox.add_argument("--replay-tape", type=Path)
         else:
             sandbox.add_argument("--employee", type=Path, required=True)
             sandbox.add_argument("--turn-budget", type=int, default=1)
             sandbox.add_argument("--idle-seconds", type=int, default=0)
+            sandbox.add_argument("--replay", action="store_true")
     paper = commands.add_parser("bind-paper")
     paper.add_argument("store", type=Path)
     paper.add_argument("journal", type=Path)
@@ -264,7 +268,11 @@ def main() -> int:
         elif args.command == "prepare-nautilus-paper":
             with hold_company_writer(args.store, args.company_id) as writer:
                 identity = prepare_paper(
-                    writer, args.directory, args.account_id, args.starting_atoms
+                    writer,
+                    args.directory,
+                    args.account_id,
+                    args.starting_atoms,
+                    tape_path=args.replay_tape,
                 )
             print(json.dumps({"destination_id": identity}))
             return 0
@@ -276,6 +284,7 @@ def main() -> int:
                     revision=args.revision,
                     charter_revision=args.charter_revision,
                     exposure_atoms=args.exposure_atoms,
+                    replay=args.replay,
                 )
         elif args.command == "serve-nautilus-paper":
             result = supervise_paper(
@@ -283,6 +292,7 @@ def main() -> int:
                 args.company_id,
                 args.directory,
                 seconds=args.seconds,
+                tape_path=args.replay_tape,
                 emit=lambda event: print(
                     json.dumps(event), file=sys.stderr, flush=True
                 ),
@@ -293,7 +303,7 @@ def main() -> int:
             result = run_paper_company(
                 args.store,
                 args.company_id,
-                paper_venue(args.store, args.directory),
+                paper_venue(args.store, args.directory, replay=args.replay),
                 EmployeeProcess(args.employee),
                 turn_budget=args.turn_budget,
                 idle_seconds=args.idle_seconds,

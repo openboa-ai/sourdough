@@ -7,21 +7,25 @@ from .market_worker import SpotInstrumentTerms, journal_key, read_spot_terms, re
 from .nautilus_paper import NautilusPaperVenue, SandboxPlan
 from .paper_account import PaperMandate, bind
 from .paper_execution import VenueRefused
+from .replay_tape import ReplayTape
 from .supervisor import SupervisionResult, supervise_worker
 from .trading_engine import VERSION, _environment, prepare_engine
 from .writer_lease import WriterLease, hold_company_writer
 
 
-_WORKER = """import sys
+_WORKER = """import importlib, sys
 sys.path.insert(0, sys.argv.pop(1))
-from sourdough.nautilus_paper_worker import main
-main()
+importlib.import_module(sys.argv.pop(1)).main()
 """
 
 
-def paper_venue(store: Path, directory: Path) -> NautilusPaperVenue:
+def paper_venue(
+    store: Path, directory: Path, *, replay: bool = False
+) -> NautilusPaperVenue:
     engine = directory.resolve() / f"nautilus-{VERSION}"
-    venue = NautilusPaperVenue(engine / "sandbox.sqlite")
+    venue = NautilusPaperVenue(
+        engine / ("replay.sqlite" if replay else "sandbox.sqlite")
+    )
     venue.require_independent_from(store)
     return venue
 
@@ -46,12 +50,24 @@ def _prepared(
 
 
 def prepare_paper(
-    writer: WriterLease, directory: Path, account_id: str, starting_atoms: int
+    writer: WriterLease,
+    directory: Path,
+    account_id: str,
+    starting_atoms: int,
+    *,
+    tape_path: Path | None = None,
 ) -> str:
-    _, venue, terms = _prepared(writer, directory)
+    if tape_path is None:
+        _, venue, terms = _prepared(writer, directory)
+        revision = None
+    else:
+        tape = ReplayTape.load(tape_path)
+        prepare_engine(writer, directory, allow_install=False)
+        venue = paper_venue(writer.store, directory, replay=True)
+        terms, revision = tape.terms, tape.revision
     writer.verify()
     return venue.provision(
-        SandboxPlan(writer.company_id, account_id, terms, starting_atoms, 0)
+        SandboxPlan(writer.company_id, account_id, terms, starting_atoms, 0, revision)
     )
 
 
@@ -62,10 +78,20 @@ def bind_paper(
     revision: str,
     charter_revision: str,
     exposure_atoms: int,
+    replay: bool = False,
 ) -> PaperMandate:
-    _, venue, terms = _prepared(writer, directory)
+    if replay:
+        prepare_engine(writer, directory, allow_install=False)
+        venue = paper_venue(writer.store, directory, replay=True)
+        terms = None
+    else:
+        _, venue, terms = _prepared(writer, directory)
     _, plan = venue.configuration()
-    if plan.company_id != writer.company_id or plan.terms != terms:
+    if (
+        plan.company_id != writer.company_id
+        or replay != (plan.tape_revision is not None)
+        or (terms is not None and plan.terms != terms)
+    ):
         raise VenueRefused(
             "Virtual account does not match the prepared company and instrument"
         )
@@ -88,13 +114,32 @@ def supervise_paper(
     *,
     seconds: int,
     emit: Callable[[dict], None],
+    tape_path: Path | None = None,
 ) -> SupervisionResult:
     if type(seconds) is not int or not 1 <= seconds <= 600:
         raise VenueRefused("Sandbox activation must be bounded to one to 600 seconds")
     with hold_company_writer(store, company_id) as writer:
-        engine, venue, terms = _prepared(writer, directory)
+        if tape_path is None:
+            engine, venue, terms = _prepared(writer, directory)
+            tape_revision = None
+            worker = "sourdough.nautilus_paper_worker"
+            argument = str(seconds)
+        else:
+            tape = ReplayTape.load(tape_path)
+            installation = prepare_engine(writer, directory, allow_install=False)
+            engine = (
+                directory.resolve() / f"nautilus-{installation.distribution_version}"
+            )
+            venue = paper_venue(writer.store, directory, replay=True)
+            terms, tape_revision = tape.terms, tape.revision
+            worker = "sourdough.nautilus_replay_worker"
+            argument = str(tape_path.resolve())
         _, plan = venue.configuration()
-        if plan.company_id != writer.company_id or plan.terms != terms:
+        if (
+            plan.company_id != writer.company_id
+            or plan.terms != terms
+            or plan.tape_revision != tape_revision
+        ):
             raise VenueRefused("Prepared sandbox does not match the company")
         key = journal_key(venue.journal)
     return supervise_worker(
@@ -104,8 +149,9 @@ def supervise_paper(
             "-c",
             _WORKER,
             str(Path(__file__).resolve().parents[1]),
+            worker,
             str(venue.journal),
-            str(seconds),
+            argument,
         ],
         venue.journal,
         company_id,

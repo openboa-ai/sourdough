@@ -21,6 +21,7 @@ from .spot_cash import MAX_ATOMS, SpotCashUnits
 
 
 CONNECTOR = "nautilus-spot-sandbox-v1"
+REPLAY_CONNECTOR = "nautilus-offline-spot-replay-v1"
 _STALE_NS = 15 * 10**9
 
 
@@ -31,6 +32,7 @@ class SandboxPlan:
     terms: SpotInstrumentTerms
     starting_atoms: int
     fee_bps: int
+    tape_revision: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -40,6 +42,17 @@ class SandboxPlan:
             or not 0 < self.starting_atoms <= MAX_ATOMS
             or type(self.fee_bps) is not int
             or self.fee_bps != 0
+            or (
+                self.tape_revision is not None
+                and (
+                    not isinstance(self.tape_revision, str)
+                    or len(self.tape_revision) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in self.tape_revision
+                    )
+                )
+            )
         ):
             raise VenueRefused(
                 "Expected a bounded virtual cash account and zero test fee"
@@ -100,6 +113,13 @@ class NautilusPaperVenue:
                        received_ns INTEGER NOT NULL, exchange_trade_ns INTEGER NOT NULL
                    )"""
             )
+            if plan.tape_revision is not None:
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS replay_decision_cut (
+                           generation TEXT PRIMARY KEY, price_atoms_per_lot INTEGER NOT NULL,
+                           event_ns INTEGER NOT NULL, available_ns INTEGER NOT NULL
+                       )"""
+                )
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS sandbox_identity (
                        singleton INTEGER PRIMARY KEY CHECK (singleton=1),
@@ -133,7 +153,7 @@ class NautilusPaperVenue:
                 "SELECT destination_id,plan FROM sandbox_config WHERE singleton=1"
             ).fetchone()
             if row is not None:
-                if row[1] != terms:
+                if self._read_plan(row[1]) != plan:
                     raise VenueRefused(
                         "Sandbox plan does not match the original account"
                     )
@@ -150,9 +170,13 @@ class NautilusPaperVenue:
         ).fetchone()
         if row is None:
             raise VenueRefused("Sandbox account has not been provisioned")
-        terms = json.loads(row[1])
+        return row[0], self._read_plan(row[1])
+
+    @staticmethod
+    def _read_plan(content: str) -> SandboxPlan:
+        terms = json.loads(content)
         terms["terms"] = SpotInstrumentTerms(**terms["terms"])
-        return row[0], SandboxPlan(**terms)
+        return SandboxPlan(**terms)
 
     def configuration(self) -> tuple[str, SandboxPlan]:
         with self._connect("ro") as connection:
@@ -170,7 +194,7 @@ class NautilusPaperVenue:
             raise VenueRefused("Virtual account has not been witnessed by the engine")
         return PaperAccount(
             account_id,
-            CONNECTOR,
+            REPLAY_CONNECTOR if plan.tape_revision is not None else CONNECTOR,
             plan.terms.revision,
             plan.terms.quote_currency,
             plan.starting_atoms,
@@ -186,9 +210,11 @@ class NautilusPaperVenue:
                FROM sandbox_quote"""
         ).fetchone()
         now = time_ns()
+        _, plan = self._configuration(connection)
         if (
             row is None
-            or any(not 0 <= now - stamp <= _STALE_NS for stamp in row[1:3])
+            or not 0 <= now - row[1] <= _STALE_NS
+            or (plan.tape_revision is None and not 0 <= now - row[2] <= _STALE_NS)
             or (generation is not None and row[3] != generation)
         ):
             raise VenueRefused(
@@ -355,6 +381,23 @@ class NautilusPaperVenue:
             connection.execute(
                 "INSERT OR REPLACE INTO sandbox_quote VALUES (1, ?, ?, ?, ?)",
                 (generation, atoms, received_ns, trade_ns),
+            )
+
+    def publish_replay_cut(
+        self, generation: str, atoms: int, event_ns: int, available_ns: int
+    ) -> None:
+        with self._connect("rw") as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            _, plan = self._configuration(connection)
+            if plan.tape_revision is None or not 0 < event_ns <= available_ns:
+                raise VenueRefused("Invalid causal cut for this execution environment")
+            connection.execute(
+                "INSERT INTO replay_decision_cut VALUES (?, ?, ?, ?)",
+                (generation, atoms, event_ns, available_ns),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO sandbox_quote VALUES (1, ?, ?, ?, ?)",
+                (generation, atoms, time_ns(), event_ns),
             )
 
     def invalidate_quote(self) -> None:
