@@ -3,6 +3,7 @@
 from contextlib import closing
 from dataclasses import astuple, dataclass
 from pathlib import Path
+from sqlite3 import Connection
 from typing import Protocol
 from uuid import uuid4
 
@@ -10,6 +11,7 @@ from .company import _connect
 from .duty_run import DutyClaim
 from .first_duty import require_historical_claim, require_paper_authority
 from .paper_account import PaperAccount, reopen_binding
+from .paper_decision import has_matching_paper_decision
 
 
 class OrderRefused(Exception):
@@ -36,15 +38,24 @@ class PaperDestination(Protocol):
     def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None: ...
 
 
+def reserved_exposure(connection: Connection, account_id: str) -> int:
+    return connection.execute(
+        """SELECT COALESCE(SUM(reserved_minor_units), 0)
+           FROM paper_order WHERE account_id = ?""",
+        (account_id,),
+    ).fetchone()[0]
+
+
 def _historical_receipt(connection, claim, intent):
     if not connection.execute(
         "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_order'"
     ).fetchone():
         return None
     previous = connection.execute(
-        """SELECT order_id, instrument_rules_digest, quantity, limit_minor_units
-           FROM paper_order WHERE run_id = ? AND action_id = ?""",
-        (claim.run_id, intent.action_id),
+        """SELECT o.order_id, o.instrument_rules_digest, o.quantity, o.limit_minor_units
+           FROM paper_order o JOIN duty_run r ON r.run_id = o.run_id
+           WHERE r.duty_id = ? AND o.action_id = ?""",
+        (claim.duty_id, intent.action_id),
     ).fetchone()
     if previous is None:
         return None
@@ -84,6 +95,22 @@ def submit_paper_order(
             raise OrderRefused("Paper binding changed")
         if intent.instrument_rules_digest != account.instrument_rules_digest:
             raise OrderRefused("Instrument does not match paper binding")
+        first = connection.execute(
+            "SELECT 1 FROM founding_receipt WHERE company_id = ? AND due_work_id = ?",
+            (claim.company_id, claim.duty_id),
+        ).fetchone()
+        if first is None and not has_matching_paper_decision(
+            connection,
+            claim,
+            intent.action_id,
+            account.account_id,
+            intent.instrument_rules_digest,
+            intent.quantity,
+            intent.limit_minor_units,
+        ):
+            raise OrderRefused(
+                "Later paper order requires its persisted decision and exact terms"
+            )
         connection.execute(
             """CREATE TABLE IF NOT EXISTS paper_order (
                 order_id TEXT PRIMARY KEY NOT NULL,
@@ -99,11 +126,7 @@ def submit_paper_order(
             )"""
         )
         reservation = intent.quantity * intent.limit_minor_units
-        pending = connection.execute(
-            """SELECT COALESCE(SUM(reserved_minor_units), 0)
-               FROM paper_order WHERE account_id = ?""",
-            (account.account_id,),
-        ).fetchone()[0]
+        pending = reserved_exposure(connection, account.account_id)
         if reservation + pending > observed_binding.exposure_limit_minor_units:
             raise OrderRefused("Paper exposure limit exceeded")
         order_id = uuid4().hex

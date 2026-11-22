@@ -46,12 +46,14 @@ class FollowUp:
     duty_id: str
     due_at: int
     result: ResultReference
+    purpose: str = POSITION_REVIEW
 
 
 @dataclass(frozen=True)
 class FollowUpClaim:
     claim: DutyClaim
     result: ResultReference
+    purpose: str = POSITION_REVIEW
 
 
 @dataclass(frozen=True)
@@ -109,14 +111,18 @@ def _check_store(connection: sqlite3.Connection, company_id: str) -> None:
         raise DutyRefused("Expected current company work store")
 
 
-def _schedule(
+def schedule_follow_up(
     connection: sqlite3.Connection,
     previous: DutyClaim,
     scope: str,
     result: ResultReference,
     due_at: int,
+    *,
+    purpose: str = POSITION_REVIEW,
 ) -> FollowUp:
-    successor = FollowUp(uuid4().hex, due_at, result)
+    if purpose not in (POSITION_REVIEW, PAPER_EXECUTION):
+        raise DutyRefused("Unsupported duty purpose")
+    successor = FollowUp(uuid4().hex, due_at, result, purpose)
     connection.execute(
         "INSERT INTO duty VALUES (?, ?, 'scheduled')",
         (successor.duty_id, previous.founder_id),
@@ -124,8 +130,8 @@ def _schedule(
     connection.execute(
         """INSERT INTO work_follow_up (
                previous_duty_id, duty_id, grant_id, grant_scope, due_at,
-               result_kind, result_id, result_revision, available_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               result_kind, result_id, result_revision, available_at, purpose
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             previous.duty_id,
             successor.duty_id,
@@ -136,6 +142,7 @@ def _schedule(
             result.resource_id,
             result.revision,
             result.available_at,
+            purpose,
         ),
     )
     connection.execute(
@@ -145,7 +152,12 @@ def _schedule(
 
 
 def finish_first_duty(
-    store: Path, claim: DutyClaim, result: ResultReference, *, due_at: int
+    store: Path,
+    claim: DutyClaim,
+    result: ResultReference,
+    *,
+    due_at: int,
+    purpose: str = POSITION_REVIEW,
 ) -> FollowUp:
     """Consume an internal result receipt; callers cannot mint one through Work."""
     _time(due_at)
@@ -155,34 +167,42 @@ def finish_first_duty(
         authority = resolve_first_run(connection, claim)
         scope, state = authority.current_scope, authority.duty_state
         existing = connection.execute(
-            """SELECT duty_id, due_at, result_kind, result_id, result_revision, available_at
+            """SELECT duty_id, due_at, purpose, result_kind, result_id, result_revision, available_at
                FROM work_follow_up WHERE previous_duty_id = ?""",
             (claim.duty_id,),
         ).fetchone()
         if existing is not None:
-            duty_id, saved_due_at, *saved_result = existing
-            if (state, saved_due_at, ResultReference(*saved_result)) != (
+            duty_id, saved_due_at, saved_purpose, *saved_result = existing
+            if (state, saved_due_at, ResultReference(*saved_result), saved_purpose) != (
                 "settled",
                 due_at,
                 result,
+                purpose,
             ):
                 raise DutyRefused("Work settlement conflicts with the original receipt")
-            return FollowUp(duty_id, due_at, result)
+            return FollowUp(duty_id, due_at, result, purpose)
         authority.require_current(PAPER_EXECUTION)
         if (scope, state) != (FIRST_DUTY_SCOPE, "running"):
             raise DutyRefused("Current duty cannot be settled")
-        return _schedule(connection, claim, scope, result, due_at)
+        return schedule_follow_up(
+            connection, claim, scope, result, due_at, purpose=purpose
+        )
 
 
 def claim_follow_up(
-    store: Path, company_id: str, execution_profile: str, *, now: int
+    store: Path,
+    company_id: str,
+    execution_profile: str,
+    *,
+    now: int,
+    allow_paper_execution: bool = False,
 ) -> FollowUpClaim | None:
     _time(now)
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _check_store(connection, company_id)
         row = connection.execute(
-            """SELECT d.id, f.id, g.id, w.grant_scope,
+            """SELECT d.id, f.id, g.id, w.grant_scope, w.purpose,
                       w.result_kind, w.result_id, w.result_revision, w.available_at
                FROM work_follow_up w
                JOIN duty d ON d.id = w.duty_id AND d.state = 'scheduled'
@@ -190,12 +210,21 @@ def claim_follow_up(
                JOIN standing_grant g ON g.id = w.grant_id AND g.founder_id = f.id
                WHERE w.due_at <= ? AND w.available_at <= ?
                  AND g.scope = w.grant_scope AND f.execution_profile = ?
+                 AND (w.purpose = ? OR (? AND w.purpose = ?))
                ORDER BY w.due_at, d.id LIMIT 1""",
-            (company_id, now, now, execution_profile),
+            (
+                company_id,
+                now,
+                now,
+                execution_profile,
+                POSITION_REVIEW,
+                allow_paper_execution,
+                PAPER_EXECUTION,
+            ),
         ).fetchone()
         if row is None:
             return None
-        duty_id, founder_id, grant_id, scope, *stored_result = row
+        duty_id, founder_id, grant_id, scope, purpose, *stored_result = row
         result = ResultReference(*stored_result)
         claim = start_run(
             connection,
@@ -204,25 +233,29 @@ def claim_follow_up(
             grant_id,
             duty_id,
             execution_profile,
-            purpose=POSITION_REVIEW,
+            purpose=purpose,
             grant_scope=scope,
         )
-    return FollowUpClaim(claim, result)
+    return FollowUpClaim(claim, result, purpose)
 
 
-def _review_state(
-    connection: sqlite3.Connection, follow_up: FollowUpClaim
+def follow_up_state(
+    connection: sqlite3.Connection, follow_up: FollowUpClaim, purpose: str
 ) -> tuple[str, str]:
     claim = follow_up.claim
     _check_store(connection, claim.company_id)
     authority = resolve_run(connection, claim)
-    authority.require_current(POSITION_REVIEW)
+    authority.require_current(purpose)
     row = connection.execute(
         """SELECT result_kind, result_id, result_revision, available_at
-           FROM work_follow_up WHERE duty_id = ? AND grant_id = ?""",
-        (claim.duty_id, claim.grant_id),
+           FROM work_follow_up WHERE duty_id = ? AND grant_id = ? AND purpose = ?""",
+        (claim.duty_id, claim.grant_id, purpose),
     ).fetchone()
-    if row is None or ResultReference(*row) != follow_up.result:
+    if (
+        row is None
+        or ResultReference(*row) != follow_up.result
+        or purpose != follow_up.purpose
+    ):
         raise DutyRefused("Review result does not match its scheduled duty")
     return authority.duty_state, authority.current_scope
 
@@ -233,12 +266,13 @@ def read_follow_up_result(
     *,
     now: int,
     read: Callable[[sqlite3.Connection, ResultReference], dict],
+    purpose: str = POSITION_REVIEW,
 ) -> dict:
     _time(now)
     claim = follow_up.claim
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        state, _ = _review_state(connection, follow_up)
+        state, _ = follow_up_state(connection, follow_up, purpose)
         if state != "running" or now < follow_up.result.available_at:
             raise DutyRefused("Review cannot read this result")
         result = read(connection, follow_up.result)
@@ -259,15 +293,43 @@ def read_follow_up_result(
     return result
 
 
+def require_result_read(
+    connection: sqlite3.Connection, follow_up: FollowUpClaim, revision: str, now: int
+) -> None:
+    claim = follow_up.claim
+    has_reads = connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name = 'work_result_read' AND type = 'table'"
+    ).fetchone()
+    observed = (
+        has_reads
+        and connection.execute(
+            "SELECT run_id, result_revision, read_at FROM work_result_read WHERE duty_id = ?",
+            (claim.duty_id,),
+        ).fetchone()
+    )
+    if (
+        not observed
+        or observed[:2] != (claim.run_id, revision)
+        or revision != follow_up.result.revision
+        or observed[2] > now
+    ):
+        raise DutyRefused("Decision requires a preceding authorized result read")
+
+
 def settle_review(
-    store: Path, follow_up: FollowUpClaim, decision: ReviewDecision, *, now: int
+    store: Path,
+    follow_up: FollowUpClaim,
+    decision: ReviewDecision,
+    *,
+    now: int,
+    successor_purpose: str = POSITION_REVIEW,
 ) -> FollowUp:
     _time(now)
     next_due = _time(now + decision.next_check_seconds)
     claim = follow_up.claim
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        state, scope = _review_state(connection, follow_up)
+        state, scope = follow_up_state(connection, follow_up, POSITION_REVIEW)
         connection.execute(
             """CREATE TABLE IF NOT EXISTS work_review_decision (
                 duty_id TEXT PRIMARY KEY NOT NULL REFERENCES work_follow_up(duty_id),
@@ -291,44 +353,40 @@ def settle_review(
         if state == "settled":
             replay = connection.execute(
                 """SELECT j.run_id, j.call_id, j.result_revision, j.action, j.rationale,
-                          j.next_check_seconds, w.duty_id, w.due_at
+                          j.next_check_seconds, w.duty_id, w.due_at, w.purpose
                    FROM work_review_decision j
                    JOIN work_follow_up w ON w.previous_duty_id = j.duty_id
                    WHERE j.duty_id = ?""",
                 (claim.duty_id,),
             ).fetchone()
-            if replay is not None and replay[:6] == terms:
-                return FollowUp(replay[6], replay[7], follow_up.result)
+            if (
+                replay is not None
+                and replay[:6] == terms
+                and replay[8] == successor_purpose
+            ):
+                return FollowUp(replay[6], replay[7], follow_up.result, replay[8])
             raise DutyRefused("Review conflicts with the original decision")
-        has_reads = connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE name = 'work_result_read' AND type = 'table'"
-        ).fetchone()
-        observed = (
-            has_reads
-            and connection.execute(
-                "SELECT run_id, result_revision, read_at FROM work_result_read WHERE duty_id = ?",
-                (claim.duty_id,),
-            ).fetchone()
-        )
-        if (
-            state != "running"
-            or not observed
-            or observed[:2] != (claim.run_id, decision.observation_revision)
-            or decision.observation_revision != follow_up.result.revision
-            or observed[2] > now
-        ):
-            raise DutyRefused("Decision requires a preceding authorized result read")
+        if state != "running":
+            raise DutyRefused("Duty cannot settle a review")
+        require_result_read(connection, follow_up, decision.observation_revision, now)
         connection.execute(
             "INSERT INTO work_review_decision VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (claim.duty_id, *terms, now),
         )
-        return _schedule(connection, claim, scope, follow_up.result, next_due)
+        return schedule_follow_up(
+            connection,
+            claim,
+            scope,
+            follow_up.result,
+            next_due,
+            purpose=successor_purpose,
+        )
 
 
 def mark_review_incomplete(store: Path, follow_up: FollowUpClaim) -> None:
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        state, _ = _review_state(connection, follow_up)
+        state, _ = follow_up_state(connection, follow_up, POSITION_REVIEW)
         if state == "running":
             connection.execute(
                 "UPDATE duty SET state = 'incomplete' WHERE id = ?",

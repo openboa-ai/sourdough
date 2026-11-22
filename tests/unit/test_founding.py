@@ -70,7 +70,7 @@ class Founding(unittest.TestCase):
         original = self.inventory()
         [[setup, company, founder, grant, duty]] = original["founding_receipt"]
         self.assertEqual(setup, "board-setup")
-        self.assertEqual(original["company"], [(1, company, 3, "charter-v1")])
+        self.assertEqual(original["company"], [(1, company, 4, "charter-v1")])
         self.assertEqual(original["founder"], [(founder, company, "profile-v1")])
         self.assertEqual(
             original["standing_grant"], [(grant, founder, "manage-company")]

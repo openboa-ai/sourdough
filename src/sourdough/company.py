@@ -9,7 +9,8 @@ from uuid import uuid4
 
 LEGACY_SCHEMA_REVISION = 1
 CONTINUATION_SCHEMA_REVISION = 2
-SCHEMA_REVISION = 3
+RUN_SCHEMA_REVISION = 3
+SCHEMA_REVISION = 4
 DUTY_SCHEMA = """CREATE TABLE duty (
     id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL REFERENCES founder(id),
     state TEXT NOT NULL
@@ -23,7 +24,8 @@ FOLLOW_UP_SCHEMA = """CREATE TABLE work_follow_up (
     result_kind TEXT NOT NULL,
     result_id TEXT NOT NULL,
     result_revision TEXT NOT NULL,
-    available_at INTEGER NOT NULL
+    available_at INTEGER NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'position_review'
 )"""
 DUTY_RUN_SCHEMA = """CREATE TABLE duty_run (
     run_id TEXT PRIMARY KEY NOT NULL,
@@ -117,6 +119,7 @@ def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
     if row is None or row[1] not in (
         LEGACY_SCHEMA_REVISION,
         CONTINUATION_SCHEMA_REVISION,
+        RUN_SCHEMA_REVISION,
         SCHEMA_REVISION,
     ):
         raise FoundingRefused("Unsupported company store schema")
@@ -167,7 +170,9 @@ def _consolidate_runs(connection: sqlite3.Connection, revision: int) -> None:
             )
         )
         connection.execute(
-            """INSERT INTO follow_up_next
+            """INSERT INTO follow_up_next (
+                      previous_duty_id, duty_id, grant_id, grant_scope, due_at,
+                      result_kind, result_id, result_revision, available_at)
                SELECT previous_duty_id, duty_id, grant_id, grant_scope, due_at,
                       result_kind, result_id, result_revision, available_at
                FROM work_follow_up"""
@@ -190,9 +195,14 @@ def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
                 raise FoundingRefused("Company identity mismatch")
             if revision == SCHEMA_REVISION:
                 return
-            if revision == LEGACY_SCHEMA_REVISION:
-                _upgrade_duties(connection)
-            _consolidate_runs(connection, revision)
+            if revision == RUN_SCHEMA_REVISION:
+                connection.execute(
+                    "ALTER TABLE work_follow_up ADD COLUMN purpose TEXT NOT NULL DEFAULT 'position_review'"
+                )
+            else:
+                if revision == LEGACY_SCHEMA_REVISION:
+                    _upgrade_duties(connection)
+                _consolidate_runs(connection, revision)
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise FoundingRefused("Company store failed foreign-key validation")
             connection.execute(
