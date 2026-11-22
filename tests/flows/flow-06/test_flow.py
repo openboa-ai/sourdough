@@ -88,7 +88,7 @@ import os, signal, sqlite3, sys
 from contextlib import closing
 from pathlib import Path
 from time import time
-from sourdough import assessment_run, cli, company_assessment, hired_paper_run
+from sourdough import assessment_run, cli, company_assessment, hired_paper_run, onboarding
 from sourdough.paper_venue import FixedQuoteVenue
 marker = Path(sys.argv.pop(1))
 fault_site = sys.argv.pop(1)
@@ -130,6 +130,12 @@ def withheld_assessment(*args, **kwargs):
     result = publish(*args, **kwargs)
     interrupted()
     return result
+accept = onboarding.accept_first_duty
+def withheld_acceptance(*args, **kwargs):
+    result = accept(*args, **kwargs)
+    if fault_site == "after_acceptance":
+        interrupted()
+    return result
 def environment_clock():
     return time() + (121 if marker.exists() else 0)
 assessment_run.time = environment_clock
@@ -137,6 +143,7 @@ hired_paper_run.time = environment_clock
 hired_paper_run._apply_paper_order = withheld_order
 cli.FixedQuoteVenue = WithheldFill
 company_assessment.publish_assessment = withheld_assessment
+onboarding.accept_first_duty = withheld_acceptance
 raise SystemExit(cli.main())
 """
 
@@ -175,7 +182,9 @@ class ConnectedFlow(unittest.TestCase):
     def test_end_to_end(self):
         for scope, submit_request, fault_site in (
             ("assessment", True, "after_publication"),
+            ("assessment", True, "after_acceptance"),
             ("paper", True, "after_fill"),
+            ("paper", True, "after_acceptance"),
             ("paper", True, "after_fill_with_lookup_timeout"),
             ("paper", True, "before_send"),
             ("paper", False, "none"),
@@ -305,7 +314,7 @@ class ConnectedFlow(unittest.TestCase):
                         "--idle-seconds",
                         "6" if fault_site == "after_fill_with_lookup_timeout" else "2",
                         "--turn-budget",
-                        "3",
+                        "4" if fault_site == "after_acceptance" else "3",
                         "--max-restarts",
                         "1",
                     ],
@@ -338,7 +347,23 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(claim["agent_id"], agent_id)
                 self.assertNotEqual(claim["duty_id"], first_duty)
                 self.assertEqual(claim["execution_profile"], profile)
-                self.assertEqual(rows(store, "SELECT count(*) FROM duty_run"), [(3,)])
+                expected_runs = 4 if fault_site == "after_acceptance" else 3
+                self.assertEqual(
+                    rows(store, "SELECT count(*) FROM duty_run"), [(expected_runs,)]
+                )
+                if fault_site == "after_acceptance":
+                    self.assertEqual(
+                        rows(
+                            store,
+                            """SELECT accepted.is_current, count(resumed.run_id)
+                               FROM onboarding_acceptance receipt
+                               JOIN duty_run accepted ON accepted.run_id=receipt.run_id
+                               JOIN duty_run resumed ON resumed.duty_id=receipt.duty_id
+                                   AND resumed.is_current=1
+                               GROUP BY accepted.run_id""",
+                        ),
+                        [(0, 1)],
+                    )
                 self.assertEqual(
                     rows(store, "SELECT count(*) FROM work_follow_up"), [(2,)]
                 )

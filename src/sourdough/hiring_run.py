@@ -53,8 +53,11 @@ def prepare_hiring(
     *,
     first_purpose: str,
     allow_staffing: bool = True,
+    resume_accepted: bool = False,
 ) -> HiringRun:
-    manager = pending_onboarding(writer, runtime.profile, first_purpose)
+    manager = pending_onboarding(
+        writer, runtime.profile, first_purpose, resume_accepted=resume_accepted
+    )
     resumed = manager is not None
     if manager is None:
         if not allow_staffing:

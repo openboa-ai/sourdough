@@ -9,6 +9,7 @@ from sqlite3 import Connection
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
+from .abandoned_work import has_uncommitted_work
 from .company import _connect
 from .duty_run import (
     PAPER_EXECUTION,
@@ -74,7 +75,7 @@ def _active_hire(
 
 
 def pending_onboarding(
-    writer: WriterLease, execution_profile: str, purpose: str
+    writer: WriterLease, execution_profile: str, purpose: str, *, resume_accepted: bool
 ) -> DutyClaim | None:
     if purpose not in _SCOPE:
         raise DutyRefused("Unsupported first duty purpose")
@@ -91,16 +92,18 @@ def pending_onboarding(
             return None
         join = ""
         active = ""
+        first_duty_fields = "NULL, NULL"
         arguments = [writer.company_id, execution_profile, _SCOPE[purpose]]
         if "hire_onboarding" in tables:
             join = "LEFT JOIN hire_onboarding o ON o.agent_id=h.agent_id"
+            first_duty_fields = "o.state, o.first_duty_id"
             active = """AND (o.agent_id IS NULL OR (
-                o.purpose=? AND o.state != 'accepted'
+                o.purpose=? AND (o.state != 'accepted' OR ?)
                 AND (o.state != 'blocked' OR o.retry_at IS NOT NULL)
             ))"""
-            arguments.append(purpose)
+            arguments.extend((purpose, resume_accepted))
         candidates = connection.execute(
-            f"""SELECT a.id, manager.id, r.grant_id, r.duty_id, r.run_id,
+            f"""SELECT a.id, {first_duty_fields}, manager.id, r.grant_id, r.duty_id, r.run_id,
                        manager.execution_profile
                 FROM hire_receipt h
                 JOIN agent a ON a.id=h.agent_id
@@ -120,8 +123,12 @@ def pending_onboarding(
         return next(
             (
                 DutyClaim(writer.company_id, *identity)
-                for agent_id, *identity in candidates
+                for agent_id, state, first_duty_id, *identity in candidates
                 if has_turn_capacity(connection, agent_id)
+                and (
+                    state != "accepted"
+                    or has_uncommitted_work(connection, first_duty_id)
+                )
             ),
             None,
         )
@@ -249,12 +256,12 @@ def claim_hired_first(
             return None
         profile, grant_id, scope = _active_hire(connection, writer.company_id, agent_id)
         row = connection.execute(
-            """SELECT d.id, o.purpose, d.state
+            """SELECT d.id, o.purpose, d.state, o.state
                FROM hire_onboarding o
                JOIN duty d ON d.id = o.first_duty_id AND d.agent_id = o.agent_id
                JOIN private_desk desk ON desk.agent_id = o.agent_id
-               WHERE o.agent_id = ? AND o.state = 'ready'""",
-            (agent_id,),
+               WHERE o.agent_id = ? AND (o.state = 'ready' OR (? AND o.state = 'accepted'))""",
+            (agent_id, resume),
         ).fetchone()
         if (
             row is None
@@ -262,9 +269,13 @@ def claim_hired_first(
             or not has_turn_capacity(connection, agent_id)
         ):
             return None
-        duty_id, purpose, state = row
+        duty_id, purpose, state, onboarding_state = row
         if _SCOPE.get(purpose) != scope:
             raise DutyRefused("First duty purpose does not match the hire scope")
+        if onboarding_state == "accepted" and not has_uncommitted_work(
+            connection, duty_id
+        ):
+            return None
         if state == "running" and resume:
             connection.execute(
                 "UPDATE duty_run SET is_current = 0 WHERE duty_id = ? AND is_current = 1",
@@ -348,7 +359,11 @@ def accept_first_duty(
             """SELECT run_id, revision, rationale FROM onboarding_acceptance WHERE duty_id = ?""",
             (claim.duty_id,),
         ).fetchone()
-        if prior is not None and prior != acceptance:
+        if prior is not None and (
+            not has_hired_acceptance(connection, claim)
+            or prior[1] != revision
+            or (prior[0] == claim.run_id and prior != acceptance)
+        ):
             raise DutyRefused("Acceptance conflicts with its original record")
         if prior is None:
             connection.execute(
@@ -367,13 +382,7 @@ def first_duty_accepted(writer: WriterLease, claim: DutyClaim) -> bool:
     with closing(_connect(writer.store, "ro")) as connection:
         connection.execute("BEGIN")
         _desk(connection, claim)
-        return (
-            connection.execute(
-                "SELECT 1 FROM onboarding_acceptance WHERE duty_id = ? AND run_id = ?",
-                (claim.duty_id, claim.run_id),
-            ).fetchone()
-            is not None
-        )
+        return has_hired_acceptance(connection, claim)
 
 
 def is_hired_first_duty(connection: Connection, claim: DutyClaim) -> bool:
@@ -393,8 +402,14 @@ def is_hired_first_duty(connection: Connection, claim: DutyClaim) -> bool:
 def has_hired_acceptance(connection: Connection, claim: DutyClaim) -> bool:
     return is_hired_first_duty(connection, claim) and (
         connection.execute(
-            "SELECT 1 FROM onboarding_acceptance WHERE duty_id = ? AND run_id = ?",
-            (claim.duty_id, claim.run_id),
+            """SELECT 1 FROM onboarding_acceptance accepted
+               JOIN duty_run original ON original.run_id=accepted.run_id
+               JOIN duty_run claimed ON claimed.duty_id=accepted.duty_id
+                 AND claimed.grant_id=original.grant_id
+                 AND claimed.grant_scope=original.grant_scope
+                 AND claimed.purpose=original.purpose
+               WHERE accepted.duty_id=? AND claimed.run_id=? AND claimed.grant_id=?""",
+            (claim.duty_id, claim.run_id, claim.grant_id),
         ).fetchone()
         is not None
     )

@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from .company import _connect
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, resolve_run
-from .onboarding import invoke_onboarding
+from .onboarding import has_hired_acceptance, invoke_onboarding
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -107,20 +107,21 @@ def seal_assessment_source(
 def _audience(connection: Connection, claim: DutyClaim) -> str:
     authority = resolve_run(connection, claim)
     authority.require_current(ASSESSMENT)
-    row = connection.execute(
-        """SELECT manager.agent_id FROM onboarding_acceptance accepted
-           JOIN hire_receipt hire ON hire.agent_id = ?
-           JOIN standing_grant manager ON manager.id = hire.manager_grant_id
-           WHERE accepted.duty_id = ? AND accepted.run_id = ?""",
-        (claim.founder_id, claim.duty_id, claim.run_id),
-    ).fetchone()
     if (authority.current_scope, authority.duty_state) != (
         ASSESSMENT,
         "running",
-    ) or row is None:
+    ) or not has_hired_acceptance(connection, claim):
         raise DutyRefused(
             "Only the hired Agent's accepted assessment duty may use this source"
         )
+    row = connection.execute(
+        """SELECT manager.agent_id FROM hire_receipt hire
+           JOIN standing_grant manager ON manager.id = hire.manager_grant_id
+           WHERE hire.agent_id = ?""",
+        (claim.founder_id,),
+    ).fetchone()
+    if row is None:
+        raise DutyRefused("Assessment has no original staffing owner")
     return row[0]
 
 
