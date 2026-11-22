@@ -368,7 +368,7 @@ def read_staffing_outcome(
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as connection:
         connection.execute("BEGIN")
-        _assignment(connection, claim, replay=True)
+        _staffing_run(connection, claim)
         row = connection.execute(
             """SELECT c.choice_id, c.terms, c.decided_at, h.agent_id, h.grant_id, h.allocated_turns
                FROM staffing_choice c LEFT JOIN hire_receipt h ON h.choice_id = c.choice_id
