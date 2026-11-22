@@ -9,7 +9,7 @@ from .company import _connect, _identity
 from .duty_run import DutyClaim
 from .paper_account import reopen_binding
 from .paper_books import Posting, PostingRefused, post_confirmed_fill, read_booked_fill
-from .paper_venue import FixedQuoteVenue
+from .paper_execution import PaperExecution
 from .writer_lease import WriterLease
 
 
@@ -118,7 +118,7 @@ def _record_lookup(
 def reconcile_paper_orders(
     store: Path,
     company_id: str,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     *,
     now: int,
     lookup_limit: int = 16,

@@ -28,7 +28,7 @@ from .hiring_run import HiringRun, prepare_hiring
 from .onboarding import first_duty_accepted, invoke_onboarding
 from .paper_account import reopen_binding
 from .paper_books import Posting
-from .paper_order import PaperIntent
+from .paper_execution import PaperExecution, PaperIntent
 from .paper_reconcile import PaperReconciliation
 from .paper_research import (
     ResearchDecisionReceipt,
@@ -39,7 +39,6 @@ from .paper_research import (
     recoverable_hired_research,
     reopen_research_decision,
 )
-from .paper_venue import FixedQuoteVenue
 from .work import (
     ResultReference,
     claim_bound_position_review,
@@ -82,7 +81,7 @@ def _settle_opening(
 def _hired_research(
     writer: WriterLease,
     claim: DutyClaim,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     employee: EmployeeProcess,
 ) -> ResearchDecisionReceipt:
     binding = reopen_binding(writer.store, claim.company_id)
@@ -153,7 +152,7 @@ def _hired_research(
 def run_hired_paper_company(
     store: Path,
     company_id: str,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: Callable[[], EmployeeProcess],
     *,
     turn_budget: int,
@@ -164,10 +163,7 @@ def run_hired_paper_company(
 ) -> HiredPaperRun:
     if not 3 <= turn_budget <= 8 or not 0 <= idle_seconds <= 300:
         raise DutyRefused("Invalid hired-paper activation limits")
-    if store.resolve() == venue.journal.resolve() or (
-        store.exists() and venue.journal.exists() and store.samefile(venue.journal)
-    ):
-        raise TradeRefused("Company store and venue journal must be separate")
+    venue.require_independent_from(store)
     with hold_company_writer(store, company_id, expected_store_key=store_key) as writer:
         upgrade_work_schema(store, company_id)
         reconciled, blocked = _recover(writer, venue, POSITION_REVIEW)

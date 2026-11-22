@@ -41,11 +41,11 @@ from .paper_decision import (
     reopen_unsubmitted_decisions,
     settle_paper_decision,
 )
-from .paper_order import PaperIntent, reserved_exposure, submit_paper_order
+from .paper_execution import PaperExecution, PaperIntent
+from .paper_order import reserved_exposure, submit_paper_order
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
 from .paper_review import bind_review_quote, observe_review_quote
-from .paper_venue import FixedQuoteVenue
 from .writer_lease import WriterLease, hold_company_writer
 from .work import (
     FollowUp,
@@ -90,7 +90,7 @@ class CompanyRun:
 def run_paper_company(
     store: Path,
     company_id: str,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeProcess,
     *,
     repeat_paper: bool = False,
@@ -102,6 +102,7 @@ def run_paper_company(
 ) -> CompanyRun:
     if not 1 <= turn_budget <= 8 or not 0 <= idle_seconds <= 900:
         raise TradeRefused("Invalid company turn or idle budget")
+    venue.require_independent_from(store)
     with hold_company_writer(
         store, company_id, expected_store_key=expected_store_key
     ) as writer:
@@ -119,7 +120,7 @@ def run_paper_company(
 
 def _operate(
     writer: WriterLease,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeProcess,
     repeat_paper: bool,
     turn_budget: int,
@@ -238,7 +239,7 @@ def _operate(
 
 
 def _recover(
-    writer: WriterLease, venue: FixedQuoteVenue, purpose: str
+    writer: WriterLease, venue: PaperExecution, purpose: str
 ) -> tuple[PaperReconciliation, tuple[str, ...]]:
     store, company_id = writer.store, writer.company_id
     recovery = reconcile_paper_orders(
@@ -287,7 +288,7 @@ def _recover(
 
 def _retry_reconciliation(
     writer: WriterLease,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     purpose: str,
     recovery: PaperReconciliation,
     blocked: tuple[str, ...],
@@ -333,7 +334,7 @@ def _read_paper_observation(
 def _review(
     writer: WriterLease,
     follow_up: FollowUpClaim,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeProcess,
     next_purpose: str,
 ) -> PositionReview:
@@ -387,7 +388,7 @@ def _review(
 def _trade(
     writer: WriterLease,
     follow_up: FollowUpClaim,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeProcess,
 ) -> LaterPaperTrade:
     store = writer.store
@@ -423,7 +424,7 @@ def _trade(
 
 
 def _resume_later_decisions(
-    writer: WriterLease, venue: FixedQuoteVenue, *, allow_buy: bool
+    writer: WriterLease, venue: PaperExecution, *, allow_buy: bool
 ) -> list[LaterPaperTrade]:
     writer.verify()
     resumed = []
@@ -440,7 +441,7 @@ def _resume_later_decisions(
 def _apply_later_decision(
     writer: WriterLease,
     follow_up: FollowUpClaim,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     receipt: PaperDecisionReceipt,
 ) -> LaterPaperTrade:
     writer.verify()

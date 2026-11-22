@@ -21,7 +21,8 @@ from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, 
 from sourdough.paper_books import PostingRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
-from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
+from sourdough.paper_execution import VenueRefused
+from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.writer_lease import WriterRefused, hold_company_writer
@@ -202,11 +203,8 @@ def main() -> int:
             )
             return 0
         elif args.command == "bind-paper":
-            if args.store.resolve() == args.journal.resolve() or (
-                args.journal.exists() and args.store.samefile(args.journal)
-            ):
-                raise TradeRefused("Company store and venue journal must be separate")
             venue = FixedQuoteVenue(args.journal)
+            venue.require_independent_from(args.store)
             account = PaperAccount(
                 args.account_id,
                 "fixed-quote-v1",

@@ -6,7 +6,7 @@ from sqlite3 import Connection, OperationalError
 from time import time
 
 from .paper_account import BindingRefused, reopen_binding
-from .paper_venue import FixedQuoteVenue, VenueRefused
+from .paper_execution import PaperExecution, VenueRefused
 
 
 @dataclass(frozen=True)
@@ -18,7 +18,7 @@ class ReviewQuote:
 
 
 def observe_review_quote(
-    store: Path, company_id: str, venue: FixedQuoteVenue
+    store: Path, company_id: str, venue: PaperExecution
 ) -> ReviewQuote:
     try:
         account = reopen_binding(store, company_id).account

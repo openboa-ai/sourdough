@@ -4,15 +4,15 @@ from contextlib import closing
 from dataclasses import astuple, dataclass
 from pathlib import Path
 from sqlite3 import Connection
-from typing import Protocol
 from uuid import uuid4
 
 from .company import _connect
 from .duty_run import DutyClaim
 from .first_duty import require_historical_claim, require_paper_authority
 from .onboarding import is_hired_first_duty
-from .paper_account import PaperAccount, reopen_binding
+from .paper_account import reopen_binding
 from .paper_decision import has_matching_paper_decision
+from .paper_execution import PaperDestination, PaperIntent
 from .paper_research import allows_hired_research_order, allows_research_order
 from .writer_lease import WriterLease
 
@@ -22,23 +22,9 @@ class OrderRefused(Exception):
 
 
 @dataclass(frozen=True)
-class PaperIntent:
-    action_id: str
-    instrument_rules_digest: str
-    quantity: int
-    limit_minor_units: int
-
-
-@dataclass(frozen=True)
 class OrderReceipt:
     order_id: str
     dispatched_now: bool
-
-
-class PaperDestination(Protocol):
-    def observe_account(self, account_id: str) -> PaperAccount: ...
-
-    def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None: ...
 
 
 def reserved_exposure(connection: Connection, account_id: str) -> int:
