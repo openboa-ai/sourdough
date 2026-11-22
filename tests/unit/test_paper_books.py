@@ -16,7 +16,7 @@ from sourdough.paper_books import (
     read_booked_fill,
 )
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
-from sourdough.paper_reconcile import reconcile_paper_orders
+from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.work_projection import read_local_board_timeline
 
@@ -129,6 +129,13 @@ class PaperBooksTests(unittest.TestCase):
             (179, 99, 1),
         )
         self.assertEqual(projection["unresolved_orders"], 1)
+        for _attempt in range(MAX_LOOKUP_ATTEMPTS):
+            self.assertIsNotNone(initial.next_query_at)
+            initial = reconcile_paper_orders(
+                self.store, self.company_id, first, now=initial.next_query_at
+            )
+            self.assertEqual((initial.recovered, initial.unresolved), ((), 1))
+        self.assertIsNotNone(initial.next_query_at)
         with self.assertRaisesRegex(PostingRefused, "exceed the admitted order"):
             post_confirmed_fill(
                 self.store,
