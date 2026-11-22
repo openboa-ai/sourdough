@@ -9,6 +9,7 @@ from pathlib import Path
 
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
 from sourdough.company_run import run_paper_company
+from sourdough.duty_run import count_company_runs
 from sourdough.employee_process import EmployeeProcess
 from sourdough.first_duty import DutyRefused
 from sourdough.first_trade import TradeRefused, run_first_trade
@@ -16,6 +17,51 @@ from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, 
 from sourdough.paper_books import PostingRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
+from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
+from sourdough.writer_lease import WriterRefused, hold_company_writer
+
+
+def _store_key(value: str) -> tuple[int, int]:
+    try:
+        device, inode = (int(part) for part in value.split(":"))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Expected device:inode") from error
+    if device < 0 or inode <= 0:
+        raise argparse.ArgumentTypeError("Invalid device:inode")
+    return device, inode
+
+
+def _start_supervisor(args):
+    command = [
+        sys.executable,
+        "-I",
+        "-m",
+        "sourdough.cli",
+        "_paper-worker",
+        str(args.store),
+        str(args.journal),
+        "--company-id",
+        args.company_id,
+        "--employee",
+        str(args.employee),
+        "--turn-budget",
+        str(args.turn_budget),
+        "--idle-seconds",
+        str(args.idle_seconds),
+        "--budget-from",
+        str(count_company_runs(args.store, args.company_id)),
+    ]
+    if args.repeat_paper:
+        command.append("--repeat-paper")
+    return supervise_worker(
+        command,
+        args.store,
+        args.company_id,
+        max_restarts=args.max_restarts,
+        startup_seconds=args.startup_seconds,
+        max_seconds=args.max_seconds,
+        emit=lambda event: print(json.dumps(event), file=sys.stderr, flush=True),
+    )
 
 
 def main() -> int:
@@ -45,16 +91,25 @@ def main() -> int:
         paper.add_argument(f"--{name}", required=True)
     for name in ("starting-minor-units", "exposure-minor-units", "quote-minor-units"):
         paper.add_argument(f"--{name}", required=True, type=int)
-    for command in ("first-duty", "operate-paper"):
+    paper.add_argument("--fee-bps", type=int, default=0)
+    for command in ("first-duty", "operate-paper", "supervise-paper", "_paper-worker"):
         running = commands.add_parser(command)
         running.add_argument("store", type=Path)
         running.add_argument("journal", type=Path)
         running.add_argument("--company-id", required=True)
         running.add_argument("--employee", type=Path, required=True)
-        if command == "operate-paper":
+        if command != "first-duty":
             running.add_argument("--repeat-paper", action="store_true")
             running.add_argument("--turn-budget", type=int, default=2)
             running.add_argument("--idle-seconds", type=int, default=0)
+        if command == "supervise-paper":
+            running.add_argument("--max-restarts", type=int, default=2)
+            running.add_argument("--startup-seconds", type=int, default=60)
+            running.add_argument("--max-seconds", type=int, default=180)
+        if command == "_paper-worker":
+            running.add_argument("--ready-fd", type=int, required=True)
+            running.add_argument("--store-key", type=_store_key, required=True)
+            running.add_argument("--budget-from", type=int, required=True)
     args = parser.parse_args()
 
     try:
@@ -82,7 +137,6 @@ def main() -> int:
                 args.journal.exists() and args.store.samefile(args.journal)
             ):
                 raise TradeRefused("Company store and venue journal must be separate")
-            reopen(args.store, args.company_id)
             venue = FixedQuoteVenue(args.journal)
             account = PaperAccount(
                 args.account_id,
@@ -92,18 +146,27 @@ def main() -> int:
                 args.starting_minor_units,
                 "paper",
             )
-            account = venue.provision(account, args.quote_minor_units)
-            result = bind(
-                args.store,
-                PaperMandate(
-                    args.revision,
-                    args.company_id,
-                    args.charter_revision,
-                    account,
-                    args.exposure_minor_units,
-                ),
-                venue,
-            )
+            with hold_company_writer(args.store, args.company_id) as writer:
+                writer.verify()
+                account = venue.provision(
+                    account, args.quote_minor_units, fee_bps=args.fee_bps
+                )
+                writer.verify()
+                result = bind(
+                    args.store,
+                    PaperMandate(
+                        args.revision,
+                        args.company_id,
+                        args.charter_revision,
+                        account,
+                        args.exposure_minor_units,
+                    ),
+                    venue,
+                )
+        elif args.command == "supervise-paper":
+            result = _start_supervisor(args)
+            print(json.dumps(asdict(result)))
+            return 0 if result.completed else 1
         else:
             inputs = (
                 args.store,
@@ -111,15 +174,26 @@ def main() -> int:
                 FixedQuoteVenue(args.journal),
                 EmployeeProcess(args.employee),
             )
-            if args.command == "operate-paper":
+            if args.command == "first-duty":
+                with hold_company_writer(args.store, args.company_id) as writer:
+                    result = run_first_trade(*inputs, writer=writer)
+            elif args.command == "_paper-worker":
+                result = run_paper_company(
+                    *inputs,
+                    repeat_paper=args.repeat_paper,
+                    turn_budget=args.turn_budget,
+                    idle_seconds=args.idle_seconds,
+                    expected_store_key=args.store_key,
+                    budget_from=args.budget_from,
+                    on_ready=lambda lease: announce_ready(args.ready_fd, lease),
+                )
+            else:
                 result = run_paper_company(
                     *inputs,
                     repeat_paper=args.repeat_paper,
                     turn_budget=args.turn_budget,
                     idle_seconds=args.idle_seconds,
                 )
-            else:
-                result = run_first_trade(*inputs)
     except (
         FoundingRefused,
         BindingRefused,
@@ -128,6 +202,8 @@ def main() -> int:
         OrderRefused,
         PostingRefused,
         VenueRefused,
+        SupervisionRefused,
+        WriterRefused,
         sqlite3.Error,
         OSError,
     ) as error:

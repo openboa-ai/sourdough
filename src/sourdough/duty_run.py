@@ -1,9 +1,12 @@
 """Resolve historical run identity separately from current duty authority."""
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import uuid4
 
+from .company import _connect, _identity
 
 PAPER_EXECUTION = "paper_execution"
 POSITION_REVIEW = "position_review"
@@ -90,3 +93,28 @@ def resolve_run(connection: sqlite3.Connection, claim: DutyClaim) -> RunAuthorit
         raise DutyRefused("Duty claim identity mismatch")
     purpose, issued_scope, current_scope, state, is_current = row
     return RunAuthority(purpose, issued_scope, current_scope, state, bool(is_current))
+
+
+def count_company_runs(store: Path, company_id: str) -> int:
+    with closing(_connect(store, "ro")) as connection:
+        connection.execute("BEGIN")
+        if _identity(connection) != company_id:
+            raise DutyRefused("Company identity mismatch")
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            )
+        }
+        if "duty_run" in tables:
+            return connection.execute("SELECT count(*) FROM duty_run").fetchone()[0]
+        total = 0
+        if "first_duty_claim" in tables:
+            total += connection.execute(
+                "SELECT count(*) FROM first_duty_claim"
+            ).fetchone()[0]
+        if "work_follow_up" in tables:
+            total += connection.execute(
+                "SELECT count(*) FROM work_follow_up WHERE run_id IS NOT NULL"
+            ).fetchone()[0]
+        return total

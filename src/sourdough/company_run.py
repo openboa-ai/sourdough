@@ -1,12 +1,20 @@
 """Run the paper company without the Client."""
 
+from collections.abc import Callable
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from sqlite3 import Connection
 from time import monotonic, sleep, time
 
-from .company import reopen, upgrade_work_schema
-from .duty_run import PAPER_EXECUTION, POSITION_REVIEW, DutyClaim, DutyRefused
+from .company import _connect, reopen, upgrade_work_schema
+from .duty_run import (
+    PAPER_EXECUTION,
+    POSITION_REVIEW,
+    DutyClaim,
+    DutyRefused,
+    count_company_runs,
+)
 from .employee_process import EmployeeProcess
 from .first_trade import TradeRefused, TradeResult, run_first_trade
 from .paper_account import reopen_binding
@@ -21,10 +29,13 @@ from .paper_decision import (
     PaperDecision,
     PaperDecisionReceipt,
     persist_paper_decision,
+    reopen_paper_decision,
     settle_paper_decision,
 )
 from .paper_order import PaperIntent, reserved_exposure, submit_paper_order
+from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_venue import FixedQuoteVenue
+from .writer_lease import WriterLease, hold_company_writer
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -34,6 +45,7 @@ from .work import (
     finish_first_duty,
     mark_review_incomplete,
     read_follow_up_result,
+    reopen_follow_up,
     settle_review,
 )
 
@@ -59,6 +71,8 @@ class CompanyRun:
     first_trade: TradeResult | None
     review: PositionReview | None
     later_trades: tuple[LaterPaperTrade, ...] = ()
+    reconciliation: PaperReconciliation | None = None
+    blocked_work: tuple[str, ...] = ()
 
 
 def run_paper_company(
@@ -70,18 +84,65 @@ def run_paper_company(
     repeat_paper: bool = False,
     turn_budget: int = 2,
     idle_seconds: int = 0,
+    expected_store_key: tuple[int, int] | None = None,
+    budget_from: int | None = None,
+    on_ready: Callable[[WriterLease], None] | None = None,
 ) -> CompanyRun:
     if not 1 <= turn_budget <= 8 or not 0 <= idle_seconds <= 900:
         raise TradeRefused("Invalid company turn or idle budget")
+    with hold_company_writer(
+        store, company_id, expected_store_key=expected_store_key
+    ) as writer:
+        return _operate(
+            writer,
+            venue,
+            runtime,
+            repeat_paper,
+            turn_budget,
+            idle_seconds,
+            budget_from,
+            on_ready,
+        )
+
+
+def _operate(
+    writer: WriterLease,
+    venue: FixedQuoteVenue,
+    runtime: EmployeeProcess,
+    repeat_paper: bool,
+    turn_budget: int,
+    idle_seconds: int,
+    budget_from: int | None,
+    on_ready: Callable[[WriterLease], None] | None,
+) -> CompanyRun:
+    store, company_id = writer.store, writer.company_id
+    writer.verify()
     upgrade_work_schema(store, company_id)
+    if budget_from is not None:
+        consumed = count_company_runs(store, company_id) - budget_from
+        if consumed < 0:
+            raise TradeRefused(
+                "Company run history is behind the activation budget baseline"
+            )
+        turn_budget = max(0, turn_budget - consumed)
     idle_deadline = monotonic() + idle_seconds
     next_purpose = PAPER_EXECUTION if repeat_paper else POSITION_REVIEW
+    reconciliation, blocked = _recover(writer, venue, next_purpose)
+    if on_ready is not None:
+        on_ready(writer)
     first = None
-    if reopen(store, company_id).due_work_ids:
-        first = run_first_trade(store, company_id, venue, runtime)
+    if (
+        turn_budget
+        and not reconciliation.unresolved
+        and reopen(store, company_id).due_work_ids
+    ):
+        first = run_first_trade(store, company_id, venue, runtime, writer=writer)
         turn_budget -= 1
         if first.order is None or first.order.posting is None:
-            return CompanyRun(first, None)
+            return CompanyRun(
+                first, None, reconciliation=reconciliation, blocked_work=blocked
+            )
+        writer.verify()
         result = _book_reference(store, company_id, first.order.posting)
         finish_first_duty(
             store, first.claim, result, due_at=result.available_at, purpose=next_purpose
@@ -89,15 +150,25 @@ def run_paper_company(
 
     review = None
     trades = []
-    while turn_budget:
-        follow_up = claim_follow_up(
-            store,
-            company_id,
-            runtime.profile,
-            now=int(time()),
-            allow_paper_execution=repeat_paper,
-        )
+    while turn_budget or reconciliation.next_query_at is not None:
+        if (
+            reconciliation.next_query_at is not None
+            and reconciliation.next_query_at <= int(time())
+        ):
+            reconciliation, blocked = _recover(writer, venue, next_purpose)
+        writer.verify()
+        follow_up = None
+        if turn_budget:
+            follow_up = claim_follow_up(
+                store,
+                company_id,
+                runtime.profile,
+                now=int(time()),
+                allow_paper_execution=repeat_paper and not reconciliation.unresolved,
+            )
         if follow_up is None:
+            if not turn_budget and reconciliation.next_query_at is None:
+                break
             remaining = idle_deadline - monotonic()
             if remaining <= 0:
                 break
@@ -105,13 +176,46 @@ def run_paper_company(
             continue
         turn_budget -= 1
         if follow_up.purpose == POSITION_REVIEW:
-            review = _review(store, follow_up, runtime, next_purpose)
+            review = _review(writer, follow_up, runtime, next_purpose)
         else:
-            trade = _trade(store, follow_up, venue, runtime)
+            trade = _trade(writer, follow_up, venue, runtime)
             trades.append(trade)
             if trade.next_duty is None:
                 break
-    return CompanyRun(first, review, tuple(trades))
+    return CompanyRun(first, review, tuple(trades), reconciliation, blocked)
+
+
+def _recover(
+    writer: WriterLease, venue: FixedQuoteVenue, purpose: str
+) -> tuple[PaperReconciliation, tuple[str, ...]]:
+    store, company_id = writer.store, writer.company_id
+    recovery = reconcile_paper_orders(
+        store, company_id, venue, now=int(time()), writer=writer
+    )
+    if not recovery.recovered:
+        return recovery, ()
+    with closing(_connect(store, "ro")) as connection:
+        (first_duty_id,) = connection.execute(
+            "SELECT due_work_id FROM founding_receipt WHERE company_id = ?",
+            (company_id,),
+        ).fetchone()
+    blocked = []
+    for original in recovery.recovered:
+        writer.verify()
+        result = _book_reference(store, company_id, original.posting)
+        claim = original.original_claim
+        try:
+            if claim.duty_id == first_duty_id:
+                finish_first_duty(
+                    store, claim, result, due_at=result.available_at, purpose=purpose
+                )
+            else:
+                work = reopen_follow_up(store, claim)
+                decision = reopen_paper_decision(store, work)
+                settle_paper_decision(store, work, decision, result)
+        except DutyRefused:
+            blocked.append(claim.duty_id)
+    return recovery, tuple(blocked)
 
 
 def _book_reference(store: Path, company_id: str, posting: Posting) -> ResultReference:
@@ -137,12 +241,15 @@ def _read_paper_observation(
 
 
 def _review(
-    store: Path,
+    writer: WriterLease,
     follow_up: FollowUpClaim,
     runtime: EmployeeProcess,
     next_purpose: str,
 ) -> PositionReview:
+    store = writer.store
+
     def read_result():
+        writer.verify()
         return read_follow_up_result(
             store,
             follow_up,
@@ -154,6 +261,7 @@ def _review(
 
     try:
         decision = ReviewDecision.from_proposal(runtime.review(read_result))
+        writer.verify()
         next_duty = settle_review(
             store,
             follow_up,
@@ -163,6 +271,7 @@ def _review(
         )
     except (DutyRefused, TradeRefused):
         try:
+            writer.verify()
             mark_review_incomplete(store, follow_up)
         except DutyRefused:
             pass
@@ -171,11 +280,12 @@ def _review(
 
 
 def _trade(
-    store: Path,
+    writer: WriterLease,
     follow_up: FollowUpClaim,
     venue: FixedQuoteVenue,
     runtime: EmployeeProcess,
 ) -> LaterPaperTrade:
+    store = writer.store
     claim = follow_up.claim
     binding = reopen_binding(store, claim.company_id)
     account = binding.account
@@ -196,11 +306,13 @@ def _trade(
         }
 
     def read_result():
+        writer.verify()
         return read_follow_up_result(
             store, follow_up, now=int(time()), read=project, purpose=PAPER_EXECUTION
         )
 
     decision = PaperDecision.from_proposal(runtime.trade(read_result))
+    writer.verify()
     receipt = persist_paper_decision(store, follow_up, decision, now=int(time()))
     if decision.action != "buy":
         next_duty = settle_paper_decision(store, follow_up, receipt, follow_up.result)
@@ -215,10 +327,14 @@ def _trade(
             decision.limit_minor_units,
         ),
         venue,
+        writer=writer,
     )
-    posting = post_confirmed_fill(store, claim.company_id, order.order_id, venue)
+    posting = post_confirmed_fill(
+        store, claim.company_id, order.order_id, venue, writer=writer
+    )
     if posting is None:
         return LaterPaperTrade(claim, receipt, order.order_id, None, None)
+    writer.verify()
     result = _book_reference(store, claim.company_id, posting)
     next_duty = settle_paper_decision(store, follow_up, receipt, result)
     return LaterPaperTrade(claim, receipt, order.order_id, posting, next_duty)

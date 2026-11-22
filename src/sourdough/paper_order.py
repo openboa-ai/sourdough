@@ -12,6 +12,7 @@ from .duty_run import DutyClaim
 from .first_duty import require_historical_claim, require_paper_authority
 from .paper_account import PaperAccount, reopen_binding
 from .paper_decision import has_matching_paper_decision
+from .writer_lease import WriterLease
 
 
 class OrderRefused(Exception):
@@ -66,8 +67,15 @@ def _historical_receipt(connection, claim, intent):
 
 
 def submit_paper_order(
-    store: Path, claim: DutyClaim, intent: PaperIntent, destination: PaperDestination
+    store: Path,
+    claim: DutyClaim,
+    intent: PaperIntent,
+    destination: PaperDestination,
+    *,
+    writer: WriterLease | None = None,
 ) -> OrderReceipt:
+    if writer is not None:
+        writer.verify_for(store, claim.company_id)
     if (
         not isinstance(intent.action_id, str)
         or not intent.action_id.strip()
@@ -87,6 +95,8 @@ def submit_paper_order(
         raise OrderRefused("Paper destination mismatch")
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
+        if writer is not None:
+            writer.verify_for(store, claim.company_id)
         receipt = _historical_receipt(connection, claim, intent)
         if receipt is not None:
             return receipt
@@ -141,5 +151,7 @@ def submit_paper_order(
                 reservation,
             ),
         )
+    if writer is not None:
+        writer.verify_for(store, claim.company_id)
     destination.submit(order_id, account.account_id, intent)
     return OrderReceipt(order_id, True)

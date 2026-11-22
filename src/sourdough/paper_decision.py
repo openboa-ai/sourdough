@@ -174,6 +174,23 @@ def has_matching_paper_decision(
     )
 
 
+def reopen_paper_decision(
+    store: Path, follow_up: FollowUpClaim
+) -> PaperDecisionReceipt:
+    with closing(_connect(store, "ro")) as connection:
+        connection.execute("BEGIN")
+        follow_up_state(connection, follow_up, PAPER_EXECUTION)
+        row = connection.execute(
+            """SELECT decision_id, decided_at, call_id, result_revision, rationale,
+                      next_check_seconds, action, quantity, limit_minor_units
+               FROM paper_decision WHERE duty_id = ?""",
+            (follow_up.claim.duty_id,),
+        ).fetchone()
+        if row is None:
+            raise DutyRefused("No original paper decision to recover")
+        return PaperDecisionReceipt(row[0], row[1], PaperDecision(*row[2:]))
+
+
 def settle_paper_decision(
     store: Path,
     follow_up: FollowUpClaim,
