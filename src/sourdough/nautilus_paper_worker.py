@@ -56,20 +56,16 @@ def capture_cancellation(
 ) -> str:
     from nautilus_trader.model.enums import OrderStatus
 
-    if (
-        order is None
-        or order.status != OrderStatus.CANCELED
-        or order.client_order_id != event.client_order_id
-    ):
-        raise VenueRefused("SDK did not corroborate its cancellation event")
     order_id = str(event.client_order_id)
-    amount = order.filled_qty.as_decimal()
-    venue.record_cancellation(
-        generation,
-        order_id,
-        str(event.id),
-        0 if amount.is_zero() else units.lots(amount),
-    )
+    filled_quantity = None
+    if (
+        order is not None
+        and order.client_order_id == event.client_order_id
+        and order.status == OrderStatus.CANCELED
+    ):
+        amount = order.filled_qty.as_decimal()
+        filled_quantity = 0 if amount.is_zero() else units.lots(amount)
+    venue.record_cancellation(generation, order_id, str(event.id), filled_quantity)
     return order_id
 
 

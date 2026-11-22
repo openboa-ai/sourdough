@@ -623,22 +623,37 @@ class NautilusPaperVenue:
             )
 
     def record_cancellation(
-        self, generation: str, order_id: str, event_id: str, filled_quantity: int
+        self, generation: str, order_id: str, event_id: str, filled_quantity: int | None
     ) -> None:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             order = connection.execute(
-                """SELECT quantity,COALESCE((SELECT SUM(quantity) FROM sandbox_fill_observation
-                         WHERE order_id=o.order_id),0) FROM sandbox_order o
-                   WHERE order_id=? AND generation=? AND state IN ('dispatching','unresolved')""",
+                """SELECT o.quantity,COALESCE((SELECT SUM(quantity) FROM sandbox_fill_observation
+                         WHERE order_id=o.order_id AND generation=o.generation),0),o.state
+                   FROM sandbox_order o WHERE order_id=? AND generation=?""",
                 (order_id, generation),
             ).fetchone()
+            if order is None or not isinstance(event_id, str) or not event_id:
+                raise VenueRefused(
+                    "Sandbox cancellation conflicts with the original order"
+                )
+            requested, booked, state = order
             if (
-                order is None
-                or not isinstance(event_id, str)
-                or not event_id
+                state == "filled"
+                and requested == booked
+                and (
+                    filled_quantity is None
+                    or (type(filled_quantity) is int and filled_quantity == booked)
+                )
+            ):
+                return
+            if state in ("dispatching", "unresolved") and filled_quantity is None:
+                self._mark_unresolved(connection, generation, order_id)
+                return
+            if (
+                state not in ("dispatching", "unresolved")
                 or type(filled_quantity) is not int
-                or not order[1] <= filled_quantity < order[0]
+                or not booked <= filled_quantity < requested
             ):
                 raise VenueRefused(
                     "Sandbox cancellation conflicts with the original order"
