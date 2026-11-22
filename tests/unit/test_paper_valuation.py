@@ -44,8 +44,10 @@ from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.paper_window import WindowPlan, WindowRefused, register_window
 from sourdough.paper_window_movement import read_paper_movement
 from sourdough.paper_window_statement import read_paper_statement
+from sourdough.supervisor import SupervisionResult
 from sourdough.trading_engine import VERSION
 from sourdough.window_costs import CostInventory
+from sourdough.window_run import run_window
 from sourdough.window_sampler import WindowSampler, register_managed_window
 from sourdough.writer_lease import hold_company_writer
 
@@ -507,6 +509,94 @@ class PaperValuationTests(unittest.TestCase):
         self.assertEqual([slot for slot, _ in samples.captures], [0, 1])
         self.assertEqual(samples.missing_ranges, ())
         self.assertEqual(count_company_runs(self.store, self.company_id), 0)
+
+    def test_automatic_window_rotates_after_both_previous_workers_finish(self):
+        second = 10**9
+        opens = time_ns() + second
+        closes = opens + 13 * second
+        plan = replace(self.plan(opens, closes, cadence=6 * second), agent_turn_limit=0)
+        with hold_company_writer(self.store, self.company_id) as writer:
+            registered = register_managed_window(writer, self.engine, plan)
+
+        clock = opens
+        stopped = Event()
+        observations = []
+        pids = iter((10, 20))
+
+        def serve(store, company_id, directory, *, seconds, emit, max_restarts):
+            nonlocal clock
+            pid = next(pids)
+            starts = clock
+            self.assertEqual(
+                (store, company_id, directory),
+                (self.store, self.company_id, self.engine),
+            )
+            self.assertEqual(max_restarts, 0)
+            observations.append(("ready", pid))
+            emit({"event": "worker_ready", "pid": pid, "time_ns": starts})
+            self.assertTrue(stopped.wait(3))
+            stopped.clear()
+            clock = max(starts + seconds * second, clock)
+            observations.append(("venue-exit", pid))
+            return SupervisionResult((), True)
+
+        def company(through, work_before, limit):
+            nonlocal clock
+            self.assertLess(work_before, clock)
+            self.assertGreater(limit * second, through - clock)
+            observations.append(("company-exit", through))
+            clock = through + 1
+            stopped.set()
+            return SupervisionResult((), True)
+
+        with (
+            patch("sourdough.window_run.time_ns", side_effect=lambda: clock),
+            patch("sourdough.window_run.supervise_paper", side_effect=serve),
+        ):
+            result = run_window(
+                self.store,
+                self.company_id,
+                self.engine,
+                plan.window_id,
+                company,
+                segment_seconds=12,
+                emit=Mock(),
+            )
+        self.assertTrue(result.completed)
+        self.assertEqual(result.window_revision, registered.revision)
+        self.assertEqual(result.missing_ranges, ((0, 2),))
+        self.assertEqual(
+            observations,
+            [
+                ("ready", 10),
+                ("company-exit", opens + 3 * second),
+                ("venue-exit", 10),
+                ("ready", 20),
+                ("company-exit", closes),
+                ("venue-exit", 20),
+            ],
+        )
+
+        company = Mock()
+        with (
+            patch("sourdough.window_run.time_ns", return_value=opens),
+            patch(
+                "sourdough.window_run.supervise_paper",
+                return_value=SupervisionResult((), False),
+            ),
+        ):
+            failed = run_window(
+                self.store,
+                self.company_id,
+                self.engine,
+                plan.window_id,
+                company,
+                segment_seconds=12,
+                emit=Mock(),
+            )
+        self.assertFalse(failed.completed)
+        self.assertEqual(failed.segments, ())
+        company.assert_not_called()
 
     def test_closed_statement_uses_original_cash_and_deducts_only_operating_costs(self):
         day = date(2027, 1, 15)

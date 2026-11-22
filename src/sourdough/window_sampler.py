@@ -8,7 +8,11 @@ from threading import Event
 from time import time_ns
 
 from .nautilus_paper import CONNECTOR, NautilusPaperVenue
-from .nautilus_runtime import VALUATION_SOURCE_REVISION, paper_venue
+from .nautilus_runtime import (
+    PAPER_ACTIVATION_LIMIT_SECONDS,
+    VALUATION_SOURCE_REVISION,
+    paper_venue,
+)
 from .paper_account import reopen_binding
 from .paper_execution import PaperExecution, VenueRefused
 from .paper_valuation import (
@@ -27,7 +31,7 @@ from .paper_window import (
 from .writer_lease import WriterLease
 
 
-_MAX_SEGMENT_NS = 600 * 10**9
+_MAX_SEGMENT_NS = PAPER_ACTIVATION_LIMIT_SECONDS * 10**9
 
 
 def _verify_scope(

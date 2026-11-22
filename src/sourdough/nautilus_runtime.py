@@ -26,6 +26,8 @@ sys.path.insert(0, sys.argv.pop(1))
 importlib.import_module(sys.argv.pop(1)).main()
 """
 VALUATION_SOURCE_REVISION = "binance-public-spot-quote-v1"
+PAPER_READY_SECONDS = 32
+PAPER_ACTIVATION_LIMIT_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -178,8 +180,9 @@ def supervise_paper(
     seconds: int,
     emit: Callable[[dict], None],
     tape_path: Path | None = None,
+    max_restarts: int = 1,
 ) -> SupervisionResult:
-    if type(seconds) is not int or not 1 <= seconds <= 600:
+    if type(seconds) is not int or not 1 <= seconds <= PAPER_ACTIVATION_LIMIT_SECONDS:
         raise VenueRefused("Sandbox activation must be bounded to one to 600 seconds")
     with hold_company_writer(store, company_id) as writer:
         if tape_path is None:
@@ -218,8 +221,8 @@ def supervise_paper(
         ],
         venue.journal,
         company_id,
-        max_restarts=1,
-        startup_seconds=32,
+        max_restarts=max_restarts,
+        startup_seconds=PAPER_READY_SECONDS,
         max_seconds=seconds + 80,
         emit=emit,
         environment=_environment(engine / "home"),

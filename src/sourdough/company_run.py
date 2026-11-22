@@ -5,7 +5,7 @@ from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from sqlite3 import Connection
-from time import monotonic, sleep, time
+from time import monotonic, sleep, time, time_ns
 
 from .abandoned_work import requeue_uncommitted_work
 from .company import _connect, upgrade_work_schema
@@ -113,9 +113,16 @@ def run_paper_company(
     budget_from: int | None = None,
     on_ready: Callable[[WriterLease], None] | None = None,
     sampler: WindowSampler | None = None,
+    start_work_before_ns: int | None = None,
 ) -> CompanyRun:
     if not 1 <= turn_budget <= 8 or not 0 <= idle_seconds <= 900:
         raise TradeRefused("Invalid company turn or idle budget")
+    if start_work_before_ns is not None and (
+        sampler is None
+        or sampler.observe_through_ns is None
+        or not 0 < start_work_before_ns <= sampler.observe_through_ns
+    ):
+        raise TradeRefused("Work cutoff requires a bounded observation segment")
     venue.require_independent_from(store)
     with hold_company_writer(
         store, company_id, expected_store_key=expected_store_key
@@ -134,6 +141,7 @@ def run_paper_company(
                 budget_from,
                 on_ready,
                 window,
+                start_work_before_ns,
             )
 
 
@@ -147,6 +155,7 @@ def _operate(
     budget_from: int | None,
     on_ready: Callable[[WriterLease], None] | None,
     window: RegisteredWindow | None,
+    start_work_before_ns: int | None,
 ) -> CompanyRun:
     store, company_id = writer.store, writer.company_id
     writer.verify()
@@ -184,9 +193,14 @@ def _operate(
         if reconciliation.unresolved or switching
         else resume_opening_research(writer, venue)
     )
+
+    def may_start_work():
+        return start_work_before_ns is None or time_ns() < start_work_before_ns
+
     if (
         first is None
         and turn_budget
+        and may_start_work()
         and not reconciliation.unresolved
         and not switching
         and founding_duty_due(store, company_id)
@@ -258,6 +272,8 @@ def _operate(
         )
 
     while turn_budget or reconciliation.next_query_at is not None:
+        if not may_start_work():
+            turn_budget = 0
         if (
             reconciliation.next_query_at is not None
             and reconciliation.next_query_at <= int(time())
