@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from time import time_ns
@@ -17,7 +17,7 @@ from .nautilus_paper import (
 from .nautilus_runtime import paper_venue
 from .paper_execution import VenueRefused
 from .paper_valuation import ValuationRefused, read_window_samples
-from .paper_window import WindowRefused, read_window
+from .paper_window import RegisteredWindow, WindowRefused, read_window
 from .paper_window_movement import read_paper_movement
 from .window_costs import WindowCosts, read_window_costs
 
@@ -37,14 +37,109 @@ class PaperStatement:
     def as_report(self) -> dict:
         report = asdict(self)
         for name in ("trading", "company"):
-            ratio = report[name]["time_weighted_return"]
-            if ratio is not None:
-                report[name]["time_weighted_return"] = {
-                    "numerator": ratio.numerator,
-                    "denominator": ratio.denominator,
-                }
-        canonical = json.dumps(report, sort_keys=True, separators=(",", ":"))
-        return report | {"revision": sha256(canonical.encode()).hexdigest()}
+            _encode_ratio(report[name])
+        return _seal_report(report)
+
+
+def _encode_ratio(report: dict) -> dict:
+    ratio = report["time_weighted_return"]
+    if ratio is not None:
+        report["time_weighted_return"] = {
+            "numerator": ratio.numerator,
+            "denominator": ratio.denominator,
+        }
+    return report
+
+
+def _seal_report(report: dict) -> dict:
+    report = {key: value for key, value in report.items() if key != "revision"}
+    canonical = json.dumps(report, sort_keys=True, separators=(",", ":"))
+    return report | {"revision": sha256(canonical.encode()).hexdigest()}
+
+
+def _trading_scope(window: RegisteredWindow) -> ReturnScope:
+    return ReturnScope(
+        window.company_id,
+        window.account.destination_id,
+        window.account.currency,
+        "trading_net",
+        window.plan.valuation_revision,
+    )
+
+
+def _company_result(
+    store: Path,
+    window: RegisteredWindow,
+    trading: ReturnMeasurement,
+    scale: int | None,
+    close_id: str | None,
+) -> tuple[ReturnMeasurement, int | None]:
+    costs = (
+        WindowCosts(window.revision, None, ("accounting-close",))
+        if close_id is None
+        else read_window_costs(
+            store, window.company_id, window.plan.window_id, close_id
+        )
+    )
+    cost_atoms = (
+        costs.amount_in_units(window.account.currency, scale)
+        if scale is not None
+        else None
+    )
+    missing = (*trading.missing, *costs.missing)
+    if scale is not None and not costs.missing and cost_atoms is None:
+        missing += ("accounting-units",)
+    sources = trading.sources
+    if costs.accounting is not None:
+        receipt = costs.accounting.receipt
+        sources += (receipt.request_id, receipt.statement_revision)
+    closing = trading.closing_minor
+    company = measure(
+        replace(trading.scope, series="company_net"),
+        trading.start_ns,
+        trading.end_ns,
+        trading.opening_minor,
+        closing - cost_atoms
+        if closing is not None and cost_atoms is not None
+        else None,
+        (),
+        sources=sources,
+        missing=missing,
+    )
+    return company, cost_atoms
+
+
+def reassess_retained_costs(
+    store: Path, window: RegisteredWindow, prior: dict, close_id: str | None
+) -> dict | None:
+    if prior["window_revision"] != window.revision:
+        raise WindowRefused("Predecessor does not belong to the sealed window")
+    historical = prior["trading"]
+    if historical["missing"] or historical["pnl_minor"] is None:
+        return None
+    trading = measure(
+        _trading_scope(window),
+        window.plan.opens_ns,
+        window.plan.closes_ns,
+        historical["opening_minor"],
+        historical["closing_minor"],
+        (),
+        sources=tuple(historical["sources"]),
+    )
+    if json.dumps(_encode_ratio(asdict(trading)), sort_keys=True) != json.dumps(
+        historical, sort_keys=True
+    ):
+        raise WindowRefused("Predecessor trading evidence cannot be verified")
+    company, cost_atoms = _company_result(
+        store, window, trading, prior["units_per_whole"], close_id
+    )
+    return _seal_report(
+        prior
+        | {
+            "company": _encode_ratio(asdict(company)),
+            "operating_cost_atoms": cost_atoms,
+        }
+    )
 
 
 def read_paper_statement(
@@ -105,10 +200,8 @@ def read_paper_statement(
                 closing, fees = after.trading_nav_atoms, movement.fee_atoms
                 scale = movement.units_per_whole
 
-    common = (company_id, window.account.destination_id, window.account.currency)
-    policy = plan.valuation_revision
     trading = measure(
-        ReturnScope(*common, "trading_net", policy),
+        _trading_scope(window),
         plan.opens_ns,
         plan.closes_ns,
         opening,
@@ -117,34 +210,7 @@ def read_paper_statement(
         sources=sources,
         missing=tuple(missing),
     )
-    costs = (
-        WindowCosts(window.revision, None, ("accounting-close",))
-        if close_id is None
-        else read_window_costs(store, company_id, window_id, close_id)
-    )
-    cost_atoms = (
-        costs.amount_in_units(window.account.currency, scale)
-        if scale is not None
-        else None
-    )
-    company_missing = (*missing, *costs.missing)
-    if scale is not None and not costs.missing and cost_atoms is None:
-        company_missing += ("accounting-units",)
-    if costs.accounting is not None:
-        receipt = costs.accounting.receipt
-        sources += (receipt.request_id, receipt.statement_revision)
-    company = measure(
-        ReturnScope(*common, "company_net", policy),
-        plan.opens_ns,
-        plan.closes_ns,
-        opening,
-        closing - cost_atoms
-        if closing is not None and cost_atoms is not None
-        else None,
-        (),
-        sources=sources,
-        missing=company_missing,
-    )
+    company, cost_atoms = _company_result(store, window, trading, scale, close_id)
     return PaperStatement(
         window.revision,
         plan.operating_revision,

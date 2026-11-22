@@ -26,6 +26,8 @@ The first managed cash-spot statement uses the provisioned cash as opening NAV o
 
 After the window closes, a writer may retain the statement under an exact close request ID, even if the result is unavailable. Seal the company, window, request terms, assessment time and full report together. An exact retry reopens that receipt without requiring the venue to remain online; it never recomputes its result. A changed computation needs a new request that supersedes the latest retained report for the same window. Earlier incomplete reports remain inspectable by ID after late cost evidence arrives. Report retention does not write to the venue or the general ledger.
 
+When a retained predecessor has complete trading evidence for this sealed window, an operating-cost correction reuses its original trading series, marks, and venue fees. It rechecks only the operating close and its coverage. Subsequent trading or an unavailable venue does not invalidate the historical trading series. An incomplete trading predecessor cannot supply new trading evidence, and this correction does not authorize a trading restatement or change the original receipt.
+
 **Concern for the responsible component:** Choose valuation cut, cost currency and conversion source before comparing periods; missing costs prohibit a fully net claim.
 
 ## Functional and quality requirements

@@ -10,7 +10,7 @@ from time import time_ns
 
 from .company import _connect, _identity
 from .paper_window import WindowRefused, read_window
-from .paper_window_statement import read_paper_statement
+from .paper_window_statement import read_paper_statement, reassess_retained_costs
 from .writer_lease import WriterLease
 
 
@@ -112,21 +112,35 @@ def retain_paper_statement(
     assessed_ns = time_ns()
     if window is None or assessed_ns <= window.plan.closes_ns:
         raise WindowRefused("Wait for the registered window to close")
-    report = read_paper_statement(
-        store,
-        company_id,
-        directory,
-        request.window_id,
-        close_id=request.accounting_close_id,
-    )
-    if "window-still-open" in report.trading.missing:
+    report = None
+    if request.supersedes is not None:
+        predecessor = read_retained_statement(store, company_id, request.supersedes)
+        if predecessor is None or predecessor.request.window_id != request.window_id:
+            raise WindowRefused(
+                "Statement must supersede the latest report for the window"
+            )
+        report = reassess_retained_costs(
+            store,
+            window,
+            predecessor.as_receipt()["statement"],
+            request.accounting_close_id,
+        )
+    if report is None:
+        report = read_paper_statement(
+            store,
+            company_id,
+            directory,
+            request.window_id,
+            close_id=request.accounting_close_id,
+        ).as_report()
+    if "window-still-open" in report["trading"]["missing"]:
         raise WindowRefused("Statement observation preceded the closing cutoff")
     payload = json.dumps(
         {
             "company_id": company_id,
             "request": asdict(request),
             "assessed_ns": assessed_ns,
-            "statement": report.as_report(),
+            "statement": report,
         },
         sort_keys=True,
         separators=(",", ":"),
