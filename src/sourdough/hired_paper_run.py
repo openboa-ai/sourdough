@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from time import monotonic, sleep, time
 
+from .abandoned_work import requeue_uncommitted_work
 from .company import _connect, upgrade_work_schema
 from .company_run import PositionReview, _book_reference, _recover, _review
 from .duty_run import (
@@ -18,11 +19,7 @@ from .duty_run import (
 from .employee_process import EmployeeProcess
 from .first_trade import TradeRefused, _apply_paper_order
 from .hiring_run import HiringRun, prepare_hiring
-from .onboarding import (
-    first_duty_accepted,
-    has_hired_turn,
-    invoke_onboarding,
-)
+from .onboarding import first_duty_accepted, invoke_onboarding
 from .paper_account import reopen_binding
 from .paper_order import PaperIntent
 from .paper_reconcile import PaperReconciliation
@@ -39,7 +36,7 @@ from .work import (
     ResultReference,
     claim_bound_position_review,
     finish_first_duty,
-    owed_follow_up_owner,
+    owed_hired_follow_up_owner,
 )
 from .writer_lease import WriterLease, hold_company_writer
 
@@ -158,6 +155,7 @@ def run_hired_paper_company(
     with hold_company_writer(store, company_id, expected_store_key=store_key) as writer:
         upgrade_work_schema(store, company_id)
         reconciled, blocked = _recover(writer, venue, POSITION_REVIEW)
+        requeue_uncommitted_work(writer, purpose=POSITION_REVIEW, hired_only=True)
         on_ready(writer)
         used = count_company_runs(store, company_id) - budget_from
         if used < 0:
@@ -167,10 +165,10 @@ def run_hired_paper_company(
         remaining = max(0, turn_budget - used)
         if not remaining or reconciled.unresolved or blocked:
             return HiredPaperRun(None, None, reconciled, None, blocked)
-        agent_id = owed_follow_up_owner(
-            store, company_id, POSITION_REVIEW, hired_only=True
-        )
         employee = runtime()
+        agent_id = owed_hired_follow_up_owner(
+            store, company_id, employee.profile, POSITION_REVIEW
+        )
         hiring = None
         research = None
         if agent_id is None and remaining >= 2:
@@ -180,14 +178,14 @@ def run_hired_paper_company(
                 return HiredPaperRun(hiring, None, reconciled, None)
             research = _hired_research(writer, claim, venue, employee)
             hiring = replace(hiring, accepted=True)
-            agent_id = owed_follow_up_owner(
-                store, company_id, POSITION_REVIEW, hired_only=True
+            agent_id = owed_hired_follow_up_owner(
+                store, company_id, employee.profile, POSITION_REVIEW
             )
             remaining -= 2
         if agent_id is None or not remaining:
             return HiredPaperRun(hiring, research, reconciled, None)
         deadline = monotonic() + idle_seconds
-        while has_hired_turn(writer, agent_id):
+        while True:
             writer.verify()
             work = claim_bound_position_review(
                 store, company_id, agent_id, employee.profile, now=int(time())

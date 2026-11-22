@@ -323,18 +323,6 @@ def has_hired_acceptance(connection: Connection, claim: DutyClaim) -> bool:
     )
 
 
-def has_hired_turn(writer: WriterLease, agent_id: str) -> bool:
-    with closing(_connect(writer.store, "ro")) as connection:
-        row = connection.execute(
-            """SELECT h.allocated_turns > count(r.run_id)
-               FROM hire_receipt h JOIN agent a ON a.id=h.agent_id AND a.company_id=?
-               LEFT JOIN duty d ON d.agent_id=h.agent_id LEFT JOIN duty_run r ON r.duty_id=d.id
-               WHERE h.agent_id=? GROUP BY h.agent_id""",
-            (writer.company_id, agent_id),
-        ).fetchone()
-    return row == (1,)
-
-
 def invoke_onboarding(
     writer: WriterLease, claim: DutyClaim, name: str, arguments: dict
 ) -> dict:

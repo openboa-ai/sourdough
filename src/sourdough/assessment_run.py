@@ -1,14 +1,12 @@
 """Run a hired assessment and its saved review without an execution venue."""
 
 from collections.abc import Callable
-from contextlib import closing
 from dataclasses import dataclass, replace
 from pathlib import Path
-from sqlite3 import Connection
 from time import monotonic, sleep, time
 
 from .abandoned_work import requeue_uncommitted_work
-from .company import _connect, upgrade_work_schema
+from .company import upgrade_work_schema
 from .company_assessment import (
     ASSESSMENT,
     AssessmentReceipt,
@@ -21,7 +19,13 @@ from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, count_company_r
 from .employee_process import EmployeeProcess
 from .first_trade import TradeRefused
 from .hiring_run import HiringRun, prepare_hiring
-from .work import FollowUp, ReviewDecision, claim_assessment_review, settle_review
+from .work import (
+    FollowUp,
+    ReviewDecision,
+    claim_assessment_review,
+    owed_hired_follow_up_owner,
+    settle_review,
+)
 from .writer_lease import WriterLease, hold_company_writer
 
 
@@ -38,38 +42,6 @@ class AssessmentRun:
     publication: AssessmentReceipt | None
     restored: tuple[AssessmentReceipt, ...]
     review: AssessmentReview | None
-
-
-def _owed_agent(writer: WriterLease, execution_profile: str) -> str | None:
-    with closing(_connect(writer.store, "ro")) as connection:
-        candidates = connection.execute(
-            """SELECT a.id FROM work_follow_up w
-               JOIN duty d ON d.id=w.duty_id AND d.state='scheduled'
-               JOIN agent a ON a.id=d.agent_id AND a.company_id=?
-               JOIN standing_grant g ON g.id=w.grant_id AND g.agent_id=a.id
-               WHERE w.purpose=? AND a.execution_profile=? AND g.scope=w.grant_scope
-               ORDER BY max(w.due_at,w.available_at),d.id""",
-            (writer.company_id, ASSESSMENT_REVIEW, execution_profile),
-        )
-        return next(
-            (
-                agent_id
-                for (agent_id,) in candidates
-                if _has_hired_turn(connection, agent_id)
-            ),
-            None,
-        )
-
-
-def _has_hired_turn(connection: Connection, agent_id: str) -> bool:
-    row = connection.execute(
-        """SELECT h.allocated_turns > count(r.run_id)
-           FROM hire_receipt h
-           LEFT JOIN duty d ON d.agent_id=h.agent_id LEFT JOIN duty_run r ON r.duty_id=d.id
-           WHERE h.agent_id=? GROUP BY h.agent_id""",
-        (agent_id,),
-    ).fetchone()
-    return row == (1,)
 
 
 def run_assessment_company(
@@ -101,7 +73,9 @@ def run_assessment_company(
             return AssessmentRun(None, None, tuple(restored), None)
 
         employee = runtime()
-        agent_id = _owed_agent(writer, employee.profile)
+        agent_id = owed_hired_follow_up_owner(
+            store, company_id, employee.profile, ASSESSMENT_REVIEW
+        )
         hiring = None
         publication = None
         if agent_id is None and remaining >= 2:
@@ -126,7 +100,9 @@ def run_assessment_company(
             if publication is None:
                 return AssessmentRun(hiring, None, tuple(restored), None)
             hiring = replace(hiring, accepted=True)
-            agent_id = _owed_agent(writer, employee.profile)
+            agent_id = owed_hired_follow_up_owner(
+                store, company_id, employee.profile, ASSESSMENT_REVIEW
+            )
             remaining -= 2
 
         review = (
