@@ -32,6 +32,24 @@ _CANCELLATION_SCHEMA = """CREATE TABLE IF NOT EXISTS sandbox_cancellation (
     order_id TEXT PRIMARY KEY NOT NULL REFERENCES sandbox_order(order_id),
     generation TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL
 )"""
+_STORE_QUOTE = """INSERT OR REPLACE INTO sandbox_quote
+    (singleton,generation,price_atoms_per_lot,received_ns,exchange_trade_ns,event_ns)
+    VALUES (1, ?, ?, ?, ?, ?)"""
+
+
+def current_quote_times(event_ns: int, received_ns: int, now_ns: int) -> bool:
+    return (
+        type(event_ns) is int
+        and type(received_ns) is int
+        and 0 < event_ns <= received_ns <= now_ns
+        and now_ns - event_ns <= _STALE_NS
+    )
+
+
+def _ensure_quote_time(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(sandbox_quote)")}
+    if "event_ns" not in columns:
+        connection.execute("ALTER TABLE sandbox_quote ADD COLUMN event_ns INTEGER")
 
 
 @dataclass(frozen=True)
@@ -125,9 +143,11 @@ class NautilusPaperVenue:
                 """CREATE TABLE IF NOT EXISTS sandbox_quote (
                        singleton INTEGER PRIMARY KEY CHECK (singleton=1),
                        generation TEXT NOT NULL, price_atoms_per_lot INTEGER NOT NULL,
-                       received_ns INTEGER NOT NULL, exchange_trade_ns INTEGER NOT NULL
+                       received_ns INTEGER NOT NULL, exchange_trade_ns INTEGER NOT NULL,
+                       event_ns INTEGER
                    )"""
             )
+            _ensure_quote_time(connection)
             if plan.tape_revision is not None:
                 connection.execute(
                     """CREATE TABLE IF NOT EXISTS replay_decision_cut (
@@ -221,19 +241,23 @@ class NautilusPaperVenue:
     def _quote_observation(
         self, connection: sqlite3.Connection, generation: str | None = None
     ) -> tuple[int, ReplayAvailability | None]:
-        row = connection.execute(
-            """SELECT price_atoms_per_lot,received_ns,exchange_trade_ns,generation
-               FROM sandbox_quote"""
-        ).fetchone()
+        cursor = connection.execute("SELECT * FROM sandbox_quote")
+        values = cursor.fetchone()
+        row = (
+            dict(zip((column[0] for column in cursor.description), values, strict=True))
+            if values is not None
+            else {}
+        )
         now = time_ns()
         _, plan = self._configuration(connection)
         if (
-            row is None
-            or (generation is not None and row[3] != generation)
+            not row
+            or (generation is not None and row["generation"] != generation)
             or (
                 plan.tape_revision is None
                 and not (
-                    0 <= now - row[1] <= _STALE_NS and 0 <= now - row[2] <= _STALE_NS
+                    current_quote_times(row.get("event_ns"), row["received_ns"], now)
+                    and 0 <= now - row["exchange_trade_ns"] <= _STALE_NS
                 )
             )
         ):
@@ -241,15 +265,15 @@ class NautilusPaperVenue:
                 "Sandbox has no fresh quote and supporting exchange trade"
             )
         if plan.tape_revision is None:
-            return row[0], None
+            return row["price_atoms_per_lot"], None
         cut = connection.execute(
             """SELECT event_ns,available_ns FROM replay_decision_cut
                WHERE generation=? AND price_atoms_per_lot=? AND event_ns=?""",
-            (row[3], row[0], row[2]),
+            (row["generation"], row["price_atoms_per_lot"], row["exchange_trade_ns"]),
         ).fetchone()
         if cut is None or not 0 < cut[0] <= cut[1]:
             raise VenueRefused("Replay requires the current sealed availability cut")
-        return row[0], ReplayAvailability(plan.tape_revision, *cut)
+        return row["price_atoms_per_lot"], ReplayAvailability(plan.tape_revision, *cut)
 
     def observe_account(self, account_id: str) -> PaperAccount:
         with self._connect("ro") as connection:
@@ -344,6 +368,7 @@ class NautilusPaperVenue:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(_CANCELLATION_SCHEMA)
+            _ensure_quote_time(connection)
             connection.execute("DELETE FROM sandbox_quote")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS sandbox_activation (
@@ -566,12 +591,24 @@ class NautilusPaperVenue:
             return True
 
     def publish_quote(
-        self, generation: str, atoms: int, received_ns: int, trade_ns: int
+        self,
+        generation: str,
+        atoms: int,
+        received_ns: int,
+        trade_ns: int,
+        *,
+        event_ns: int | None = None,
     ) -> None:
         with self._connect("rw") as connection, connection:
             connection.execute(
-                "INSERT OR REPLACE INTO sandbox_quote VALUES (1, ?, ?, ?, ?)",
-                (generation, atoms, received_ns, trade_ns),
+                _STORE_QUOTE,
+                (
+                    generation,
+                    atoms,
+                    received_ns,
+                    trade_ns,
+                    received_ns if event_ns is None else event_ns,
+                ),
             )
 
     def publish_replay_cut(
@@ -587,8 +624,8 @@ class NautilusPaperVenue:
                 (generation, atoms, event_ns, available_ns),
             )
             connection.execute(
-                "INSERT OR REPLACE INTO sandbox_quote VALUES (1, ?, ?, ?, ?)",
-                (generation, atoms, time_ns(), event_ns),
+                _STORE_QUOTE,
+                (generation, atoms, available_ns, event_ns, event_ns),
             )
 
     def invalidate_quote(self) -> None:
