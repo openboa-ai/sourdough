@@ -10,6 +10,18 @@ Start at the [implementation architecture](../implementation-architecture.md) fo
 
 **Branches and handoff.** Follow [Contributing](../../../CONTRIBUTING.md): `<type>/<kebab-slug>` for topics (e.g. `feat/7-book-paper-fill`), `codex/<kebab-slug>` for managed worktrees, and conventional PR titles such as `feat(trading): book the first paper fill`. Base a unit PR on the current tip of `feat/flow-01-04`, not on `main`. Fix review findings on the same PR; recheck the new head. Only the same-repository aggregate goes from `feat/flow-<slug>` to `main` for product delivery. An automation must honor the same branch, target and title contract or leave publication to the normal contributor path.
 
+## Automatic merge
+
+As part of opening an authorized, ready PR, request automatic squash merge for its exact head:
+
+```sh
+gh pr merge "$PR" --auto --squash --match-head-commit "$PR_HEAD_SHA"
+```
+
+Do not request optional human reviews by default. Required reviews and CI still apply; never use `--admin`. For an aggregate product PR, attach and verify the Goal's required actual-run evidence for that head **before** requesting merge. Keep auto-merge off while evidence is missing or a replacement head is being qualified.
+
+Read back that auto-merge is enabled or the PR is already merged. If GitHub blocks the request, report the exact missing condition. After merge, check the destination revision and its applicable CI.
+
 **Status.** In the existing flow Issue or PR, record only what changed. Keep these facts separate:
 
 | Fact | What to record |
