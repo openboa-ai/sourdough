@@ -6,7 +6,7 @@ import platform
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
-from hashlib import sha256
+from hashlib import file_digest, sha256
 from importlib.resources import as_file, files
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -45,6 +45,7 @@ class EngineInstallation:
     distribution_version: str
     lock_digest: str
     distribution_record_digest: str
+    installed_content_digest: str
 
 
 def _require_supported_platform() -> None:
@@ -92,8 +93,31 @@ def _check_private_directory(directory: Path) -> None:
         raise EngineRefused("Engine directory must be an owned, private directory")
 
 
+def _installed_content_digest(runtime: Path) -> str:
+    digest = sha256()
+    for item in sorted(runtime.rglob("*")):
+        relative = os.fsencode(item.relative_to(runtime))
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        if item.is_symlink():
+            target = os.fsencode(item.readlink())
+            digest.update(b"l" + len(target).to_bytes(8, "big") + target)
+        elif item.is_dir():
+            digest.update(b"d")
+        elif item.is_file():
+            with item.open("rb") as file:
+                digest.update(b"f" + file_digest(file, "sha256").digest())
+        else:
+            raise EngineRefused("Unexpected occupied path in the installed engine")
+    return digest.hexdigest()
+
+
 def _inspect_installation(
-    root: Path, company_id: str, lock_digest: str
+    root: Path,
+    company_id: str,
+    lock_digest: str,
+    *,
+    expected_content: str | None = None,
 ) -> EngineInstallation:
     _check_private_directory(root)
     home, runtime = root / "home", root / "runtime"
@@ -105,6 +129,9 @@ def _inspect_installation(
         or interpreter.resolve(strict=True) != Path(sys._base_executable).resolve()
     ):
         raise EngineRefused("Engine interpreter is not the pinned application Python")
+    content = _installed_content_digest(runtime)
+    if expected_content is not None and expected_content != content:
+        raise EngineRefused("Installed engine files differ from the verified receipt")
     result = _run([str(interpreter), "-IB", "-c", _PROBE], home, timeout=30)
     try:
         probe = json.loads(result)
@@ -118,7 +145,9 @@ def _inspect_installation(
         }
         if set(probe["entrypoints"]) != entrypoints:
             raise EngineRefused("Pinned engine entry points are unavailable")
-        return EngineInstallation(company_id, VERSION, lock_digest, probe["record"])
+        return EngineInstallation(
+            company_id, VERSION, lock_digest, probe["record"], content
+        )
     except (KeyError, TypeError, ValueError) as error:
         raise EngineRefused(
             "The engine installation did not identify itself"
@@ -159,7 +188,14 @@ def prepare_engine(
             raise EngineRefused(
                 "Existing engine installation belongs to another scope or pin"
             )
-        checked = _inspect_installation(selected, writer.company_id, lock_digest)
+        expected = saved.get("installed_content_digest")
+        if not isinstance(expected, str) or len(expected) != 64:
+            raise EngineRefused(
+                "Existing engine receipt has no installed content fingerprint"
+            )
+        checked = _inspect_installation(
+            selected, writer.company_id, lock_digest, expected_content=expected
+        )
         if saved != asdict(checked):
             raise EngineRefused("Existing engine installation differs from its receipt")
         return checked
