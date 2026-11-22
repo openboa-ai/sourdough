@@ -87,10 +87,21 @@ class NautilusPaperPort(unittest.TestCase):
             [partial] = self.venue.read_fills(account.account_id, "order")
             self.assertEqual((partial.quantity, partial.filled_quantity), (20, 8))
             self.assertFalse(submission.done())
+            self.venue.record_cancellation("current", "order", "unconfirmed", None)
+            self.assertIsNone(self.venue.read_cancellation(account.account_id, "order"))
+            self.assertEqual(
+                self.venue.read_fills(account.account_id, "order"), (partial,)
+            )
             with self.assertRaisesRegex(VenueRefused, "exceed the original order"):
                 self.venue.record_fill("current", "order", "overfill", 13, price, 0)
             self.venue.record_fill("current", "order", "final", 12, price, 0)
             self.venue.record_fill("current", "order", "final", 12, price, 0)
+            self.venue.record_cancellation("current", "order", "late", None)
+            self.assertIsNone(self.venue.read_cancellation(account.account_id, "order"))
+            with self.assertRaisesRegex(VenueRefused, "cancellation conflicts"):
+                self.venue.record_cancellation("departed", "order", "stale", None)
+            with self.assertRaisesRegex(VenueRefused, "cancellation conflicts"):
+                self.venue.record_cancellation("current", "order", "contradictory", 8)
             submission.result(timeout=2)
         sender = NautilusPaperVenue(self.venue.journal)
         history = sender.read_fills(account.account_id, "order")
