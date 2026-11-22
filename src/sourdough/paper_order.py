@@ -4,15 +4,15 @@ from contextlib import closing
 from dataclasses import astuple, dataclass
 from pathlib import Path
 from sqlite3 import Connection
-from typing import Protocol
 from uuid import uuid4
 
 from .company import _connect
 from .duty_run import DutyClaim
 from .first_duty import require_historical_claim, require_paper_authority
 from .onboarding import is_hired_first_duty
-from .paper_account import PaperAccount, reopen_binding
+from .paper_account import has_pending_binding_change, reopen_binding
 from .paper_decision import has_matching_paper_decision
+from .paper_execution import PaperDestination, PaperIntent, VenueRefused
 from .paper_research import allows_hired_research_order, allows_research_order
 from .writer_lease import WriterLease
 
@@ -21,24 +21,16 @@ class OrderRefused(Exception):
     """The order does not fit the paper mandate."""
 
 
-@dataclass(frozen=True)
-class PaperIntent:
-    action_id: str
-    instrument_rules_digest: str
-    quantity: int
-    limit_minor_units: int
+class OrderReplyUnknown(TimeoutError):
+    def __init__(self, order_id: str):
+        self.order_id = order_id
+        super().__init__("The original paper order outcome remains unknown")
 
 
 @dataclass(frozen=True)
 class OrderReceipt:
     order_id: str
     dispatched_now: bool
-
-
-class PaperDestination(Protocol):
-    def observe_account(self, account_id: str) -> PaperAccount: ...
-
-    def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None: ...
 
 
 def reserved_exposure(connection: Connection, account_id: str) -> int:
@@ -93,7 +85,11 @@ def submit_paper_order(
             return receipt
     observed_binding = reopen_binding(store, claim.company_id)
     account = observed_binding.account
-    if destination.observe_account(account.account_id) != account:
+    try:
+        checked_account = destination.check_order_terms(account.account_id, intent)
+    except VenueRefused as error:
+        raise OrderRefused("Paper destination refused the order terms") from error
+    if checked_account != account:
         raise OrderRefused("Paper destination mismatch")
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -103,6 +99,8 @@ def submit_paper_order(
         if receipt is not None:
             return receipt
         require_paper_authority(connection, claim)
+        if has_pending_binding_change(connection):
+            raise OrderRefused("Paper binding change is pending; new sends are fenced")
         if reopen_binding(store, claim.company_id) != observed_binding:
             raise OrderRefused("Paper binding changed")
         if intent.instrument_rules_digest != account.instrument_rules_digest:
@@ -117,6 +115,7 @@ def submit_paper_order(
             intent.action_id,
             intent.quantity,
             intent.limit_minor_units,
+            account=account,
         ):
             raise OrderRefused(
                 "Opening order requires its committed research decision and exact terms"
@@ -128,6 +127,7 @@ def submit_paper_order(
             intent.action_id,
             intent.quantity,
             intent.limit_minor_units,
+            account=account,
         ):
             raise OrderRefused(
                 "First hired order requires acceptance, research and a separate request"
@@ -180,5 +180,8 @@ def submit_paper_order(
         )
     if writer is not None:
         writer.verify_for(store, claim.company_id)
-    destination.submit(order_id, account.account_id, intent)
+    try:
+        destination.submit(order_id, account.account_id, intent)
+    except TimeoutError as error:
+        raise OrderReplyUnknown(order_id) from error
     return OrderReceipt(order_id, True)

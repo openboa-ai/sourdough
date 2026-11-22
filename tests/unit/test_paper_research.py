@@ -1,6 +1,7 @@
 import sqlite3
 import unittest
 from contextlib import closing
+from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -8,6 +9,7 @@ from sourdough.company import FoundingTerms, found
 from sourdough.duty_run import DutyRefused
 from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
+from sourdough.paper_execution import PaperOrderSizing
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
 from sourdough.paper_research import (
     ResearchTools,
@@ -66,6 +68,16 @@ class PaperResearch(unittest.TestCase):
             "quantity": 1,
             "limit_minor_units": 5000,
         }
+
+    def test_research_reopens_the_original_destination_sizing(self):
+        rules = PaperOrderSizing(
+            "BTCUSDT", "0.00001", "USDT", 100_000_000, 10, 1, 500_000_000
+        )
+        tools = replace(self.tools, sizing=rules)
+        snapshot = tools.invoke("read_research_inputs", {}, now=100)
+        self.assertEqual(snapshot["order_sizing"], asdict(rules))
+        changed = replace(tools, sizing=replace(rules, minimum_lots=20))
+        self.assertEqual(changed.invoke("read_research_inputs", {}, now=106), snapshot)
 
     def finding(self):
         snapshot = self.tools.invoke("read_research_inputs", {}, now=100)

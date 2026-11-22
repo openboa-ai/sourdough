@@ -8,8 +8,18 @@ from sqlite3 import Connection
 from .company import _connect, _identity
 from .duty_run import DutyClaim
 from .paper_account import reopen_binding
-from .paper_books import Posting, PostingRefused, post_confirmed_fill, read_booked_fill
-from .paper_venue import FixedQuoteVenue
+from .paper_books import (
+    FILLED_QUANTITY,
+    NoFillObservation,
+    Posting,
+    PostingRefused,
+    pending_no_fill_observation_sql,
+    post_confirmed_fill,
+    read_booked_fill,
+    read_booked_no_fill,
+    resolved_order_sql,
+)
+from .paper_execution import PaperExecution
 from .writer_lease import WriterLease
 
 
@@ -19,8 +29,9 @@ MAX_LOOKUP_ATTEMPTS = 6
 @dataclass(frozen=True)
 class ReconciledOrder:
     original_claim: DutyClaim
-    posting: Posting
+    posting: Posting | None
     sources: tuple[str, ...]
+    no_fill: NoFillObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -66,18 +77,20 @@ def _open_recovery(
                 JOIN agent f ON f.id = d.agent_id
                 LEFT JOIN paper_reconciliation j ON j.order_id = o.order_id
                 WHERE o.account_id = ? AND f.company_id = ?
-                  AND ({_missing_fill(db)} OR d.state = 'running')
+                  AND ({_pending_recovery(db)} OR d.state = 'running')
                   AND (j.order_id IS NULL OR j.fill_id IS NOT NULL OR j.next_query_at <= ?
-                       OR NOT ({_missing_fill(db)}))
+                       OR NOT ({_pending_recovery(db)}))
                 ORDER BY COALESCE(j.next_query_at, 0), o.order_id LIMIT ?""",
             (account_id, company_id, now, limit),
         ).fetchall()
 
 
-def _missing_fill(connection: Connection) -> str:
-    if _has_table(connection, "paper_fill"):
-        return "NOT EXISTS (SELECT 1 FROM paper_fill WHERE order_id = o.order_id)"
-    return "1"
+def _pending_recovery(connection: Connection) -> str:
+    return f"(NOT ({resolved_order_sql(connection)}) OR {pending_no_fill_observation_sql(connection)})"
+
+
+def _has_booked_fill(connection: Connection) -> str:
+    return f"{FILLED_QUANTITY}>0" if _has_table(connection, "paper_fill") else "0"
 
 
 def _record_lookup(
@@ -89,19 +102,30 @@ def _record_lookup(
     posting: Posting | None,
     sources: tuple[str, ...],
 ) -> None:
-    next_query = None
-    if posting is None and attempts < MAX_LOOKUP_ATTEMPTS:
-        next_query = now + min(60, 2**attempts)
     with closing(_connect(store, "rw")) as db, db:
         db.execute("BEGIN IMMEDIATE")
         if _identity(db) != company_id:
             raise PostingRefused("Company identity mismatch")
+        next_query = None
+        if posting is None:
+            pending_cancellation = (
+                "EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id)"
+                if _has_table(db, "paper_cancellation")
+                else "0"
+            )
+            unresolved, has_evidence = db.execute(
+                f"""SELECT {_pending_recovery(db)}, ({_has_booked_fill(db)} OR {pending_cancellation})
+                    FROM paper_order o WHERE o.order_id=?""",
+                (order_id,),
+            ).fetchone()
+            if unresolved and (attempts < MAX_LOOKUP_ATTEMPTS or has_evidence):
+                next_query = now + min(60, 2 ** min(attempts, MAX_LOOKUP_ATTEMPTS))
         db.execute(
             """INSERT INTO paper_reconciliation VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(order_id) DO UPDATE SET
                    attempts = excluded.attempts, next_query_at = excluded.next_query_at,
                    fill_id = excluded.fill_id,
-                   sources = CASE WHEN paper_reconciliation.fill_id IS NOT NULL
+                   sources = CASE WHEN paper_reconciliation.sources != ''
                                   AND excluded.sources = 'book'
                                   THEN paper_reconciliation.sources ELSE excluded.sources END
                WHERE paper_reconciliation.fill_id IS NULL OR excluded.fill_id IS NOT NULL""",
@@ -118,7 +142,7 @@ def _record_lookup(
 def reconcile_paper_orders(
     store: Path,
     company_id: str,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     *,
     now: int,
     lookup_limit: int = 16,
@@ -148,7 +172,8 @@ def reconcile_paper_orders(
         attempts,
     ) in candidates:
         posting = read_booked_fill(store, company_id, order_id)
-        if posting is not None:
+        no_fill = read_booked_no_fill(store, company_id, order_id)
+        if posting is not None or no_fill is not None:
             sources = ("book",)
         else:
             if venue.observe_account(account.account_id) != account:
@@ -168,17 +193,21 @@ def reconcile_paper_orders(
                     continue
                 if confirmed is not None:
                     observed.append((source, confirmed))
+                else:
+                    no_fill = read_booked_no_fill(store, company_id, order_id)
+                    if no_fill is not None:
+                        observed.append((source, None))
             posting = observed[0][1] if observed else None
             sources = tuple(source for source, _ in observed)
             attempts += 1
         if writer is not None:
             writer.verify_for(store, company_id)
         _record_lookup(store, company_id, order_id, now, attempts, posting, sources)
-        if posting is not None:
+        if posting is not None or no_fill is not None:
             claim = DutyClaim(
                 company_id, founder_id, grant_id, duty_id, run_id, profile
             )
-            recovered.append(ReconciledOrder(claim, posting, sources))
+            recovered.append(ReconciledOrder(claim, posting, sources, no_fill))
     with closing(_connect(store, "ro")) as db:
         if not _has_table(db, "paper_order"):
             return PaperReconciliation((), 0, None)
@@ -186,7 +215,7 @@ def reconcile_paper_orders(
             f"""SELECT count(*), min(CASE WHEN j.order_id IS NULL THEN ? ELSE j.next_query_at END)
                 FROM paper_order o
                 LEFT JOIN paper_reconciliation j ON j.order_id = o.order_id
-                WHERE o.account_id = ? AND {_missing_fill(db)}""",
+                WHERE o.account_id = ? AND {_pending_recovery(db)}""",
             (now, account.account_id),
         ).fetchone()
     return PaperReconciliation(tuple(recovered), unresolved, next_query)

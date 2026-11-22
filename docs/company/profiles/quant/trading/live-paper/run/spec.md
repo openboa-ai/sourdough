@@ -31,3 +31,17 @@ The [runtime integration qualification contract](../../execution-environment/qua
 | Model sensitivity | Replay identical recorded market observations with the sealed base and adverse spread, delay and fill assumptions. Report both net outcomes and source coverage independently; do not pick the favorable case as the only result or present observed public prints as proof the paper order really filled. |
 
 The first local fault test can use a fixed synthetic feed for repeatability; this spec's forward-market evidence requires an actual separately observed current feed and is not satisfied by that fixture.
+
+## Recurring decisions
+
+On a recurring managed paper execution duty, resolve the current account's instrument and order sizing before asking the Agent for its decision. The authorized result exposes the instrument, whole lots and base units per lot, quote scale, price step, minimum lots and minimum notional. The current quote is in integer quote units per lot and the reported position counts lots. This projection does not rewrite the preceding book observation or relax admission checks. A destination without an explicit lot contract retains its own existing unit names.
+
+## Recovering the bounded spot cash worker
+
+The company supervises the sandbox independently of the Agent worker. On sandbox restart, discard the previous generation's quote. Reconcile all original completed orders against the durable fill and virtual balance receipts and start the same account from that verified cash and spot holding, not its configured initial capital. The replacement must independently observe those balances in the SDK and obtain a fresh current quote before readiness. A queued order never claimed by a sender retains its original identity. An order possibly sent without conclusive evidence, an unsupported partial result, or a missing balance receipt prevents activation and does not authorize resubmission. This is a cash-spot checkpoint, not recovery of a general-purpose matching engine or evidence of testnet behavior.
+
+If the quote expires between company admission and sandbox enqueue, persist the exact original command as queued. A queue row is not a market send, a rejection, or proof of a fill. Keep the company reservation, and require a fresh quote from the claiming generation before any send. Recovery drains the one durable command rather than retrying it under a different action or synthesizing terminal evidence.
+
+The cash-spot worker uses the original SDK quote event and availability timestamps plus a corroborating source trade. Neither callback execution nor an unrelated newer trade resets the quote age. Both quote timestamps must be ordered and within the existing 15-second limit. An older SDK journal without the event timestamp cannot authorize current-market admission from that quote; the replacement waits for a fresh observation.
+
+The managed worker claims only one command at a time until the original terminal history and SDK account checkpoint agree. At activation expiry it withdraws the quote and stops claiming queued commands, then gives the already claimed order up to five seconds to reach that checkpoint. A late native callback and corroborated balance may complete the original order during this drain. If they do not, the worker reports an unresolved shutdown rather than a clean exit; it does not invent an account receipt, release exposure, or send another order. Unclaimed commands keep their original IDs.

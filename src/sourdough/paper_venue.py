@@ -2,33 +2,26 @@
 
 import sqlite3
 from contextlib import closing
-from dataclasses import astuple, dataclass, replace
+from dataclasses import astuple, replace
 from pathlib import Path
 from uuid import uuid4
 
 from .paper_account import PaperAccount
-from .paper_order import PaperIntent
-
-
-class VenueRefused(Exception):
-    """The paper destination cannot accept the command."""
-
-
-@dataclass(frozen=True)
-class VenueExecution:
-    order_id: str
-    account_id: str
-    instrument_rules_digest: str
-    quantity: int
-    limit_minor_units: int
-    fill_id: str | None
-    fill_price_minor_units: int | None
-    fee_minor_units: int = 0
+from .paper_execution import (
+    PaperIntent,
+    VenueExecution,
+    VenuePosition,
+    VenueRefused,
+    require_separate_journal,
+)
 
 
 class FixedQuoteVenue:
     def __init__(self, journal: Path):
         self.journal = journal
+
+    def require_independent_from(self, company_store: Path) -> None:
+        require_separate_journal(company_store, self.journal)
 
     def _open(self, mode: str):
         connection = sqlite3.connect(
@@ -111,15 +104,27 @@ class FixedQuoteVenue:
             raise VenueRefused("Unknown destination account")
         return PaperAccount(*row[1:-1])
 
-    def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None:
+    @staticmethod
+    def _check_units(intent: PaperIntent) -> None:
         if (
-            not order_id
-            or type(intent.quantity) is not int
+            type(intent.quantity) is not int
             or type(intent.limit_minor_units) is not int
             or not 0 < intent.quantity <= 2**63 - 1
             or not 0 < intent.limit_minor_units <= 2**63 - 1
         ):
             raise VenueRefused("Invalid paper order terms")
+
+    def check_order_terms(self, account_id: str, intent: PaperIntent) -> PaperAccount:
+        self._check_units(intent)
+        account = self.observe_account(account_id)
+        if account.instrument_rules_digest != intent.instrument_rules_digest:
+            raise VenueRefused("Unknown destination instrument")
+        return account
+
+    def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None:
+        if not order_id:
+            raise VenueRefused("Missing paper order identity")
+        self._check_units(intent)
         with self._open("rw") as db, db:
             db.execute("BEGIN IMMEDIATE")
             account = db.execute(
@@ -157,6 +162,12 @@ class FixedQuoteVenue:
             raise VenueRefused("Unknown destination account")
         return row[0]
 
+    def observe_research_quote(self, account_id: str) -> tuple[int, None]:
+        return self.observe_quote(account_id), None
+
+    def observe_order_sizing(self, account_id: str) -> None:
+        self.observe_account(account_id)
+
     def observe_fee_bps(self, account_id: str) -> int:
         with self._open("ro") as db:
             db.execute("BEGIN")
@@ -184,6 +195,39 @@ class FixedQuoteVenue:
                 (account_id, order_id),
             ).fetchone()
             return self._execution_with_fee(db, row)
+
+    def read_fills(
+        self, account_id: str, order_id: str, *, account_sync: bool = False
+    ) -> tuple[VenueExecution, ...]:
+        observed = (
+            self.sync_account_execution(account_id, order_id)
+            if account_sync
+            else self.observe_execution(order_id)
+        )
+        return (
+            (observed,) if observed is not None and observed.fill_id is not None else ()
+        )
+
+    def read_cancellation(
+        self, account_id: str, order_id: str, *, account_sync: bool = False
+    ) -> None:
+        return None
+
+    def read_order_position(
+        self, account_id: str, order_id: str
+    ) -> VenuePosition | None:
+        with self._open("ro") as db:
+            row = db.execute(
+                """SELECT target.rules, COALESCE(SUM(booked.quantity), 0)
+                   FROM venue_execution target
+                   LEFT JOIN venue_execution booked ON booked.account_id=target.account_id
+                     AND booked.rules=target.rules AND booked.rowid<=target.rowid
+                     AND booked.fill_id IS NOT NULL
+                   WHERE target.account_id=? AND target.order_id=?
+                   GROUP BY target.order_id""",
+                (account_id, order_id),
+            ).fetchone()
+        return VenuePosition(order_id, account_id, *row) if row else None
 
     @staticmethod
     def _fee_rate(db: sqlite3.Connection) -> int:

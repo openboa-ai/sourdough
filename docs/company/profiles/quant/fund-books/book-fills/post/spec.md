@@ -6,7 +6,7 @@ Design draft · Verification **UNRUN** · Responsible component: Ledger
 
 ## Boundary and dependencies
 
-Consume order and fill identity, side, contract multiplier, price, quantity and fee. In one transaction store the fill and update position and fee; adjust an existing linked reservation when the effect has one. A venue-originated effect with no company reservation must not create a fictitious reservation or release.
+Consume order and fill identity, side, contract multiplier, price, quantity and fee. In one transaction store the fill and fee and adjust an existing linked reservation when the effect has one. A venue-originated effect with no company reservation must not create a fictitious reservation or release. A balance derived for accounting is not the trading position: operational position observations come from the [bound execution runtime](../../../trading/execution-environment/launch/spec.md).
 
 An independently confirmed venue-originated or otherwise unattributed account effect uses its own external provenance and original venue identity; it does not require a fabricated Agent decision or a prior company-created order. Such effects follow [external-effect reconciliation](../../../trading/recover-order/reconcile-external/spec.md), including containment while coverage is unresolved.
 
@@ -29,7 +29,7 @@ Key postings by venue, account and fill identity rather than order identity; one
 
 ## Acceptance and independent evidence
 
-**Oracle:** Compute signed position, fees and remaining quantity from the independently captured venue fills and declared contract terms; do not call the ledger's calculator.
+**Oracle:** Compare booked quantity, fees and remaining reservation against independently captured venue fills and declared terms. For the operational position, compare the result with the runtime's scoped account observation; a tally of booked fills is not the oracle.
 
 | Case | Setup, action and expected observation |
 | --- | --- |

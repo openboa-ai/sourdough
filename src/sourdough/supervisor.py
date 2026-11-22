@@ -4,7 +4,7 @@ import json
 import os
 import select
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, sleep, time_ns
@@ -75,6 +75,8 @@ def supervise_worker(
     startup_seconds: int,
     max_seconds: int,
     emit: Callable[[dict], None],
+    environment: Mapping[str, str] | None = None,
+    expected_store_key: tuple[int, int] | None = None,
 ) -> SupervisionResult:
     if (
         not 0 <= max_restarts <= 4
@@ -86,6 +88,8 @@ def supervise_worker(
         raise SupervisionRefused("Original company store is unavailable")
     identity = store.stat(follow_symlinks=False)
     key = identity.st_dev, identity.st_ino
+    if expected_store_key is not None and key != expected_store_key:
+        raise SupervisionRefused("Original worker store changed before launch")
     deadline = monotonic() + max_seconds
     attempts = []
     for sequence in range(max_restarts + 1):
@@ -105,6 +109,7 @@ def supervise_worker(
                         f"{key[0]}:{key[1]}",
                     ],
                     pass_fds=(write_end,),
+                    env=environment,
                 )
             finally:
                 os.close(write_end)
