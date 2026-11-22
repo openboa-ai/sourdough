@@ -272,7 +272,7 @@ def observe(output, employee):
     assert author != trial["founding"]["founder_id"]
     assert publication[6] == trial["founding"]["founder_id"]
     claim = review["claim"]
-    assert (claim["founder_id"], claim["execution_profile"]) == (
+    assert (claim["agent_id"], claim["execution_profile"]) == (
         author,
         trial["profile"],
     )

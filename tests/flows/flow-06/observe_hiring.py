@@ -109,7 +109,7 @@ def observe(output, employee):
         json.loads(line) for line in deliveries.read_text().splitlines()
     ]
     assert original == replay
-    assert original["agent_id"] == blocked[0] == receipt["hire_claim"]["founder_id"]
+    assert original["agent_id"] == blocked[0] == receipt["hire_claim"]["agent_id"]
     assert original["agent_id"] != trial["founding"]["founder_id"]
     assert receipt["hire_claim"]["execution_profile"] == trial["profile"]
     assert rows(company, "SELECT agent_id,allocated_turns FROM hire_receipt") == [

@@ -202,7 +202,7 @@ def observe(output, employee):
     review = result["review"]
     assert review is not None
     claim = review["claim"]
-    assert (claim["founder_id"], claim["execution_profile"]) == (agent_id, profile)
+    assert (claim["agent_id"], claim["execution_profile"]) == (agent_id, profile)
     assert claim["duty_id"] != accepted[0] and claim["run_id"] != accepted[1]
     (observed,) = rows(
         company,

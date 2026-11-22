@@ -38,6 +38,13 @@ def _store_key(value: str) -> tuple[int, int]:
     return device, inode
 
 
+def _agent_receipt(fields):
+    receipt = dict(fields)
+    if "founder_id" in receipt and "run_id" in receipt:
+        receipt["agent_id"] = receipt.pop("founder_id")
+    return receipt
+
+
 def _start_supervisor(args):
     assessment = args.command == "supervise-assessment"
     worker_name = {
@@ -351,7 +358,13 @@ def main() -> int:
     ) as error:
         print(f"Company command refused: {error}", file=sys.stderr)
         return 1
-    print(json.dumps(asdict(result)))
+    fields = (
+        _agent_receipt
+        if args.command
+        in ("operate-hiring", "_assessment-worker", "_hired-paper-worker")
+        else dict
+    )
+    print(json.dumps(asdict(result, dict_factory=fields)))
     return 0
 
 

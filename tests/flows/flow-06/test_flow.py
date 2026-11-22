@@ -64,7 +64,10 @@ elif operation in ("assessment_duty", "hired_research_duty"):
             "call_id": "fixture-research", "action": "buy", "quantity": 1, "limit_minor_units": 5000,
             "rationale": "Use the measured positive change for one bounded synthetic order.", "next_check_seconds": 60,
         })
-        result = invoke("request_research_order", {"decision_id": decision["decision_id"]})
+        result = (
+            invoke("request_research_order", {"decision_id": decision["decision_id"]})
+            if submit_request else decision
+        )
 elif operation in ("assessment_review", "review_duty"):
     with socket.socket(socket.AF_UNIX) as client:
         client.connect(request["read_endpoint"])
@@ -143,14 +146,24 @@ def rows(store, sql):
 
 class ConnectedFlow(unittest.TestCase):
     def test_end_to_end(self):
-        for scope in ("assessment", "paper"):
-            with self.subTest(scope=scope), TemporaryDirectory() as local:
+        for scope, submit_request in (
+            ("assessment", True),
+            ("paper", True),
+            ("paper", False),
+        ):
+            with (
+                self.subTest(scope=scope, submit_request=submit_request),
+                TemporaryDirectory() as local,
+            ):
                 root = Path(local)
                 employee, store, venue = (
                     root / name
                     for name in ("employee", "company.sqlite", "venue.sqlite")
                 )
-                employee.write_text(f"#!{sys.executable}\n" + EMPLOYEE)
+                employee.write_text(
+                    f"#!{sys.executable}\nsubmit_request = {submit_request!r}\n"
+                    + EMPLOYEE
+                )
                 employee.chmod(0o700)
                 profile = cli("employee-profile", employee)["execution_profile"]
                 founded = cli(
@@ -274,6 +287,14 @@ class ConnectedFlow(unittest.TestCase):
                 result, supervisor = [
                     json.loads(line) for line in response.stdout.splitlines()
                 ]
+                if not submit_request:
+                    self.assertEqual(len(supervisor["attempts"]), 1)
+                    self.assertEqual(result["research"]["decision"]["action"], "buy")
+                    self.assertIsNone(result["review"])
+                    self.assertEqual(
+                        rows(venue, "SELECT count(*) FROM venue_execution"), [(0,)]
+                    )
+                    continue
                 original, resumed = supervisor["attempts"]
                 self.assertEqual(original["returncode"], -signal.SIGKILL)
                 self.assertLess(original["exited_at_ns"], resumed["ready_at_ns"])
@@ -284,7 +305,7 @@ class ConnectedFlow(unittest.TestCase):
                        JOIN onboarding_acceptance w ON w.duty_id=a.first_duty_id""",
                 )
                 self.assertNotEqual(agent_id, founded["founder_id"])
-                self.assertEqual(claim["founder_id"], agent_id)
+                self.assertEqual(claim["agent_id"], agent_id)
                 self.assertNotEqual(claim["duty_id"], first_duty)
                 self.assertEqual(claim["execution_profile"], profile)
                 self.assertEqual(rows(store, "SELECT count(*) FROM duty_run"), [(3,)])
