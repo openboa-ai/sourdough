@@ -10,6 +10,7 @@ from .company_assets import (
     publish_selection,
     read_shared_asset,
 )
+from .conversation_delivery import acknowledge_delivery, read_inbox
 from .conversations import Post, append_message, read_messages
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused
 from .harness import ScopedRun, ScopedWorkflow, tool
@@ -45,6 +46,17 @@ POST_DISCUSSION = tool(
         "body": {"type": "string"},
         "asset_id": {"type": "string"},
     },
+)
+READ_INBOX = tool(
+    "read_project_inbox",
+    "List your project deliveries without acknowledging or accepting work. "
+    "Use an empty cursor or continue after a previous delivery ID.",
+    {"after": {"type": "string"}},
+)
+ACKNOWLEDGE_DELIVERY = tool(
+    "acknowledge_project_delivery",
+    "Record that you saw a project notification without accepting work.",
+    {"delivery_id": {"type": "string"}},
 )
 PUBLISH_DRAFT = tool(
     "publish_draft_selection",
@@ -90,7 +102,16 @@ def company_work_run(
 ) -> ScopedRun:
     projects = project_access(writer, claim, workflow.purpose)
     additional = (
-        (PROJECTS, READ_ASSET, READ_DISCUSSION, POST_DISCUSSION) if projects else ()
+        (
+            PROJECTS,
+            READ_ASSET,
+            READ_DISCUSSION,
+            POST_DISCUSSION,
+            READ_INBOX,
+            ACKNOWLEDGE_DELIVERY,
+        )
+        if projects
+        else ()
     )
     if any(project.can_publish for project in projects):
         additional += (PUBLISH_DRAFT,)
@@ -102,6 +123,18 @@ def company_work_run(
             additional += (OFFER_HANDOFF,)
 
     def dispatch(name: str, arguments: dict) -> dict:
+        if name == "read_project_inbox":
+            deliveries, next_cursor = read_inbox(
+                writer, claim, workflow.purpose, **arguments
+            )
+            return {
+                "deliveries": [asdict(delivery) for delivery in deliveries],
+                "next_cursor": next_cursor,
+            }
+        if name == "acknowledge_project_delivery":
+            return asdict(
+                acknowledge_delivery(writer, claim, workflow.purpose, **arguments)
+            )
         if name == "read_project_discussion":
             messages, next_cursor = read_messages(
                 writer, claim, workflow.purpose, **arguments

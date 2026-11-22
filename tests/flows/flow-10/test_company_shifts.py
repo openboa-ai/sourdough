@@ -93,10 +93,14 @@ else:
         rationale = "Pass the check to another Agent."
     elif evidence["asset_id"] == "recipient-input":
         [project] = call("read_project_assignments", {"after": ""})["projects"]
+        [delivery] = call("read_project_inbox", {"after": ""})["deliveries"]
+        assert delivery["read_run"] is None, delivery
         [message] = call("read_project_discussion", {
             "project_id": project["project_id"], "after": "",
         })["messages"]
         assert message["sender_id"] == "author" and message["body"] == "Can you check the discrepancy?"
+        assert message["message_id"] == delivery["message_id"]
+        assert call("acknowledge_project_delivery", {"delivery_id": delivery["delivery_id"]})["read_run"]
         call("post_project_message", {
             "project_id": project["project_id"], "project_revision": project["revision"],
             "request_id": "answer", "body": "I will check the discrepancy.", "asset_id": "",
@@ -298,6 +302,18 @@ class CompanyShifts(unittest.TestCase):
                         recipient["claim"]["run_id"],
                         "I will check the discrepancy.",
                     ),
+                ],
+            )
+            self.assertEqual(
+                rows(
+                    store,
+                    """SELECT m.sender_id,d.recipient_id,d.read_run
+                       FROM project_delivery d JOIN project_message m USING(message_id)
+                       ORDER BY d.rowid""",
+                ),
+                [
+                    ("author", "recipient", recipient["claim"]["run_id"]),
+                    ("recipient", "author", None),
                 ],
             )
             self.assertEqual(
