@@ -23,7 +23,11 @@ from sourdough.nautilus_runtime import VALUATION_SOURCE_REVISION
 from sourdough.paper_account import PaperMandate, bind
 from sourdough.paper_execution import PaperIntent
 from sourdough.paper_order import submit_paper_order
-from sourdough.paper_valuation import BEST_BID_POLICY, capture_window_sample
+from sourdough.paper_valuation import (
+    BEST_BID_POLICY,
+    ValuationRefused,
+    capture_window_sample,
+)
 from sourdough.paper_window import WindowPlan
 from sourdough.trading_engine import VERSION
 from sourdough.window_costs import CostInventory
@@ -176,6 +180,8 @@ class ConnectedFlow(unittest.TestCase):
             )
         )
         final_bid = ask - 30
+        with self.assertRaisesRegex(ValuationRefused, "registered closing instant"):
+            sample(1, opens + day_ns // 2 + 10, final_bid - 100)
         sample(1, closes - 4, final_bid)
         venue.invalidate_quote()
 

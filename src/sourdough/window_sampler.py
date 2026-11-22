@@ -11,7 +11,12 @@ from .nautilus_paper import CONNECTOR, NautilusPaperVenue
 from .nautilus_runtime import VALUATION_SOURCE_REVISION, paper_venue
 from .paper_account import reopen_binding
 from .paper_execution import PaperExecution, VenueRefused
-from .paper_valuation import BEST_BID_POLICY, ValuationRefused, capture_window_sample
+from .paper_valuation import (
+    BEST_BID_POLICY,
+    ValuationRefused,
+    capture_window_sample,
+    earliest_sample_ns,
+)
 from .paper_window import (
     RegisteredWindow,
     WindowPlan,
@@ -96,6 +101,10 @@ class WindowSampler:
                 delay_seconds = min(1, (plan.opens_ns - now) / 10**9)
             else:
                 slot = (now - plan.opens_ns) // plan.cadence_ns
+                eligible = earliest_sample_ns(window, slot)
+                if now < eligible:
+                    stop.wait(min(1, (eligible - now) / 10**9))
+                    continue
                 if slot != captured:
                     try:
                         capture_window_sample(
