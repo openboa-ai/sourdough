@@ -27,7 +27,7 @@ from .employee_process import EmployeeProcess
 from .first_trade import TradeRefused, _apply_paper_order, resume_opening_research
 from .hiring_run import HiringRun, prepare_hiring
 from .onboarding import first_duty_accepted, invoke_onboarding
-from .paper_account import reopen_binding
+from .paper_account import has_pending_binding_change, reopen_binding
 from .paper_books import Posting
 from .paper_execution import PaperExecution, PaperIntent
 from .paper_reconcile import PaperReconciliation
@@ -205,7 +205,11 @@ def run_hired_paper_company(
         remaining = max(0, turn_budget - used)
         if reconciled.unresolved or blocked:
             return HiredPaperRun(None, None, reconciled, None, blocked)
-        opening = resume_opening_research(writer, venue, hired=True)
+        with closing(_connect(store, "ro")) as connection:
+            switching = has_pending_binding_change(connection)
+        opening = (
+            None if switching else resume_opening_research(writer, venue, hired=True)
+        )
         research = opening.research if opening is not None else None
         if opening is not None and research is not None:
             posting = opening.order.posting if opening.order is not None else None
@@ -227,6 +231,8 @@ def run_hired_paper_company(
         )
         hiring = None
         if opening is None and agent_id is None:
+            if switching:
+                return HiredPaperRun(None, research, reconciled, None)
             hiring = prepare_hiring(
                 writer,
                 employee,

@@ -10,7 +10,7 @@ from .company import _connect
 from .duty_run import DutyClaim
 from .first_duty import require_historical_claim, require_paper_authority
 from .onboarding import is_hired_first_duty
-from .paper_account import reopen_binding
+from .paper_account import has_pending_binding_change, reopen_binding
 from .paper_decision import has_matching_paper_decision
 from .paper_execution import PaperDestination, PaperIntent, VenueRefused
 from .paper_research import allows_hired_research_order, allows_research_order
@@ -99,6 +99,8 @@ def submit_paper_order(
         if receipt is not None:
             return receipt
         require_paper_authority(connection, claim)
+        if has_pending_binding_change(connection):
+            raise OrderRefused("Paper binding change is pending; new sends are fenced")
         if reopen_binding(store, claim.company_id) != observed_binding:
             raise OrderRefused("Paper binding changed")
         if intent.instrument_rules_digest != account.instrument_rules_digest:
@@ -113,6 +115,7 @@ def submit_paper_order(
             intent.action_id,
             intent.quantity,
             intent.limit_minor_units,
+            account=account,
         ):
             raise OrderRefused(
                 "Opening order requires its committed research decision and exact terms"
@@ -124,6 +127,7 @@ def submit_paper_order(
             intent.action_id,
             intent.quantity,
             intent.limit_minor_units,
+            account=account,
         ):
             raise OrderRefused(
                 "First hired order requires acceptance, research and a separate request"

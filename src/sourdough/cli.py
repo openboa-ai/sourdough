@@ -20,7 +20,12 @@ from sourdough.hiring_run import run_hiring
 from sourdough.market_runtime import observe_market
 from sourdough.market_worker import MarketRefused
 from sourdough.nautilus_runtime import bind_paper as bind_nautilus_paper
-from sourdough.nautilus_runtime import paper_venue, prepare_paper, supervise_paper
+from sourdough.nautilus_runtime import (
+    paper_venue,
+    prepare_paper,
+    supervise_paper,
+    switch_paper,
+)
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
 from sourdough.paper_execution import VenueRefused
@@ -146,6 +151,7 @@ def main() -> int:
     for command in (
         "prepare-nautilus-paper",
         "bind-nautilus-paper",
+        "switch-nautilus-paper",
         "serve-nautilus-paper",
         "operate-nautilus-paper",
     ):
@@ -157,11 +163,15 @@ def main() -> int:
             sandbox.add_argument("--account-id", required=True)
             sandbox.add_argument("--starting-atoms", required=True, type=int)
             sandbox.add_argument("--replay-tape", type=Path)
-        elif command == "bind-nautilus-paper":
+        elif command in ("bind-nautilus-paper", "switch-nautilus-paper"):
             sandbox.add_argument("--revision", required=True)
             sandbox.add_argument("--charter-revision", required=True)
             sandbox.add_argument("--exposure-atoms", required=True, type=int)
             sandbox.add_argument("--replay", action="store_true")
+            if command == "switch-nautilus-paper":
+                sandbox.add_argument("--previous-directory", type=Path, required=True)
+                sandbox.add_argument("--previous-revision", required=True)
+                sandbox.add_argument("--from-replay", action="store_true")
         elif command == "serve-nautilus-paper":
             sandbox.add_argument("--seconds", type=int, default=60)
             sandbox.add_argument("--replay-tape", type=Path)
@@ -302,6 +312,19 @@ def main() -> int:
                     revision=args.revision,
                     charter_revision=args.charter_revision,
                     exposure_atoms=args.exposure_atoms,
+                    replay=args.replay,
+                )
+        elif args.command == "switch-nautilus-paper":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                result = switch_paper(
+                    writer,
+                    args.previous_directory,
+                    args.directory,
+                    previous_revision=args.previous_revision,
+                    revision=args.revision,
+                    charter_revision=args.charter_revision,
+                    exposure_atoms=args.exposure_atoms,
+                    from_replay=args.from_replay,
                     replay=args.replay,
                 )
         elif args.command == "serve-nautilus-paper":

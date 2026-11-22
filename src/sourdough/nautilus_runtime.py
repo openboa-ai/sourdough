@@ -5,7 +5,13 @@ from pathlib import Path
 
 from .market_worker import SpotInstrumentTerms, journal_key, read_spot_terms, reopen
 from .nautilus_paper import NautilusPaperVenue, SandboxPlan
-from .paper_account import PaperMandate, bind
+from .paper_account import (
+    BindingChange,
+    PaperAccount,
+    PaperMandate,
+    bind,
+    change_paper_binding,
+)
 from .paper_execution import VenueRefused
 from .replay_tape import ReplayTape
 from .supervisor import SupervisionResult, supervise_worker
@@ -71,15 +77,9 @@ def prepare_paper(
     )
 
 
-def bind_paper(
-    writer: WriterLease,
-    directory: Path,
-    *,
-    revision: str,
-    charter_revision: str,
-    exposure_atoms: int,
-    replay: bool = False,
-) -> PaperMandate:
+def _binding_destination(
+    writer: WriterLease, directory: Path, replay: bool
+) -> tuple[NautilusPaperVenue, PaperAccount]:
     if replay:
         prepare_engine(writer, directory, allow_install=False)
         venue = paper_venue(writer.store, directory, replay=True)
@@ -95,8 +95,20 @@ def bind_paper(
         raise VenueRefused(
             "Virtual account does not match the prepared company and instrument"
         )
-    account = venue.observe_account(plan.account_id)
-    venue.observe_quote(plan.account_id)
+    return venue, venue.observe_account(plan.account_id)
+
+
+def bind_paper(
+    writer: WriterLease,
+    directory: Path,
+    *,
+    revision: str,
+    charter_revision: str,
+    exposure_atoms: int,
+    replay: bool = False,
+) -> PaperMandate:
+    venue, account = _binding_destination(writer, directory, replay)
+    venue.observe_quote(account.account_id)
     writer.verify()
     return bind(
         writer.store,
@@ -104,6 +116,31 @@ def bind_paper(
             revision, writer.company_id, charter_revision, account, exposure_atoms
         ),
         venue,
+    )
+
+
+def switch_paper(
+    writer: WriterLease,
+    previous_directory: Path,
+    directory: Path,
+    *,
+    previous_revision: str,
+    revision: str,
+    charter_revision: str,
+    exposure_atoms: int,
+    from_replay: bool = False,
+    replay: bool = False,
+) -> BindingChange:
+    current = paper_venue(writer.store, previous_directory, replay=from_replay)
+    next_venue, next_account = _binding_destination(writer, directory, replay)
+    return change_paper_binding(
+        writer,
+        previous_revision,
+        PaperMandate(
+            revision, writer.company_id, charter_revision, next_account, exposure_atoms
+        ),
+        current,
+        next_venue,
     )
 
 
