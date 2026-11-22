@@ -32,6 +32,10 @@ These are proposed company types, not vendor endpoints. Any local process or rem
 
 **Isolation.** Start with a scoped workspace, explicitly granted mounts, restricted tools and approved endpoints. Disable or isolate any native shell, browser, hosted tool or network path that could reach company credentials, venue dispatch or another desk outside company mediation. A working directory, instructions or provider hook alone is not this boundary. If the adapter cannot establish it, label it read-only or unsupported; do not qualify it for effectful turns. Persist minimal audit evidence and redacted tool metadata rather than credentials, unrestricted transcripts or hidden reasoning.
 
+**Local execution boundary.** The application supplies an app-owned permission profile from outside the run. Native commands get only the assigned workspace and the minimum system reads, no writes, and no direct network; web search is disabled. The trusted runtime and company tool bridge are separate from the model-directed command boundary. The company service, not the sandbox, owns tool grants, external credentials, durable data and effect admission. A workspace, skill or plug-in cannot change the selected policy. Do not silently substitute a generic read-only profile: it may allow reads of other same-user files.
+
+**Environment portability.** Local Mac execution is required and must operate without a hosted sandbox, cloud deployment, or cloud fallback. The company-side contract is independent of execution location: bind a run and admitted runtime profile, attach only the authorized workspace and tool routes, start with a deadline, observe the effective boundary and status, and fence or stop that run. A future hosted adapter may use different mounts, transport and process controls; it must pass the same authority, isolation, receipt and continuation cases independently before activation. Missing capabilities block that adapter instead of weakening the contract. Moving execution does not transfer credentials, Desk access or an unresolved business effect; it cannot silently change an existing Agent's pinned runtime.
+
 ## Adapter qualification cases
 
 These are acceptance requirements, not claims that a runtime is installed or qualified.
@@ -43,6 +47,7 @@ These are acceptance requirements, not claims that a runtime is installed or qua
 | Trigger and authority | Deliver a scheduled trigger twice. Observe one due duty, no automatic authority and rejection of unsupported effects. A request/response adapter must enforce its own deadline and persist its cursor. |
 | Writer generation | Delay a prior writer's event until after replacement. Neither company work nor the books may change on its authority. |
 | Workspace isolation | Use two authenticated principals. Sharing an excerpt or mentioning an Agent must neither disclose a private desk nor accept an assignment. |
+| Native containment | Run two separately rooted instances through the installed adapter's exact profile. Verify the effective profile, own-workspace reads, denied peer/workbook/credential-canary reads, denied writes, denied peer signaling, and denied direct networking. These observations qualify the tested native command boundary only; a successful start or an authorized company tool result does not prove containment. |
 | Work ownership | Race two workers for one duty and drop the winning worker's terminal event. Observe one accountable generation and an outstanding closure duty; the adapter must not schedule a second copy. |
 
 ## Example: losing the provider connection after a tool request
