@@ -10,6 +10,11 @@ from pathlib import Path
 from sourdough.assessment_run import run_assessment_company
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
 from sourdough.company_assessment import SourceRecord, seal_assessment_source
+from sourdough.company_checkpoint import (
+    CheckpointRefused,
+    checkpoint_company,
+    inspect_company_checkpoint,
+)
 from sourdough.company_run import run_paper_company
 from sourdough.duty_run import count_company_runs
 from sourdough.employee_process import EmployeeProcess
@@ -129,6 +134,13 @@ def main() -> int:
     )
     opening.add_argument("store", type=Path)
     opening.add_argument("--company-id", required=True)
+    checkpoint = commands.add_parser("checkpoint-company")
+    checkpoint.add_argument("store", type=Path)
+    checkpoint.add_argument("archive", type=Path)
+    checkpoint.add_argument("--company-id", required=True)
+    checkpoint_read = commands.add_parser("inspect-company-checkpoint")
+    checkpoint_read.add_argument("archive", type=Path)
+    checkpoint_read.add_argument("--company-id", required=True)
     inspection = commands.add_parser(
         "inspect-work", help="Inspect the local read-only company timeline"
     )
@@ -265,6 +277,10 @@ def main() -> int:
             )
         elif args.command == "reopen":
             result = reopen(args.store, args.company_id)
+        elif args.command == "checkpoint-company":
+            result = checkpoint_company(args.store, args.company_id, args.archive)
+        elif args.command == "inspect-company-checkpoint":
+            result = inspect_company_checkpoint(args.archive, args.company_id)
         elif args.command == "inspect-work":
             print(
                 json.dumps(
@@ -498,6 +514,7 @@ def main() -> int:
                     idle_seconds=args.idle_seconds,
                 )
     except (
+        CheckpointRefused,
         FoundingRefused,
         BindingRefused,
         DutyRefused,
