@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time_ns
+from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
 from sourdough.first_duty import claim_first_duty
@@ -15,7 +16,8 @@ from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxBalance, SandboxPlan
 from sourdough.paper_account import PaperMandate, bind
 from sourdough.paper_execution import PaperIntent, VenueRefused
-from sourdough.paper_order import OrderRefused, submit_paper_order
+from sourdough.paper_order import OrderRefused, OrderReplyUnknown, submit_paper_order
+from sourdough.paper_reconcile import reconcile_paper_orders
 from sourdough.spot_cash import SpotCashUnits
 
 
@@ -97,6 +99,80 @@ class NautilusPaperPort(unittest.TestCase):
             self.assertEqual(
                 venue.execute("SELECT count(*) FROM sandbox_order").fetchone(), (0,)
             )
+
+    def test_admitted_order_waits_for_a_fresh_worker_without_losing_its_identity(self):
+        store = self.venue.journal.with_name("company.sqlite")
+        founded = found(store, FoundingTerms("setup", "charter", "paper", "runtime"))
+        plan = replace(self.plan, company_id=founded.company_id)
+        self.venue.provision(plan)
+        balance = self.venue.start_generation()
+        self.venue.prove_account("departed", "BINANCE-001", "USDT", balance)
+        account = self.venue.observe_account("paper")
+        bind(
+            store,
+            PaperMandate(
+                "mandate", founded.company_id, "charter", account, 10_000_000_000
+            ),
+            self.venue,
+        )
+        price = self.units.price_per_lot(Decimal("59000"))
+        stamp = time_ns()
+        self.venue.publish_quote("departed", price, stamp, stamp)
+        claim = claim_first_duty(store, founded.company_id, "runtime")
+        intent = PaperIntent("resume-original", self.terms.revision, 20, price)
+        self.venue.invalidate_quote()
+        with (
+            patch("sourdough.nautilus_paper.monotonic", side_effect=(0, 13)),
+            self.assertRaises(OrderReplyUnknown) as awaiting,
+        ):
+            submit_paper_order(store, claim, intent, self.venue)
+        order_id = awaiting.exception.order_id
+        with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
+            self.venue.claim_command("departed")
+        with closing(sqlite3.connect(self.venue.journal)) as journal:
+            self.assertEqual(
+                journal.execute(
+                    "SELECT order_id,state,generation FROM sandbox_order"
+                ).fetchall(),
+                [(order_id, "queued", None)],
+            )
+        with closing(sqlite3.connect(store)) as book:
+            self.assertEqual(
+                book.execute("SELECT reserved_minor_units FROM paper_order").fetchall(),
+                [(20 * price,)],
+            )
+        pending = reconcile_paper_orders(store, founded.company_id, self.venue, now=100)
+        self.assertEqual(pending.unresolved, 1)
+        self.assertEqual(pending.recovered, ())
+
+        replacement = NautilusPaperVenue(self.venue.journal)
+        self.assertEqual(replacement.start_generation(), balance)
+        replacement.prove_account("current", "BINANCE-001", "USDT", balance)
+        stamp = time_ns()
+        replacement.publish_quote("current", price, stamp, stamp)
+        command = replacement.claim_command("current")
+        self.assertIsNotNone(command)
+        self.assertEqual(
+            (command.order_id, command.action_id), (order_id, intent.action_id)
+        )
+        self.assertIsNone(replacement.claim_command("current"))
+        replacement.record_fill("current", order_id, "original-fill", 20, price, 0)
+        self.assertTrue(
+            replacement.record_account(
+                "current", order_id, 20, plan.starting_atoms - 20 * price
+            )
+        )
+        receipt = reconcile_paper_orders(
+            store, founded.company_id, replacement, now=102
+        )
+        self.assertEqual(receipt.unresolved, 0)
+        [recovered] = receipt.recovered
+        self.assertEqual(recovered.posting.order_id, order_id)
+        self.assertEqual(recovered.posting.fill_id, "original-fill")
+        self.assertEqual(recovered.original_claim, claim)
+        again = submit_paper_order(store, claim, intent, replacement)
+        self.assertEqual(again.order_id, order_id)
+        self.assertFalse(again.dispatched_now)
 
     def test_fill_replays_once_and_survives_the_sender(self):
         destination = self.venue.provision(self.plan)

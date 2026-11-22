@@ -397,7 +397,6 @@ class NautilusPaperVenue:
             if existing and existing != [astuple(command)]:
                 raise VenueRefused("Sandbox order conflicts with its original identity")
             if not existing:
-                self._fresh_quote(connection)
                 if connection.execute(
                     """SELECT 1 FROM sandbox_order o WHERE state!='filled' AND NOT EXISTS (
                          SELECT 1 FROM sandbox_cancellation c
