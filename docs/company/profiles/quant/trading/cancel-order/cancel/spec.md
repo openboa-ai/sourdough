@@ -18,6 +18,8 @@ The local SDK bridge records a terminal cancellation event with the original ord
 
 A reconciled zero-fill cancellation is a work result, not a fill. Record the original order and event, the position already booked for that account and instrument, and the time the result became available. The same authorized Agent may review that receipt on its next scheduled duty. Recovery settles the original duty from the existing receipt without submitting again.
 
+The SDK adapter uses the same reconciliation path for explicit rejection, denial, and expiry, but preserves the terminal reason. It matches the native event to the original cached order and cumulative fill quantity. A refusal is not published as conclusive to the company until independent SDK account balances corroborate the terminal history; balances must be observable even when the quote feed is stale. A timeout, incomplete event, contradicting fill, or missing balance does not release the original reservation or permit another send.
+
 **Concern for the responsible component:** A cancellation response is not final fill history; obtain terminal evidence and account for late fills before releasing headroom.
 
 ## Functional and quality requirements
@@ -34,6 +36,7 @@ A reconciled zero-fill cancellation is a work result, not a fill. Record the ori
 | --- | --- |
 | Normal | Cancel after two of five are filled. Observe the linked terminal exchange record and release only the confirmed unfilled three. |
 | Failure or contention | Deliver a fill during cancellation and duplicate the earlier cancel response. Apply the fill once and retain uncertainty until the terminal book reconciles. |
+| Terminal refusal | Reject an admitted zero-fill order. Without a corroborated account receipt, the reservation remains held. With the valid receipt, confirm the original terminal reason, zero new position, one release and restart readiness; a timeout on another order does not take this path. |
 
 ## Operations and change review
 

@@ -13,11 +13,12 @@ from typing import TYPE_CHECKING
 
 from .company import _connect, _identity
 from .paper_account import read_applied_binding, reopen_binding
-from .paper_execution import observe_bound_position
+from .paper_execution import TERMINAL_OUTCOMES, observe_bound_position
 
 if TYPE_CHECKING:
     from .paper_execution import (
         PaperExecution,
+        TerminalOutcome,
         VenueCancellation,
         VenueExecution,
         VenuePosition,
@@ -64,7 +65,7 @@ class NoFillObservation:
     position_quantity: int
     available_at: int
     fill_quantity: int = 0
-    status: str = "cancelled"
+    status: TerminalOutcome = "cancelled"
     position_units: str = "instrument_units"
 
     @property
@@ -220,6 +221,8 @@ def _apply_cancellation(
             or not evidence.event_id
             or type(evidence.filled_quantity) is not int
             or not 0 <= evidence.filled_quantity < order[3]
+            or evidence.outcome not in TERMINAL_OUTCOMES
+            or (evidence.outcome in ("rejected", "denied") and evidence.filled_quantity)
         ):
             raise PostingRefused("Cancellation does not match the original order")
         db.execute(
@@ -227,17 +230,29 @@ def _apply_cancellation(
                 order_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_order(order_id),
                 event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL,
                 released INTEGER NOT NULL CHECK (released IN (0,1)),
-                position_quantity INTEGER, available_at INTEGER
+                position_quantity INTEGER, available_at INTEGER,
+                outcome TEXT NOT NULL DEFAULT 'cancelled'
             )"""
         )
+        if "outcome" not in _cancellation_columns(db):
+            db.execute(
+                "ALTER TABLE paper_cancellation ADD COLUMN outcome TEXT NOT NULL DEFAULT 'cancelled'"
+            )
         previous = db.execute(
-            "SELECT order_id,event_id,filled_quantity FROM paper_cancellation WHERE order_id=? OR event_id=?",
+            """SELECT order_id,event_id,filled_quantity,outcome
+               FROM paper_cancellation WHERE order_id=? OR event_id=?""",
             (order_id, evidence.event_id),
         ).fetchall()
-        terms = (order_id, evidence.event_id, evidence.filled_quantity)
+        terms = (
+            order_id,
+            evidence.event_id,
+            evidence.filled_quantity,
+            evidence.outcome,
+        )
         if not previous:
             db.execute(
-                "INSERT INTO paper_cancellation (order_id,event_id,filled_quantity,released) VALUES (?,?,?,0)",
+                """INSERT INTO paper_cancellation
+                   (order_id,event_id,filled_quantity,outcome,released) VALUES (?,?,?,?,0)""",
                 terms,
             )
         elif previous != [terms]:
@@ -288,16 +303,18 @@ def read_no_fill(
 ) -> NoFillObservation | None:
     if _identity(connection) != company_id:
         raise PostingRefused("Company identity mismatch")
-    if not {"position_quantity", "available_at"} <= _cancellation_columns(connection):
+    columns = _cancellation_columns(connection)
+    if not {"position_quantity", "available_at"} <= columns:
         return None
+    outcome = "c.outcome" if "outcome" in columns else "'cancelled'"
     row = connection.execute(
-        """SELECT o.order_id,c.event_id,o.account_id,o.instrument_rules_digest,
-                  c.position_quantity,c.available_at
+        f"""SELECT o.order_id,c.event_id,o.account_id,o.instrument_rules_digest,
+                   c.position_quantity,c.available_at,{outcome}
            FROM paper_cancellation c JOIN paper_order o USING(order_id)
            WHERE c.order_id=? AND c.released=1 AND c.filled_quantity=0 AND c.available_at IS NOT NULL""",
         (order_id,),
     ).fetchone()
-    return NoFillObservation(*row) if row else None
+    return NoFillObservation(*row[:-1], status=row[-1]) if row else None
 
 
 def read_booked_no_fill(
@@ -364,9 +381,16 @@ def post_confirmed_fill(
         return None
     position = (
         observe_bound_position(venue, binding.account, order_id)
-        if cancellation is not None and cancellation.filled_quantity == 0
+        if cancellation is not None
+        and (cancellation.filled_quantity == 0 or cancellation.outcome != "cancelled")
         else None
     )
+    if (
+        cancellation is not None
+        and cancellation.outcome != "cancelled"
+        and position is None
+    ):
+        cancellation = None
     with closing(_connect(store, "rw")) as db, db:
         legacy = _has_legacy_order_index(db)
         if legacy:

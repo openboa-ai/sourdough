@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .market_worker import journal_key
 from .nautilus_paper import NautilusPaperVenue, SandboxBalance
-from .nautilus_paper_worker import capture_cancellation, capture_fill, submit_limit
+from .nautilus_paper_worker import capture_fill, capture_terminal, submit_limit
 from .paper_execution import VenueRefused
 from .replay_tape import ReplayTape
 from .spot_cash import QUOTE_SCALE, SpotCashUnits
@@ -121,9 +121,9 @@ def run(
             except Exception as error:
                 self.error = error
 
-        def on_order_canceled(self, event):
+        def terminal_event(self, event):
             try:
-                self.order_id = capture_cancellation(
+                self.order_id = capture_terminal(
                     venue,
                     generation,
                     units,
@@ -132,6 +132,11 @@ def run(
                 )
             except Exception as error:
                 self.error = error
+
+        on_order_canceled = terminal_event
+        on_order_rejected = terminal_event
+        on_order_denied = terminal_event
+        on_order_expired = terminal_event
 
     engine = BacktestEngine(
         config=BacktestEngineConfig(logging=LoggingConfig(log_level="ERROR"))

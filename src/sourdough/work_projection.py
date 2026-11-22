@@ -122,6 +122,14 @@ def _paper_projection(connection: Connection, tables: set[str]) -> dict | None:
     have_fills = "paper_fill" in tables
     have_fees = have_fills and "paper_fill_fee" in tables
     have_cancellations = "paper_cancellation" in tables
+    terminal = "NULL"
+    if have_cancellations:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(paper_cancellation)")
+        }
+        outcome = "c.outcome" if "outcome" in columns else "'cancelled'"
+        terminal = f"CASE WHEN c.released=1 THEN {outcome} END"
     details = (
         """(SELECT latest.fill_id FROM paper_fill latest WHERE order_id=o.order_id
             ORDER BY latest.rowid DESC LIMIT 1) AS fill_id,
@@ -137,7 +145,7 @@ def _paper_projection(connection: Connection, tables: set[str]) -> dict | None:
                o.quantity AS ordered_quantity,o.reserved_minor_units,o.limit_minor_units,
                {details},
                {"SUM(f.fee_minor_units)" if have_fees else "NULL"} AS fee_minor_units,
-               {"c.released" if have_cancellations else "NULL"} AS cancelled
+               {terminal} AS terminal
         FROM paper_order o
         {"LEFT JOIN paper_fill p ON o.order_id=p.order_id" if have_fills else ""}
         {"LEFT JOIN paper_fill_fee f ON f.fill_id=p.fill_id" if have_fees else ""}
@@ -150,12 +158,9 @@ def _paper_projection(connection: Connection, tables: set[str]) -> dict | None:
             order["quantity"] or 0
         )
         limit = order.pop("limit_minor_units")
-        if order.pop("cancelled"):
-            order["status"] = "cancelled"
-        else:
-            order["status"] = (
-                "filled" if order["remaining_quantity"] == 0 else "unresolved"
-            )
+        order["status"] = order.pop("terminal") or (
+            "filled" if order["remaining_quantity"] == 0 else "unresolved"
+        )
         order["open_reservation_minor_units"] = (
             order["remaining_quantity"] * limit
             if order["status"] == "unresolved"

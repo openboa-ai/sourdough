@@ -56,21 +56,39 @@ def capture_fill(venue, generation: str, units: SpotCashUnits, event) -> str:
     return order_id
 
 
-def capture_cancellation(
-    venue, generation: str, units: SpotCashUnits, order, event
-) -> str:
+def capture_terminal(venue, generation: str, units: SpotCashUnits, order, event) -> str:
     from nautilus_trader.model.enums import OrderStatus
+    from nautilus_trader.model.events import (
+        OrderCanceled,
+        OrderDenied,
+        OrderExpired,
+        OrderRejected,
+    )
+
+    match event:
+        case OrderCanceled():
+            outcome, status = "cancelled", OrderStatus.CANCELED
+        case OrderDenied():
+            outcome, status = "denied", OrderStatus.DENIED
+        case OrderExpired():
+            outcome, status = "expired", OrderStatus.EXPIRED
+        case OrderRejected():
+            outcome, status = "rejected", OrderStatus.REJECTED
+        case _:
+            raise VenueRefused("SDK event does not prove a terminal order outcome")
 
     order_id = str(event.client_order_id)
     filled_quantity = None
     if (
         order is not None
         and order.client_order_id == event.client_order_id
-        and order.status == OrderStatus.CANCELED
+        and order.status == status
     ):
         amount = order.filled_qty.as_decimal()
         filled_quantity = 0 if amount.is_zero() else units.lots(amount)
-    venue.record_cancellation(generation, order_id, str(event.id), filled_quantity)
+    venue.record_cancellation(
+        generation, order_id, str(event.id), filled_quantity, outcome=outcome
+    )
     return order_id
 
 
@@ -164,13 +182,10 @@ async def serve(
                 if not failure.done():
                     failure.set_result(error)
 
-        def on_order_rejected(self, event):
-            venue.mark_unresolved(generation, str(event.client_order_id))
-
-        def on_order_canceled(self, event):
+        def terminal_event(self, event):
             try:
                 pending_account.add(
-                    capture_cancellation(
+                    capture_terminal(
                         venue,
                         generation,
                         units,
@@ -182,8 +197,10 @@ async def serve(
                 if not failure.done():
                     failure.set_result(error)
 
-        on_order_denied = on_order_rejected
-        on_order_expired = on_order_rejected
+        on_order_canceled = terminal_event
+        on_order_rejected = terminal_event
+        on_order_denied = terminal_event
+        on_order_expired = terminal_event
 
     cash = Decimal(checkpoint.cash_atoms) / QUOTE_SCALE
     balances = [f"{cash:f} {currency}"]
@@ -221,6 +238,21 @@ async def serve(
     node.trader.add_strategy(strategy)
     node.build()
     task = asyncio.create_task(node.run_async())
+
+    def read_balance() -> tuple[str, SandboxBalance]:
+        account = strategy.portfolio.account(market_venue)
+        if account is None or not account.is_cash_account:
+            raise VenueRefused("SDK did not create the scoped virtual cash account")
+        quote_cash = account.balance_total(strategy.instrument.quote_currency)
+        base_balance = account.balance_total(strategy.instrument.base_currency)
+        base_amount = (
+            base_balance.as_decimal() if base_balance is not None else Decimal(0)
+        )
+        return str(account.id), SandboxBalance(
+            0 if base_amount.is_zero() else units.lots(base_amount),
+            units.quote_atoms(quote_cash.as_decimal()),
+        )
+
     ready = False
     start_deadline = monotonic() + 30
     deadline = start_deadline
@@ -232,6 +264,13 @@ async def serve(
             if task.done():
                 await task
                 raise VenueRefused("Sandbox stopped before completing its activation")
+            if pending_account:
+                _, balance = read_balance()
+                for order_id in tuple(pending_account):
+                    if venue.record_account(
+                        generation, order_id, balance.position_lots, balance.cash_atoms
+                    ):
+                        pending_account.remove(order_id)
             quote = strategy.quote
             now = time_ns()
             if (
@@ -240,29 +279,8 @@ async def serve(
                 and 0 <= now - strategy.trade_ns <= 15 * 10**9
             ):
                 if not ready:
-                    account = strategy.portfolio.account(market_venue)
-                    if account is None or not account.is_cash_account:
-                        raise VenueRefused(
-                            "SDK did not create the scoped virtual cash account"
-                        )
-                    balance = account.balance_total(strategy.instrument.quote_currency)
-                    base_balance = account.balance_total(
-                        strategy.instrument.base_currency
-                    )
-                    base_amount = (
-                        base_balance.as_decimal()
-                        if base_balance is not None
-                        else Decimal(0)
-                    )
-                    venue.prove_account(
-                        generation,
-                        str(account.id),
-                        currency,
-                        SandboxBalance(
-                            0 if base_amount.is_zero() else units.lots(base_amount),
-                            units.quote_atoms(balance.as_decimal()),
-                        ),
-                    )
+                    account_id, balance = read_balance()
+                    venue.prove_account(generation, account_id, currency, balance)
                 observation = (*quote, strategy.trade_ns)
                 if observation != last_quote:
                     atoms, event_ns, received_ns, trade_ns = observation
@@ -279,27 +297,6 @@ async def serve(
                     os.write(ready_fd, json.dumps(payload).encode() + b"\n")
                     ready = True
                     deadline = monotonic() + seconds
-                if pending_account:
-                    account = strategy.portfolio.account(market_venue)
-                    quote_cash = account.balance_total(
-                        strategy.instrument.quote_currency
-                    )
-                    base_balance = account.balance_total(
-                        strategy.instrument.base_currency
-                    )
-                    base_amount = (
-                        base_balance.as_decimal()
-                        if base_balance is not None
-                        else Decimal(0)
-                    )
-                    for order_id in tuple(pending_account):
-                        if venue.record_account(
-                            generation,
-                            order_id,
-                            0 if base_amount.is_zero() else units.lots(base_amount),
-                            units.quote_atoms(quote_cash.as_decimal()),
-                        ):
-                            pending_account.remove(order_id)
                 command = venue.claim_command(generation)
                 if command is not None:
                     submit_limit(strategy, strategy.instrument, units, command)

@@ -8,6 +8,23 @@ from observe_paper import observe
 
 
 class ConnectedFlow(unittest.TestCase):
+    def test_native_sdk_denial_releases_the_original_reservation_without_a_fill(self):
+        tape = Path(__file__).with_name("causal-quotes.json")
+        with TemporaryDirectory() as scratch:
+            result = observe(
+                Path(scratch) / "sdk-denial",
+                None,
+                tape,
+                expected_lots=0,
+                sdk_risk_denial=True,
+            )
+        self.assertIsNone(result["posting"])
+        self.assertEqual(result["cancellation"]["reserved_atoms"], 0)
+        self.assertEqual(
+            result["sandbox_account"],
+            {"position_lots": 0, "cash_atoms": 100_000_000_000},
+        )
+
     def test_zero_fill_schedules_the_original_agents_follow_up(self):
         tape = Path(__file__).with_name("causal-quotes.json")
         with TemporaryDirectory() as scratch:
