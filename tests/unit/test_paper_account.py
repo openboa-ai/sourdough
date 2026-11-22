@@ -33,7 +33,7 @@ class PaperBindingTests(unittest.TestCase):
             self.store, FoundingTerms("setup", "charter", "paper", "runtime")
         )
         self.account = PaperAccount(
-            "account", "local-v1", "rules", "USD", 5000, "paper"
+            "account", "local-v1", "rules", "USD", 5000, "paper", "venue-id"
         )
         self.destination = Destination(self.account)
         self.mandate = PaperMandate(

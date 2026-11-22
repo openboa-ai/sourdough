@@ -38,7 +38,9 @@ class PaperOrderTests(unittest.TestCase):
         company = found(
             self.store, FoundingTerms("setup", "charter", "paper", "runtime")
         )
-        account = PaperAccount("account", "local-v1", "rules", "USD", 5000, "paper")
+        account = PaperAccount(
+            "account", "local-v1", "rules", "USD", 5000, "paper", "venue-id"
+        )
         self.destination = ObservingDestination(self.store, account)
         bind(
             self.store,
@@ -73,3 +75,16 @@ class PaperOrderTests(unittest.TestCase):
         with self.assertRaises(DutyRefused):
             self.submit(self.intent)
         self.assertEqual(self.destination.submissions, [])
+
+    def test_revoked_grant_replays_only_the_original_receipt(self):
+        self.destination.lose_reply = True
+        with self.assertRaises(TimeoutError):
+            self.submit(self.intent)
+        with closing(sqlite3.connect(self.store)) as db, db:
+            db.execute("UPDATE standing_grant SET scope = 'read'")
+        replay = self.submit(self.intent)
+        self.assertFalse(replay.dispatched_now)
+        self.assertEqual(replay.order_id, self.destination.submissions[0][0])
+        with self.assertRaises(DutyRefused):
+            self.submit(replace(self.intent, action_id="new-action"))
+        self.assertEqual(len(self.destination.submissions), 1)

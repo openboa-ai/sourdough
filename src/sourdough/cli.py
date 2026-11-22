@@ -86,7 +86,7 @@ def main() -> int:
                 args.starting_minor_units,
                 "paper",
             )
-            venue.provision(account, args.quote_minor_units)
+            account = venue.provision(account, args.quote_minor_units)
             result = bind(
                 args.store,
                 PaperMandate(

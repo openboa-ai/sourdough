@@ -94,6 +94,7 @@ def main():
         return
     request = json.load(sys.stdin)
     codex = "/opt/homebrew/bin/codex"
+    model = "gpt-5.6-sol"
     codex_home = Path.home() / "Library/Application Support/Sourdough/Codex"
     env = {
         "HOME": str(codex_home.parent),
@@ -101,6 +102,26 @@ def main():
         "PATH": "/usr/bin:/bin",
     }
     credential_store = ["-c", 'cli_auth_credentials_store="file"']
+    if request["operation"] == "identify":
+        catalog = subprocess.check_output(
+            [codex, *credential_store, "debug", "models"], env=env, timeout=10
+        )
+        entries = [
+            item for item in json.loads(catalog)["models"] if item["slug"] == model
+        ]
+        if len(entries) != 1 or not entries[0].get("comp_hash"):
+            raise SystemExit("Codex model revision is unresolved")
+        version = subprocess.check_output([codex, "--version"], env=env, timeout=10)
+        print(
+            json.dumps(
+                {
+                    "provider": "openai",
+                    "model": model,
+                    "revision": f"{version.decode().strip()}:{entries[0]['comp_hash']}",
+                }
+            )
+        )
+        return
     if not (codex_home / "auth.json").is_file():
         if request["operation"] == "ready":
             print('{"ready":false}')
@@ -134,7 +155,7 @@ def main():
             "exec",
             "--ignore-user-config",
             "--model",
-            "gpt-5.6-sol",
+            model,
             "--ephemeral",
             "--skip-git-repo-check",
             "--sandbox",

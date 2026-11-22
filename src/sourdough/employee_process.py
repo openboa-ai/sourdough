@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from dataclasses import asdict
-from hashlib import file_digest
+from hashlib import file_digest, sha256
 from pathlib import Path
 
 from .first_trade import OrderTool, TradeRefused, TradingContext
@@ -14,8 +14,18 @@ from .first_trade import OrderTool, TradeRefused, TradingContext
 class EmployeeProcess:
     def __init__(self, executable: Path):
         self.executable = executable.resolve()
+        self.profile = self._profile()
+
+    def _profile(self) -> str:
+        selection = self._exchange({"operation": "identify"})
+        if set(selection) != {"provider", "model", "revision"} or not all(
+            isinstance(value, str) and value.strip() for value in selection.values()
+        ):
+            raise TradeRefused("Employee model binding is unresolved")
         with self.executable.open("rb") as stream:
-            self.profile = "process-v1:" + file_digest(stream, "sha256").hexdigest()
+            executable = file_digest(stream, "sha256").hexdigest()
+        terms = json.dumps([executable, selection], sort_keys=True).encode()
+        return "process-v2:" + sha256(terms).hexdigest()
 
     def _exchange(self, request: dict) -> dict:
         try:
@@ -39,10 +49,14 @@ class EmployeeProcess:
         return response
 
     def check_ready(self) -> None:
+        if self._profile() != self.profile:
+            raise TradeRefused("Employee model binding changed")
         if self._exchange({"operation": "ready"}) != {"ready": True}:
             raise TradeRefused("Employee process is unavailable")
 
     def run(self, context: TradingContext, order_tool: OrderTool) -> None:
+        if self._profile() != self.profile:
+            raise TradeRefused("Employee model binding changed")
         response = self._exchange(
             {
                 "operation": "first_duty",

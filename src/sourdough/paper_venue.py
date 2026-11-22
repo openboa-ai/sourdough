@@ -2,7 +2,7 @@
 
 import sqlite3
 from contextlib import closing
-from dataclasses import astuple, dataclass
+from dataclasses import astuple, dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -34,7 +34,7 @@ class FixedQuoteVenue:
             sqlite3.connect(f"{self.journal.absolute().as_uri()}?mode={mode}", uri=True)
         )
 
-    def provision(self, account: PaperAccount, quote_minor_units: int) -> None:
+    def provision(self, account: PaperAccount, quote_minor_units: int) -> PaperAccount:
         if (
             account.environment != "paper"
             or type(quote_minor_units) is not int
@@ -49,7 +49,7 @@ class FixedQuoteVenue:
                    account_id TEXT NOT NULL, connector_revision TEXT NOT NULL,
                    rules TEXT NOT NULL, currency TEXT NOT NULL,
                    starting_minor_units INTEGER NOT NULL, environment TEXT NOT NULL,
-                   quote INTEGER NOT NULL)"""
+                   destination_id TEXT NOT NULL, quote INTEGER NOT NULL)"""
             )
             db.execute(
                 """CREATE TABLE IF NOT EXISTS venue_execution (
@@ -58,14 +58,26 @@ class FixedQuoteVenue:
                    limit_minor_units INTEGER NOT NULL, fill_id TEXT UNIQUE,
                    fill_price_minor_units INTEGER)"""
             )
-            terms = (*astuple(account), quote_minor_units)
             existing = db.execute("SELECT * FROM venue_account").fetchone()
             if existing is None:
+                if account.destination_id:
+                    raise VenueRefused(
+                        "Cannot provision an existing destination identity"
+                    )
+                account = replace(account, destination_id=uuid4().hex)
                 db.execute(
-                    "INSERT INTO venue_account VALUES (1, ?, ?, ?, ?, ?, ?, ?)", terms
+                    "INSERT INTO venue_account VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (*astuple(account), quote_minor_units),
                 )
-            elif existing[1:] != terms:
+            elif (
+                existing[1:-2] != astuple(account)[:-1]
+                or existing[-1] != quote_minor_units
+                or account.destination_id not in ("", existing[-2])
+            ):
                 raise VenueRefused("Paper venue configuration conflicts")
+            else:
+                account = PaperAccount(*existing[1:-1])
+        return account
 
     def observe_account(self, account_id: str) -> PaperAccount:
         with self._open("ro") as db:
