@@ -102,12 +102,15 @@ def company_work_run(
     clock: Callable[[], int] | None = None,
 ) -> ScopedRun:
     projects = project_access(writer, claim, workflow.purpose)
-    if workflow.purpose == ASSESSMENT_REVIEW:
-        instruction = project_review_instruction(writer, claim)
-        if instruction is not None:
-            workflow = replace(
-                workflow, instruction=f"{instruction} {workflow.instruction}"
-            )
+    instruction = (
+        project_review_instruction(writer, claim)
+        if workflow.purpose == ASSESSMENT_REVIEW
+        else None
+    )
+    if instruction is not None:
+        workflow = replace(
+            workflow, instruction=f"{instruction} {workflow.instruction}"
+        )
     additional = (
         (
             PROJECTS,
@@ -204,5 +207,13 @@ def company_work_run(
         return invoke(name, arguments)
 
     return ScopedRun(
-        writer, claim, replace(workflow, tools=workflow.tools + additional), dispatch
+        writer,
+        claim,
+        replace(workflow, tools=workflow.tools + additional),
+        dispatch,
+        context_current=(
+            (lambda: project_review_instruction(writer, claim) == instruction)
+            if instruction is not None
+            else None
+        ),
     )

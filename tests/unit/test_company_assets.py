@@ -464,12 +464,16 @@ class CompanyAssets(unittest.TestCase):
             for agent in ("author", "peer")
         }
 
-        def manifest(agent):
+        def prepare(agent):
             return company_work_run(
                 self.writer, claims[agent], workflow, lambda *_: {"finished": True}
-            ).manifest()
+            )
 
-        self.assertIn("Prepare a private draft.", manifest("author")["instruction"])
+        def manifest(agent):
+            return prepare(agent).manifest()
+
+        prepared = prepare("author")
+        self.assertIn("Prepare a private draft.", prepared.manifest()["instruction"])
         self.assertNotIn("Prepare a private draft.", manifest("peer")["instruction"])
         self.assertIn("Review only shared material.", manifest("peer")["instruction"])
         assign_project(
@@ -480,6 +484,8 @@ class CompanyAssets(unittest.TestCase):
             publishers=(),
             expected_revision=self.project,
         )
+        with self.assertRaisesRegex(DutyRefused, "context changed before disclosure"):
+            prepared.manifest()
         reopened = manifest("author")
         self.assertEqual(reopened["instruction"], workflow.instruction)
         self.assertEqual([entry["name"] for entry in reopened["tools"]], ["finish"])

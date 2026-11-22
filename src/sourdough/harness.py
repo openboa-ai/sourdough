@@ -41,6 +41,8 @@ class ScopedRun:
         claim: DutyClaim,
         workflow: ScopedWorkflow,
         invoke: Callable[[str, dict], dict],
+        *,
+        context_current: Callable[[], bool] | None = None,
     ):
         definitions = {item["name"]: item["inputSchema"] for item in workflow.tools}
         if (
@@ -58,6 +60,7 @@ class ScopedRun:
         self._claim = claim
         self._purpose = workflow.purpose
         self._invoke = invoke
+        self._context_current = context_current
         self._desk_revision, drafts = resolve_desk(
             writer,
             claim,
@@ -91,6 +94,8 @@ class ScopedRun:
     def manifest(self) -> dict:
         if self._current_desk() != self._desk_revision:
             raise DutyRefused("The Agent Desk changed after the context was prepared")
+        if self._context_current is not None and not self._context_current():
+            raise DutyRefused("Scoped context changed before disclosure")
         return json.loads(self._manifest) | {
             "revision": sha256(self._manifest.encode()).hexdigest()
         }
