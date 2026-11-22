@@ -23,5 +23,6 @@ The Agent can investigate, act, wait or delegate within its grant. The quant pro
 ## Development changes
 
 - [Record a decision and its next condition](decide/spec.md)
+- [Continue a duty after a committed result](continue-after-result/spec.md)
 
 Review this intent against the company outcome above. Evidence for implementation, regression and operating behavior belongs to the individual changes; cross-feature acceptance belongs to the company map.
