@@ -96,7 +96,7 @@ def main():
     codex = "/opt/homebrew/bin/codex"
     codex_home = Path.home() / "Library/Application Support/Sourdough/Codex"
     env = {
-        "HOME": str(Path.home()),
+        "HOME": str(codex_home.parent),
         "CODEX_HOME": str(codex_home),
         "PATH": "/usr/bin:/bin",
     }

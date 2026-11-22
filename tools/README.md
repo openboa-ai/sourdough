@@ -10,6 +10,9 @@ mkdir -p -m 700 "$CODEX_HOME"
 codex -c 'cli_auth_credentials_store="file"' login
 ```
 
+The employee process uses an application-specific home and a temporary
+working directory, ignores user Codex configuration, and supplies the
+paper tool explicitly instead of inheriting development MCP settings.
 The adapter starts a
 separate read-only Codex session with one preauthorized MCP proposal tool.
 The tool stages one paper proposal; it has no company or venue database access.
