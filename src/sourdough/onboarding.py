@@ -197,15 +197,19 @@ def claim_hired_first(
 def _desk(connection: Connection, claim: DutyClaim) -> dict:
     authority = resolve_run(connection, claim)
     row = connection.execute(
-        """SELECT o.purpose, desk.manifest_revision, c.charter_revision
+        """SELECT o.purpose, desk.manifest_revision, c.charter_revision,
+                  json_extract(assignment.evidence, '$.summary')
            FROM hire_onboarding o JOIN private_desk desk ON desk.agent_id = o.agent_id
            JOIN agent a ON a.id = o.agent_id JOIN company c ON c.id = a.company_id
+           JOIN hire_receipt hire ON hire.agent_id = o.agent_id
+           JOIN staffing_choice choice ON choice.choice_id = hire.choice_id
+           JOIN staffing_assignment assignment ON assignment.duty_id = choice.duty_id
            WHERE o.first_duty_id = ? AND o.agent_id = ? AND o.state IN ('ready', 'accepted')""",
         (claim.duty_id, claim.founder_id),
     ).fetchone()
     if row is None or authority.duty_state != "running":
         raise DutyRefused("This claim has no active first-duty desk")
-    purpose, manifest, charter = row
+    purpose, manifest, charter, assignment = row
     authority.require_current(purpose)
     snapshot = {
         "duty_id": claim.duty_id,
@@ -213,6 +217,8 @@ def _desk(connection: Connection, claim: DutyClaim) -> dict:
         "purpose": purpose,
         "private_desk_revision": manifest,
         "charter_revision": charter,
+        "assignment_summary": assignment,
+        "granted_scope": authority.current_scope,
     }
     revision = sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
     return snapshot | {"revision": revision}

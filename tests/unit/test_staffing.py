@@ -236,6 +236,8 @@ class Staffing(unittest.TestCase):
             accept_first_duty(self.writer, hire, "unread", "Accept the work.")
         context = read_first_duty(self.writer, hire)
         self.assertEqual(context["charter_revision"], "charter")
+        self.assertEqual(context["assignment_summary"], "Investigate book exceptions")
+        self.assertEqual(context["granted_scope"], "assessment")
         self.assertEqual(read_first_duty(self.writer, hire), context)
         for attempt in range(2):
             self.assertEqual(
