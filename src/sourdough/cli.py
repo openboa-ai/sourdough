@@ -19,6 +19,8 @@ from sourdough.hired_paper_run import run_hired_paper_company
 from sourdough.hiring_run import run_hiring
 from sourdough.market_runtime import observe_market
 from sourdough.market_worker import MarketRefused
+from sourdough.nautilus_runtime import bind_paper as bind_nautilus_paper
+from sourdough.nautilus_runtime import paper_venue, prepare_paper, supervise_paper
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
 from sourdough.paper_execution import VenueRefused
@@ -125,6 +127,29 @@ def main() -> int:
     market.add_argument("--symbol", required=True)
     market.add_argument("--max-age-seconds", type=int, default=15)
     market.add_argument("--samples", type=int, default=3)
+    for command in (
+        "prepare-nautilus-paper",
+        "bind-nautilus-paper",
+        "serve-nautilus-paper",
+        "operate-nautilus-paper",
+    ):
+        sandbox = commands.add_parser(command)
+        sandbox.add_argument("store", type=Path)
+        sandbox.add_argument("directory", type=Path)
+        sandbox.add_argument("--company-id", required=True)
+        if command == "prepare-nautilus-paper":
+            sandbox.add_argument("--account-id", required=True)
+            sandbox.add_argument("--starting-atoms", required=True, type=int)
+        elif command == "bind-nautilus-paper":
+            sandbox.add_argument("--revision", required=True)
+            sandbox.add_argument("--charter-revision", required=True)
+            sandbox.add_argument("--exposure-atoms", required=True, type=int)
+        elif command == "serve-nautilus-paper":
+            sandbox.add_argument("--seconds", type=int, default=60)
+        else:
+            sandbox.add_argument("--employee", type=Path, required=True)
+            sandbox.add_argument("--turn-budget", type=int, default=1)
+            sandbox.add_argument("--idle-seconds", type=int, default=0)
     paper = commands.add_parser("bind-paper")
     paper.add_argument("store", type=Path)
     paper.add_argument("journal", type=Path)
@@ -236,6 +261,43 @@ def main() -> int:
             )
             print(json.dumps(asdict(result)))
             return 0 if result.completed else 1
+        elif args.command == "prepare-nautilus-paper":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                identity = prepare_paper(
+                    writer, args.directory, args.account_id, args.starting_atoms
+                )
+            print(json.dumps({"destination_id": identity}))
+            return 0
+        elif args.command == "bind-nautilus-paper":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                result = bind_nautilus_paper(
+                    writer,
+                    args.directory,
+                    revision=args.revision,
+                    charter_revision=args.charter_revision,
+                    exposure_atoms=args.exposure_atoms,
+                )
+        elif args.command == "serve-nautilus-paper":
+            result = supervise_paper(
+                args.store,
+                args.company_id,
+                args.directory,
+                seconds=args.seconds,
+                emit=lambda event: print(
+                    json.dumps(event), file=sys.stderr, flush=True
+                ),
+            )
+            print(json.dumps(asdict(result)))
+            return 0 if result.completed else 1
+        elif args.command == "operate-nautilus-paper":
+            result = run_paper_company(
+                args.store,
+                args.company_id,
+                paper_venue(args.store, args.directory),
+                EmployeeProcess(args.employee),
+                turn_budget=args.turn_budget,
+                idle_seconds=args.idle_seconds,
+            )
         elif args.command == "bind-paper":
             venue = FixedQuoteVenue(args.journal)
             venue.require_independent_from(args.store)
