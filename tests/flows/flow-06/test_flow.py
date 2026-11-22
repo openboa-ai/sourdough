@@ -84,12 +84,14 @@ print(json.dumps(result))
 """
 
 WORKER = """
-import os, signal, sys
+import os, signal, sqlite3, sys
+from contextlib import closing
 from pathlib import Path
 from time import time
 from sourdough import assessment_run, cli, company_assessment, hired_paper_run
 from sourdough.paper_venue import FixedQuoteVenue
 marker = Path(sys.argv.pop(1))
+fault_site = sys.argv.pop(1)
 def interrupted():
     if not marker.exists():
         marker.touch()
@@ -97,8 +99,16 @@ def interrupted():
 class WithheldFill(FixedQuoteVenue):
     def submit(self, *args):
         result = super().submit(*args)
-        interrupted()
+        if fault_site == "after_fill":
+            interrupted()
         return result
+apply_order = hired_paper_run._apply_paper_order
+def withheld_order(store, claim, intent, venue, writer):
+    if fault_site == "before_send":
+        with closing(sqlite3.connect(venue.journal)) as db:
+            assert db.execute("SELECT count(*) FROM venue_execution").fetchone() == (0,)
+        interrupted()
+    return apply_order(store, claim, intent, venue, writer)
 publish = company_assessment.publish_assessment
 def withheld_assessment(*args, **kwargs):
     result = publish(*args, **kwargs)
@@ -108,6 +118,7 @@ def environment_clock():
     return time() + (121 if marker.exists() else 0)
 assessment_run.time = environment_clock
 hired_paper_run.time = environment_clock
+hired_paper_run._apply_paper_order = withheld_order
 cli.FixedQuoteVenue = WithheldFill
 company_assessment.publish_assessment = withheld_assessment
 raise SystemExit(cli.main())
@@ -116,11 +127,11 @@ raise SystemExit(cli.main())
 DRIVER = """
 import sys
 from sourdough import cli
-worker, marker = sys.argv[1:3]
-del sys.argv[1:3]
+worker, marker, fault_site = sys.argv[1:4]
+del sys.argv[1:4]
 supervise = cli.supervise_worker
 def start(command, store, company_id, **options):
-    candidate = [sys.executable, "-IB", "-c", worker, marker, *command[4:]]
+    candidate = [sys.executable, "-IB", "-c", worker, marker, fault_site, *command[4:]]
     return supervise(candidate, store, company_id, **options)
 cli.supervise_worker = start
 raise SystemExit(cli.main())
@@ -146,13 +157,14 @@ def rows(store, sql):
 
 class ConnectedFlow(unittest.TestCase):
     def test_end_to_end(self):
-        for scope, submit_request in (
-            ("assessment", True),
-            ("paper", True),
-            ("paper", False),
+        for scope, submit_request, fault_site in (
+            ("assessment", True, "after_publication"),
+            ("paper", True, "after_fill"),
+            ("paper", True, "before_send"),
+            ("paper", False, "none"),
         ):
             with (
-                self.subTest(scope=scope, submit_request=submit_request),
+                self.subTest(scope=scope, fault_site=fault_site),
                 TemporaryDirectory() as local,
             ):
                 root = Path(local)
@@ -268,6 +280,7 @@ class ConnectedFlow(unittest.TestCase):
                         DRIVER,
                         WORKER,
                         str(root / "cut"),
+                        fault_site,
                         *entry,
                         *identity,
                         "--employee",

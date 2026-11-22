@@ -17,10 +17,11 @@ from .duty_run import (
     count_company_runs,
 )
 from .employee_process import EmployeeProcess
-from .first_trade import TradeRefused, _apply_paper_order
+from .first_trade import TradeRefused, _apply_paper_order, resume_opening_research
 from .hiring_run import HiringRun, prepare_hiring
 from .onboarding import first_duty_accepted, invoke_onboarding
 from .paper_account import reopen_binding
+from .paper_books import Posting
 from .paper_order import PaperIntent
 from .paper_reconcile import PaperReconciliation
 from .paper_research import (
@@ -32,7 +33,6 @@ from .paper_research import (
 )
 from .paper_venue import FixedQuoteVenue
 from .work import (
-    FollowUp,
     ResultReference,
     claim_bound_position_review,
     finish_first_duty,
@@ -54,10 +54,21 @@ def _settle_opening(
     writer: WriterLease,
     claim: DutyClaim,
     receipt: ResearchDecisionReceipt,
-    result: ResultReference,
-) -> FollowUp:
+    posting: Posting | None = None,
+) -> None:
     writer.verify_for(writer.store, claim.company_id)
-    return finish_first_duty(writer.store, claim, result, due_at=receipt.next_due_at)
+    if posting is not None:
+        result = _book_reference(writer.store, claim.company_id, posting)
+    elif receipt.decision.action != "buy":
+        result = ResultReference(
+            "research_finding",
+            receipt.finding_id,
+            receipt.decision.observation_revision,
+            receipt.decided_at,
+        )
+    else:
+        return
+    finish_first_duty(writer.store, claim, result, due_at=receipt.next_due_at)
 
 
 def _hired_research(
@@ -102,13 +113,7 @@ def _hired_research(
             "Hired paper execution needs the Agent's own committed finding"
         )
     if receipt.decision.action != "buy":
-        result = ResultReference(
-            "research_finding",
-            receipt.finding_id,
-            receipt.decision.observation_revision,
-            receipt.decided_at,
-        )
-        _settle_opening(writer, claim, receipt, result)
+        _settle_opening(writer, claim, receipt)
         return receipt
     decision = receipt.decision
     with closing(_connect(writer.store, "ro")) as connection:
@@ -128,9 +133,7 @@ def _hired_research(
         decision.limit_minor_units,
     )
     order = _apply_paper_order(writer.store, claim, intent, venue, writer)
-    if order.posting is not None:
-        result = _book_reference(writer.store, claim.company_id, order.posting)
-        _settle_opening(writer, claim, receipt, result)
+    _settle_opening(writer, claim, receipt, order.posting)
     return receipt
 
 
@@ -163,15 +166,21 @@ def run_hired_paper_company(
                 "Company run history is behind the hired paper activation"
             )
         remaining = max(0, turn_budget - used)
-        if not remaining or reconciled.unresolved or blocked:
+        if reconciled.unresolved or blocked:
             return HiredPaperRun(None, None, reconciled, None, blocked)
+        opening = resume_opening_research(writer, venue, hired=True)
+        research = opening.research if opening is not None else None
+        if opening is not None and research is not None:
+            posting = opening.order.posting if opening.order is not None else None
+            _settle_opening(writer, opening.claim, research, posting)
+        if not remaining:
+            return HiredPaperRun(None, research, reconciled, None)
         employee = runtime()
         agent_id = owed_hired_follow_up_owner(
             store, company_id, employee.profile, POSITION_REVIEW
         )
         hiring = None
-        research = None
-        if agent_id is None and remaining >= 2:
+        if opening is None and agent_id is None and remaining >= 2:
             hiring = prepare_hiring(writer, employee, first_purpose=PAPER_EXECUTION)
             claim = hiring.hire_claim
             if claim is None:
