@@ -45,6 +45,7 @@ def main() -> int:
         paper.add_argument(f"--{name}", required=True)
     for name in ("starting-minor-units", "exposure-minor-units", "quote-minor-units"):
         paper.add_argument(f"--{name}", required=True, type=int)
+    paper.add_argument("--fee-bps", type=int, default=0)
     for command in ("first-duty", "operate-paper"):
         running = commands.add_parser(command)
         running.add_argument("store", type=Path)
@@ -92,7 +93,9 @@ def main() -> int:
                 args.starting_minor_units,
                 "paper",
             )
-            account = venue.provision(account, args.quote_minor_units)
+            account = venue.provision(
+                account, args.quote_minor_units, fee_bps=args.fee_bps
+            )
             result = bind(
                 args.store,
                 PaperMandate(

@@ -27,6 +27,7 @@ class Posting:
     order_id: str
     quantity: int
     price_minor_units: int
+    fee_minor_units: int = 0
 
 
 @dataclass(frozen=True)
@@ -47,17 +48,29 @@ class PositionObservation:
 
 
 def post_confirmed_fill(
-    store: Path, company_id: str, order_id: str, venue: FixedQuoteVenue
+    store: Path,
+    company_id: str,
+    order_id: str,
+    venue: FixedQuoteVenue,
+    *,
+    account_sync: bool = False,
 ) -> Posting | None:
     binding = reopen_binding(store, company_id)
     if venue.observe_account(binding.account.account_id) != binding.account:
         raise PostingRefused("Destination account mismatch")
-    observed = venue.observe_execution(order_id)
+    observed = (
+        venue.sync_account_execution(binding.account.account_id, order_id)
+        if account_sync
+        else venue.observe_execution(order_id)
+    )
     if observed is None or observed.fill_id is None:
         return None
     price = observed.fill_price_minor_units
     if type(price) is not int or not 0 < price <= observed.limit_minor_units:
         raise PostingRefused("Invalid fill price")
+    fee = observed.fee_minor_units
+    if type(fee) is not int or not 0 <= fee <= 2**63 - 1:
+        raise PostingRefused("Invalid fill fee")
     with closing(_connect(store, "rw")) as db, db:
         db.execute("BEGIN IMMEDIATE")
         if _identity(db) != company_id or reopen_binding(store, company_id) != binding:
@@ -84,6 +97,12 @@ def post_confirmed_fill(
                 price_minor_units INTEGER NOT NULL
             )"""
         )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS paper_fill_fee (
+                fill_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_fill(fill_id),
+                fee_minor_units INTEGER NOT NULL
+            )"""
+        )
         terms = (observed.fill_id, order_id, observed.quantity, price)
         existing = db.execute(
             "SELECT * FROM paper_fill WHERE order_id = ? OR fill_id = ?",
@@ -92,12 +111,20 @@ def post_confirmed_fill(
         if not existing:
             db.execute("INSERT INTO paper_fill VALUES (?, ?, ?, ?)", terms)
             db.execute(
+                "INSERT INTO paper_fill_fee VALUES (?, ?)", (observed.fill_id, fee)
+            )
+            db.execute(
                 "UPDATE paper_order SET reserved_minor_units = ? WHERE order_id = ?",
                 (observed.quantity * price, order_id),
             )
-        elif existing != [terms]:
-            raise PostingRefused("Fill conflicts with an existing posting")
-    return Posting(*terms)
+        else:
+            prior_fee = db.execute(
+                "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id = ?",
+                (observed.fill_id,),
+            ).fetchone()
+            if existing != [terms] or (prior_fee or (0,)) != (fee,):
+                raise PostingRefused("Fill conflicts with an existing posting")
+    return Posting(*terms, fee)
 
 
 def position_quantity(store: Path, company_id: str) -> int:
