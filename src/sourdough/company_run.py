@@ -16,7 +16,12 @@ from .duty_run import (
     count_company_runs,
 )
 from .employee_process import EmployeeProcess
-from .first_trade import TradeRefused, TradeResult, run_first_trade
+from .first_trade import (
+    TradeRefused,
+    TradeResult,
+    resume_opening_research,
+    run_first_trade,
+)
 from .paper_account import reopen_binding
 from .paper_books import (
     Posting,
@@ -131,14 +136,18 @@ def _operate(
     reconciliation, blocked = _recover(writer, venue, next_purpose)
     if on_ready is not None:
         on_ready(writer)
-    first = None
+    first = (
+        None if reconciliation.unresolved else resume_opening_research(writer, venue)
+    )
     if (
-        turn_budget
+        first is None
+        and turn_budget
         and not reconciliation.unresolved
         and reopen(store, company_id).due_work_ids
     ):
         first = run_first_trade(store, company_id, venue, runtime, writer=writer)
         turn_budget -= 1
+    if first is not None:
         research = first.research
         writer.verify()
         if first.order is not None and first.order.posting is not None:

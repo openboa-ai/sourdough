@@ -380,6 +380,39 @@ def reopen_research_decision(
         return receipt
 
 
+def find_unsubmitted_opening(
+    store: Path, company_id: str
+) -> tuple[DutyClaim, ResearchDecisionReceipt] | None:
+    with closing(_connect(store, "ro")) as connection:
+        connection.execute("BEGIN")
+        if not _table(connection, "paper_research_decision"):
+            return None
+        unsubmitted = (
+            "AND NOT EXISTS (SELECT 1 FROM paper_order o WHERE o.run_id = r.run_id)"
+            if _table(connection, "paper_order")
+            else ""
+        )
+        row = connection.execute(
+            f"""SELECT f.id, s.grant_id, d.id, r.run_id, f.execution_profile
+                FROM founding_receipt s
+                JOIN founder f ON f.id = s.founder_id AND f.company_id = s.company_id
+                JOIN duty d ON d.id = s.due_work_id AND d.state = 'running'
+                JOIN duty_run r ON r.duty_id = d.id AND r.is_current = 1
+                JOIN paper_research_decision decision
+                    ON decision.duty_id = d.id AND decision.run_id = r.run_id
+                WHERE s.company_id = ? {unsubmitted}""",
+            (company_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        claim = DutyClaim(company_id, *row)
+        require_paper_authority(connection, claim)
+        receipt = _research_decision(connection, claim)
+        if receipt is None:
+            raise DutyRefused("Interrupted research decision has no matching finding")
+        return claim, receipt
+
+
 def allows_research_order(
     connection: Connection, claim: DutyClaim, action_id: str, quantity: int, limit: int
 ) -> bool:

@@ -16,6 +16,8 @@ from .first_duty import DutyRefused
 from .first_trade import OrderTool, TradeRefused, TradingContext
 from .writer_lease import WriterRefused
 
+MAX_RESEARCH_REQUEST = 64 * 1024
+
 
 class _ReadWorkResult(socketserver.BaseRequestHandler):
     def handle(self) -> None:
@@ -37,8 +39,8 @@ class _ResearchTool(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         self.request.settimeout(2)
         try:
-            line = self.rfile.readline(8193)
-            if not line.endswith(b"\n") or len(line) > 8192:
+            line = self.rfile.readline(MAX_RESEARCH_REQUEST + 1)
+            if not line.endswith(b"\n") or len(line) > MAX_RESEARCH_REQUEST:
                 raise DutyRefused("Invalid research tool request")
             request = json.loads(line)
             if not isinstance(request, dict) or set(request) != {"name", "arguments"}:

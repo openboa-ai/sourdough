@@ -20,6 +20,8 @@ class ConnectedFlow(unittest.TestCase):
         later_action="buy",
         fee_bps=0,
         research_action="buy",
+        research_reply="complete",
+        long_finding=False,
     ):
         directory = Path(self.enterContext(TemporaryDirectory()))
         self.store = directory / "company.sqlite"
@@ -31,7 +33,9 @@ class ConnectedFlow(unittest.TestCase):
             f"limit = {limit}\n"
             f"later_action = {later_action!r}\n"
             f"research_action = {research_action!r}\n"
-            """import json, socket, sys
+            f"research_reply = {research_reply!r}\n"
+            f"long_finding = {long_finding}\n"
+            """import json, os, signal, socket, sys
 request = json.load(sys.stdin)
 operation = request["operation"]
 if operation == "identify":
@@ -55,10 +59,10 @@ elif operation == "research_duty":
     gross = prices[1] - prices[0]
     fees = sum((value * snapshot["fee_bps"] + 5000) // 10000 for value in prices)
     finding = invoke("publish_research_finding", {
-        "snapshot_revision":snapshot["revision"],"hypothesis":"Compare move and synthetic costs",
+        "snapshot_revision":snapshot["revision"],"hypothesis":"🧪" * 2000 if long_finding else "Compare move and synthetic costs",
         "start_id":start["observation_id"],"end_id":end["observation_id"],
         "gross_change_minor_units":gross,"round_trip_fee_minor_units":fees,"net_change_minor_units":gross-fees,
-        "uncertainty":"A fixture does not provide market evidence.",
+        "uncertainty":"証" * 2000 if long_finding else "A fixture does not provide market evidence.",
     })
     proposal = {
         "finding_id":finding["finding_id"],"finding_revision":finding["revision"],"call_id":"research-decision",
@@ -68,6 +72,11 @@ elif operation == "research_duty":
     if research_action == "buy":
         proposal.update(quantity=2, limit_minor_units=100)
     result = invoke("record_research_decision", proposal)
+    if research_reply == "exit":
+        raise SystemExit(37)
+    if research_reply == "kill":
+        os.kill(os.getppid(), signal.SIGKILL)
+        raise SystemExit(38)
 elif operation in ("review_duty", "trade_duty"):
     revision = "invented"
     rationale = "No result was read."
@@ -557,3 +566,66 @@ raise SystemExit(0 if bound.completed else 1)
         self.assertEqual(
             self.read(self.venue, "SELECT count(*) FROM venue_execution"), [(0,)]
         )
+
+    def test_research_commit_survives_employee_exit_and_full_unicode_payload(self):
+        self.prepare(
+            research_action="investigate", research_reply="exit", long_finding=True
+        )
+        self.stage_observations()
+        result = self.operate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (body,) = self.read(self.store, "SELECT content FROM paper_research_finding")
+        finding = json.loads(body[0])
+        self.assertEqual(finding["hypothesis"], "🧪" * 2000)
+        self.assertEqual(finding["uncertainty"], "証" * 2000)
+        self.assertEqual(self.read(self.store, "SELECT count(*) FROM duty_run"), [(1,)])
+        self.assertEqual(
+            self.read(self.store, "SELECT count(*) FROM work_follow_up"), [(1,)]
+        )
+        self.assertEqual(
+            self.read(self.venue, "SELECT count(*) FROM venue_execution"), [(0,)]
+        )
+
+    def test_company_reopens_committed_research_without_a_second_agent_turn(self):
+        for action, expected_orders in (("investigate", 0), ("buy", 1)):
+            with self.subTest(action=action):
+                self.prepare(research_action=action, research_reply="kill")
+                self.stage_observations()
+                cut = self.operate()
+                self.assertEqual(cut.returncode, -signal.SIGKILL, cut.stderr)
+                original = self.read(
+                    self.store,
+                    "SELECT run_id, decision_id FROM paper_research_decision",
+                )
+                self.assertEqual(len(original), 1)
+                self.assertEqual(
+                    self.read(self.venue, "SELECT count(*) FROM venue_execution"),
+                    [(0,)],
+                )
+                self.success(
+                    "operate-paper",
+                    self.store,
+                    self.venue,
+                    *self.identity,
+                    "--employee",
+                    self.peer,
+                    "--turn-budget",
+                    "1",
+                )
+                self.assertEqual(
+                    self.read(
+                        self.store,
+                        "SELECT run_id, decision_id FROM paper_research_decision",
+                    ),
+                    original,
+                )
+                self.assertEqual(
+                    self.read(self.store, "SELECT count(*) FROM duty_run"), [(1,)]
+                )
+                self.assertEqual(
+                    self.read(self.venue, "SELECT count(*) FROM venue_execution"),
+                    [(expected_orders,)],
+                )
+                self.assertEqual(
+                    self.read(self.store, "SELECT count(*) FROM work_follow_up"), [(1,)]
+                )
