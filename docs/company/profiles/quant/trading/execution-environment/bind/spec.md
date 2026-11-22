@@ -1,0 +1,32 @@
+# Bind an execution environment to the shared trading core
+
+Design draft · Verification **UNRUN** · Responsible component: Quant profile and connector gateway; risk, investment subledger and reconciliation retain their existing ownership. [Feature intent](../intent.md) · [Paper binding](../../paper-account/bind/spec.md) · [External qualification](../../venue-qualification/intent.md) · [Parity trial](../../../../../../acceptance/execution-parity/spec.md)
+
+## Boundary and dependencies
+
+An authorized actor registers company, account, immutable environment kind (paper, external test or live), destination and credential handles, connector and schema revisions, canonical instrument and account-mode mapping, units and rounding, grant, risk envelope, and declared observation/dispatch/recovery capabilities. The actual destination independently confirms identity and environment before the binding is eligible. The trading core, its risk and accounting invariants and its tool contracts are common; the adapter translates the destination-specific protocol. A provider-specific client ID need not be globally unique: the company action ID and its scoped venue/account/order mapping stay stable.
+
+The market-data source is separately identified and can be a read-only production feed for paper evaluation. Its source environment must never be interpreted as authorization for a production execution endpoint.
+
+The selected runtime implements trading functions rather than being duplicated; the company [launches and configures it](../launch/spec.md). Company ownership is an authority and durability contract, not a requirement for a second accounting database: the selected store may be supplied by an integrated component if it proves the required atomic commit, single-writer, access and recovery properties. The company owns idempotency, retry and recovery across the runtime boundary; where needed it supplies a narrow durable admission boundary. Clearly identify which record is authoritative; an engine cache or projection must not silently become a competing financial writer. The same admitted path and binding checks apply even if the engine can otherwise send orders directly.
+
+Input contracts: [connector registration](../../../../../systems/connectors/connect-resource/register/spec.md) · [paper bind](../../paper-account/bind/spec.md) for the first simulator binding · [risk admission](../../admit-intent/reserve/spec.md). An external binding additionally requires its selected profile and separately authorized [qualification](../../venue-qualification/intent.md). Merely declaring a live binding does not authorize or send a live order.
+
+## Requirements
+
+- **FR-1 Common core.** The same core revision and public decision, order, risk, reservation, cancellation, reconciliation, posting and performance contracts serve each environment. Bind environment and immutable account/connector revision into every action, submission, fill and financial source before dispatch. A mode flag, adapter or strategy cannot bypass an invariant. Paper is not a separate simplified trading engine.
+- **FR-2 Identity and isolation.** Separate credentials, execution-destination identifiers, account state, funding, reservations and books by company/account/environment. Authenticate the actual destination independently, fail closed on mismatch and never fall back to another environment. A paper order cannot reach a live execution destination even if endpoint configuration or an adapter is malformed. Read-only production market-data requests are permitted only under their separate source binding and can never submit an order.
+- **FR-3 Capability matching.** Declare and verify support for instrument/account modes, order types, sizing, time-in-force, identities, lookup, history coverage and finality before the affected capability is enabled. Normalize accepted, rejected, partial, terminal and unknown outcomes without inventing unsupported guarantees. Where a venue cannot prove definitive absence, an empty lookup remains unknown; do not assume a simulator's seal or universal idempotence.
+- **FR-4 Safe changeover.** Select an already-authorized new binding by explicit versioned command and record its effective point. Prevent new dispatch on the retired selection; fence old senders and preserve each outstanding effect, reservation, position, credential access and lookup on its original binding. An incompatible binding, exposure or unresolved state blocks dependent activation until the applicable risk and authority policy is satisfied. Do not transfer or replay the old order into the new environment. Independent reconciliation continues even if the new binding cannot activate.
+- **NFR.** Environment isolation is enforced server-side, not by display color or Agent instructions. A change of venue, account, credentials, instrument rules or core revision is independently qualified; registration is not conformance, external readiness or live activation.
+
+## Independent evidence
+
+| Case | Required observation |
+| --- | --- |
+| Same core, two bindings | Pin one core artifact and run the common [parity suite](../../../../../../acceptance/execution-parity/spec.md) against separate simulator and external-protocol emulator bindings. Confirm matching core digest, normalized decisions, exposure and books on common declared scripted capabilities. |
+| Mismatch and leakage | Pair paper execution with a read-only production market feed and confirm allowed data reads. Attempt to send paper authority to a live execution destination or credentials, and substitute a different instrument multiplier. Deny before order network send, retain original execution binding and prove zero order calls to the forbidden destination with an independent observer. |
+| Outstanding effect | Simulate timeout after an external acceptance, switch selections and restart. Query and reconcile the original environment and ID, retain its reserved exposure until conclusive, and prove no duplicate or cross-environment replay. The new account does not inherit the old position. |
+| Missing capability | An adapter cannot establish historical order coverage or delayed-send fencing. The affected absence stays unknown and dependent new risk remains blocked; an adapter registration or simulator result cannot upgrade that capability. |
+
+This spec defines a shared core and binding contract, not authorization to execute a live order.
