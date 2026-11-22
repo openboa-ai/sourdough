@@ -1,4 +1,6 @@
 import json
+import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -6,10 +8,11 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import monotonic, sleep
 
 
 class ConnectedFlow(unittest.TestCase):
-    def prepare(self, *, skip_read=False, limit=100, later_action="buy"):
+    def prepare(self, *, skip_read=False, limit=100, later_action="buy", fee_bps=0):
         directory = Path(self.enterContext(TemporaryDirectory()))
         self.store = directory / "company.sqlite"
         self.venue = directory / "venue.sqlite"
@@ -88,6 +91,8 @@ print(json.dumps(result))
             "1000",
             "--quote-minor-units",
             "100",
+            "--fee-bps",
+            str(fee_bps),
         )
 
     def cli(self, *args):
@@ -279,3 +284,151 @@ print(json.dumps(result))
         self.assertEqual(
             self.read(self.venue, "SELECT count(*) FROM venue_execution"), [(1,)]
         )
+
+    def test_supervisor_rebooks_original_fill_after_a_physical_receipt_cut(self):
+        self.prepare(fee_bps=50)
+        marker = self.store.with_name("venue-barrier")
+        worker = """
+import json, os, sys
+from pathlib import Path
+from time import sleep
+from sourdough import cli
+from sourdough.paper_venue import FixedQuoteVenue
+
+marker = Path(sys.argv.pop(1))
+class ReceiptBarrier(FixedQuoteVenue):
+    def submit(self, order_id, account_id, intent):
+        super().submit(order_id, account_id, intent)
+        with marker.open("x") as stream:
+            json.dump({"pid":os.getpid(),"order_id":order_id},stream)
+        sleep(30)
+cli.FixedQuoteVenue = ReceiptBarrier
+raise SystemExit(cli.main())
+"""
+        driver = """
+from dataclasses import asdict
+import json, sys
+from pathlib import Path
+from sourdough.supervisor import supervise_worker
+
+worker, marker, store, journal, company, employee = sys.argv[1:]
+events = []
+bound = supervise_worker(
+    [sys.executable, "-IB", "-c", worker, marker, "_paper-worker", store, journal,
+     "--company-id", company, "--employee", employee, "--turn-budget", "2", "--budget-from", "0"],
+    Path(store), company, max_restarts=1, startup_seconds=5, max_seconds=12, emit=events.append,
+)
+print(json.dumps({"supervisor":asdict(bound),"events":events}),flush=True)
+raise SystemExit(0 if bound.completed else 1)
+"""
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-IB",
+                "-c",
+                driver,
+                worker,
+                str(marker),
+                str(self.store),
+                str(self.venue),
+                self.company["company_id"],
+                str(self.peer),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as parent:
+            deadline = monotonic() + 5
+            cut = None
+            while parent.poll() is None and monotonic() < deadline:
+                if marker.is_file():
+                    try:
+                        cut = json.loads(marker.read_text())
+                        break
+                    except ValueError:
+                        pass
+                sleep(0.02)
+            if cut is None:
+                _, diagnostic = parent.communicate(timeout=14)
+                self.fail(f"The durable venue cut was not observed: {diagnostic}")
+            (original,) = self.read(
+                self.venue, "SELECT order_id, fill_id, quantity FROM venue_execution"
+            )
+            self.assertEqual(original[0], cut["order_id"])
+            self.assertIsNotNone(original[1])
+            self.assertEqual(
+                self.read(
+                    self.store,
+                    "SELECT name FROM sqlite_schema WHERE name = 'paper_fill'",
+                ),
+                [],
+            )
+            os.kill(cut["pid"], signal.SIGKILL)
+            output, diagnostic = parent.communicate(timeout=14)
+        self.assertEqual(parent.returncode, 0, diagnostic)
+        worker_receipt, supervisor_receipt = [
+            json.loads(line) for line in output.splitlines()
+        ]
+        prior, replacement = supervisor_receipt["supervisor"]["attempts"]
+        self.assertEqual(
+            (prior["pid"], prior["returncode"]), (cut["pid"], -signal.SIGKILL)
+        )
+        self.assertNotEqual(replacement["pid"], prior["pid"])
+        self.assertLess(prior["exited_at_ns"], replacement["ready_at_ns"])
+        self.assertEqual(replacement["returncode"], 0)
+        self.assertEqual(
+            self.read(
+                self.venue, "SELECT order_id, fill_id, quantity FROM venue_execution"
+            ),
+            [original],
+        )
+        self.assertEqual(
+            self.read(self.store, "SELECT order_id, fill_id, quantity FROM paper_fill"),
+            [original],
+        )
+        self.assertEqual(
+            self.read(self.store, "SELECT fee_minor_units FROM paper_fill_fee"), [(1,)]
+        )
+        self.assertEqual(
+            self.read(self.venue, "SELECT fee_minor_units FROM venue_fill_fee"), [(1,)]
+        )
+        self.assertEqual(
+            self.read(self.store, "SELECT reserved_minor_units FROM paper_order"),
+            [(200,)],
+        )
+        (recovered,) = worker_receipt["reconciliation"]["recovered"]
+        self.assertEqual(recovered["sources"], ["history", "account_sync"])
+        self.assertEqual(recovered["posting"]["fill_id"], original[1])
+        decision = worker_receipt["review"]
+        self.assertEqual(decision["claim"]["founder_id"], self.company["founder_id"])
+        self.assertNotEqual(
+            decision["claim"]["duty_id"], recovered["original_claim"]["duty_id"]
+        )
+        self.assertEqual(self.read(self.store, "SELECT count(*) FROM duty_run"), [(2,)])
+        self.assertEqual(
+            self.read(self.store, "SELECT count(*) FROM work_review_decision"), [(1,)]
+        )
+
+    def test_installed_supervisor_entry_completes_the_normal_operating_path(self):
+        self.prepare()
+        response = self.cli(
+            "supervise-paper",
+            self.store,
+            self.venue,
+            *self.identity,
+            "--employee",
+            self.peer,
+            "--max-restarts",
+            "0",
+            "--turn-budget",
+            "2",
+        )
+        self.assertEqual(response.returncode, 0, response.stderr)
+        worker, supervisor = [json.loads(line) for line in response.stdout.splitlines()]
+        self.assertTrue(supervisor["completed"])
+        (attempt,) = supervisor["attempts"]
+        self.assertIsNotNone(attempt["ready_at_ns"])
+        self.assertEqual(
+            worker["review"]["claim"]["founder_id"], self.company["founder_id"]
+        )
+        self.assertEqual(self.read(self.store, "SELECT count(*) FROM duty_run"), [(2,)])

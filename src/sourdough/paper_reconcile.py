@@ -10,6 +10,7 @@ from .duty_run import DutyClaim
 from .paper_account import reopen_binding
 from .paper_books import Posting, PostingRefused, post_confirmed_fill
 from .paper_venue import FixedQuoteVenue
+from .writer_lease import WriterLease
 
 
 MAX_LOOKUP_ATTEMPTS = 6
@@ -117,6 +118,7 @@ def reconcile_paper_orders(
     *,
     now: int,
     lookup_limit: int = 16,
+    writer: WriterLease | None = None,
 ) -> PaperReconciliation:
     if (
         type(now) is not int
@@ -128,6 +130,8 @@ def reconcile_paper_orders(
     account = binding.account
     if venue.observe_account(account.account_id) != account:
         raise PostingRefused("Recovery requires the original paper destination")
+    if writer is not None:
+        writer.verify_for(store, company_id)
     candidates = _open_recovery(
         store, company_id, account.account_id, now, lookup_limit
     )
@@ -145,7 +149,12 @@ def reconcile_paper_orders(
         for source, account_sync in (("history", False), ("account_sync", True)):
             try:
                 posting = post_confirmed_fill(
-                    store, company_id, order_id, venue, account_sync=account_sync
+                    store,
+                    company_id,
+                    order_id,
+                    venue,
+                    account_sync=account_sync,
+                    writer=writer,
                 )
             except TimeoutError:
                 continue
@@ -153,6 +162,8 @@ def reconcile_paper_orders(
                 observed.append((source, posting))
         posting = observed[0][1] if observed else None
         sources = tuple(source for source, _ in observed)
+        if writer is not None:
+            writer.verify_for(store, company_id)
         _record_lookup(store, company_id, order_id, now, attempts + 1, posting, sources)
         if posting is not None:
             claim = DutyClaim(

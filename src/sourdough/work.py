@@ -260,6 +260,21 @@ def follow_up_state(
     return authority.duty_state, authority.current_scope
 
 
+def reopen_follow_up(store: Path, claim: DutyClaim) -> FollowUpClaim:
+    with closing(_connect(store, "ro")) as connection:
+        connection.execute("BEGIN")
+        _check_store(connection, claim.company_id)
+        authority = resolve_run(connection, claim)
+        row = connection.execute(
+            """SELECT result_kind, result_id, result_revision, available_at, purpose
+               FROM work_follow_up WHERE duty_id = ? AND grant_id = ?""",
+            (claim.duty_id, claim.grant_id),
+        ).fetchone()
+        if row is None or row[-1] != authority.purpose:
+            raise DutyRefused("No matching scheduled duty for the original run")
+        return FollowUpClaim(claim, ResultReference(*row[:4]), row[4])
+
+
 def read_follow_up_result(
     store: Path,
     follow_up: FollowUpClaim,

@@ -43,6 +43,11 @@ class WriterLease:
     def store_key(self) -> tuple[int, int]:
         return self._store_key
 
+    def verify_for(self, store: Path, company_id: str) -> None:
+        if self.store != store.absolute() or self.company_id != company_id:
+            raise WriterRefused("Writer lease belongs to another store or company")
+        self.verify()
+
     def verify(self) -> None:
         try:
             opened = os.fstat(self._store_descriptor)

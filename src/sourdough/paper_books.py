@@ -15,6 +15,7 @@ from .paper_account import reopen_binding
 
 if TYPE_CHECKING:
     from .paper_venue import FixedQuoteVenue
+    from .writer_lease import WriterLease
 
 
 class PostingRefused(Exception):
@@ -54,6 +55,7 @@ def post_confirmed_fill(
     venue: FixedQuoteVenue,
     *,
     account_sync: bool = False,
+    writer: WriterLease | None = None,
 ) -> Posting | None:
     binding = reopen_binding(store, company_id)
     if venue.observe_account(binding.account.account_id) != binding.account:
@@ -73,6 +75,8 @@ def post_confirmed_fill(
         raise PostingRefused("Invalid fill fee")
     with closing(_connect(store, "rw")) as db, db:
         db.execute("BEGIN IMMEDIATE")
+        if writer is not None:
+            writer.verify_for(store, company_id)
         if _identity(db) != company_id or reopen_binding(store, company_id) != binding:
             raise PostingRefused("Company binding changed")
         order = db.execute(
