@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 
 from sourdough.abandoned_work import requeue_uncommitted_work
 from sourdough.company import FoundingTerms, found
-from sourdough.duty_run import DutyRefused
+from sourdough.duty_run import POSITION_REVIEW, DutyRefused
 from sourdough.first_duty import claim_first_duty, require_paper_authority
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_order import PaperIntent, submit_paper_order
@@ -30,11 +30,11 @@ class RecoverAbandonedWork(unittest.TestCase):
             self.store, FoundingTerms("setup", "charter", "paper", "profile")
         ).company_id
 
-    def requeue(self):
+    def requeue(self, **filters):
         with hold_company_writer(
             self.store, self.company_id, lease_directory=self.root / "lease"
         ) as writer:
-            return requeue_uncommitted_work(writer)
+            return requeue_uncommitted_work(writer, **filters)
 
     def start(self):
         return claim_first_duty(self.store, self.company_id, "profile")
@@ -106,3 +106,11 @@ class RecoverAbandonedWork(unittest.TestCase):
             self.assertEqual(
                 connection.execute("SELECT state FROM duty").fetchone(), ("running",)
             )
+
+    def test_hired_review_recovery_does_not_fence_the_founder_review(self):
+        opening = self.start()
+        result = ResultReference("document", "result", "observed", 100)
+        finish_first_duty(self.store, opening, result, due_at=100)
+        work = self.scheduled()
+        self.assertEqual(self.requeue(purpose=POSITION_REVIEW, hired_only=True), ())
+        self.assertEqual(self.requeue(purpose=POSITION_REVIEW), (work.claim.run_id,))

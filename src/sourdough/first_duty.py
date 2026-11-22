@@ -13,9 +13,25 @@ from .duty_run import (
     resolve_run,
     start_run,
 )
+from .onboarding import has_hired_acceptance
 
 
 FIRST_DUTY_SCOPE = "paper"
+
+
+def founding_duty_due(store: Path, company_id: str) -> bool:
+    with closing(_connect(store, "ro")) as connection:
+        connection.execute("BEGIN")
+        if _identity(connection) != company_id:
+            raise DutyRefused("Company identity mismatch")
+        return bool(
+            connection.execute(
+                """SELECT 1 FROM founding_receipt receipt
+                   JOIN duty d ON d.id = receipt.due_work_id
+                   WHERE receipt.company_id = ? AND d.state = 'due'""",
+                (company_id,),
+            ).fetchone()
+        )
 
 
 def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> DutyClaim:
@@ -27,9 +43,9 @@ def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> Du
         row = connection.execute(
             """SELECT f.id, g.id, d.id, f.execution_profile
                FROM founding_receipt r
-               JOIN founder f ON r.founder_id = f.id AND r.company_id = f.company_id
-               JOIN standing_grant g ON r.grant_id = g.id AND g.founder_id = f.id
-               JOIN duty d ON r.due_work_id = d.id AND d.founder_id = f.id
+               JOIN agent f ON r.founder_id = f.id AND r.company_id = f.company_id
+               JOIN standing_grant g ON r.grant_id = g.id AND g.agent_id = f.id
+               JOIN duty d ON r.due_work_id = d.id AND d.agent_id = f.id
                WHERE r.company_id = ? AND d.state = 'due' AND g.scope = ?""",
             (company_id, FIRST_DUTY_SCOPE),
         ).fetchone()
@@ -46,14 +62,14 @@ def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> Du
 
 def resolve_first_run(connection: sqlite3.Connection, claim: DutyClaim) -> RunAuthority:
     authority = resolve_run(connection, claim)
-    if (
-        authority.purpose != PAPER_EXECUTION
-        or not connection.execute(
-            "SELECT 1 FROM founding_receipt WHERE company_id = ? AND due_work_id = ?",
-            (claim.company_id, claim.duty_id),
-        ).fetchone()
+    founder = connection.execute(
+        "SELECT 1 FROM founding_receipt WHERE company_id = ? AND due_work_id = ?",
+        (claim.company_id, claim.duty_id),
+    ).fetchone()
+    if authority.purpose != PAPER_EXECUTION or (
+        founder is None and not has_hired_acceptance(connection, claim)
     ):
-        raise DutyRefused("Claim is not the original founding duty")
+        raise DutyRefused("Claim is not an admitted original paper duty")
     return authority
 
 

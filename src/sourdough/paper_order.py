@@ -10,9 +10,10 @@ from uuid import uuid4
 from .company import _connect
 from .duty_run import DutyClaim
 from .first_duty import require_historical_claim, require_paper_authority
+from .onboarding import is_hired_first_duty
 from .paper_account import PaperAccount, reopen_binding
 from .paper_decision import has_matching_paper_decision
-from .paper_research import allows_research_order
+from .paper_research import allows_hired_research_order, allows_research_order
 from .writer_lease import WriterLease
 
 
@@ -120,14 +121,29 @@ def submit_paper_order(
             raise OrderRefused(
                 "Opening order requires its committed research decision and exact terms"
             )
-        if first is None and not has_matching_paper_decision(
+        hired = first is None and is_hired_first_duty(connection, claim)
+        if hired and not allows_hired_research_order(
             connection,
             claim,
             intent.action_id,
-            account.account_id,
-            intent.instrument_rules_digest,
             intent.quantity,
             intent.limit_minor_units,
+        ):
+            raise OrderRefused(
+                "First hired order requires acceptance, research and a separate request"
+            )
+        if (
+            first is None
+            and not hired
+            and not has_matching_paper_decision(
+                connection,
+                claim,
+                intent.action_id,
+                account.account_id,
+                intent.instrument_rules_digest,
+                intent.quantity,
+                intent.limit_minor_units,
+            )
         ):
             raise OrderRefused(
                 "Later paper order requires its persisted decision and exact terms"

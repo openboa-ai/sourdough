@@ -117,6 +117,107 @@ RESEARCH_TOOLS = [
 ]
 
 
+def scoped_tool(name, description, properties):
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": properties,
+            "required": list(properties),
+            "additionalProperties": False,
+        },
+    }
+
+
+STAFFING_TOOLS = [
+    scoped_tool(
+        "read_staffing_need",
+        "Read the assigned workload and remaining hiring allowance.",
+        {},
+    ),
+    scoped_tool(
+        "record_staffing_choice",
+        "Record your reasoned choice; this does not hire or spend.",
+        {
+            "evidence_revision": {"type": "string"},
+            "action": {"enum": ["hire", "reassign", "defer"]},
+            "rationale": {"type": "string", "maxLength": 2000},
+            "alternatives": {
+                "type": "array",
+                "items": {"enum": ["hire", "reassign", "defer"]},
+            },
+            "next_check_seconds": {"type": "integer", "minimum": 60, "maximum": 86400},
+        },
+    ),
+    scoped_tool(
+        "request_hire",
+        "Apply for one hire against your committed choice and current grant.",
+        {
+            **{
+                field: {"type": "string"}
+                for field in (
+                    "request_id",
+                    "choice_id",
+                    "role",
+                    "execution_profile",
+                    "scope",
+                )
+            },
+            "turns": {"type": "integer", "minimum": 1, "maximum": 64},
+        },
+    ),
+]
+ONBOARDING_TOOLS = [
+    scoped_tool(
+        "read_first_duty", "Read your assignment and authorized private desk.", {}
+    ),
+    scoped_tool(
+        "accept_first_duty",
+        "Explicitly accept your first duty.",
+        {
+            "revision": {"type": "string"},
+            "rationale": {"type": "string", "maxLength": 2000},
+        },
+    ),
+]
+
+
+ASSESSMENT_TOOLS = [
+    *ONBOARDING_TOOLS,
+    scoped_tool(
+        "read_assessment_inputs", "Read company records for your accepted duty.", {}
+    ),
+    scoped_tool(
+        "publish_assessment",
+        "Publish one attributed assessment for the permitted audience.",
+        {
+            "source_revision": {"type": "string"},
+            "record_id": {"type": "string"},
+            "disposition": {"enum": ["recommend_change", "no_change", "investigate"]},
+            "rationale": {"type": "string", "maxLength": 2000},
+            "next_check_seconds": {"type": "integer", "minimum": 60, "maximum": 86400},
+        },
+    ),
+]
+HIRED_RESEARCH_TOOLS = [
+    *ONBOARDING_TOOLS,
+    *RESEARCH_TOOLS,
+    scoped_tool(
+        "request_research_order",
+        "Ask Trading to admit the exact paper order from a prior buy decision.",
+        {"decision_id": {"type": "string"}},
+    ),
+]
+SCOPED_MODES = {
+    "--mcp-research": (RESEARCH_TOOLS, "record_research_decision"),
+    "--mcp-staffing": (STAFFING_TOOLS, "record_staffing_choice"),
+    "--mcp-onboarding": (ONBOARDING_TOOLS, "accept_first_duty"),
+    "--mcp-assessment": (ASSESSMENT_TOOLS, "publish_assessment"),
+    "--mcp-hired-research": (HIRED_RESEARCH_TOOLS, "record_research_decision"),
+}
+
+
 def tool_output(value, *, denied=False):
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
     return {"isError": denied, "content": [{"type": "text", "text": text}]}
@@ -130,27 +231,30 @@ def read_result(address):
             return json.load(stream)
 
 
-def research_call(address, name, args, outbox):
-    if not isinstance(args, dict) or name not in (
-        tool["name"] for tool in RESEARCH_TOOLS
-    ):
-        return tool_output("Research tool is unavailable.", denied=True)
+def scoped_call(address, name, args, outbox, tools, terminal_tool):
+    if not isinstance(args, dict) or name not in (tool["name"] for tool in tools):
+        return tool_output("Tool is unavailable for this duty.", denied=True)
     if name == "record_research_decision":
         data = json.dumps(args, sort_keys=True, separators=(",", ":")).encode()
         args = args | {"call_id": sha256(data).hexdigest()}
-    try:
-        with socket.socket(socket.AF_UNIX) as client:
-            client.settimeout(5)
-            client.connect(address)
-            message = json.dumps({"name": name, "arguments": args}).encode()
-            client.sendall(message + b"\n")
-            with client.makefile() as stream:
-                result = json.load(stream)
-    except (OSError, ValueError):
-        return tool_output("Research service is unavailable.", denied=True)
+    message = json.dumps({"name": name, "arguments": args}).encode() + b"\n"
+    for _ in range(2 if name == "request_hire" else 1):
+        try:
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(5)
+                client.connect(address)
+                client.sendall(message)
+                with client.makefile() as stream:
+                    result = json.load(stream)
+            if isinstance(result, dict):
+                break
+        except (OSError, ValueError):
+            continue
+    else:
+        return tool_output("Scoped service is unavailable.", denied=True)
     if "error" in result:
         return tool_output(result["error"], denied=True)
-    if name == "record_research_decision":
+    if name == terminal_tool:
         try:
             with outbox.open("x") as stream:
                 json.dump(result, stream)
@@ -186,12 +290,12 @@ def decision_args(args, proposal, revision):
     )
 
 
-def serve(outbox, address=None, *, trading=False, research=False):
+def serve(outbox, address=None, *, trading=False, scoped_mode=None):
     revision = None
     proposal = PROPOSE_TRADE if trading else PROPOSE_DECISION
     tools = [PAPER_BUY] if address is None else [READ_RESULT, proposal]
-    if research:
-        tools = RESEARCH_TOOLS
+    if scoped_mode is not None:
+        tools, terminal_tool = scoped_mode
     for line in sys.stdin:
         message = json.loads(line)
         if "id" not in message:
@@ -209,8 +313,8 @@ def serve(outbox, address=None, *, trading=False, research=False):
             params = message["params"]
             args = params.get("arguments", {})
             name = params["name"]
-            if research:
-                result = research_call(address, name, args, outbox)
+            if scoped_mode is not None:
+                result = scoped_call(address, name, args, outbox, tools, terminal_tool)
             elif address is not None and name == "read_work_result" and args == {}:
                 try:
                     observation = read_result(address)
@@ -270,13 +374,13 @@ def main():
     if len(sys.argv) == 4 and sys.argv[1] in (
         "--mcp-review",
         "--mcp-trade",
-        "--mcp-research",
+        *SCOPED_MODES,
     ):
         serve(
             Path(sys.argv[3]),
             sys.argv[2],
             trading=sys.argv[1] == "--mcp-trade",
-            research=sys.argv[1] == "--mcp-research",
+            scoped_mode=SCOPED_MODES.get(sys.argv[1]),
         )
         return
     request = json.load(sys.stdin)
@@ -330,7 +434,18 @@ def main():
         return
     operation = request["operation"]
     if (
-        operation not in ("first_duty", "review_duty", "trade_duty", "research_duty")
+        operation
+        not in (
+            "first_duty",
+            "review_duty",
+            "trade_duty",
+            "research_duty",
+            "staffing_duty",
+            "onboarding_duty",
+            "assessment_duty",
+            "assessment_review",
+            "hired_research_duty",
+        )
         or not ready
     ):
         raise SystemExit("An existing ChatGPT subscription login is required")
@@ -338,7 +453,70 @@ def main():
         outbox = Path(directory) / "proposal.json"
         decision = Path(directory) / "decision.txt"
         tool_args = [str(Path(__file__).resolve())]
-        if operation == "research_duty":
+        if operation == "hired_research_duty":
+            tool_args += ["--mcp-hired-research", request["read_endpoint"], str(outbox)]
+            tool_names = [tool["name"] for tool in HIRED_RESEARCH_TOOLS]
+            prompt = (
+                "You are newly hired for a bounded synthetic paper execution verification, not for live trading or forecasting. "
+                "Read your desk and responsibility with read_first_duty and explicitly accept it if authorized. "
+                "If the desk shows saved_buy, your original finding and pending decision are already recorded. "
+                "Do not replace them. Decide whether to separately request that decision_id and do not act if it is no longer justified. "
+                "Then read_research_inputs, choose your own comparison question and evaluate two observed prices. "
+                "Publish the signed later-minus-earlier change, the sum of the two fees "
+                "(price times fee_bps divided by 10000, rounded half up for each), their difference and uncertainty. "
+                "Use record_research_decision to explain how the immutable finding changes your choice. "
+                "Here the disclosed quote and cap are synthetic execution terms. A bounded simulation exercise "
+                "does not require evidence of live liquidity or profitable persistence; assess whether the disclosed "
+                "paper terms and the finding warrant exercising that path. "
+                "A feasible bounded verification buy, a hold or investigation is valid. Choose a follow-up of 60 to 120 seconds. "
+                "If you choose a buy, separately call request_research_order with the returned decision_id. "
+                "A recorded research decision is not an order or a fill. No shell, external account or live funds."
+            )
+        elif operation == "assessment_duty":
+            tool_args += ["--mcp-assessment", request["read_endpoint"], str(outbox)]
+            tool_names = [tool["name"] for tool in ASSESSMENT_TOOLS]
+            prompt = (
+                "You are a newly hired Sourdough Agent. Read your assignment with read_first_duty. "
+                "Accept it explicitly if in scope, then read the records with read_assessment_inputs. "
+                "Choose a record and compare what was reported with what was observed. "
+                "Publish one assessment tied to what you read. Recommend a correction, no change or "
+                "investigation as appropriate. Explain the evidence and select a next check in 60 to "
+                "120 seconds. You cannot change source records; no shell or external access."
+            )
+        elif operation == "assessment_review":
+            tool_args += ["--mcp-review", request["read_endpoint"], str(outbox)]
+            tool_names = ["read_work_result", "record_review_decision"]
+            prompt = (
+                "Review your previous company assessment. Read that result and current records via "
+                "read_work_result. Explain what the current records support and relate it to the "
+                "original assessment. Decide whether to hold, investigate or recommend a change. "
+                "Record the new decision and next responsibility. No shell or external access."
+            )
+        elif operation == "onboarding_duty":
+            tool_args += ["--mcp-onboarding", request["read_endpoint"], str(outbox)]
+            tool_names = [tool["name"] for tool in ONBOARDING_TOOLS]
+            prompt = (
+                "You are a newly hired Sourdough Agent. Use read_first_duty to read your "
+                "company mandate, private desk and assigned first duty. If you accept responsibility, "
+                "use accept_first_duty with the returned revision and a reason grounded in that assignment. "
+                "Do not perform another Agent's duty or invent a grant. No shell or external access."
+            )
+        elif operation == "staffing_duty":
+            tool_args += ["--mcp-staffing", request["read_endpoint"], str(outbox)]
+            tool_names = [tool["name"] for tool in STAFFING_TOOLS]
+            prompt = (
+                "You are the delegated hiring manager for a local Sourdough company trial. "
+                "Use read_staffing_need to compare workload, existing coverage and delegated allowance. "
+                "If the result includes saved_choice, keep that original judgment and choice ID. "
+                "Recheck current allowance before explicitly deciding whether to request the hire; a saved choice grants nothing. "
+                "Choose whether to hire, reassign or defer. Consider both unselected alternatives and "
+                "cite the revision, factual rationale and next check in record_staffing_choice. "
+                "Do not assume hiring is needed. If justified and affordable, use request_hire with "
+                "the committed choice ID, a stable request ID, role, displayed profile and scope, "
+                "and a bounded turn allocation sufficient for the hire's independent work and review. "
+                "No shell, external account or spending permission is available."
+            )
+        elif operation == "research_duty":
             tool_args += ["--mcp-research", request["read_endpoint"], str(outbox)]
             tool_names = [tool["name"] for tool in RESEARCH_TOOLS]
             prompt = (
@@ -425,7 +603,9 @@ def main():
             env=env,
             cwd=directory,
             stdout=sys.stderr,
-            timeout=80 if operation == "research_duty" else 50,
+            timeout=80
+            if operation in ("research_duty", "assessment_duty", "hired_research_duty")
+            else 50,
             check=True,
         )
         if outbox.exists():

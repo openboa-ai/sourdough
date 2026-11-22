@@ -7,17 +7,22 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from sourdough.assessment_run import run_assessment_company
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
+from sourdough.company_assessment import SourceRecord, seal_assessment_source
 from sourdough.company_run import run_paper_company
 from sourdough.duty_run import count_company_runs
 from sourdough.employee_process import EmployeeProcess
 from sourdough.first_duty import DutyRefused
 from sourdough.first_trade import TradeRefused, run_first_trade
+from sourdough.hired_paper_run import run_hired_paper_company
+from sourdough.hiring_run import run_hiring
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
 from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
+from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 from sourdough.work_projection import read_local_board_timeline
@@ -33,15 +38,28 @@ def _store_key(value: str) -> tuple[int, int]:
     return device, inode
 
 
+def _agent_receipt(fields):
+    receipt = dict(fields)
+    if "founder_id" in receipt and "run_id" in receipt:
+        receipt["agent_id"] = receipt.pop("founder_id")
+    return receipt
+
+
 def _start_supervisor(args):
+    assessment = args.command == "supervise-assessment"
+    worker_name = {
+        "supervise-assessment": "_assessment-worker",
+        "supervise-hired-paper": "_hired-paper-worker",
+        "supervise-paper": "_paper-worker",
+    }[args.command]
     command = [
         sys.executable,
         "-I",
         "-m",
         "sourdough.cli",
-        "_paper-worker",
+        worker_name,
         str(args.store),
-        str(args.journal),
+        *([] if assessment else [str(args.journal)]),
         "--company-id",
         args.company_id,
         "--employee",
@@ -53,7 +71,7 @@ def _start_supervisor(args):
         "--budget-from",
         str(count_company_runs(args.store, args.company_id)),
     ]
-    if args.repeat_paper:
+    if getattr(args, "repeat_paper", False):
         command.append("--repeat-paper")
     return supervise_worker(
         command,
@@ -103,6 +121,43 @@ def main() -> int:
     inputs.add_argument("store", type=Path)
     inputs.add_argument("observations", type=Path)
     inputs.add_argument("--company-id", required=True)
+    staffing = commands.add_parser("stage-staffing")
+    staffing.add_argument("store", type=Path)
+    staffing.add_argument("envelope", type=Path)
+    staffing.add_argument("--company-id", required=True)
+    source = commands.add_parser("stage-assessment-source")
+    source.add_argument("store", type=Path)
+    source.add_argument("records", type=Path)
+    source.add_argument("--company-id", required=True)
+    for command in (
+        "supervise-assessment",
+        "_assessment-worker",
+        "supervise-hired-paper",
+        "_hired-paper-worker",
+    ):
+        managed = commands.add_parser(command)
+        managed.add_argument("store", type=Path)
+        if "hired-paper" in command:
+            managed.add_argument("journal", type=Path)
+        managed.add_argument("--company-id", required=True)
+        managed.add_argument("--employee", type=Path, required=True)
+        managed.add_argument("--turn-budget", type=int, default=3)
+        managed.add_argument("--idle-seconds", type=int, default=140)
+        if command.startswith("supervise-"):
+            managed.add_argument("--max-restarts", type=int, default=1)
+            managed.add_argument("--startup-seconds", type=int, default=35)
+            managed.add_argument("--max-seconds", type=int, default=360)
+        else:
+            managed.add_argument("--ready-fd", type=int, required=True)
+            managed.add_argument("--store-key", type=_store_key, required=True)
+            managed.add_argument("--budget-from", type=int, required=True)
+    hiring = commands.add_parser("operate-hiring")
+    hiring.add_argument("store", type=Path)
+    hiring.add_argument("--company-id", required=True)
+    hiring.add_argument("--employee", type=Path, required=True)
+    hiring.add_argument(
+        "--first-purpose", required=True, choices=("assessment", "paper_execution")
+    )
     for command in ("first-duty", "operate-paper", "supervise-paper", "_paper-worker"):
         running = commands.add_parser(command)
         running.add_argument("store", type=Path)
@@ -195,10 +250,72 @@ def main() -> int:
                 )
             print(json.dumps(result))
             return 0
-        elif args.command == "supervise-paper":
+        elif args.command in (
+            "supervise-paper",
+            "supervise-assessment",
+            "supervise-hired-paper",
+        ):
             result = _start_supervisor(args)
             print(json.dumps(asdict(result)))
             return 0 if result.completed else 1
+        elif args.command == "stage-staffing":
+            with args.envelope.open("rb") as source:
+                content = source.read(8193)
+            if len(content) > 8192:
+                raise DutyRefused("Staffing envelope exceeds its size limit")
+            try:
+                data = json.loads(content)
+                authority = StaffingAuthority(**data["authority"])
+                need = StaffingNeed(**data["need"])
+            except (ValueError, TypeError, KeyError) as error:
+                raise DutyRefused("Invalid staffing envelope") from error
+            with hold_company_writer(args.store, args.company_id) as writer:
+                revision = stage_staffing(writer, authority, need)
+            print(json.dumps({"evidence_revision": revision}))
+            return 0
+        elif args.command == "stage-assessment-source":
+            with args.records.open("rb") as source:
+                content = source.read(64_001)
+            if len(content) > 64_000:
+                raise DutyRefused("Assessment source exceeds its size limit")
+            try:
+                records = tuple(SourceRecord(**item) for item in json.loads(content))
+            except (ValueError, TypeError, KeyError) as error:
+                raise DutyRefused("Invalid company assessment source") from error
+            with hold_company_writer(args.store, args.company_id) as writer:
+                revision = seal_assessment_source(writer, records)
+            print(json.dumps({"source_revision": revision}))
+            return 0
+        elif args.command == "_assessment-worker":
+            result = run_assessment_company(
+                args.store,
+                args.company_id,
+                lambda: EmployeeProcess(args.employee),
+                turn_budget=args.turn_budget,
+                idle_seconds=args.idle_seconds,
+                budget_from=args.budget_from,
+                store_key=args.store_key,
+                on_ready=lambda lease: announce_ready(args.ready_fd, lease),
+            )
+        elif args.command == "_hired-paper-worker":
+            result = run_hired_paper_company(
+                args.store,
+                args.company_id,
+                FixedQuoteVenue(args.journal),
+                lambda: EmployeeProcess(args.employee),
+                turn_budget=args.turn_budget,
+                idle_seconds=args.idle_seconds,
+                budget_from=args.budget_from,
+                store_key=args.store_key,
+                on_ready=lambda lease: announce_ready(args.ready_fd, lease),
+            )
+        elif args.command == "operate-hiring":
+            result = run_hiring(
+                args.store,
+                args.company_id,
+                EmployeeProcess(args.employee),
+                first_purpose=args.first_purpose,
+            )
         else:
             inputs = (
                 args.store,
@@ -241,7 +358,13 @@ def main() -> int:
     ) as error:
         print(f"Company command refused: {error}", file=sys.stderr)
         return 1
-    print(json.dumps(asdict(result)))
+    fields = (
+        _agent_receipt
+        if args.command
+        in ("operate-hiring", "_assessment-worker", "_hired-paper-worker")
+        else dict
+    )
+    print(json.dumps(asdict(result, dict_factory=fields)))
     return 0
 
 

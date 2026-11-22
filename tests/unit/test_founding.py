@@ -10,7 +10,7 @@ from pathlib import Path
 
 TABLES = (
     "company",
-    "founder",
+    "agent",
     "standing_grant",
     "duty",
     "founding_receipt",
@@ -70,8 +70,8 @@ class Founding(unittest.TestCase):
         original = self.inventory()
         [[setup, company, founder, grant, duty]] = original["founding_receipt"]
         self.assertEqual(setup, "board-setup")
-        self.assertEqual(original["company"], [(1, company, 5, "charter-v1")])
-        self.assertEqual(original["founder"], [(founder, company, "profile-v1")])
+        self.assertEqual(original["company"], [(1, company, 6, "charter-v1")])
+        self.assertEqual(original["agent"], [(founder, company, "profile-v1")])
         self.assertEqual(
             original["standing_grant"], [(grant, founder, "manage-company")]
         )

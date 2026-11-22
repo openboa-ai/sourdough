@@ -11,9 +11,14 @@ LEGACY_SCHEMA_REVISION = 1
 CONTINUATION_SCHEMA_REVISION = 2
 RUN_SCHEMA_REVISION = 3
 PURPOSE_SCHEMA_REVISION = 4
-SCHEMA_REVISION = 5
+RUN_READ_SCHEMA_REVISION = 5
+SCHEMA_REVISION = 6
+AGENT_SCHEMA = """CREATE TABLE agent (
+    id TEXT PRIMARY KEY NOT NULL, company_id TEXT NOT NULL REFERENCES company(id),
+    execution_profile TEXT NOT NULL
+)"""
 DUTY_SCHEMA = """CREATE TABLE duty (
-    id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL REFERENCES founder(id),
+    id TEXT PRIMARY KEY NOT NULL, agent_id TEXT NOT NULL REFERENCES agent(id),
     state TEXT NOT NULL
 )"""
 FOLLOW_UP_SCHEMA = """CREATE TABLE work_follow_up (
@@ -51,19 +56,16 @@ SCHEMA = (
         id TEXT NOT NULL UNIQUE, schema_revision INTEGER NOT NULL,
         charter_revision TEXT NOT NULL
     )""",
-    """CREATE TABLE founder (
-        id TEXT PRIMARY KEY NOT NULL, company_id TEXT NOT NULL UNIQUE REFERENCES company(id),
-        execution_profile TEXT NOT NULL
-    )""",
+    AGENT_SCHEMA,
     """CREATE TABLE standing_grant (
-        id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL UNIQUE REFERENCES founder(id),
+        id TEXT PRIMARY KEY NOT NULL, agent_id TEXT NOT NULL UNIQUE REFERENCES agent(id),
         scope TEXT NOT NULL
     )""",
     DUTY_SCHEMA,
     """CREATE TABLE founding_receipt (
         setup_identity TEXT PRIMARY KEY NOT NULL,
         company_id TEXT NOT NULL UNIQUE REFERENCES company(id),
-        founder_id TEXT NOT NULL UNIQUE REFERENCES founder(id),
+        founder_id TEXT NOT NULL UNIQUE REFERENCES agent(id),
         grant_id TEXT NOT NULL UNIQUE REFERENCES standing_grant(id),
         due_work_id TEXT NOT NULL UNIQUE REFERENCES duty(id)
     )""",
@@ -128,6 +130,7 @@ def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
         CONTINUATION_SCHEMA_REVISION,
         RUN_SCHEMA_REVISION,
         PURPOSE_SCHEMA_REVISION,
+        RUN_READ_SCHEMA_REVISION,
         SCHEMA_REVISION,
     ):
         raise FoundingRefused("Unsupported company store schema")
@@ -140,7 +143,11 @@ def _identity(connection: sqlite3.Connection) -> str:
 
 def _upgrade_duties(connection: sqlite3.Connection) -> None:
     connection.execute(
-        DUTY_SCHEMA.replace("CREATE TABLE duty", "CREATE TABLE duty_next", 1)
+        """CREATE TABLE duty_next (
+            id TEXT PRIMARY KEY NOT NULL,
+            founder_id TEXT NOT NULL REFERENCES founder(id),
+            state TEXT NOT NULL
+        )"""
     )
     connection.execute("INSERT INTO duty_next SELECT id, founder_id, state FROM duty")
     connection.execute("DROP TABLE duty")
@@ -207,17 +214,35 @@ def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
                 connection.execute(
                     "ALTER TABLE work_follow_up ADD COLUMN purpose TEXT NOT NULL DEFAULT 'position_review'"
                 )
-            elif revision != PURPOSE_SCHEMA_REVISION:
+            elif revision < PURPOSE_SCHEMA_REVISION:
                 if revision == LEGACY_SCHEMA_REVISION:
                     _upgrade_duties(connection)
                 _consolidate_runs(connection, revision)
-            _upgrade_result_reads(connection)
+            if revision < RUN_READ_SCHEMA_REVISION:
+                _upgrade_result_reads(connection)
+            _upgrade_agent_registry(connection)
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise FoundingRefused("Company store failed foreign-key validation")
             connection.execute(
                 "UPDATE company SET schema_revision = ? WHERE singleton = 1",
                 (SCHEMA_REVISION,),
             )
+
+
+def _upgrade_agent_registry(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE founder RENAME TO agent")
+    connection.execute(
+        AGENT_SCHEMA.replace("CREATE TABLE agent", "CREATE TABLE agent_next", 1)
+    )
+    connection.execute(
+        "INSERT INTO agent_next SELECT id, company_id, execution_profile FROM agent"
+    )
+    connection.execute("DROP TABLE agent")
+    connection.execute("ALTER TABLE agent_next RENAME TO agent")
+    connection.execute(
+        "ALTER TABLE standing_grant RENAME COLUMN founder_id TO agent_id"
+    )
+    connection.execute("ALTER TABLE duty RENAME COLUMN founder_id TO agent_id")
 
 
 def _upgrade_result_reads(connection: sqlite3.Connection) -> None:
@@ -252,7 +277,7 @@ def found(store: Path, terms: FoundingTerms) -> FoundingReceipt:
             (receipt.company_id, SCHEMA_REVISION, terms.charter_revision),
         )
         connection.execute(
-            "INSERT INTO founder VALUES (?, ?, ?)",
+            "INSERT INTO agent VALUES (?, ?, ?)",
             (receipt.founder_id, receipt.company_id, terms.execution_profile),
         )
         connection.execute(
@@ -277,12 +302,14 @@ def found(store: Path, terms: FoundingTerms) -> FoundingReceipt:
 
 
 def _replay(connection: sqlite3.Connection, terms: FoundingTerms) -> FoundingReceipt:
+    _, revision = _company_version(connection)
+    registry = "agent" if revision >= SCHEMA_REVISION else "founder"
     row = connection.execute(
-        """SELECT c.charter_revision, g.scope, f.execution_profile,
+        f"""SELECT c.charter_revision, g.scope, f.execution_profile,
                   r.company_id, r.founder_id, r.grant_id, r.due_work_id
            FROM founding_receipt r
            JOIN company c ON c.id = r.company_id
-           JOIN founder f ON f.id = r.founder_id
+           JOIN {registry} f ON f.id = r.founder_id
            JOIN standing_grant g ON g.id = r.grant_id
            WHERE r.setup_identity = ?""",
         (terms.setup_identity,),
@@ -294,6 +321,20 @@ def _replay(connection: sqlite3.Connection, terms: FoundingTerms) -> FoundingRec
     ):
         raise FoundingRefused("Founding terms conflict with the existing company")
     return FoundingReceipt(*row[3:])
+
+
+def founding_execution_profile(
+    connection: sqlite3.Connection, company_id: str
+) -> str | None:
+    _, revision = _company_version(connection)
+    registry = "agent" if revision >= SCHEMA_REVISION else "founder"
+    row = connection.execute(
+        f"""SELECT a.execution_profile FROM founding_receipt r
+            JOIN {registry} a ON a.id = r.founder_id AND a.company_id = r.company_id
+            WHERE r.company_id = ?""",
+        (company_id,),
+    ).fetchone()
+    return row[0] if row is not None else None
 
 
 def reopen(store: Path, expected_company_id: str) -> OpenCompany:

@@ -10,6 +10,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time
 
+from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
+from sourdough.writer_lease import hold_company_writer
+
 
 class ConnectedFlow(unittest.TestCase):
     def prepare(
@@ -412,6 +415,32 @@ raise SystemExit(cli.main())
         self.assertEqual(
             self.read(self.store, "SELECT purpose FROM work_follow_up"),
             [("paper_execution",)],
+        )
+
+    def test_an_unrelated_due_staffing_duty_does_not_reopen_the_founder_order(self):
+        self.prepare()
+        first = self.operate("--turn-budget", "1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        profile = self.success("employee-profile", self.peer)["execution_profile"]
+        with hold_company_writer(self.store, self.company["company_id"]) as writer:
+            stage_staffing(
+                writer,
+                StaffingAuthority(
+                    self.company["grant_id"], profile, "assessment", 1, 2
+                ),
+                StaffingNeed("staffing-due", "Review backlog", 4, 0, 1, int(time())),
+            )
+        resumed = self.operate("--turn-budget", "1")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        result = json.loads(resumed.stdout)
+        self.assertIsNone(result["first_trade"])
+        self.assertIsNotNone(result["review"])
+        self.assertEqual(
+            self.read(self.venue, "SELECT count(*) FROM venue_execution"), [(1,)]
+        )
+        self.assertEqual(
+            self.read(self.store, "SELECT state FROM duty WHERE id='staffing-due'"),
+            [("due",)],
         )
 
     def test_reasoned_hold_schedules_the_next_duty_without_an_order(self):
