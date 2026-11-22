@@ -46,11 +46,11 @@ class RunAuthority:
 
 def employment_cutoff(connection: sqlite3.Connection, agent_id: str) -> int | None:
     if not connection.execute(
-        "SELECT 1 FROM sqlite_schema WHERE name='agent_retirement' AND type='table'"
+        "SELECT 1 FROM sqlite_schema WHERE name='agent_archive' AND type='table'"
     ).fetchone():
         return None
     row = connection.execute(
-        "SELECT cutoff FROM agent_retirement WHERE agent_id=?", (agent_id,)
+        "SELECT cutoff FROM agent_archive WHERE agent_id=?", (agent_id,)
     ).fetchone()
     return row[0] if row else None
 

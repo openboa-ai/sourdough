@@ -1,4 +1,4 @@
-"""Commit an Agent-wide cutoff without settling held obligations."""
+"""Permanently archive an Agent without changing admitted effects."""
 
 import json
 from contextlib import closing
@@ -12,26 +12,13 @@ from .writer_lease import WriterLease
 
 
 TERMINATION_SCOPE = "retire-agent"
-_SCHEMA = (
-    """CREATE TABLE IF NOT EXISTS agent_retirement (
+_ARCHIVE = """CREATE TABLE IF NOT EXISTS agent_archive (
         cutoff INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL UNIQUE REFERENCES agent(id),
         manager_id TEXT NOT NULL REFERENCES agent(id), grant_id TEXT NOT NULL REFERENCES standing_grant(id),
         request_id TEXT NOT NULL, employment_revision TEXT NOT NULL, reason TEXT NOT NULL,
-        continuity_id TEXT NOT NULL REFERENCES agent(id), state TEXT NOT NULL,
+        previous_scope TEXT NOT NULL,
         UNIQUE(manager_id,request_id)
-    )""",
-    """CREATE TABLE IF NOT EXISTS retirement_grant (
-        cutoff INTEGER NOT NULL REFERENCES agent_retirement(cutoff),
-        grant_id TEXT NOT NULL REFERENCES standing_grant(id), previous_scope TEXT NOT NULL,
-        PRIMARY KEY(cutoff,grant_id)
-    )""",
-    """CREATE TABLE IF NOT EXISTS retirement_duty (
-        cutoff INTEGER NOT NULL REFERENCES agent_retirement(cutoff),
-        duty_id TEXT NOT NULL REFERENCES duty(id), previous_state TEXT NOT NULL,
-        last_run TEXT REFERENCES duty_run(run_id),
-        PRIMARY KEY(cutoff,duty_id)
-    )""",
-)
+    )"""
 
 
 def _reference(value: str, maximum: int = 128) -> bool:
@@ -57,7 +44,6 @@ class Retirement:
 class Cutoff:
     sequence: int
     agent_id: str
-    continuity_id: str
 
 
 def _admit_manager(
@@ -102,45 +88,40 @@ def retire_agent(
         connection.execute("BEGIN IMMEDIATE")
         company_id = writer.company_id
         _admit_manager(connection, company_id, manager_id, grant_id)
-        for schema in _SCHEMA:
-            connection.execute(schema)
+        connection.execute(_ARCHIVE)
         prior = connection.execute(
-            """SELECT cutoff,agent_id,continuity_id,grant_id,employment_revision,reason
-               FROM agent_retirement WHERE manager_id=? AND request_id=?""",
+            """SELECT cutoff,agent_id,grant_id,employment_revision,reason
+               FROM agent_archive WHERE manager_id=? AND request_id=?""",
             (manager_id, request.request_id),
         ).fetchone()
         if prior is not None:
-            if (prior[1], *prior[3:]) != (
+            if prior[1:] != (
                 request.agent_id,
                 grant_id,
                 request.employment_revision,
                 request.reason,
             ):
                 raise DutyRefused("Retirement conflicts with the original request")
-            return Cutoff(*prior[:3])
-        continuity = connection.execute(
-            """SELECT a.id FROM founding_receipt f JOIN standing_grant g ON g.id=f.grant_id
-               JOIN agent a ON a.id=g.agent_id WHERE f.company_id=? AND a.company_id=?
-                 AND g.scope='manage-company'""",
-            (company_id, company_id),
+            return Cutoff(*prior[:2])
+        founder = connection.execute(
+            "SELECT founder_id FROM founding_receipt WHERE company_id=?", (company_id,)
         ).fetchone()
-        if (
-            continuity is None
-            or request.agent_id in (continuity[0], manager_id)
-            or employment_cutoff(connection, continuity[0])
-        ):
-            raise DutyRefused(
-                "Retirement requires independent company continuity coverage"
-            )
+        if founder == (request.agent_id,) or request.agent_id == manager_id:
+            raise DutyRefused("Cannot archive the founding owner or the acting manager")
         if (
             _active_revision(connection, company_id, request.agent_id)
             != request.employment_revision
         ):
             raise DutyRefused("Employment revision changed before retirement")
-        row = connection.execute(
-            """INSERT INTO agent_retirement
-               (agent_id,manager_id,grant_id,request_id,employment_revision,reason,continuity_id,state)
-               VALUES (?,?,?,?,?,?,?,'retiring') RETURNING cutoff""",
+        previous = connection.execute(
+            "SELECT scope FROM standing_grant WHERE agent_id=?", (request.agent_id,)
+        ).fetchone()
+        if previous is None:
+            raise DutyRefused("Agent has no employment grant")
+        (sequence,) = connection.execute(
+            """INSERT INTO agent_archive
+               (agent_id,manager_id,grant_id,request_id,employment_revision,reason,previous_scope)
+               VALUES (?,?,?,?,?,?,?) RETURNING cutoff""",
             (
                 request.agent_id,
                 manager_id,
@@ -148,34 +129,21 @@ def retire_agent(
                 request.request_id,
                 request.employment_revision,
                 request.reason,
-                continuity[0],
+                previous[0],
             ),
         ).fetchone()
-        sequence = row[0]
-        connection.execute(
-            """INSERT INTO retirement_grant
-               SELECT ?,id,scope FROM standing_grant WHERE agent_id=?""",
-            (sequence, request.agent_id),
-        )
-        connection.execute(
-            """INSERT INTO retirement_duty
-               SELECT ?,d.id,d.state,r.run_id FROM duty d
-               LEFT JOIN duty_run r ON r.duty_id=d.id AND r.is_current=1
-               WHERE d.agent_id=? AND d.state IN ('due','scheduled','running')""",
-            (sequence, request.agent_id),
-        )
         connection.execute(
             """UPDATE duty_run SET is_current=0 WHERE is_current=1
                AND duty_id IN (SELECT id FROM duty WHERE agent_id=?)""",
             (request.agent_id,),
         )
         connection.execute(
-            "UPDATE duty SET state='held_for_retirement' WHERE id IN (SELECT duty_id FROM retirement_duty WHERE cutoff=?)",
-            (sequence,),
+            "UPDATE duty SET state='archived' WHERE agent_id=? AND state IN ('due','scheduled','running')",
+            (request.agent_id,),
         )
         connection.execute(
             "UPDATE standing_grant SET scope='revoked' WHERE agent_id=?",
             (request.agent_id,),
         )
         writer.verify()
-        return Cutoff(sequence, request.agent_id, continuity[0])
+        return Cutoff(sequence, request.agent_id)

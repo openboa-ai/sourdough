@@ -109,7 +109,9 @@ class RetirementFence(unittest.TestCase):
             founder_revision = employment_revision(
                 writer, "manager", "manager-grant", company.founder_id
             )
-            with self.assertRaisesRegex(DutyRefused, "continuity coverage"):
+            with self.assertRaisesRegex(
+                DutyRefused, "Cannot archive the founding owner"
+            ):
                 retire_agent(
                     writer,
                     "manager",
@@ -121,7 +123,7 @@ class RetirementFence(unittest.TestCase):
                     ),
                 )
             cutoff = retire_agent(writer, "manager", "manager-grant", request)
-            self.assertEqual(cutoff.continuity_id, company.founder_id)
+            self.assertEqual(cutoff.agent_id, "author")
             self.assertEqual(
                 retire_agent(writer, "manager", "manager-grant", request), cutoff
             )
@@ -149,17 +151,17 @@ class RetirementFence(unittest.TestCase):
         with closing(_connect(store, "rw")) as observed, observed:
             self.assertEqual(
                 observed.execute(
-                    "SELECT cutoff,agent_id,state FROM agent_retirement"
+                    "SELECT cutoff,agent_id,previous_scope FROM agent_archive"
                 ).fetchall(),
-                [(cutoff.sequence, "author", "retiring")],
+                [(cutoff.sequence, "author", "assessment")],
             )
             self.assertEqual(
                 observed.execute(
-                    "SELECT duty_id,previous_state,last_run FROM retirement_duty ORDER BY duty_id"
+                    "SELECT id,state FROM duty WHERE agent_id='author' ORDER BY id"
                 ).fetchall(),
                 [
-                    ("author-duty", "running", claims["author"].run_id),
-                    ("later", "due", None),
+                    ("author-duty", "archived"),
+                    ("later", "archived"),
                 ],
             )
             historical = resolve_run(observed, claims["author"])
