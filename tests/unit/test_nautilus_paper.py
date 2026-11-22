@@ -9,9 +9,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time_ns
 
+from sourdough.company import FoundingTerms, found
+from sourdough.first_duty import claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxBalance, SandboxPlan
+from sourdough.paper_account import PaperMandate, bind
 from sourdough.paper_execution import PaperIntent, VenueRefused
+from sourdough.paper_order import OrderRefused, submit_paper_order
 from sourdough.spot_cash import SpotCashUnits
 
 
@@ -52,6 +56,47 @@ class NautilusPaperPort(unittest.TestCase):
         self.assertEqual(reopened.configuration(), (destination, self.plan))
         with self.assertRaisesRegex(VenueRefused, "original account"):
             reopened.provision(replace(self.plan, tape_revision="1" * 64))
+
+    def test_invalid_managed_terms_never_reserve_or_reach_the_venue(self):
+        store = self.venue.journal.with_name("company.sqlite")
+        founded = found(store, FoundingTerms("setup", "charter", "paper", "runtime"))
+        plan = replace(self.plan, company_id=founded.company_id)
+        self.venue.provision(plan)
+        self.venue.prove_account(
+            "current", "BINANCE-001", "USDT", self.venue.start_generation()
+        )
+        account = self.venue.observe_account("paper")
+        bind(
+            store,
+            PaperMandate(
+                "mandate", founded.company_id, "charter", account, 10_000_000_000
+            ),
+            self.venue,
+        )
+        claim = claim_first_duty(store, founded.company_id, "runtime")
+        limit = self.units.price_per_lot(Decimal("59000"))
+        supported = PaperIntent("action", self.terms.revision, 20, limit)
+        for invalid in (
+            replace(supported, quantity=1),
+            replace(supported, limit_minor_units=limit + 1),
+            replace(supported, instrument_rules_digest="changed"),
+        ):
+            with self.subTest(intent=invalid):
+                with self.assertRaisesRegex(OrderRefused, "refused the order terms"):
+                    submit_paper_order(store, claim, invalid, self.venue)
+        self.assertEqual(self.venue.check_order_terms("paper", supported), account)
+        with closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as company:
+            self.assertIsNone(
+                company.execute(
+                    "SELECT 1 FROM sqlite_schema WHERE name='paper_order'"
+                ).fetchone()
+            )
+        with closing(
+            sqlite3.connect(self.venue.journal.as_uri() + "?mode=ro", uri=True)
+        ) as venue:
+            self.assertEqual(
+                venue.execute("SELECT count(*) FROM sandbox_order").fetchone(), (0,)
+            )
 
     def test_fill_replays_once_and_survives_the_sender(self):
         destination = self.venue.provision(self.plan)

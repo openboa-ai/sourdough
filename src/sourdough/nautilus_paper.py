@@ -345,6 +345,19 @@ class NautilusPaperVenue:
                 ),
             )
 
+    def _check_size(self, connection: sqlite3.Connection, intent: PaperIntent) -> None:
+        _, plan = self._configuration(connection)
+        SpotCashUnits(plan.terms).limit_order(intent.quantity, intent.limit_minor_units)
+
+    def check_order_terms(self, account_id: str, intent: PaperIntent) -> PaperAccount:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            account = self._account(connection, account_id)
+            if account.instrument_rules_digest != intent.instrument_rules_digest:
+                raise VenueRefused("Paper order uses different instrument terms")
+            self._check_size(connection, intent)
+        return account
+
     def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None:
         command = SandboxCommand(
             order_id, intent.action_id, intent.quantity, intent.limit_minor_units
@@ -373,10 +386,7 @@ class NautilusPaperVenue:
                     raise VenueRefused(
                         "Outstanding sandbox action has no verified terminal result"
                     )
-                _, plan = self._configuration(connection)
-                SpotCashUnits(plan.terms).limit_order(
-                    intent.quantity, intent.limit_minor_units
-                )
+                self._check_size(connection, intent)
                 connection.execute(
                     """INSERT INTO sandbox_order(order_id,action_id,quantity,limit_atoms,state)
                        VALUES (?, ?, ?, ?, 'queued')""",

@@ -104,15 +104,27 @@ class FixedQuoteVenue:
             raise VenueRefused("Unknown destination account")
         return PaperAccount(*row[1:-1])
 
-    def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None:
+    @staticmethod
+    def _check_units(intent: PaperIntent) -> None:
         if (
-            not order_id
-            or type(intent.quantity) is not int
+            type(intent.quantity) is not int
             or type(intent.limit_minor_units) is not int
             or not 0 < intent.quantity <= 2**63 - 1
             or not 0 < intent.limit_minor_units <= 2**63 - 1
         ):
             raise VenueRefused("Invalid paper order terms")
+
+    def check_order_terms(self, account_id: str, intent: PaperIntent) -> PaperAccount:
+        self._check_units(intent)
+        account = self.observe_account(account_id)
+        if account.instrument_rules_digest != intent.instrument_rules_digest:
+            raise VenueRefused("Unknown destination instrument")
+        return account
+
+    def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None:
+        if not order_id:
+            raise VenueRefused("Missing paper order identity")
+        self._check_units(intent)
         with self._open("rw") as db, db:
             db.execute("BEGIN IMMEDIATE")
             account = db.execute(

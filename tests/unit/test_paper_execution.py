@@ -35,6 +35,7 @@ class ExecutionPort(unittest.TestCase):
         reservations_at_send = []
         venue = Mock(spec_set=PaperExecution)
         venue.observe_account.return_value = account
+        venue.check_order_terms.return_value = account
         venue.read_cancellation.return_value = None
         venue.observe_quote.return_value = 100
         sizing = PaperOrderSizing("EXAMPLE", "0.1", "USD", 100, 1, 1, 50)

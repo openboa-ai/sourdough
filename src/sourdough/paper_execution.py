@@ -61,6 +61,10 @@ class VenuePosition:
 
 
 class PaperDestination(AccountObserver, Protocol):
+    def check_order_terms(
+        self, account_id: str, intent: PaperIntent
+    ) -> PaperAccount: ...
+
     def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None: ...
 
 

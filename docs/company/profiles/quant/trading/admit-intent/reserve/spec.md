@@ -16,6 +16,8 @@ Serialize policy check and reservation per account rather than letting independe
 
 Risk decides under the current grant and mandate; the account-scoped investment subledger alone writes reservation creation, adjustment and terminal release. Admission, new reservation and submission identity commit atomically under the same account serialization. Reconciliation may request a transition with identified evidence but must not mutate a second balance.
 
+Before creating a reservation, ask the bound destination to validate the immutable order terms and return the account identity used for that check. Match that identity to the current mandate. This read-only check must reject an invalid price step or lot/notional minimum without creating an order, reserving exposure or submitting anything. It does not certify current liquidity, future availability or a fill. An admitted request with an unknown send outcome still retains its reservation and original lookup identity.
+
 The company books a fill by its original fill ID and executed quantity, not by the requested order quantity. Before terminal release, the exposure consumed by a buy is the sum of booked fill notionals plus the remaining order quantity at its admitted limit. Partial or duplicate observations cannot complete the order. A known partial remains eligible for lookup at the capped backoff interval even after the unknown-outcome retry limit. Existing single-fill records retain their IDs, prices, and observation references.
 
 **Concern for the responsible component:** Check side, unit and existing reservations under the same mandate revision, including dispatch racing a board suspension.
