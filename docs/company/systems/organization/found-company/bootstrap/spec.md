@@ -20,6 +20,7 @@ Use one atomic founding receipt rather than creating the founder, grant and firs
 
 - **FR.** Repeated setup with the same identity returns the original receipt. Reopening loads its store and due work.
 - **NFR.** Reject incompatible founding replay. Keep one active company writer.
+- **Store compatibility.** Record the company identity and schema revision in the founding transaction. Before scheduling on reopen, compare the expected identity and supported schema; an absent expected store, identity mismatch or unsupported revision must not create a replacement or start work. A later schema upgrade is an explicit storage operation, not a side effect of founding.
 
 ## Acceptance and independent evidence
 
@@ -29,6 +30,7 @@ Use one atomic founding receipt rather than creating the founder, grant and firs
 | --- | --- |
 | Normal | Found a company with no industry profile, close the UI and reopen. One founder and due item remain. In the quant integration separately bind the simulated account to that same company. |
 | Failure or contention | Interrupt after commit before reply and retry: one founder, grant and due item. Changing the mandate under the same request conflicts. |
+| Incompatible reopen | Open a copy stamped with a newer, unsupported schema. Observe a compatibility refusal, unchanged company records and zero duty starts; no second store is created. |
 
 ## Operations and change review
 
