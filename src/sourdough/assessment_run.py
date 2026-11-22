@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from time import monotonic, sleep, time
 
-from .abandoned_work import requeue_uncommitted_work
+from .abandoned_work import has_uncommitted_work, requeue_uncommitted_work
 from .company import upgrade_work_schema
 from .company_assessment import (
     ASSESSMENT,
@@ -84,7 +84,7 @@ def run_assessment_company(
                 employee,
                 first_purpose=ASSESSMENT,
                 allow_staffing=remaining >= 2,
-                resume_accepted=True,
+                resume_work=has_uncommitted_work,
             )
             claim = hiring.hire_claim
             if claim is None:

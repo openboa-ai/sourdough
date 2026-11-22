@@ -9,6 +9,7 @@ from .employee_process import EmployeeProcess
 from .first_trade import TradeRefused
 from .onboarding import (
     OnboardingStatus,
+    ResumeWork,
     claim_hired_first,
     first_duty_accepted,
     invoke_onboarding,
@@ -53,24 +54,29 @@ def prepare_hiring(
     *,
     first_purpose: str,
     allow_staffing: bool = True,
-    resume_accepted: bool = False,
+    resume_work: ResumeWork | None = None,
 ) -> HiringRun:
     manager = pending_onboarding(
-        writer, runtime.profile, first_purpose, resume_accepted=resume_accepted
+        writer, runtime.profile, first_purpose, resume_work=resume_work
     )
     resumed = manager is not None
     if manager is None:
         if not allow_staffing:
             return HiringRun(None, None)
         runtime.check_ready()
-        manager = claim_staffing(writer, runtime.profile, now=int(time()))
+        manager = claim_staffing(
+            writer, runtime.profile, now=int(time()), resume_interrupted=True
+        )
         if manager is None:
             return HiringRun(None, None)
         manager_tools = StaffingTools(writer, manager)
         try:
             runtime.staffing(manager_tools.invoke)
         except TradeRefused:
-            if read_staffing_outcome(writer, manager) is None:
+            interrupted = read_staffing_outcome(writer, manager)
+            if interrupted is None or (
+                interrupted.action == "hire" and interrupted.hire is None
+            ):
                 raise
     outcome = read_staffing_outcome(writer, manager)
     if outcome is None or outcome.hire is None:
@@ -100,5 +106,7 @@ def prepare_hiring(
         manager,
         outcome,
         status,
-        claim_hired_first(writer, hire_id, runtime.profile, resume=resumed),
+        claim_hired_first(
+            writer, hire_id, runtime.profile, resume=resumed, resume_work=resume_work
+        ),
     )

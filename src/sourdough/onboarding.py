@@ -9,7 +9,6 @@ from sqlite3 import Connection
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
-from .abandoned_work import has_uncommitted_work
 from .company import _connect
 from .duty_run import (
     PAPER_EXECUTION,
@@ -25,6 +24,7 @@ from .writer_lease import WriterLease
 MAX_PROVISIONING_ATTEMPTS = 3
 PROVISIONING_RETRY_SECONDS = 60
 _SCOPE = {"assessment": "assessment", PAPER_EXECUTION: "paper"}
+ResumeWork = Callable[[Connection, str], bool]
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS hire_onboarding (
         agent_id TEXT PRIMARY KEY NOT NULL REFERENCES hire_receipt(agent_id),
@@ -75,7 +75,11 @@ def _active_hire(
 
 
 def pending_onboarding(
-    writer: WriterLease, execution_profile: str, purpose: str, *, resume_accepted: bool
+    writer: WriterLease,
+    execution_profile: str,
+    purpose: str,
+    *,
+    resume_work: ResumeWork | None = None,
 ) -> DutyClaim | None:
     if purpose not in _SCOPE:
         raise DutyRefused("Unsupported first duty purpose")
@@ -85,13 +89,19 @@ def pending_onboarding(
         tables = {
             name
             for (name,) in connection.execute(
-                "SELECT name FROM sqlite_schema WHERE name IN ('hire_receipt','hire_onboarding')"
+                """SELECT name FROM sqlite_schema
+                   WHERE name IN ('hire_receipt','hire_onboarding','hire_admission_run')"""
             )
         }
         if "hire_receipt" not in tables:
             return None
         join = ""
         active = ""
+        admission_join = ""
+        manager_run = "choice.run_id"
+        if "hire_admission_run" in tables:
+            admission_join = "LEFT JOIN hire_admission_run admitted ON admitted.request_id=h.request_id"
+            manager_run = "coalesce(admitted.run_id,choice.run_id)"
         first_duty_fields = "NULL, NULL"
         arguments = [writer.company_id, execution_profile, _SCOPE[purpose]]
         if "hire_onboarding" in tables:
@@ -101,7 +111,7 @@ def pending_onboarding(
                 o.purpose=? AND (o.state != 'accepted' OR ?)
                 AND (o.state != 'blocked' OR o.retry_at IS NOT NULL)
             ))"""
-            arguments.extend((purpose, resume_accepted))
+            arguments.extend((purpose, resume_work is not None))
         candidates = connection.execute(
             f"""SELECT a.id, {first_duty_fields}, manager.id, r.grant_id, r.duty_id, r.run_id,
                        manager.execution_profile
@@ -109,7 +119,8 @@ def pending_onboarding(
                 JOIN agent a ON a.id=h.agent_id
                 JOIN standing_grant g ON g.id=h.grant_id AND g.agent_id=a.id
                 JOIN staffing_choice choice ON choice.choice_id=h.choice_id
-                JOIN duty_run r ON r.run_id=choice.run_id
+                {admission_join}
+                JOIN duty_run r ON r.run_id={manager_run}
                 JOIN duty d ON d.id=r.duty_id
                 JOIN agent manager ON manager.id=d.agent_id AND manager.company_id=a.company_id
                 {join}
@@ -127,7 +138,10 @@ def pending_onboarding(
                 if has_turn_capacity(connection, agent_id)
                 and (
                     state != "accepted"
-                    or has_uncommitted_work(connection, first_duty_id)
+                    or (
+                        resume_work is not None
+                        and resume_work(connection, first_duty_id)
+                    )
                 )
             ),
             None,
@@ -245,7 +259,12 @@ def provision_hire(
 
 
 def claim_hired_first(
-    writer: WriterLease, agent_id: str, execution_profile: str, *, resume: bool = False
+    writer: WriterLease,
+    agent_id: str,
+    execution_profile: str,
+    *,
+    resume: bool = False,
+    resume_work: ResumeWork | None = None,
 ) -> DutyClaim | None:
     writer.verify()
     with closing(_connect(writer.store, "rw")) as connection, connection:
@@ -261,7 +280,7 @@ def claim_hired_first(
                JOIN duty d ON d.id = o.first_duty_id AND d.agent_id = o.agent_id
                JOIN private_desk desk ON desk.agent_id = o.agent_id
                WHERE o.agent_id = ? AND (o.state = 'ready' OR (? AND o.state = 'accepted'))""",
-            (agent_id, resume),
+            (agent_id, resume and resume_work is not None),
         ).fetchone()
         if (
             row is None
@@ -272,8 +291,8 @@ def claim_hired_first(
         duty_id, purpose, state, onboarding_state = row
         if _SCOPE.get(purpose) != scope:
             raise DutyRefused("First duty purpose does not match the hire scope")
-        if onboarding_state == "accepted" and not has_uncommitted_work(
-            connection, duty_id
+        if onboarding_state == "accepted" and (
+            resume_work is None or not resume_work(connection, duty_id)
         ):
             return None
         if state == "running" and resume:

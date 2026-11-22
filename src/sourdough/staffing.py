@@ -26,6 +26,10 @@ _CREATE_FOLLOW_UP = """CREATE TABLE IF NOT EXISTS staffing_follow_up (
     previous_duty_id TEXT PRIMARY KEY NOT NULL REFERENCES staffing_assignment(duty_id),
     duty_id TEXT NOT NULL UNIQUE REFERENCES staffing_assignment(duty_id)
 )"""
+_CREATE_ADMISSION_RUN = """CREATE TABLE IF NOT EXISTS hire_admission_run (
+    request_id TEXT PRIMARY KEY NOT NULL REFERENCES hire_receipt(request_id),
+    run_id TEXT NOT NULL REFERENCES duty_run(run_id)
+)"""
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS staffing_authority (
         grant_id TEXT PRIMARY KEY NOT NULL REFERENCES standing_grant(id),
@@ -60,6 +64,7 @@ SCHEMA = (
         terms TEXT NOT NULL, hired_at INTEGER NOT NULL
     )""",
     _CREATE_FOLLOW_UP,
+    _CREATE_ADMISSION_RUN,
 )
 
 
@@ -177,7 +182,11 @@ def stage_staffing(
 
 
 def claim_staffing(
-    writer: WriterLease, execution_profile: str, *, now: int
+    writer: WriterLease,
+    execution_profile: str,
+    *,
+    now: int,
+    resume_interrupted: bool = False,
 ) -> DutyClaim | None:
     writer.verify()
     with closing(_connect(writer.store, "rw")) as connection, connection:
@@ -187,16 +196,20 @@ def claim_staffing(
         ).fetchone():
             return None
         candidates = connection.execute(
-            """SELECT d.agent_id, g.id, d.id, a.execution_profile, g.scope
+            """SELECT d.agent_id, g.id, d.id, a.execution_profile, g.scope, d.state
                FROM staffing_assignment s
-               JOIN duty d ON d.id = s.duty_id AND d.state = 'due'
+               JOIN duty d ON d.id = s.duty_id
                JOIN agent a ON a.id = d.agent_id
                JOIN standing_grant g ON g.id = s.manager_grant_id AND g.agent_id = a.id
                JOIN staffing_authority delegation ON delegation.grant_id = g.id
                     AND delegation.manager_scope = g.scope
                WHERE a.company_id = ? AND a.execution_profile = ? AND s.available_at <= ?
-               ORDER BY s.available_at, d.id""",
-            (writer.company_id, execution_profile, now),
+                 AND (d.state='due' OR (? AND d.state='running' AND NOT EXISTS (
+                     SELECT 1 FROM staffing_choice c JOIN hire_receipt h ON h.choice_id=c.choice_id
+                     WHERE c.duty_id=d.id
+                 )))
+               ORDER BY d.state='running' DESC, s.available_at, d.id""",
+            (writer.company_id, execution_profile, now, resume_interrupted),
         )
         row = next(
             (
@@ -208,6 +221,12 @@ def claim_staffing(
         )
         if row is None:
             return None
+        if row[5] == "running":
+            connection.execute(
+                "UPDATE duty_run SET is_current=0 WHERE duty_id=? AND is_current=1",
+                (row[2],),
+            )
+            connection.execute("UPDATE duty SET state='due' WHERE id=?", (row[2],))
         return start_run(
             connection,
             writer.company_id,
@@ -250,12 +269,21 @@ def read_need(writer: WriterLease, claim: DutyClaim) -> dict:
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         body, revision = _assignment(connection, claim)
+        recovered = connection.execute(
+            "SELECT choice_id,terms FROM staffing_choice WHERE duty_id=? AND run_id<>?",
+            (claim.duty_id, claim.run_id),
+        ).fetchone()
+        saved_choice = (
+            {"saved_choice": {"choice_id": recovered[0]} | json.loads(recovered[1])}
+            if recovered is not None
+            else {}
+        )
         prior = connection.execute(
             "SELECT snapshot, revision FROM staffing_read WHERE run_id = ?",
             (claim.run_id,),
         ).fetchone()
         if prior is not None:
-            return json.loads(prior[0]) | {"revision": prior[1]}
+            return json.loads(prior[0]) | {"revision": prior[1]} | saved_choice
         slots, turns = _remaining(connection, claim.grant_id)
         permitted_profile, permitted_scope = connection.execute(
             "SELECT execution_profile, allowed_scope FROM staffing_authority WHERE grant_id = ?",
@@ -274,7 +302,7 @@ def read_need(writer: WriterLease, claim: DutyClaim) -> dict:
             "INSERT INTO staffing_read VALUES (?, ?, ?, ?)",
             (claim.run_id, saved, observed, int(time())),
         )
-    return snapshot | {"revision": observed}
+    return snapshot | {"revision": observed} | saved_choice
 
 
 @dataclass(frozen=True)
@@ -426,9 +454,11 @@ def read_staffing_outcome(
         _staffing_run(connection, claim)
         row = connection.execute(
             """SELECT c.choice_id, c.terms, c.decided_at, h.agent_id, h.grant_id, h.allocated_turns
-               FROM staffing_choice c LEFT JOIN hire_receipt h ON h.choice_id = c.choice_id
-               WHERE c.duty_id = ? AND c.run_id = ?""",
-            (claim.duty_id, claim.run_id),
+               FROM staffing_choice c
+               JOIN duty_run original ON original.run_id=c.run_id AND original.grant_id=?
+               LEFT JOIN hire_receipt h ON h.choice_id=c.choice_id
+               WHERE c.duty_id=?""",
+            (claim.grant_id, claim.duty_id),
         ).fetchone()
     if row is None:
         return None
@@ -450,9 +480,10 @@ def admit_hire(
         connection.execute("BEGIN IMMEDIATE")
         _staffing_run(connection, claim)
         choice = connection.execute(
-            """SELECT terms FROM staffing_choice
-               WHERE choice_id = ? AND duty_id = ? AND run_id = ?""",
-            (request.choice_id, claim.duty_id, claim.run_id),
+            """SELECT c.terms FROM staffing_choice c
+               JOIN duty_run original ON original.run_id=c.run_id AND original.grant_id=?
+               WHERE c.choice_id=? AND c.duty_id=?""",
+            (claim.grant_id, request.choice_id, claim.duty_id),
         ).fetchone()
         if choice is None or json.loads(choice[0])["action"] != "hire":
             raise DutyRefused("An admitted staffing choice to hire is required")
@@ -467,6 +498,12 @@ def admit_hire(
                 raise DutyRefused("Hire replay conflicts with the original request")
             return HireReceipt(*old[1:-1])
         _assignment(connection, claim)
+        if not connection.execute(
+            "SELECT 1 FROM staffing_read WHERE run_id=?", (claim.run_id,)
+        ).fetchone():
+            raise DutyRefused(
+                "Hire authorization requires a current staffing need read"
+            )
         scope = connection.execute(
             "SELECT execution_profile, allowed_scope FROM staffing_authority WHERE grant_id = ?",
             (claim.grant_id,),
@@ -502,5 +539,10 @@ def admit_hire(
         )
         connection.execute(
             "UPDATE duty SET state = 'settled' WHERE id = ?", (claim.duty_id,)
+        )
+        connection.execute(_CREATE_ADMISSION_RUN)
+        connection.execute(
+            "INSERT INTO hire_admission_run VALUES (?, ?)",
+            (request.request_id, claim.run_id),
         )
         return HireReceipt(agent_id, grant_id, request.turns)

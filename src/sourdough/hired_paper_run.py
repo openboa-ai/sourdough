@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import monotonic, sleep, time
 
@@ -35,6 +35,8 @@ from .paper_research import (
     ResearchTools,
     allows_hired_research_order,
     authorize_hired_research_order,
+    read_pending_hired_buy,
+    recoverable_hired_research,
     reopen_research_decision,
 )
 from .paper_venue import FixedQuoteVenue
@@ -95,7 +97,11 @@ def _hired_research(
     )
 
     def invoke(name: str, arguments: dict) -> dict:
-        if name in ("read_first_duty", "accept_first_duty"):
+        if name == "read_first_duty":
+            desk = invoke_onboarding(writer, claim, name, arguments)
+            pending = read_pending_hired_buy(writer, claim)
+            return desk if pending is None else desk | {"saved_buy": asdict(pending)}
+        if name == "accept_first_duty":
             return invoke_onboarding(writer, claim, name, arguments)
         if not first_duty_accepted(writer, claim):
             raise DutyRefused(
@@ -107,12 +113,11 @@ def _hired_research(
             )
         return research.invoke(name, arguments)
 
+    interrupted = None
     try:
         employee.research_hired(invoke)
-    except TradeRefused:
-        receipt = reopen_research_decision(writer.store, claim)
-        if receipt is None:
-            raise
+    except TradeRefused as error:
+        interrupted = error
     receipt = reopen_research_decision(writer.store, claim)
     if receipt is None:
         raise DutyRefused(
@@ -131,6 +136,8 @@ def _hired_research(
             decision.limit_minor_units,
         )
     if not requested:
+        if interrupted is not None:
+            raise interrupted
         return receipt
     intent = PaperIntent(
         receipt.decision_id,
@@ -197,7 +204,7 @@ def run_hired_paper_company(
                 employee,
                 first_purpose=PAPER_EXECUTION,
                 allow_staffing=remaining >= 2,
-                resume_accepted=True,
+                resume_work=recoverable_hired_research,
             )
             claim = hiring.hire_claim
             if claim is None:
