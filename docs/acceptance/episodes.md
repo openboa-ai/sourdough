@@ -95,7 +95,7 @@ flowchart TD
 - **Fault:** Restart the company after the archive commits. Deliver a late callback and replay a valid receipt for the earlier action. For the quant overlay, keep an uncertain order and a program without independent authority.
 - **Pass:** No new duty, run, or effect under the archived Agent. Existing receipts and shared assets retain their original attribution. The old order is queried by the existing service and any fill is booked once. No successor or retirement-specific queue is needed; an unknown effect remains unresolved separately.
 
-The Flow 10 connected CI suite runs the installed supervisor with deterministic employees. It checks separate authorship, delivery, acceptance, and successor review with the Client closed; a separate case checks booking the original paper effect after archive. These checks do not replace W1 with a real Agent, native isolation observations, or the managed-runtime variant of O1.
+The Flow 10 connected CI suite runs the installed supervisor with deterministic employees. It checks separate authorship, delivery, acceptance, and successor review with the Client closed. The core O1 case interrupts the original worker after publication commit but before the tool reply, archives the author, refuses its stale callback, and reopens the same company so an authorized peer can read the original publication. A separate quant case checks booking the original paper effect after archive. These checks do not replace W1 with a real Agent, native isolation observations, or the managed-runtime variant of O1.
 
 ## P1 Total return
 
