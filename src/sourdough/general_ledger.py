@@ -19,6 +19,17 @@ def _label(value: str) -> bool:
     return isinstance(value, str) and 0 < len(value) <= 256 and bool(value.strip())
 
 
+def _valid_scale(value: int | None) -> bool:
+    return value is None or (type(value) is int and 0 < value < 2**63)
+
+
+def _has_journal_scale(database: sqlite3.Connection) -> bool:
+    return any(
+        column[1] == "units_per_whole"
+        for column in database.execute("PRAGMA table_info(journal_entry)")
+    )
+
+
 @dataclass(frozen=True)
 class JournalLine:
     account: str
@@ -47,6 +58,7 @@ class JournalEntry:
     lines: tuple[JournalLine, ...]
     reverses: str | None = None
     replaces: str | None = None
+    units_per_whole: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -63,6 +75,7 @@ class JournalEntry:
             or type(self.effective_date) is not date
             or not isinstance(self.currency, str)
             or re.fullmatch(r"[A-Z][A-Z0-9]{1,11}", self.currency) is None
+            or not _valid_scale(self.units_per_whole)
             or any(
                 reference is not None and not _label(reference)
                 for reference in (self.reverses, self.replaces)
@@ -107,9 +120,14 @@ def post_journal(writer: WriterLease, entry: JournalEntry) -> str:
                    currency TEXT NOT NULL, mapping_revision TEXT NOT NULL,
                    reverses TEXT UNIQUE REFERENCES journal_entry(id),
                    replaces TEXT UNIQUE REFERENCES journal_entry(id),
+                   units_per_whole INTEGER,
                    UNIQUE(source,source_event)
                )"""
         )
+        if not _has_journal_scale(database):
+            database.execute(
+                "ALTER TABLE journal_entry ADD COLUMN units_per_whole INTEGER"
+            )
         database.execute(
             """CREATE TABLE IF NOT EXISTS journal_line (
                    entry_id TEXT NOT NULL REFERENCES journal_entry(id), ordinal INTEGER NOT NULL,
@@ -124,9 +142,11 @@ def post_journal(writer: WriterLease, entry: JournalEntry) -> str:
             entry.mapping_revision,
             entry.reverses,
             entry.replaces,
+            entry.units_per_whole,
         )
         existing = database.execute(
-            """SELECT id,evidence_revision,effective_date,currency,mapping_revision,reverses,replaces
+            """SELECT id,evidence_revision,effective_date,currency,mapping_revision,
+                      reverses,replaces,units_per_whole
                FROM journal_entry WHERE source=? AND source_event=?""",
             (entry.source, entry.source_event),
         ).fetchone()
@@ -140,7 +160,7 @@ def post_journal(writer: WriterLease, entry: JournalEntry) -> str:
 
         if entry.reverses is not None:
             original = database.execute(
-                """SELECT currency,mapping_revision,effective_date,reverses
+                """SELECT currency,mapping_revision,effective_date,reverses,units_per_whole
                    FROM journal_entry WHERE id=?""",
                 (entry.reverses,),
             ).fetchone()
@@ -152,6 +172,7 @@ def post_journal(writer: WriterLease, entry: JournalEntry) -> str:
                 or original[:2] != (entry.currency, entry.mapping_revision)
                 or original[2] > terms[1]
                 or original[3] is not None
+                or original[4] != entry.units_per_whole
                 or applied is not None
                 or entry.lines
                 != tuple(
@@ -164,7 +185,7 @@ def post_journal(writer: WriterLease, entry: JournalEntry) -> str:
                 )
         elif entry.replaces is not None:
             reversal = database.execute(
-                "SELECT currency,effective_date FROM journal_entry WHERE reverses=?",
+                "SELECT currency,effective_date,units_per_whole FROM journal_entry WHERE reverses=?",
                 (entry.replaces,),
             ).fetchone()
             applied = database.execute(
@@ -174,6 +195,7 @@ def post_journal(writer: WriterLease, entry: JournalEntry) -> str:
                 reversal is None
                 or reversal[0] != entry.currency
                 or reversal[1] > terms[1]
+                or reversal[2] != entry.units_per_whole
                 or applied is not None
             ):
                 raise JournalRefused(
@@ -182,7 +204,10 @@ def post_journal(writer: WriterLease, entry: JournalEntry) -> str:
 
         identifier = uuid4().hex
         database.execute(
-            "INSERT INTO journal_entry VALUES (?,?,?,?,?,?,?,?,?)",
+            """INSERT INTO journal_entry
+                     (id,source,source_event,evidence_revision,effective_date,currency,
+                      mapping_revision,reverses,replaces,units_per_whole)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (identifier, entry.source, entry.source_event, *terms),
         )
         database.executemany(

@@ -49,7 +49,11 @@ class GeneralLedger(unittest.TestCase):
 
     def test_reopened_redelivery_posts_one_balanced_receipt(self):
         receipt = self.post(self.entry)
+        with closing(sqlite3.connect(self.store)) as database, database:
+            database.execute("ALTER TABLE journal_entry DROP COLUMN units_per_whole")
         self.assertEqual(self.post(self.entry), receipt)
+        with self.assertRaisesRegex(JournalRefused, "conflicts"):
+            self.post(replace(self.entry, units_per_whole=100))
         self.assertEqual(self.balances(), [("cash", -300), ("compute-expense", 300)])
         with self.assertRaisesRegex(JournalRefused, "conflicts"):
             self.post(replace(self.entry, evidence_revision="different"))
@@ -63,10 +67,14 @@ class GeneralLedger(unittest.TestCase):
         self.assertEqual(self.balances(), [("cash", -300), ("compute-expense", 300)])
 
     def test_correction_keeps_original_lines_and_requires_exact_reversal(self):
-        original = self.post(self.entry)
-        reversal = replace(self.entry, source_event="reversal", reverses=original)
+        scaled = replace(self.entry, units_per_whole=100)
+        original = self.post(scaled)
+        self.assertEqual(self.post(scaled), original)
+        with self.assertRaisesRegex(JournalRefused, "conflicts"):
+            self.post(replace(scaled, units_per_whole=1000))
+        reversal = replace(scaled, source_event="reversal", reverses=original)
         corrected = replace(
-            self.entry,
+            scaled,
             source_event="replacement",
             evidence_revision="corrected-statement",
             lines=(JournalLine("compute-expense", 250), JournalLine("cash", -250)),
@@ -80,8 +88,12 @@ class GeneralLedger(unittest.TestCase):
             reversal,
             lines=(JournalLine("compute-expense", -300), JournalLine("cash", 300)),
         )
+        with self.assertRaisesRegex(JournalRefused, "exactly negate"):
+            self.post(replace(reversal, units_per_whole=1000))
         reversed_id = self.post(reversal)
         self.assertEqual(self.post(reversal), reversed_id)
+        with self.assertRaisesRegex(JournalRefused, "requires one effective"):
+            self.post(replace(corrected, units_per_whole=1000))
         corrected_id = self.post(corrected)
         with self.assertRaisesRegex(JournalRefused, "requires one effective"):
             self.post(replace(corrected, source_event="another-replacement"))

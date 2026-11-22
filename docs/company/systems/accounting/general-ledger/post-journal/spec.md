@@ -12,6 +12,8 @@ Input contracts: [found-company/bootstrap](../../../organization/found-company/b
 
 Accept company, source event, evidence, date, currency, account mapping revision and lines in fixed minor units. Balance each currency and commit all lines under a unique source mapping. Correct by linked reversal and replacement.
 
+When a source declares its units per currency whole, preserve that integer in the posting and replay comparison. Reversals and replacements must use the same scale. Existing postings without an explicit scale remain readable and replayable; do not infer a scale from the currency name or add one on redelivery.
+
 **Concern for the responsible component:** The company owns its chart and posting rules. A fill subledger proves quantities and fees; it is not a second general ledger.
 
 ## Functional and quality requirements

@@ -10,7 +10,7 @@ from pathlib import Path
 from time import time_ns
 
 from .company import _connect, _identity
-from .general_ledger import _label
+from .general_ledger import _has_journal_scale, _label, _valid_scale
 from .writer_lease import WriterLease
 
 
@@ -57,6 +57,7 @@ class CloseRequest:
     owner: str
     recheck_at_ns: int
     supersedes: str | None = None
+    units_per_whole: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -76,6 +77,7 @@ class CloseRequest:
             or self.from_date > self.through_date
             or not isinstance(self.currency, str)
             or re.fullmatch(r"[A-Z][A-Z0-9]{1,11}", self.currency) is None
+            or not _valid_scale(self.units_per_whole)
             or type(self.opening_cash_minor) is not int
             or type(self.statement_cash_minor) is not int
             or type(self.recheck_at_ns) is not int
@@ -198,9 +200,13 @@ def _assess(database: sqlite3.Connection, request: CloseRequest) -> CloseReceipt
     actual_costs: dict[tuple[str, str, str], tuple[str, int]] = {}
     journal_ids = set()
     mapping_conflicts = set()
+    unit_conflicts = set()
     if database.execute(
         "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='journal_entry'"
     ).fetchone():
+        scale_column = (
+            "entry.units_per_whole" if _has_journal_scale(database) else "NULL"
+        )
         for (
             entry_id,
             source,
@@ -209,9 +215,10 @@ def _assess(database: sqlite3.Connection, request: CloseRequest) -> CloseReceipt
             mapping,
             account,
             amount,
+            scale,
         ) in database.execute(
-            """SELECT entry.id,entry.source,entry.source_event,entry.evidence_revision,
-                      entry.mapping_revision,line.account,line.amount_minor
+            f"""SELECT entry.id,entry.source,entry.source_event,entry.evidence_revision,
+                      entry.mapping_revision,line.account,line.amount_minor,{scale_column}
                FROM journal_entry entry JOIN journal_line line ON line.entry_id=entry.id
                WHERE entry.currency=? AND entry.effective_date BETWEEN ? AND ?""",
             (
@@ -228,6 +235,8 @@ def _assess(database: sqlite3.Connection, request: CloseRequest) -> CloseReceipt
             journal_ids.add(entry_id)
             if mapping != request.mapping_revision:
                 mapping_conflicts.add(entry_id)
+            elif scale != request.units_per_whole:
+                unit_conflicts.add(entry_id)
             elif account == request.cash_account:
                 cash += amount
             else:
@@ -240,6 +249,10 @@ def _assess(database: sqlite3.Connection, request: CloseRequest) -> CloseReceipt
         CloseIssue("chart-mismatch", request.owner, (entry_id,))
         for entry_id in sorted(mapping_conflicts)
     ]
+    issues.extend(
+        CloseIssue("unit-mismatch", request.owner, (entry_id,))
+        for entry_id in sorted(unit_conflicts)
+    )
     if difference:
         issues.append(
             CloseIssue("cash-mismatch", request.owner, (request.statement_revision,))
@@ -291,7 +304,10 @@ def close_period(writer: WriterLease, request: CloseRequest) -> CloseReceipt:
             request.currency,
         )
     )
-    payload = _encoded(asdict(request))
+    terms = asdict(request)
+    if request.units_per_whole is None:
+        del terms["units_per_whole"]
+    payload = _encoded(terms)
     with closing(_connect(writer.store, "rw")) as database, database:
         database.execute("BEGIN IMMEDIATE")
         if _identity(database) != request.company_id:
@@ -331,12 +347,13 @@ def close_period(writer: WriterLease, request: CloseRequest) -> CloseReceipt:
             prior = json.loads(latest[1])
             if (
                 prior["mapping_revision"] != request.mapping_revision
+                or prior.get("units_per_whole") != request.units_per_whole
                 or set(prior["expense_accounts"]) != set(request.expense_accounts)
                 or not _prior_cost_keys(prior)
                 <= {cost.key for cost in request.expected_costs}
             ):
                 raise CloseRefused(
-                    "A correction cannot remove cost sources or change the chart"
+                    "A correction cannot remove cost sources or change the chart or scale"
                 )
         assessed_ns = time_ns()
         receipt = _assess(database, request)
