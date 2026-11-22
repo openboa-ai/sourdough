@@ -1,0 +1,313 @@
+import json
+import signal
+import sqlite3
+import subprocess
+import sys
+import unittest
+from contextlib import closing
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from time import time
+
+
+EMPLOYEE = r"""
+import json, socket, sys
+request = json.load(sys.stdin)
+operation = request["operation"]
+def invoke(name, args):
+    with socket.socket(socket.AF_UNIX) as client:
+        client.connect(request["read_endpoint"])
+        client.sendall(json.dumps({"name": name, "arguments": args}).encode() + b"\n")
+        with client.makefile() as stream:
+            response = json.load(stream)
+    assert "error" not in response, response
+    return response
+if operation == "identify":
+    result = {"provider": "fixture", "model": "scripted", "revision": "1"}
+elif operation == "ready":
+    result = {"ready": True}
+elif operation == "staffing_duty":
+    need = invoke("read_staffing_need", {})
+    choice = invoke("record_staffing_choice", {
+        "evidence_revision": need["revision"], "action": "hire",
+        "rationale": "Backlog exceeds available capacity.",
+        "alternatives": ["reassign", "defer"], "next_check_seconds": 300,
+    })
+    result = invoke("request_hire", {
+        "request_id": "fixture-hire", "choice_id": choice["choice_id"],
+        "role": "reviewer", "execution_profile": need["profile"], "scope": need["scope"],
+        "turns": 3,
+    })
+elif operation in ("assessment_duty", "hired_research_duty"):
+    first = invoke("read_first_duty", {})
+    invoke("accept_first_duty", {"revision": first["revision"], "rationale": first["assignment_summary"]})
+    if operation == "assessment_duty":
+        inputs = invoke("read_assessment_inputs", {})
+        result = invoke("publish_assessment", {
+            "source_revision": inputs["revision"], "record_id": "record",
+            "disposition": "recommend_change", "rationale": "Observed six rather than eight.",
+            "next_check_seconds": 60,
+        })
+    else:
+        inputs = invoke("read_research_inputs", {})
+        start, end = inputs["observations"]
+        gross = end["price_minor_units"] - start["price_minor_units"]
+        fees = sum((record["price_minor_units"] * inputs["fee_bps"] + 5000) // 10000 for record in (start, end))
+        finding = invoke("publish_research_finding", {
+            "snapshot_revision": inputs["revision"], "hypothesis": "Compare available fixture prices.",
+            "start_id": start["observation_id"], "end_id": end["observation_id"],
+            "gross_change_minor_units": gross, "round_trip_fee_minor_units": fees,
+            "net_change_minor_units": gross - fees, "uncertainty": "Only an execution fixture.",
+        })
+        decision = invoke("record_research_decision", {
+            "finding_id": finding["finding_id"], "finding_revision": finding["revision"],
+            "call_id": "fixture-research", "action": "buy", "quantity": 1, "limit_minor_units": 5000,
+            "rationale": "Use the measured positive change for one bounded synthetic order.", "next_check_seconds": 60,
+        })
+        result = invoke("request_research_order", {"decision_id": decision["decision_id"]})
+elif operation in ("assessment_review", "review_duty"):
+    with socket.socket(socket.AF_UNIX) as client:
+        client.connect(request["read_endpoint"])
+        with client.makefile() as stream:
+            prior = json.load(stream)
+    result = {
+        "tool": "record_review_decision", "observation_revision": prior["revision"],
+        "call_id": "fixture-review", "action": "hold", "next_check_seconds": 300,
+        "rationale": "Check the original result: " + str(prior["revision"]),
+    }
+else:
+    raise RuntimeError(operation)
+print(json.dumps(result))
+"""
+
+WORKER = """
+import os, signal, sys
+from pathlib import Path
+from time import time
+from sourdough import assessment_run, cli, company_assessment, hired_paper_run
+from sourdough.paper_venue import FixedQuoteVenue
+marker = Path(sys.argv.pop(1))
+def interrupted():
+    if not marker.exists():
+        marker.touch()
+        os.kill(os.getpid(), signal.SIGKILL)
+class WithheldFill(FixedQuoteVenue):
+    def submit(self, *args):
+        result = super().submit(*args)
+        interrupted()
+        return result
+publish = company_assessment.publish_assessment
+def withheld_assessment(*args, **kwargs):
+    result = publish(*args, **kwargs)
+    interrupted()
+    return result
+def environment_clock():
+    return time() + (121 if marker.exists() else 0)
+assessment_run.time = environment_clock
+hired_paper_run.time = environment_clock
+cli.FixedQuoteVenue = WithheldFill
+company_assessment.publish_assessment = withheld_assessment
+raise SystemExit(cli.main())
+"""
+
+DRIVER = """
+import sys
+from sourdough import cli
+worker, marker = sys.argv[1:3]
+del sys.argv[1:3]
+supervise = cli.supervise_worker
+def start(command, store, company_id, **options):
+    candidate = [sys.executable, "-IB", "-c", worker, marker, *command[4:]]
+    return supervise(candidate, store, company_id, **options)
+cli.supervise_worker = start
+raise SystemExit(cli.main())
+"""
+
+
+def cli(command, *arguments):
+    result = subprocess.run(
+        [sys.executable, "-IB", "-m", "sourdough.cli", command, *map(str, arguments)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr)
+    return json.loads(result.stdout)
+
+
+def rows(store, sql):
+    with closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as db:
+        return db.execute(sql).fetchall()
+
+
+class ConnectedFlow(unittest.TestCase):
+    def test_end_to_end(self):
+        for scope in ("assessment", "paper"):
+            with self.subTest(scope=scope), TemporaryDirectory() as local:
+                root = Path(local)
+                employee, store, venue = (
+                    root / name
+                    for name in ("employee", "company.sqlite", "venue.sqlite")
+                )
+                employee.write_text(f"#!{sys.executable}\n" + EMPLOYEE)
+                employee.chmod(0o700)
+                profile = cli("employee-profile", employee)["execution_profile"]
+                founded = cli(
+                    "found",
+                    store,
+                    "--setup-identity",
+                    "fixture",
+                    "--charter-revision",
+                    "synthetic",
+                    "--founder-scope",
+                    "manage-company",
+                    "--execution-profile",
+                    profile,
+                )
+                identity = ("--company-id", founded["company_id"])
+                now = int(time())
+                envelope, source = root / "envelope.json", root / "records.json"
+                envelope.write_text(
+                    json.dumps(
+                        {
+                            "authority": {
+                                "manager_grant_id": founded["grant_id"],
+                                "execution_profile": profile,
+                                "allowed_scope": scope,
+                                "slots": 1,
+                                "turns": 5,
+                            },
+                            "need": {
+                                "duty_id": "capacity",
+                                "summary": "Inspect available evidence",
+                                "backlog": 5,
+                                "available_capacity": 0,
+                                "assigned_capacity": 1,
+                                "available_at": now,
+                            },
+                        }
+                    )
+                )
+                cli("stage-staffing", store, envelope, *identity)
+                if scope == "assessment":
+                    source.write_text(
+                        json.dumps(
+                            [
+                                {
+                                    "record_id": "record",
+                                    "subject": "Reviewed documents",
+                                    "recorded": 8,
+                                    "observed": 6,
+                                    "available_at": now,
+                                }
+                            ]
+                        )
+                    )
+                    cli("stage-assessment-source", store, source, *identity)
+                    entry = ("supervise-assessment", str(store))
+                else:
+                    cli(
+                        "bind-paper",
+                        store,
+                        venue,
+                        *identity,
+                        "--charter-revision",
+                        "synthetic",
+                        "--revision",
+                        "mandate",
+                        "--account-id",
+                        "test",
+                        "--rules",
+                        "fixture",
+                        "--starting-minor-units",
+                        50000,
+                        "--exposure-minor-units",
+                        25000,
+                        "--quote-minor-units",
+                        5000,
+                        "--fee-bps",
+                        4,
+                    )
+                    source.write_text(
+                        json.dumps(
+                            [
+                                {
+                                    "observation_id": label,
+                                    "price_minor_units": price,
+                                    "observed_at": now + offset,
+                                    "available_at": now + offset + 5,
+                                }
+                                for label, price, offset in (
+                                    ("first", 4800, -120),
+                                    ("last", 5000, -60),
+                                )
+                            ]
+                        )
+                    )
+                    cli("stage-paper-observations", store, source, *identity)
+                    entry = ("supervise-hired-paper", str(store), str(venue))
+                response = subprocess.run(
+                    [
+                        sys.executable,
+                        "-IB",
+                        "-c",
+                        DRIVER,
+                        WORKER,
+                        str(root / "cut"),
+                        *entry,
+                        *identity,
+                        "--employee",
+                        str(employee),
+                        "--idle-seconds",
+                        "2",
+                        "--turn-budget",
+                        "3",
+                        "--max-restarts",
+                        "1",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(response.returncode, 0, response.stderr)
+                result, supervisor = [
+                    json.loads(line) for line in response.stdout.splitlines()
+                ]
+                original, resumed = supervisor["attempts"]
+                self.assertEqual(original["returncode"], -signal.SIGKILL)
+                self.assertLess(original["exited_at_ns"], resumed["ready_at_ns"])
+                claim = result["review"]["claim"]
+                ((agent_id, first_duty),) = rows(
+                    store,
+                    """SELECT a.agent_id,a.first_duty_id FROM hire_onboarding a
+                       JOIN onboarding_acceptance w ON w.duty_id=a.first_duty_id""",
+                )
+                self.assertNotEqual(agent_id, founded["founder_id"])
+                self.assertEqual(claim["founder_id"], agent_id)
+                self.assertNotEqual(claim["duty_id"], first_duty)
+                self.assertEqual(claim["execution_profile"], profile)
+                self.assertEqual(rows(store, "SELECT count(*) FROM duty_run"), [(3,)])
+                self.assertEqual(
+                    rows(store, "SELECT count(*) FROM work_follow_up"), [(2,)]
+                )
+                self.assertEqual(rows(store, "PRAGMA foreign_key_check"), [])
+                if scope == "assessment":
+                    self.assertEqual(
+                        rows(store, "SELECT count(*) FROM assessment_publication"),
+                        [(1,)],
+                    )
+                    self.assertFalse(venue.exists())
+                else:
+                    self.assertEqual(
+                        rows(
+                            store, "SELECT count(*) FROM hired_research_order_request"
+                        ),
+                        [(1,)],
+                    )
+                    self.assertEqual(
+                        rows(store, "SELECT count(*) FROM paper_fill"), [(1,)]
+                    )
+                    self.assertEqual(
+                        rows(venue, "SELECT count(*) FROM venue_execution"), [(1,)]
+                    )
