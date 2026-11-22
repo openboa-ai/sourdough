@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic, time_ns
@@ -20,6 +21,15 @@ from .nautilus_paper import (
 )
 from .paper_execution import VenueRefused
 from .spot_cash import QUOTE_SCALE, SpotCashUnits
+
+
+async def _drain_checkpoint(checkpoint: Callable[[], Awaitable[bool]]) -> None:
+    deadline = monotonic() + 5
+    while monotonic() < deadline:
+        if await checkpoint():
+            return
+        await asyncio.sleep(max(0, min(0.1, deadline - monotonic())))
+    raise VenueRefused("Sandbox stopped with an unresolved account checkpoint")
 
 
 def submit_limit(
@@ -122,7 +132,7 @@ async def serve(
     key = journal_key(venue.journal)
     loop = asyncio.get_running_loop()
     failure = loop.create_future()
-    pending_account: set[str] = set()
+    outstanding_order = None
 
     class ScopedSandbox(Strategy):
         quote = None
@@ -197,21 +207,19 @@ async def serve(
 
         def on_order_filled(self, event):
             try:
-                pending_account.add(capture_fill(venue, generation, units, event))
+                capture_fill(venue, generation, units, event)
             except Exception as error:
                 if not failure.done():
                     failure.set_result(error)
 
         def terminal_event(self, event):
             try:
-                pending_account.add(
-                    capture_terminal(
-                        venue,
-                        generation,
-                        units,
-                        self.cache.order(event.client_order_id),
-                        event,
-                    )
+                capture_terminal(
+                    venue,
+                    generation,
+                    units,
+                    self.cache.order(event.client_order_id),
+                    event,
                 )
             except Exception as error:
                 if not failure.done():
@@ -273,24 +281,28 @@ async def serve(
             units.quote_atoms(quote_cash.as_decimal()),
         )
 
+    async def checkpoint() -> bool:
+        nonlocal outstanding_order
+        if failure.done():
+            raise failure.result()
+        if task.done():
+            await task
+            raise VenueRefused("Sandbox stopped before completing its activation")
+        if outstanding_order is not None:
+            _, balance = read_balance()
+            if venue.record_account(
+                generation, outstanding_order, balance.position_lots, balance.cash_atoms
+            ):
+                outstanding_order = None
+        return outstanding_order is None
+
     ready = False
     start_deadline = monotonic() + 30
     deadline = start_deadline
     last_quote = None
     try:
         while monotonic() < deadline:
-            if failure.done():
-                raise failure.result()
-            if task.done():
-                await task
-                raise VenueRefused("Sandbox stopped before completing its activation")
-            if pending_account:
-                _, balance = read_balance()
-                for order_id in tuple(pending_account):
-                    if venue.record_account(
-                        generation, order_id, balance.position_lots, balance.cash_atoms
-                    ):
-                        pending_account.remove(order_id)
+            await checkpoint()
             quote = strategy.quote
             now = time_ns()
             if (
@@ -317,14 +329,18 @@ async def serve(
                     os.write(ready_fd, json.dumps(payload).encode() + b"\n")
                     ready = True
                     deadline = monotonic() + seconds
-                command = venue.claim_command(generation)
-                if command is not None:
-                    submit_limit(strategy, strategy.instrument, units, command)
+                if outstanding_order is None and monotonic() < deadline:
+                    command = venue.claim_command(generation)
+                    if command is not None:
+                        outstanding_order = command.order_id
+                        submit_limit(strategy, strategy.instrument, units, command)
             await asyncio.sleep(0.1)
         if not ready:
             raise VenueRefused(
                 "No fresh public quote, source trade, and virtual cash account"
             )
+        venue.invalidate_quote()
+        await _drain_checkpoint(checkpoint)
     finally:
         venue.invalidate_quote()
         await asyncio.wait_for(node.stop_async(), timeout=8)
