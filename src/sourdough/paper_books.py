@@ -8,6 +8,7 @@ from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
+from time import time_ns
 from typing import TYPE_CHECKING
 
 from .company import _connect, _identity
@@ -29,6 +30,19 @@ class Posting:
     quantity: int
     price_minor_units: int
     fee_minor_units: int = 0
+
+
+@dataclass(frozen=True)
+class FillAccountingSource:
+    destination_id: str
+    account_id: str
+    fill_id: str
+    order_id: str
+    binding_revision: str
+    currency: str
+    mapping_revision: str
+    recorded_at_ns: int
+    fee_minor_units: int
 
 
 @dataclass(frozen=True)
@@ -118,6 +132,23 @@ def post_confirmed_fill(
                 "INSERT INTO paper_fill_fee VALUES (?, ?)", (observed.fill_id, fee)
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS paper_fill_accounting_source (
+                    fill_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_fill_fee(fill_id),
+                    destination_id TEXT NOT NULL, currency TEXT NOT NULL,
+                    mapping_revision TEXT NOT NULL, recorded_at_ns INTEGER NOT NULL
+                )"""
+            )
+            db.execute(
+                "INSERT INTO paper_fill_accounting_source VALUES (?, ?, ?, ?, ?)",
+                (
+                    observed.fill_id,
+                    binding.account.destination_id,
+                    binding.account.currency,
+                    "paper-quote-fee-v1",
+                    time_ns(),
+                ),
+            )
+            db.execute(
                 "UPDATE paper_order SET reserved_minor_units = ? WHERE order_id = ?",
                 (observed.quantity * price, order_id),
             )
@@ -129,6 +160,33 @@ def post_confirmed_fill(
             if existing != [terms] or (prior_fee or (0,)) != (fee,):
                 raise PostingRefused("Fill conflicts with an existing posting")
     return Posting(*terms, fee)
+
+
+def read_fill_accounting_source(
+    store: Path, company_id: str, fill_id: str
+) -> FillAccountingSource | None:
+    with closing(_connect(store, "ro")) as db:
+        db.execute("BEGIN")
+        if _identity(db) != company_id:
+            raise PostingRefused("Company identity mismatch")
+        if (
+            db.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='paper_fill_accounting_source'"
+            ).fetchone()
+            is None
+        ):
+            return None
+        row = db.execute(
+            """SELECT s.destination_id,o.account_id,s.fill_id,o.order_id,o.mandate_revision,
+                      s.currency,s.mapping_revision,s.recorded_at_ns,fee.fee_minor_units
+               FROM paper_fill_accounting_source s
+               JOIN paper_fill_fee fee USING(fill_id)
+               JOIN paper_fill f USING(fill_id)
+               JOIN paper_order o USING(order_id)
+               WHERE s.fill_id=?""",
+            (fill_id,),
+        ).fetchone()
+    return FillAccountingSource(*row) if row else None
 
 
 def position_quantity(store: Path, company_id: str) -> int:

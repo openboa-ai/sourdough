@@ -12,6 +12,8 @@ Input contracts: [Fill subledger](../post/spec.md) · [General journal](../../..
 
 Deliver the pending accounting source committed atomically with the fill, using venue/account/fill ID, currency and effective mapping revision. Map cash fees and realized amounts to balanced corporate journal entries; keep contract quantities in the investment subledger. A corporate journal is not trading authority.
 
+The paper fill writer records the original destination and quote currency, fee-source mapping revision, and source registration time in the same transaction as the fill, fee and reservation change. The source references the booked fee; it does not copy the amount, derive the position or authorize a second effect. Source registration time is not an execution timestamp or an accounting effective cut. An older fill without this record remains without source coverage until independently reconciled; replay must not backdate or silently reconstruct it from a newer binding. Journal delivery must separately verify currency scale, effective cut and chart mapping before posting.
+
 **Concern for the responsible component:** While accounting is unavailable retain a durable unposted event and reconcile it by source ID on recovery. Do not erase the fill, issue an order or post the same fee twice.
 
 ## Functional and quality requirements
