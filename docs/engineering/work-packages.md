@@ -40,6 +40,7 @@ Each spec has one primary verification owner. Earlier steps implement only the p
 
 ## 05 · Continuing operation and founder resilience
 
+- [work/discover-work/continue-after-result](../company/systems/work/discover-work/continue-after-result/spec.md)
 - [acceptance/first-shift](../acceptance/first-shift/spec.md)
 - [client/inspect/present](../client/inspect/present/spec.md)
 - [investments/research/decision-note](../company/profiles/quant/investments/research/decision-note/spec.md)
