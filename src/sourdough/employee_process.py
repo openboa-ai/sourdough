@@ -1,14 +1,35 @@
-"""Bridge a provisioned employee process to the first-duty tool boundary."""
+"""Bridge a provisioned employee process to scoped company tools."""
 
 import json
 import os
+import socketserver
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from hashlib import file_digest, sha256
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Thread
 
+from .first_duty import DutyRefused
 from .first_trade import OrderTool, TradeRefused, TradingContext
+
+
+class _ReadWorkResult(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        self.request.settimeout(1)
+        try:
+            result = self.server.read_result()
+        except (DutyRefused, TradeRefused):
+            result = {"error": "Work result is not available to this claim"}
+        self.request.sendall(json.dumps(result).encode())
+
+
+class _ResultEndpoint(socketserver.UnixStreamServer):
+    def __init__(self, address: str, read_result: Callable[[], dict]):
+        self.read_result = read_result
+        super().__init__(address, _ReadWorkResult)
 
 
 class EmployeeProcess:
@@ -73,3 +94,21 @@ class EmployeeProcess:
         order_tool(
             response["call_id"], response["quantity"], response["limit_minor_units"]
         )
+
+    def review(self, read_result: Callable[[], dict]) -> dict:
+        if self._profile() != self.profile:
+            raise TradeRefused("Employee model binding changed")
+        with TemporaryDirectory(prefix="sd-") as directory:
+            address = str(Path(directory) / "result.sock")
+            with _ResultEndpoint(address, read_result) as endpoint:
+                thread = Thread(
+                    target=endpoint.serve_forever, kwargs={"poll_interval": 0.05}
+                )
+                thread.start()
+                try:
+                    return self._exchange(
+                        {"operation": "review_duty", "read_endpoint": address}
+                    )
+                finally:
+                    endpoint.shutdown()
+                    thread.join()

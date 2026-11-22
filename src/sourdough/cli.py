@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
+from sourdough.company_run import run_paper_company
 from sourdough.employee_process import EmployeeProcess
 from sourdough.first_duty import DutyRefused
 from sourdough.first_trade import TradeRefused, run_first_trade
@@ -44,11 +45,12 @@ def main() -> int:
         paper.add_argument(f"--{name}", required=True)
     for name in ("starting-minor-units", "exposure-minor-units", "quote-minor-units"):
         paper.add_argument(f"--{name}", required=True, type=int)
-    running = commands.add_parser("first-duty")
-    running.add_argument("store", type=Path)
-    running.add_argument("journal", type=Path)
-    running.add_argument("--company-id", required=True)
-    running.add_argument("--employee", type=Path, required=True)
+    for command in ("first-duty", "operate-paper"):
+        running = commands.add_parser(command)
+        running.add_argument("store", type=Path)
+        running.add_argument("journal", type=Path)
+        running.add_argument("--company-id", required=True)
+        running.add_argument("--employee", type=Path, required=True)
     args = parser.parse_args()
 
     try:
@@ -99,7 +101,12 @@ def main() -> int:
                 venue,
             )
         else:
-            result = run_first_trade(
+            run = (
+                run_paper_company
+                if args.command == "operate-paper"
+                else run_first_trade
+            )
+            result = run(
                 args.store,
                 args.company_id,
                 FixedQuoteVenue(args.journal),

@@ -20,7 +20,14 @@ from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import post_confirmed_fill
 from sourdough.paper_order import PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.work import ResultReference, claim_follow_up, finish_first_duty
+from sourdough.work import (
+    ResultReference,
+    ReviewDecision,
+    claim_follow_up,
+    finish_first_duty,
+    read_follow_up_result,
+    settle_review,
+)
 
 
 class WorkContinuation(unittest.TestCase):
@@ -168,3 +175,47 @@ class WorkContinuation(unittest.TestCase):
             self.rows("SELECT id, state FROM duty"), [(original.duty_id, "running")]
         )
         self.assertEqual(self.rows("SELECT * FROM work_follow_up"), [])
+
+    def test_review_and_next_responsibility_persist_once_with_current_grant(self):
+        original = self.founder()
+        ref = ResultReference("book", "position", "observed", 100)
+        finish_first_duty(self.store, original, ref, due_at=100)
+        follow_up = self.claim(100)
+        decision = ReviewDecision("pick", ref.revision, "hold", "Known position", 60)
+        with self.assertRaisesRegex(DutyRefused, "preceding"):
+            settle_review(self.store, follow_up, decision, now=100)
+        observation = {"revision": ref.revision, "quantity": 2}
+
+        def producer(connection, request):
+            self.assertEqual(request, ref)
+            return observation
+
+        self.assertEqual(
+            read_follow_up_result(self.store, follow_up, now=102, read=producer),
+            observation,
+        )
+        with self.assertRaisesRegex(DutyRefused, "preceding"):
+            settle_review(self.store, follow_up, decision, now=101)
+        next_duty = settle_review(self.store, follow_up, decision, now=103)
+        self.assertEqual(next_duty.due_at, 163)
+        self.assertEqual(
+            settle_review(self.store, follow_up, decision, now=104), next_duty
+        )
+        with self.assertRaisesRegex(DutyRefused, "conflicts"):
+            settle_review(
+                self.store, follow_up, replace(decision, action="investigate"), now=104
+            )
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM work_review_decision"), [(1,)])
+        self.assertIsNone(self.claim(162))
+        new_claim = self.claim(163)
+        self.assertEqual(new_claim.claim.duty_id, next_duty.duty_id)
+        read_follow_up_result(self.store, new_claim, now=163, read=producer)
+        with closing(sqlite3.connect(self.store)) as connection, connection:
+            connection.execute("UPDATE standing_grant SET scope = 'revoked'")
+        with self.assertRaisesRegex(DutyRefused, "no longer current"):
+            read_follow_up_result(self.store, new_claim, now=164, read=producer)
+        with self.assertRaisesRegex(DutyRefused, "no longer current"):
+            settle_review(
+                self.store, new_claim, replace(decision, call_id="second"), now=164
+            )
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM work_review_decision"), [(1,)])
