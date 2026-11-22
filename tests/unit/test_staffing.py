@@ -9,6 +9,12 @@ from time import time
 
 from sourdough.company import FoundingTerms, found
 from sourdough.duty_run import DutyRefused
+from sourdough.onboarding import (
+    accept_first_duty,
+    claim_hired_first,
+    provision_hire,
+    read_first_duty,
+)
 from sourdough.staffing import (
     HireRequest,
     StaffingAuthority,
@@ -175,3 +181,73 @@ class Staffing(unittest.TestCase):
                 "UPDATE standing_grant SET scope='revoked' WHERE id=?",
                 (self.founding.grant_id,),
             )
+
+    def test_hired_identity_reopens_the_same_private_desk_and_accepts_its_duty(self):
+        manager, choice = self.ready("hire")
+        choice = replace(
+            choice, evidence_revision=read_need(self.writer, manager)["revision"]
+        )
+        choice_id = record_choice(self.writer, manager, choice)
+        receipt = admit_hire(
+            self.writer,
+            manager,
+            HireRequest("hire", choice_id, "reviewer", "profile", "assessment", 4),
+        )
+        self.assertIsNone(claim_hired_first(self.writer, receipt.agent_id, "profile"))
+        probes = []
+
+        def blocked(profile):
+            probes.append(profile)
+            return False
+
+        first = provision_hire(
+            self.writer, receipt.agent_id, "assessment", blocked, now=self.now
+        )
+        self.assertEqual(first.state, "blocked")
+        self.assertIsNone(claim_hired_first(self.writer, receipt.agent_id, "profile"))
+        self.assertEqual(
+            provision_hire(
+                self.writer, receipt.agent_id, "assessment", blocked, now=self.now + 1
+            ),
+            first,
+        )
+        self.assertEqual(probes, ["profile"])
+        prepared = provision_hire(
+            self.writer,
+            receipt.agent_id,
+            "assessment",
+            lambda profile: profile == "profile",
+            now=first.retry_at,
+        )
+        self.assertEqual(prepared.state, "ready")
+        self.assertIsNone(
+            claim_hired_first(self.writer, receipt.agent_id, "replacement")
+        )
+        hire = claim_hired_first(self.writer, receipt.agent_id, "profile")
+        self.assertEqual(hire.duty_id, prepared.first_duty_id)
+        self.assertEqual(hire.founder_id, receipt.agent_id)
+        with self.assertRaises(DutyRefused):
+            read_first_duty(self.writer, replace(hire, founder_id=manager.founder_id))
+        with self.assertRaisesRegex(DutyRefused, "own current desk"):
+            accept_first_duty(self.writer, hire, "unread", "Accept the work.")
+        context = read_first_duty(self.writer, hire)
+        self.assertEqual(context["charter_revision"], "charter")
+        self.assertEqual(read_first_duty(self.writer, hire), context)
+        for attempt in range(2):
+            self.assertEqual(
+                accept_first_duty(
+                    self.writer,
+                    hire,
+                    context["revision"],
+                    "Accept the capacity review.",
+                ),
+                hire.duty_id,
+            )
+        self.assertEqual(self.rows("SELECT count(*) FROM private_desk"), [(1,)])
+        self.assertEqual(
+            self.rows("SELECT count(*) FROM onboarding_acceptance"), [(1,)]
+        )
+        self.assertEqual(
+            self.rows("SELECT state FROM hire_onboarding"), [("accepted",)]
+        )
+        self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
