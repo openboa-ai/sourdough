@@ -226,9 +226,12 @@ class ConnectedFlow(unittest.TestCase):
                 ),
             )
             close_period(writer, accounting)
+        engine.rename(root / "detached")
         second = command("close-paper-window", *window, *corrected)
         self.assertEqual(second["statement"]["observed_slots"], [0, 1])
         self.assertEqual(second["statement"]["operating_cost_atoms"], expense)
+        self.assertEqual(second["statement"]["trading"], first["statement"]["trading"])
+        self.assertEqual(second["statement"]["venue_fees_atoms"], actual_fee)
         company = second["statement"]["company"]
         self.assertEqual(company["pnl_minor"], trading_pnl - expense)
         self.assertEqual(
@@ -239,7 +242,6 @@ class ConnectedFlow(unittest.TestCase):
             first["statement"]["revision"], second["statement"]["revision"]
         )
 
-        engine.rename(root / "detached")
         self.assertEqual(
             command("close-paper-window", *window, *corrected, now=closes + 4), second
         )
