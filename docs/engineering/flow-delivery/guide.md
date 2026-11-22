@@ -2,6 +2,15 @@
 
 Start at the [implementation architecture](../implementation-architecture.md) for dependency direction, transaction boundaries, version compatibility and operating limits. Change the owning spec if a decision changes; do not copy these rules into every unit.
 
+## Keeping a change maintainable
+
+- **Localize the next edit.** Put a rule where its owner changes it. Fix derived views at their source and check the consumer's result. Keep a direct call unless a boundary hides a real dependency or enforces a guarantee; similar-looking code with different policies need not share a helper.
+- **Preserve meaning across implementations.** An adapter may change the transport, not what its caller can infer. An unanswered order is not a rejection. Run the same relevant contract cases against each supported adapter; declare unsupported operations instead of silently approximating them.
+- **Make effects easy to trace.** Keep the authority check, state transition and commit boundary visible. Commit related local facts together; never wait for an external call inside that transaction. Distinguish a safe replay from a new request with conflicting terms.
+- **Test what the next consumer sees.** Exercise the public entry point and inspect its result independently, not its helper-call sequence. For [founding](../../company/systems/organization/found-company/bootstrap/spec.md), lose the reply after commit and repeat setup: the receipt must identify the same company, founder, grant and duty, with no new records. Renaming a private helper must not break that test.
+
+Apply only the criteria the change touches. Block a broken guarantee or needless coupling, not a preference for another directory layout or design pattern.
+
 **Stack.** Start with one Python package under `src/sourdough/` and a transactional SQLite store. The company owns identity, grants and work; the fund owns paper accounts, orders and positions. Neither the Agent nor the Client writes directly to the books. Keep the trading SDK behind the company-managed execution adapter; use Yogurt only in the Client build. Separate the macOS supervisor when implementing recovery, not as a prerequisite for the first trade.
 
 **First package.** Pin a tested CPython patch in `.python-version`. Declare the package, entry point and build backend in `pyproject.toml`. Pin Ruff, the backend and other CI tools with hashes in `requirements-dev.lock`. Use the standard library for founding. Add modules with their first use; do not create a service per spec.
