@@ -3,11 +3,13 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 from sourdough.company import FoundingTerms, found
+from sourdough.company_run import run_paper_company
 from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_books import PostingRefused
+from sourdough.paper_books import PostingRefused, post_confirmed_fill
 from sourdough.paper_order import PaperIntent, submit_paper_order
 from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
@@ -93,10 +95,12 @@ class ReconcilePaper(unittest.TestCase):
             self.rows(self.store, "SELECT reserved_minor_units FROM paper_order"),
             [(200,)],
         )
-        self.assertEqual(self.recover(edge, 101).recovered, recovery.recovered)
+        replay = self.recover(edge, 101).recovered
+        self.assertEqual(replay[0].posting, resolved.posting)
+        self.assertEqual(replay[0].sources, ("book",))
         self.assertEqual(
             edge.reads,
-            [("history", self.order_id), ("account_sync", self.order_id)] * 2,
+            [("history", self.order_id), ("account_sync", self.order_id)],
         )
         self.assertEqual(
             self.rows(
@@ -151,4 +155,61 @@ class ReconcilePaper(unittest.TestCase):
         self.assertEqual(
             self.rows(self.store, "SELECT reserved_minor_units FROM paper_order"),
             [(220,)],
+        )
+
+    def test_booked_fill_is_usable_if_worker_died_before_settling_and_venue_is_unavailable(
+        self,
+    ):
+        posting = post_confirmed_fill(
+            self.store, self.company_id, self.order_id, self.venue
+        )
+
+        class Offline(RecoveryView):
+            def observe_account(self, account_id):
+                raise AssertionError(
+                    "Already booked effects must not require venue availability"
+                )
+
+        offline = Offline(self.journal, visible=False)
+        (resolved,) = self.recover(offline, 100).recovered
+        self.assertEqual(resolved.posting, posting)
+        self.assertEqual(resolved.sources, ("book",))
+        self.assertEqual(offline.reads, [])
+        self.assertEqual(
+            self.rows(self.store, "SELECT count(*) FROM paper_fill_fee"), [(1,)]
+        )
+
+    def test_replacement_retries_unresolved_lookup_after_agent_budget_is_exhausted(
+        self,
+    ):
+        class BecomesVisible(RecoveryView):
+            def sync_account_execution(self, account_id, order_id):
+                observed = super().sync_account_execution(account_id, order_id)
+                self.visible = True
+                return observed
+
+        edge = BecomesVisible(self.journal, visible=False)
+        result = run_paper_company(
+            self.store,
+            self.company_id,
+            edge,
+            SimpleNamespace(profile="runtime"),
+            budget_from=0,
+            turn_budget=1,
+            idle_seconds=4,
+        )
+        self.assertIsNone(result.review)
+        self.assertEqual(result.later_trades, ())
+        self.assertEqual(result.reconciliation.unresolved, 0)
+        self.assertEqual(
+            result.reconciliation.recovered[0].posting.order_id, self.order_id
+        )
+        self.assertEqual(
+            edge.reads,
+            [("history", self.order_id), ("account_sync", self.order_id)] * 2,
+        )
+        self.assertEqual(self.rows(self.store, "SELECT count(*) FROM duty_run"), [(1,)])
+        self.assertEqual(
+            self.rows(self.store, "SELECT count(*) FROM duty WHERE state='scheduled'"),
+            [(1,)],
         )

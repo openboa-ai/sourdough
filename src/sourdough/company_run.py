@@ -150,21 +150,25 @@ def _operate(
 
     review = None
     trades = []
-    while turn_budget:
+    while turn_budget or reconciliation.next_query_at is not None:
         if (
             reconciliation.next_query_at is not None
             and reconciliation.next_query_at <= int(time())
         ):
             reconciliation, blocked = _recover(writer, venue, next_purpose)
         writer.verify()
-        follow_up = claim_follow_up(
-            store,
-            company_id,
-            runtime.profile,
-            now=int(time()),
-            allow_paper_execution=repeat_paper and not reconciliation.unresolved,
-        )
+        follow_up = None
+        if turn_budget:
+            follow_up = claim_follow_up(
+                store,
+                company_id,
+                runtime.profile,
+                now=int(time()),
+                allow_paper_execution=repeat_paper and not reconciliation.unresolved,
+            )
         if follow_up is None:
+            if not turn_budget and reconciliation.next_query_at is None:
+                break
             remaining = idle_deadline - monotonic()
             if remaining <= 0:
                 break

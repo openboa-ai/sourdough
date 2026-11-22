@@ -145,6 +145,34 @@ def position_quantity(store: Path, company_id: str) -> int:
         ).fetchone()[0]
 
 
+def read_booked_fill(store: Path, company_id: str, order_id: str) -> Posting | None:
+    with closing(_connect(store, "ro")) as db:
+        db.execute("BEGIN")
+        if _identity(db) != company_id:
+            raise PostingRefused("Company identity mismatch")
+        tables = {
+            name
+            for (name,) in db.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('paper_fill', 'paper_fill_fee')"
+            )
+        }
+        if "paper_fill" not in tables:
+            return None
+        row = db.execute(
+            "SELECT fill_id, order_id, quantity, price_minor_units FROM paper_fill WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        fee = None
+        if "paper_fill_fee" in tables:
+            fee = db.execute(
+                "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id = ?",
+                (row[0],),
+            ).fetchone()
+        return Posting(*row, fee[0] if fee else 0)
+
+
 def capture_position(
     store: Path, company_id: str, fill_id: str, *, now: int
 ) -> PositionObservation:

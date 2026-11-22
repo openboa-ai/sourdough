@@ -8,7 +8,7 @@ from sqlite3 import Connection
 from .company import _connect, _identity
 from .duty_run import DutyClaim
 from .paper_account import reopen_binding
-from .paper_books import Posting, PostingRefused, post_confirmed_fill
+from .paper_books import Posting, PostingRefused, post_confirmed_fill, read_booked_fill
 from .paper_venue import FixedQuoteVenue
 from .writer_lease import WriterLease
 
@@ -67,7 +67,8 @@ def _open_recovery(
                 LEFT JOIN paper_reconciliation j ON j.order_id = o.order_id
                 WHERE o.account_id = ? AND f.company_id = ?
                   AND ({_missing_fill(db)} OR d.state = 'running')
-                  AND (j.order_id IS NULL OR j.fill_id IS NOT NULL OR j.next_query_at <= ?)
+                  AND (j.order_id IS NULL OR j.fill_id IS NOT NULL OR j.next_query_at <= ?
+                       OR NOT ({_missing_fill(db)}))
                 ORDER BY COALESCE(j.next_query_at, 0), o.order_id LIMIT ?""",
             (account_id, company_id, now, limit),
         ).fetchall()
@@ -99,7 +100,10 @@ def _record_lookup(
             """INSERT INTO paper_reconciliation VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(order_id) DO UPDATE SET
                    attempts = excluded.attempts, next_query_at = excluded.next_query_at,
-                   fill_id = excluded.fill_id, sources = excluded.sources
+                   fill_id = excluded.fill_id,
+                   sources = CASE WHEN paper_reconciliation.fill_id IS NOT NULL
+                                  AND excluded.sources = 'book'
+                                  THEN paper_reconciliation.sources ELSE excluded.sources END
                WHERE paper_reconciliation.fill_id IS NULL OR excluded.fill_id IS NOT NULL""",
             (
                 order_id,
@@ -128,8 +132,6 @@ def reconcile_paper_orders(
         raise PostingRefused("Invalid paper reconciliation bounds")
     binding = reopen_binding(store, company_id)
     account = binding.account
-    if venue.observe_account(account.account_id) != account:
-        raise PostingRefused("Recovery requires the original paper destination")
     if writer is not None:
         writer.verify_for(store, company_id)
     candidates = _open_recovery(
@@ -145,26 +147,33 @@ def reconcile_paper_orders(
         profile,
         attempts,
     ) in candidates:
-        observed = []
-        for source, account_sync in (("history", False), ("account_sync", True)):
-            try:
-                posting = post_confirmed_fill(
-                    store,
-                    company_id,
-                    order_id,
-                    venue,
-                    account_sync=account_sync,
-                    writer=writer,
-                )
-            except TimeoutError:
-                continue
-            if posting is not None:
-                observed.append((source, posting))
-        posting = observed[0][1] if observed else None
-        sources = tuple(source for source, _ in observed)
+        posting = read_booked_fill(store, company_id, order_id)
+        if posting is not None:
+            sources = ("book",)
+        else:
+            if venue.observe_account(account.account_id) != account:
+                raise PostingRefused("Recovery requires the original paper destination")
+            observed = []
+            for source, account_sync in (("history", False), ("account_sync", True)):
+                try:
+                    confirmed = post_confirmed_fill(
+                        store,
+                        company_id,
+                        order_id,
+                        venue,
+                        account_sync=account_sync,
+                        writer=writer,
+                    )
+                except TimeoutError:
+                    continue
+                if confirmed is not None:
+                    observed.append((source, confirmed))
+            posting = observed[0][1] if observed else None
+            sources = tuple(source for source, _ in observed)
+            attempts += 1
         if writer is not None:
             writer.verify_for(store, company_id)
-        _record_lookup(store, company_id, order_id, now, attempts + 1, posting, sources)
+        _record_lookup(store, company_id, order_id, now, attempts, posting, sources)
         if posting is not None:
             claim = DutyClaim(
                 company_id, founder_id, grant_id, duty_id, run_id, profile
