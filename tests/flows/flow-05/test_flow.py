@@ -540,6 +540,15 @@ raise SystemExit(0 if bound.completed else 1)
             ),
             (10, 1, 9),
         )
+        before = self.store.read_bytes()
+        view = self.success("inspect-work", self.store, *self.identity)
+        first, follow_up = view["duties"]
+        (order,) = view["paper"]["orders"]
+        self.assertEqual(first["decision"]["finding_id"], receipt["finding_id"])
+        self.assertEqual(first["decision"]["decision_id"], order["action_id"])
+        self.assertEqual(follow_up["due_at"], chain[5])
+        self.assertEqual(view["paper"]["booked_position"], 2)
+        self.assertEqual(self.store.read_bytes(), before)
 
     def test_research_investigation_without_order_arms_a_read_only_follow_up(self):
         self.prepare(fee_bps=50, research_action="investigate")

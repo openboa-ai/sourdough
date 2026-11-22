@@ -237,9 +237,14 @@ def observe(output: Path, employee: Path):
             original, finding, decision, research_receipt = check_research(
                 store, setup, known
             )
+            cut_at = monotonic()
             os.kill(cut["pid"], signal.SIGKILL)
             log(
                 {"cut": cut, "fill": known[1], "finding": finding, "decision": decision}
+            )
+            book_observed_at = await_booking(service, store, known[1], cut_at + 120)
+            assert book_observed_at is not None, (
+                "Original fill was not observed in the recovery window"
             )
             service.wait(max(1, started + 365 - monotonic()))
     if service.returncode != 0:
@@ -323,6 +328,32 @@ def observe(output: Path, employee: Path):
     assert read(store, "SELECT count(*) FROM duty_run") == [(2,)]
     assert read(store, "SELECT count(*) FROM work_review_decision") == [(1,)]
     assert read(store, "PRAGMA foreign_key_check") == []
+    before_inspection = store.read_bytes()
+    projection = cli("inspect-work", store, *identity)
+    orders = projection["paper"]["orders"]
+    assert projection["paper"]["booked_position"] == quantity
+    assert (
+        len(orders) == 1
+        and orders[0]["fill_id"] == fill_id
+        and orders[0]["fee_minor_units"] == fee
+    )
+    assert orders[0]["action_id"] == research_receipt["decision_id"]
+    assert (
+        orders[0]["remaining_quantity"]
+        == orders[0]["open_reservation_minor_units"]
+        == 0
+    )
+    rows = {item["duty_id"]: item for item in projection["duties"]}
+    assert rows[original[0]]["decision"]["finding_id"] == research_receipt["finding_id"]
+    assert (
+        rows[claim["duty_id"]]["decision"]["decision_id"]
+        == review["decision"]["call_id"]
+    )
+    assert (
+        rows[review["next_duty"]["duty_id"]]["due_at"] == review["next_duty"]["due_at"]
+    )
+    assert store.read_bytes() == before_inspection
+    (output / "board-projection.json").write_text(json.dumps(projection))
     receipt = {
         "verdict": "OBSERVED",
         "candidate": revision,
@@ -338,11 +369,13 @@ def observe(output: Path, employee: Path):
         "fee": fee,
         "sources": recovered["sources"],
         "elapsed_seconds": round(monotonic() - started, 3),
+        "cut_to_book_seconds": round(book_observed_at - cut_at, 3),
         "post_activation_operating_commands": 0,
         "driver_actions": [
             "independent read-only observations",
             "one SIGKILL at the committed venue cut",
         ],
+        "board_projection_revision": projection["revision"],
     }
     (output / "observer.json").write_text(json.dumps(receipt))
     log(receipt)
@@ -356,6 +389,18 @@ def await_cut(service, barrier, deadline):
                 return json.loads(barrier.read_text())
             except ValueError:
                 pass
+        sleep(0.03)
+    return None
+
+
+def await_booking(service, store, fill_id, deadline):
+    while monotonic() < deadline:
+        if read(store, "SELECT 1 FROM sqlite_schema WHERE name='paper_fill'") and read(
+            store, "SELECT 1 FROM paper_fill WHERE fill_id=?", (fill_id,)
+        ):
+            return monotonic()
+        if service.poll() is not None:
+            break
         sleep(0.03)
     return None
 
