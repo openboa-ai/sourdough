@@ -13,6 +13,7 @@ from sourdough.company_assets import (
     assign_project,
     publish_selection,
     read_shared_asset,
+    seal_project_review,
 )
 from sourdough.duty_run import ASSESSMENT_REVIEW, DutyRefused, start_run
 from sourdough.harness import ScopedWorkflow, tool
@@ -404,6 +405,97 @@ class CompanyAssets(unittest.TestCase):
             )
             self.assertEqual(
                 database.execute("SELECT count(*) FROM work_follow_up").fetchone(), (0,)
+            )
+
+    def test_review_briefs_follow_the_assigned_claim_not_the_project_audience(self):
+        with closing(_connect(self.writer.store, "rw")) as database, database:
+            for agent in ("author", "peer"):
+                database.execute(
+                    "INSERT INTO duty VALUES (?,?,'scheduled')",
+                    (f"{agent}-review", agent),
+                )
+                database.execute(
+                    """INSERT INTO work_follow_up VALUES
+                       (?,?,?,'assessment',20,'fixture','report','original',20,?)""",
+                    (
+                        f"{agent}-duty",
+                        f"{agent}-review",
+                        f"{agent}-grant",
+                        ASSESSMENT_REVIEW,
+                    ),
+                )
+        with self.assertRaisesRegex(DutyRefused, "requires current company management"):
+            seal_project_review(
+                self.writer, "peer-grant", "author-review", "project", "Wrong grant."
+            )
+        for _attempt in range(2):
+            seal_project_review(
+                self.writer,
+                self.manager,
+                "author-review",
+                "project",
+                "Prepare a private draft.",
+            )
+        with self.assertRaisesRegex(DutyRefused, "already has a brief"):
+            seal_project_review(
+                self.writer,
+                self.manager,
+                "author-review",
+                "project",
+                "Replace the original brief.",
+            )
+        seal_project_review(
+            self.writer,
+            self.manager,
+            "peer-review",
+            "project",
+            "Review only shared material.",
+        )
+        workflow = ScopedWorkflow(
+            ASSESSMENT_REVIEW,
+            "Review the result.",
+            (tool("finish", "Commit the result.", {}),),
+            "finish",
+        )
+        claims = {
+            agent: claim_assessment_review(
+                self.writer.store, self.writer.company_id, agent, "profile", now=20
+            ).claim
+            for agent in ("author", "peer")
+        }
+
+        def prepare(agent):
+            return company_work_run(
+                self.writer, claims[agent], workflow, lambda *_: {"finished": True}
+            )
+
+        def manifest(agent):
+            return prepare(agent).manifest()
+
+        prepared = prepare("author")
+        self.assertIn("Prepare a private draft.", prepared.manifest()["instruction"])
+        self.assertNotIn("Prepare a private draft.", manifest("peer")["instruction"])
+        self.assertIn("Review only shared material.", manifest("peer")["instruction"])
+        assign_project(
+            self.writer,
+            self.manager,
+            "project",
+            ("peer",),
+            publishers=(),
+            expected_revision=self.project,
+        )
+        with self.assertRaisesRegex(DutyRefused, "context changed before disclosure"):
+            prepared.manifest()
+        reopened = manifest("author")
+        self.assertEqual(reopened["instruction"], workflow.instruction)
+        self.assertEqual([entry["name"] for entry in reopened["tools"]], ["finish"])
+        self.assertIn("Review only shared material.", manifest("peer")["instruction"])
+        with closing(_connect(self.writer.store, "ro")) as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT count(*) FROM project_review_brief"
+                ).fetchone(),
+                (2,),
             )
 
     def test_explicit_acceptance_fences_the_old_owner_and_schedules_the_recipient(self):

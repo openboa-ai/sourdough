@@ -18,6 +18,8 @@ The durable Desk and ephemeral run are separate. The Desk supplies company-owned
 
 For the first company-only consumer, the company work service supplies the instruction and an explicit manifest of named tools, argument schemas and the terminal receipt. The Harness validates the current claim, binds the manifest to the original Agent's Desk, and rejects stale or unlisted calls before forwarding them. The runtime adapter translates that manifest without knowing the business workflow. Existing role-specific routes remain compatibility paths until separately migrated; this slice does not load executable plug-ins.
 
+An existing company manager may seal a bounded deliverable for an already scheduled project assessment review before the duty is claimed. The brief identifies that duty, its assigned Agent, and one project; it is not inferred from the previous result, a message, or a document. An exact repeat is idempotent; replacement under the same duty is refused. The current claim receives its own brief in the company instruction, separate from optional draft and evidence data. If the authorizing grant or project membership is no longer current, reject an already prepared manifest before disclosure and omit the brief from a fresh pack. A publication, later follow-up or handoff does not inherit the prior brief automatically.
+
 **Concern for the responsible component:** Mark retrieved messages, notes and documents as data. Omit future outcomes, evaluation labels, secrets, inaccessible references and revoked instructions; do not persist hidden model reasoning.
 
 ## Functional and quality requirements
@@ -34,6 +36,7 @@ For the first company-only consumer, the company work service supplies the instr
 | First claim | Assemble the founder's first context from its founding receipt, current claim and grants with no previous decision. Start a real bounded turn and observe its new decision; missing prior decision alone must not block it. |
 | System capability | Run a company-only duty through the manifest transport. Observe exactly the registered tool schemas in the process, one service-owned receipt, and denial of an invented tool or mismatched Desk/run. Substitute a different registered tool set without editing the adapter. Model judgment quality is a later evaluation. |
 | Continuing company work | In one bounded activation, run an assessment and successive due reviews through the same Harness. Each review reads its authorized result and commits a decision with the next due responsibility. Verify a distinct run, the same Agent and Desk binding, and no market or execution tools. The activation limit does not erase future work. |
+| Scoped document assignment | Seal a different deliverable on each of two scheduled reviews under an existing management grant. Only the assigned Agent's manifest gets its own brief; replay leaves one record, a changed deliverable or unprivileged grant is denied, and source documents never become instructions. Remove project membership and verify the old brief and associated project tools are omitted. |
 
 **Oracle:** Compare independently sealed ACL, duty and artifact inventories with what the runtime actually received. Exercise [W1](../../../../../acceptance/episodes.md#w1-personal-work) and [L1](../../../../../acceptance/episodes.md#l1-learning).
 
