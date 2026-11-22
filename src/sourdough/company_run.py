@@ -1,7 +1,7 @@
 """Run the paper company without the Client."""
 
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from sqlite3 import Connection
@@ -54,6 +54,7 @@ from .paper_order import reserved_exposure
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
 from .paper_review import bind_review_quote, observe_review_quote
+from .window_sampler import WindowSampler
 from .writer_lease import WriterLease, hold_company_writer
 from .work import (
     FollowUp,
@@ -110,6 +111,7 @@ def run_paper_company(
     expected_store_key: tuple[int, int] | None = None,
     budget_from: int | None = None,
     on_ready: Callable[[WriterLease], None] | None = None,
+    sampler: WindowSampler | None = None,
 ) -> CompanyRun:
     if not 1 <= turn_budget <= 8 or not 0 <= idle_seconds <= 900:
         raise TradeRefused("Invalid company turn or idle budget")
@@ -117,16 +119,17 @@ def run_paper_company(
     with hold_company_writer(
         store, company_id, expected_store_key=expected_store_key
     ) as writer:
-        return _operate(
-            writer,
-            venue,
-            runtime,
-            repeat_paper,
-            turn_budget,
-            idle_seconds,
-            budget_from,
-            on_ready,
-        )
+        with sampler.activate(writer, venue) if sampler is not None else nullcontext():
+            return _operate(
+                writer,
+                venue,
+                runtime,
+                repeat_paper,
+                turn_budget,
+                idle_seconds,
+                budget_from,
+                on_ready,
+            )
 
 
 def _operate(

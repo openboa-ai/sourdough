@@ -32,9 +32,11 @@ from sourdough.paper_execution import VenueRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.paper_window import WindowPlan, WindowRefused
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.trading_engine import EngineRefused, prepare_engine
+from sourdough.window_sampler import WindowSampler, register_managed_window
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 from sourdough.work_projection import read_local_board_timeline
 
@@ -86,6 +88,9 @@ def _start_supervisor(args):
         command.append("--repeat-paper")
     if getattr(args, "managed_engine", False):
         command.append("--managed-engine")
+    if args.command == "supervise-paper" and args.observe_window is not None:
+        _paper_sampler(args, args.journal, managed=args.managed_engine)
+        command.extend(("--observe-window", args.observe_window))
     return supervise_worker(
         command,
         args.store,
@@ -101,6 +106,16 @@ def _paper_destination(args):
     if getattr(args, "managed_engine", False):
         return paper_venue(args.store, args.journal)
     return FixedQuoteVenue(args.journal)
+
+
+def _paper_sampler(args, directory: Path, *, managed: bool) -> WindowSampler | None:
+    if args.observe_window is None:
+        return None
+    if not managed:
+        raise WindowRefused(
+            "Only a managed current-market activation can sample a window"
+        )
+    return WindowSampler(directory, args.observe_window)
 
 
 def _managed_destination_flag(command):
@@ -136,6 +151,11 @@ def main() -> int:
     inspection.add_argument("--company-id", required=True)
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
+    seal = commands.add_parser("seal-paper-window")
+    seal.add_argument("store", type=Path)
+    seal.add_argument("directory", type=Path)
+    seal.add_argument("--company-id", required=True)
+    seal.add_argument("--plan", required=True, type=Path)
     engine = commands.add_parser("prepare-trading-engine")
     engine.add_argument("store", type=Path)
     engine.add_argument("directory", type=Path)
@@ -180,6 +200,7 @@ def main() -> int:
             sandbox.add_argument("--turn-budget", type=int, default=1)
             sandbox.add_argument("--idle-seconds", type=int, default=0)
             sandbox.add_argument("--replay", action="store_true")
+            sandbox.add_argument("--observe-window")
     paper = commands.add_parser("bind-paper")
     paper.add_argument("store", type=Path)
     paper.add_argument("journal", type=Path)
@@ -241,6 +262,7 @@ def main() -> int:
             running.add_argument("--repeat-paper", action="store_true")
             running.add_argument("--turn-budget", type=int, default=2)
             running.add_argument("--idle-seconds", type=int, default=0)
+            running.add_argument("--observe-window")
         if command == "supervise-paper":
             running.add_argument("--max-restarts", type=int, default=2)
             running.add_argument("--startup-seconds", type=int, default=60)
@@ -267,6 +289,17 @@ def main() -> int:
         elif args.command == "inspect-work":
             print(json.dumps(read_local_board_timeline(args.store, args.company_id)))
             return 0
+        elif args.command == "seal-paper-window":
+            with args.plan.open("rb") as source:
+                payload = source.read(16_385)
+            if len(payload) > 16_384:
+                raise WindowRefused("Window plan exceeds its size limit")
+            try:
+                plan = WindowPlan(**json.loads(payload))
+            except (ValueError, TypeError) as error:
+                raise WindowRefused("Window plan is not a valid declaration") from error
+            with hold_company_writer(args.store, args.company_id) as writer:
+                result = register_managed_window(writer, args.directory, plan)
         elif args.command == "employee-profile":
             print(
                 json.dumps(
@@ -341,6 +374,7 @@ def main() -> int:
             print(json.dumps(asdict(result)))
             return 0 if result.completed else 1
         elif args.command == "operate-nautilus-paper":
+            sampler = _paper_sampler(args, args.directory, managed=not args.replay)
             result = run_paper_company(
                 args.store,
                 args.company_id,
@@ -348,6 +382,7 @@ def main() -> int:
                 EmployeeProcess(args.employee),
                 turn_budget=args.turn_budget,
                 idle_seconds=args.idle_seconds,
+                sampler=sampler,
             )
         elif args.command == "bind-paper":
             venue = FixedQuoteVenue(args.journal)
@@ -480,6 +515,9 @@ def main() -> int:
                     expected_store_key=args.store_key,
                     budget_from=args.budget_from,
                     on_ready=lambda lease: announce_ready(args.ready_fd, lease),
+                    sampler=_paper_sampler(
+                        args, args.journal, managed=args.managed_engine
+                    ),
                 )
             else:
                 result = run_paper_company(
@@ -487,6 +525,9 @@ def main() -> int:
                     repeat_paper=args.repeat_paper,
                     turn_budget=args.turn_budget,
                     idle_seconds=args.idle_seconds,
+                    sampler=_paper_sampler(
+                        args, args.journal, managed=args.managed_engine
+                    ),
                 )
     except (
         FoundingRefused,
@@ -500,6 +541,7 @@ def main() -> int:
         VenueRefused,
         SupervisionRefused,
         WriterRefused,
+        WindowRefused,
         sqlite3.Error,
         OSError,
     ) as error:
