@@ -8,7 +8,13 @@ from time import monotonic, sleep, time
 
 from .abandoned_work import requeue_uncommitted_work
 from .company import _connect, upgrade_work_schema
-from .company_run import PositionReview, _book_reference, _recover, _review
+from .company_run import (
+    PositionReview,
+    _book_reference,
+    _recover,
+    _retry_reconciliation,
+    _review,
+)
 from .duty_run import (
     PAPER_EXECUTION,
     POSITION_REVIEW,
@@ -160,6 +166,11 @@ def run_hired_paper_company(
         reconciled, blocked = _recover(writer, venue, POSITION_REVIEW)
         requeue_uncommitted_work(writer, purpose=POSITION_REVIEW, hired_only=True)
         on_ready(writer)
+        deadline = monotonic() + idle_seconds
+        if reconciled.next_query_at is not None:
+            reconciled, blocked = _retry_reconciliation(
+                writer, venue, POSITION_REVIEW, reconciled, blocked, deadline
+            )
         used = count_company_runs(store, company_id) - budget_from
         if used < 0:
             raise DutyRefused(
@@ -193,7 +204,6 @@ def run_hired_paper_company(
             remaining -= 2
         if agent_id is None or not remaining:
             return HiredPaperRun(hiring, research, reconciled, None)
-        deadline = monotonic() + idle_seconds
         while True:
             writer.verify()
             work = claim_bound_position_review(

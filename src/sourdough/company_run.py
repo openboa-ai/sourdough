@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from sqlite3 import Connection
 from time import monotonic, sleep, time
@@ -283,6 +283,27 @@ def _recover(
         except DutyRefused:
             blocked.append(claim.duty_id)
     return recovery, tuple(blocked)
+
+
+def _retry_reconciliation(
+    writer: WriterLease,
+    venue: FixedQuoteVenue,
+    purpose: str,
+    recovery: PaperReconciliation,
+    blocked: tuple[str, ...],
+    deadline: float,
+) -> tuple[PaperReconciliation, tuple[str, ...]]:
+    recovered = list(recovery.recovered)
+    while recovery.next_query_at is not None and not blocked:
+        remaining = deadline - monotonic()
+        delay = max(0, recovery.next_query_at - time())
+        if remaining <= 0 or delay >= remaining:
+            break
+        if delay:
+            sleep(delay)
+        recovery, blocked = _recover(writer, venue, purpose)
+        recovered.extend(recovery.recovered)
+    return replace(recovery, recovered=tuple(recovered)), blocked
 
 
 def _book_reference(store: Path, company_id: str, posting: Posting) -> ResultReference:

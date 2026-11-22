@@ -97,11 +97,27 @@ def interrupted():
         marker.touch()
         os.kill(os.getpid(), signal.SIGKILL)
 class WithheldFill(FixedQuoteVenue):
+    failed_history = False
+    failed_sync = False
+
     def submit(self, *args):
         result = super().submit(*args)
-        if fault_site == "after_fill":
+        if fault_site in ("after_fill", "after_fill_with_lookup_timeout"):
             interrupted()
         return result
+
+    def observe_execution(self, order_id):
+        if fault_site == "after_fill_with_lookup_timeout" and not self.failed_history:
+            self.failed_history = True
+            raise TimeoutError("One missed history response")
+        return super().observe_execution(order_id)
+
+    def sync_account_execution(self, account_id, order_id):
+        if fault_site == "after_fill_with_lookup_timeout" and not self.failed_sync:
+            self.failed_sync = True
+            raise TimeoutError("One missed account-sync response")
+        return super().sync_account_execution(account_id, order_id)
+
 apply_order = hired_paper_run._apply_paper_order
 def withheld_order(store, claim, intent, venue, writer):
     if fault_site == "before_send":
@@ -160,6 +176,7 @@ class ConnectedFlow(unittest.TestCase):
         for scope, submit_request, fault_site in (
             ("assessment", True, "after_publication"),
             ("paper", True, "after_fill"),
+            ("paper", True, "after_fill_with_lookup_timeout"),
             ("paper", True, "before_send"),
             ("paper", False, "none"),
         ):
@@ -286,7 +303,7 @@ class ConnectedFlow(unittest.TestCase):
                         "--employee",
                         str(employee),
                         "--idle-seconds",
-                        "2",
+                        "6" if fault_site == "after_fill_with_lookup_timeout" else "2",
                         "--turn-budget",
                         "3",
                         "--max-restarts",
@@ -345,3 +362,12 @@ class ConnectedFlow(unittest.TestCase):
                     self.assertEqual(
                         rows(venue, "SELECT count(*) FROM venue_execution"), [(1,)]
                     )
+                    if fault_site == "after_fill_with_lookup_timeout":
+                        self.assertEqual(
+                            rows(
+                                store,
+                                "SELECT attempts, next_query_at, sources FROM paper_reconciliation",
+                            ),
+                            [(2, None, "history,account_sync")],
+                        )
+                        self.assertEqual(result["reconciliation"]["unresolved"], 0)
