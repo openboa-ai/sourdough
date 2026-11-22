@@ -8,7 +8,7 @@ from sqlite3 import Connection
 from time import monotonic, sleep, time
 
 from .abandoned_work import requeue_uncommitted_work
-from .company import _connect, reopen, upgrade_work_schema
+from .company import _connect, upgrade_work_schema
 from .duty_run import (
     PAPER_EXECUTION,
     POSITION_REVIEW,
@@ -17,6 +17,7 @@ from .duty_run import (
     count_company_runs,
 )
 from .employee_process import EmployeeProcess
+from .first_duty import founding_duty_due
 from .first_trade import (
     TradeRefused,
     TradeResult,
@@ -148,7 +149,7 @@ def _operate(
         first is None
         and turn_budget
         and not reconciliation.unresolved
-        and reopen(store, company_id).due_work_ids
+        and founding_duty_due(store, company_id)
     ):
         first = run_first_trade(store, company_id, venue, runtime, writer=writer)
         turn_budget -= 1

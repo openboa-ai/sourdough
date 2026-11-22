@@ -18,6 +18,21 @@ from .duty_run import (
 FIRST_DUTY_SCOPE = "paper"
 
 
+def founding_duty_due(store: Path, company_id: str) -> bool:
+    with closing(_connect(store, "ro")) as connection:
+        connection.execute("BEGIN")
+        if _identity(connection) != company_id:
+            raise DutyRefused("Company identity mismatch")
+        return bool(
+            connection.execute(
+                """SELECT 1 FROM founding_receipt receipt
+                   JOIN duty d ON d.id = receipt.due_work_id
+                   WHERE receipt.company_id = ? AND d.state = 'due'""",
+                (company_id,),
+            ).fetchone()
+        )
+
+
 def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> DutyClaim:
     upgrade_work_schema(store, company_id)
     with closing(_connect(store, "rw")) as connection, connection:
