@@ -48,6 +48,19 @@ PROPOSE_DECISION = {
         "additionalProperties": False,
     },
 }
+PROPOSE_TRADE = {
+    "name": "record_paper_decision",
+    "description": "Record a later paper decision. Supply order terms only when choosing buy.",
+    "inputSchema": PROPOSE_DECISION["inputSchema"]
+    | {
+        "properties": PROPOSE_DECISION["inputSchema"]["properties"]
+        | {
+            "action": {"enum": ["hold", "investigate", "buy"]},
+            "quantity": {"type": "integer", "minimum": 1},
+            "limit_minor_units": {"type": "integer", "minimum": 1},
+        }
+    },
+}
 
 
 def tool_output(value, *, denied=False):
@@ -63,9 +76,34 @@ def read_result(address):
             return json.load(stream)
 
 
-def serve(outbox, address=None):
+def decision_args(args, proposal, revision):
+    if revision is None or not isinstance(args, dict):
+        return False
+    schema = proposal["inputSchema"]
+    has_terms = args.get("action") == "buy"
+    fields = set(schema["required"])
+    if has_terms:
+        fields.update(("quantity", "limit_minor_units"))
+    if (
+        set(args) != fields
+        or args["observation_revision"] != revision
+        or args["action"] not in schema["properties"]["action"]["enum"]
+        or not isinstance(args["rationale"], str)
+        or not 0 < len(args["rationale"].strip()) <= 2000
+        or type(args["next_check_seconds"]) is not int
+        or not 60 <= args["next_check_seconds"] <= 86400
+    ):
+        return False
+    return not has_terms or all(
+        type(args[field]) is int and args[field] > 0
+        for field in ("quantity", "limit_minor_units")
+    )
+
+
+def serve(outbox, address=None, *, trading=False):
     revision = None
-    tools = [PAPER_BUY] if address is None else [READ_RESULT, PROPOSE_DECISION]
+    proposal = PROPOSE_TRADE if trading else PROPOSE_DECISION
+    tools = [PAPER_BUY] if address is None else [READ_RESULT, proposal]
     for line in sys.stdin:
         message = json.loads(line)
         if "id" not in message:
@@ -95,23 +133,17 @@ def serve(outbox, address=None):
                 valid_buy = (
                     address is None
                     and name == "paper_buy"
+                    and isinstance(args, dict)
                     and set(args) == {"quantity", "limit_minor_units"}
                     and all(type(value) is int and value > 0 for value in args.values())
                 )
-                valid_review = (
+                valid_decision = (
                     address is not None
-                    and name == "record_review_decision"
-                    and revision is not None
-                    and set(args) == set(PROPOSE_DECISION["inputSchema"]["required"])
-                    and args["observation_revision"] == revision
-                    and args["action"] in ("hold", "investigate", "recommend_change")
-                    and isinstance(args["rationale"], str)
-                    and 0 < len(args["rationale"].strip()) <= 2000
-                    and type(args["next_check_seconds"]) is int
-                    and 60 <= args["next_check_seconds"] <= 86400
+                    and name == proposal["name"]
+                    and decision_args(args, proposal, revision)
                 )
                 try:
-                    if not (valid_buy or valid_review):
+                    if not (valid_buy or valid_decision):
                         raise ValueError
                     with outbox.open("x") as stream:
                         json.dump(
@@ -145,8 +177,8 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--mcp":
         serve(Path(sys.argv[2]))
         return
-    if len(sys.argv) == 4 and sys.argv[1] == "--mcp-review":
-        serve(Path(sys.argv[3]), sys.argv[2])
+    if len(sys.argv) == 4 and sys.argv[1] in ("--mcp-review", "--mcp-trade"):
+        serve(Path(sys.argv[3]), sys.argv[2], trading=sys.argv[1] == "--mcp-trade")
         return
     request = json.load(sys.stdin)
     codex = "/opt/homebrew/bin/codex"
@@ -198,13 +230,25 @@ def main():
         print(json.dumps({"ready": ready}))
         return
     operation = request["operation"]
-    if operation not in ("first_duty", "review_duty") or not ready:
+    if operation not in ("first_duty", "review_duty", "trade_duty") or not ready:
         raise SystemExit("An existing ChatGPT subscription login is required")
     with TemporaryDirectory() as directory:
         outbox = Path(directory) / "proposal.json"
         decision = Path(directory) / "decision.txt"
         tool_args = [str(Path(__file__).resolve())]
-        if operation == "review_duty":
+        if operation == "trade_duty":
+            tool_args += ["--mcp-trade", request["read_endpoint"], str(outbox)]
+            tool_names = ["read_work_result", "record_paper_decision"]
+            prompt = (
+                "You are operating a synthetic Sourdough paper account. "
+                "Inspect the committed position and paper terms with read_work_result. "
+                "Your operational objective is to assess whether a second small paper execution can exercise "
+                "the later duty safely. Decide whether to hold, investigate or buy; do not assume a buy is required. "
+                "If buying, choose quantity and limit yourself within the disclosed available exposure. "
+                "Use record_paper_decision with the observed revision, your reason and the next check interval. "
+                "Do not use the shell. A staged request is not an execution or a fill."
+            )
+        elif operation == "review_duty":
             tool_args += ["--mcp-review", request["read_endpoint"], str(outbox)]
             tool_names = ["read_work_result", "record_review_decision"]
             prompt = (

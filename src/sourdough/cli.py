@@ -51,6 +51,10 @@ def main() -> int:
         running.add_argument("journal", type=Path)
         running.add_argument("--company-id", required=True)
         running.add_argument("--employee", type=Path, required=True)
+        if command == "operate-paper":
+            running.add_argument("--repeat-paper", action="store_true")
+            running.add_argument("--turn-budget", type=int, default=2)
+            running.add_argument("--idle-seconds", type=int, default=0)
     args = parser.parse_args()
 
     try:
@@ -101,17 +105,21 @@ def main() -> int:
                 venue,
             )
         else:
-            run = (
-                run_paper_company
-                if args.command == "operate-paper"
-                else run_first_trade
-            )
-            result = run(
+            inputs = (
                 args.store,
                 args.company_id,
                 FixedQuoteVenue(args.journal),
                 EmployeeProcess(args.employee),
             )
+            if args.command == "operate-paper":
+                result = run_paper_company(
+                    *inputs,
+                    repeat_paper=args.repeat_paper,
+                    turn_budget=args.turn_budget,
+                    idle_seconds=args.idle_seconds,
+                )
+            else:
+                result = run_first_trade(*inputs)
     except (
         FoundingRefused,
         BindingRefused,

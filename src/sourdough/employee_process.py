@@ -96,6 +96,12 @@ class EmployeeProcess:
         )
 
     def review(self, read_result: Callable[[], dict]) -> dict:
+        return self._follow_up("review_duty", read_result)
+
+    def trade(self, read_result: Callable[[], dict]) -> dict:
+        return self._follow_up("trade_duty", read_result)
+
+    def _follow_up(self, operation: str, read_result: Callable[[], dict]) -> dict:
         if self._profile() != self.profile:
             raise TradeRefused("Employee model binding changed")
         with TemporaryDirectory(prefix="sd-") as directory:
@@ -107,7 +113,7 @@ class EmployeeProcess:
                 thread.start()
                 try:
                     return self._exchange(
-                        {"operation": "review_duty", "read_endpoint": address}
+                        {"operation": operation, "read_endpoint": address}
                     )
                 finally:
                     endpoint.shutdown()

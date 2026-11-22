@@ -56,7 +56,12 @@ class WorkContinuation(unittest.TestCase):
                     "founder_id TEXT NOT NULL UNIQUE REFERENCES",
                 )
             else:
-                schema.append(company.FOLLOW_UP_SCHEMA[:-1] + ", run_id TEXT UNIQUE)")
+                schema.append(
+                    company.FOLLOW_UP_SCHEMA.replace(
+                        "purpose TEXT NOT NULL DEFAULT 'position_review'",
+                        "run_id TEXT UNIQUE",
+                    )
+                )
             with (
                 patch.object(company, "SCHEMA", schema),
                 patch.object(company, "SCHEMA_REVISION", legacy),
@@ -138,7 +143,7 @@ class WorkContinuation(unittest.TestCase):
         before = [self.rows(query) for query in queries]
         upgrade_work_schema(self.store, self.company_id)
         upgrade_work_schema(self.store, self.company_id)
-        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(3,)])
+        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(4,)])
         self.assertEqual(
             self.rows("SELECT duty_id, run_id FROM duty_run"),
             [(original.duty_id, original.run_id)],

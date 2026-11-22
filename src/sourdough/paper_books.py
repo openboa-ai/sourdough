@@ -1,15 +1,20 @@
 """Post a confirmed full fill from the first-trade paper destination."""
 
+from __future__ import annotations
+
 import json
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .company import _connect, _identity
 from .paper_account import reopen_binding
-from .paper_venue import FixedQuoteVenue
+
+if TYPE_CHECKING:
+    from .paper_venue import FixedQuoteVenue
 
 
 class PostingRefused(Exception):
