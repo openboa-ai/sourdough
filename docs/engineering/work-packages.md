@@ -98,6 +98,9 @@ Each spec has one primary verification owner. Earlier steps implement only the p
 - [work/conversations/notify](../company/systems/work/conversations/notify/spec.md)
 - [work/conversations/publish](../company/systems/work/conversations/publish/spec.md)
 - [desk/publish](../employee/agent/desk/publish/spec.md)
+- [desk/reopen](../employee/agent/desk/reopen/spec.md)
+- [harness/execute/context-pack](../employee/agent/harness/execute/context-pack/spec.md)
+- [harness/execute/tool-turn](../employee/agent/harness/execute/tool-turn/spec.md)
 
 ## 11 · Client, operations and restore
 
