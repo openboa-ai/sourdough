@@ -8,6 +8,7 @@ from sqlite3 import Connection
 from time import time
 from uuid import uuid4
 
+from .agent_desk import save_draft
 from .company import _connect
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, resolve_run
 from .harness import ScopedWorkflow, tool
@@ -23,12 +24,22 @@ from .writer_lease import WriterLease
 
 
 ASSESSMENT = "assessment"
+SAVE_PRIVATE_DRAFT = tool(
+    "save_private_draft",
+    "Save a private Markdown draft for your next duty. No sharing. Use an empty revision for a new draft.",
+    {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,47}$"},
+        "content": {"type": "string"},
+        "expected_revision": {"type": "string"},
+    },
+)
 ASSESSMENT_WORKFLOW = ScopedWorkflow(
     ASSESSMENT,
     "Read your assignment and accept it if authorized. Compare the reported and observed "
     "values in one accessible company record. Publish an assessment with your rationale "
     "and a proposed next check. You cannot change the source records.",
     (
+        SAVE_PRIVATE_DRAFT,
         tool("read_first_duty", "Read your assignment and private Desk reference.", {}),
         tool(
             "accept_first_duty",
@@ -66,6 +77,7 @@ ASSESSMENT_REVIEW_WORKFLOW = ScopedWorkflow(
     "a change. Cite the observation, record the reason, and choose the next check. "
     "A review does not change the source records.",
     (
+        SAVE_PRIVATE_DRAFT,
         tool("read_work_result", "Read the authorized result and current records.", {}),
         tool(
             "record_review_decision",
@@ -425,6 +437,8 @@ def read_assessment_result(
 def invoke_assessment(
     writer: WriterLease, claim: DutyClaim, name: str, arguments: dict
 ) -> dict:
+    if name == "save_private_draft":
+        return persist_assessment_draft(writer, claim, ASSESSMENT, arguments)
     if name == "read_assessment_inputs" and arguments == {}:
         return read_assessment_inputs(writer, claim, now=int(time()))
     if name == "publish_assessment" and isinstance(arguments, dict):
@@ -434,3 +448,24 @@ def invoke_assessment(
             raise DutyRefused("Unexpected assessment publication fields") from error
         return asdict(publish_assessment(writer, claim, proposal, now=int(time())))
     return invoke_onboarding(writer, claim, name, arguments)
+
+
+def persist_assessment_draft(
+    writer: WriterLease, claim: DutyClaim, purpose: str, arguments: dict
+) -> dict:
+    if (
+        not isinstance(arguments, dict)
+        or arguments.keys() != {"name", "content", "expected_revision"}
+        or not isinstance(arguments["expected_revision"], str)
+    ):
+        raise DutyRefused("Private draft requires an explicit base revision")
+    return asdict(
+        save_draft(
+            writer,
+            claim,
+            purpose,
+            name=arguments["name"],
+            content=arguments["content"],
+            expected_revision=arguments["expected_revision"] or None,
+        )
+    )

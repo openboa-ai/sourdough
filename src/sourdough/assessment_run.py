@@ -14,6 +14,7 @@ from .company_assessment import (
     AssessmentReceipt,
     invoke_assessment,
     pending_publications,
+    persist_assessment_draft,
     read_assessment_result,
     settle_assessment,
 )
@@ -167,6 +168,10 @@ def _run_review(
 
     def invoke(name: str, arguments: dict) -> dict:
         nonlocal committed
+        if name == "save_private_draft":
+            return persist_assessment_draft(
+                writer, work.claim, ASSESSMENT_REVIEW, arguments
+            )
         if name == "read_work_result":
             return read_assessment_result(writer, work, now=int(time()))
         if name != "record_review_decision":

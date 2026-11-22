@@ -43,6 +43,10 @@ elif operation in ("assessment_duty", "hired_research_duty"):
     invoke("accept_first_duty", {"revision": first["revision"], "rationale": first["assignment_summary"]})
     if operation == "assessment_duty":
         inputs = invoke("read_assessment_inputs", {})
+        invoke("save_private_draft", {
+            "name": "private-research", "content": "Private comparison notes.",
+            "expected_revision": "",
+        })
         result = invoke("publish_assessment", {
             "source_revision": inputs["revision"], "record_id": "record",
             "disposition": "recommend_change", "rationale": "Observed six rather than eight.",
@@ -73,7 +77,9 @@ elif operation in ("assessment_duty", "hired_research_duty"):
         )
 elif operation == "assessment_review":
     tools = [tool["name"] for tool in request["harness"]["tools"]]
-    assert tools == ["read_work_result", "record_review_decision"]
+    assert tools == ["save_private_draft", "read_work_result", "record_review_decision"]
+    drafts = request["harness"]["drafts"]
+    assert len(drafts) == 1 and drafts[0]["content"] == "Private comparison notes."
     prior = invoke("read_work_result", {})
     result = invoke("record_review_decision", {
         "observation_revision": prior["revision"], "action": "hold", "next_check_seconds": 300,
