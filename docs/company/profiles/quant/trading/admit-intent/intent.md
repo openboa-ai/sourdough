@@ -23,5 +23,6 @@ Trade judgment belongs to the actor. Authority and portfolio limits are enforced
 ## Development changes
 
 - [Reserve exposure for an immutable intent](reserve/spec.md)
+- [Admit paper orders in later unattended duties](continue-execution/spec.md)
 
 Review this intent against the company outcome above. Evidence for implementation, regression and operating behavior belongs to the individual changes; cross-feature acceptance belongs to the company map.
