@@ -17,6 +17,40 @@ from .paper_execution import VenueRefused
 from .spot_cash import QUOTE_SCALE, SpotCashUnits
 
 
+def submit_limit(
+    strategy, instrument, units: SpotCashUnits, command: SandboxCommand
+) -> None:
+    from nautilus_trader.model.enums import OrderSide, TimeInForce
+    from nautilus_trader.model.identifiers import ClientOrderId
+
+    quantity, limit = units.limit_order(command.quantity, command.limit_minor_units)
+    strategy.submit_order(
+        strategy.order_factory.limit(
+            instrument.id,
+            OrderSide.BUY,
+            instrument.make_qty(quantity),
+            instrument.make_price(limit),
+            time_in_force=TimeInForce.IOC,
+            client_order_id=ClientOrderId(command.order_id),
+        )
+    )
+
+
+def capture_fill(venue, generation: str, units: SpotCashUnits, event) -> str:
+    if str(event.commission.currency) != units.terms.quote_currency:
+        raise VenueRefused("Sandbox fill fee has unexpected currency")
+    order_id = str(event.client_order_id)
+    venue.record_fill(
+        generation,
+        order_id,
+        str(event.trade_id),
+        units.lots(event.last_qty.as_decimal()),
+        units.price_per_lot(event.last_px.as_decimal()),
+        units.quote_atoms(event.commission.as_decimal()),
+    )
+    return order_id
+
+
 async def serve(venue: NautilusPaperVenue, ready_fd: int, seconds: int) -> None:
     from nautilus_trader.adapters.binance import (
         BinanceDataClientConfig,
@@ -27,12 +61,15 @@ async def serve(venue: NautilusPaperVenue, ready_fd: int, seconds: int) -> None:
     from nautilus_trader.config import InstrumentProviderConfig, LoggingConfig
     from nautilus_trader.live.config import LiveExecEngineConfig, TradingNodeConfig
     from nautilus_trader.live.node import TradingNode
-    from nautilus_trader.model.enums import OrderSide, TimeInForce
-    from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId
+    from nautilus_trader.model.identifiers import InstrumentId
     from nautilus_trader.model.instruments import CurrencyPair
     from nautilus_trader.trading.strategy import Strategy
 
     _, plan = venue.configuration()
+    if plan.tape_revision is not None:
+        raise VenueRefused(
+            "A historical binding cannot start the current market worker"
+        )
     units = SpotCashUnits(plan.terms)
     instrument_id = InstrumentId.from_str(f"{plan.terms.symbol}.BINANCE")
     market_venue = instrument_id.venue
@@ -88,34 +125,9 @@ async def serve(venue: NautilusPaperVenue, ready_fd: int, seconds: int) -> None:
                 if not failure.done():
                     failure.set_result(error)
 
-        def execute_command(self, command: SandboxCommand) -> None:
-            quantity, limit = units.limit_order(
-                command.quantity, command.limit_minor_units
-            )
-            self.submit_order(
-                self.order_factory.limit(
-                    instrument_id,
-                    OrderSide.BUY,
-                    self.instrument.make_qty(quantity),
-                    self.instrument.make_price(limit),
-                    time_in_force=TimeInForce.IOC,
-                    client_order_id=ClientOrderId(command.order_id),
-                )
-            )
-
         def on_order_filled(self, event):
             try:
-                if str(event.commission.currency) != currency:
-                    raise VenueRefused("Sandbox fill fee has unexpected currency")
-                venue.record_fill(
-                    generation,
-                    str(event.client_order_id),
-                    str(event.trade_id),
-                    units.lots(event.last_qty.as_decimal()),
-                    units.price_per_lot(event.last_px.as_decimal()),
-                    units.quote_atoms(event.commission.as_decimal()),
-                )
-                pending_account.add(str(event.client_order_id))
+                pending_account.add(capture_fill(venue, generation, units, event))
             except Exception as error:
                 if not failure.done():
                     failure.set_result(error)
@@ -215,7 +227,7 @@ async def serve(venue: NautilusPaperVenue, ready_fd: int, seconds: int) -> None:
                                 pending_account.remove(order_id)
                 command = venue.claim_command(generation)
                 if command is not None:
-                    strategy.execute_command(command)
+                    submit_limit(strategy, strategy.instrument, units, command)
             await asyncio.sleep(0.1)
         if not ready:
             raise VenueRefused(
