@@ -13,6 +13,9 @@ from .paper_books import read_fill_accounting_source
 from .writer_lease import WriterLease
 
 
+PAPER_FILL_FEE_SOURCE = "paper-fill-fee"
+
+
 @dataclass(frozen=True)
 class VerifiedFee:
     destination_id: str
@@ -148,7 +151,7 @@ def deliver_paper_fee(
     entry = (
         JournalEntry(
             writer.company_id,
-            "paper-fill-fee",
+            PAPER_FILL_FEE_SOURCE,
             source_event,
             verified.revision,
             verified.effective_date,
