@@ -9,3 +9,6 @@ requires-python = ">=3.14"
 
 [project.scripts]
 sourdough = "sourdough.cli:main"
+
+[tool.setuptools.package-data]
+sourdough = ["nautilus-macos-arm64.lock"]

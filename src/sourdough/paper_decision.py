@@ -9,7 +9,13 @@ from uuid import uuid4
 from .company import _connect
 from .duty_run import PAPER_EXECUTION, DutyClaim, DutyRefused
 from .first_duty import FIRST_DUTY_SCOPE
-from .paper_books import read_position
+from .paper_account import reopen_binding
+from .paper_books import (
+    read_book_observation,
+    read_no_fill,
+    read_position,
+    resolved_order_sql,
+)
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -93,7 +99,11 @@ def persist_paper_decision(
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         state, scope = follow_up_state(connection, follow_up, PAPER_EXECUTION)
-        if scope != FIRST_DUTY_SCOPE or follow_up.result.kind != "paper_position":
+        if scope != FIRST_DUTY_SCOPE or follow_up.result.kind not in (
+            "paper_position",
+            "paper_no_fill",
+            "paper_binding",
+        ):
             raise DutyRefused("Duty is not authorized for this paper decision")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS paper_decision (
@@ -125,8 +135,11 @@ def persist_paper_decision(
         if state != "running":
             raise DutyRefused("Duty cannot record a paper decision")
         require_result_read(connection, follow_up, decision.observation_revision, now)
-        observation = read_position(
-            connection, claim.company_id, follow_up.result.resource_id
+        observation = read_book_observation(
+            connection,
+            claim.company_id,
+            follow_up.result.kind,
+            follow_up.result.resource_id,
         )
         if observation.revision != decision.observation_revision:
             raise DutyRefused(
@@ -201,19 +214,26 @@ def reopen_unsubmitted_decisions(
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_decision'"
         ).fetchone():
             return ()
+        account = reopen_binding(store, company_id).account
         rows = connection.execute(
             """SELECT a.id, r.grant_id, d.id, r.run_id, a.execution_profile
                FROM paper_decision decision
                JOIN duty_run r ON r.run_id = decision.run_id AND r.is_current = 1
                JOIN duty d ON d.id = decision.duty_id AND d.id = r.duty_id AND d.state = 'running'
                JOIN agent a ON a.id = d.agent_id AND a.company_id = ?
-               WHERE (? OR decision.action != 'buy')
+               WHERE (decision.action != 'buy' OR (? AND decision.account_id=?
+                      AND decision.instrument_rules_digest=?))
                  AND NOT EXISTS (
                      SELECT 1 FROM paper_order o JOIN duty_run original ON original.run_id = o.run_id
                      WHERE original.duty_id = d.id
                  )
                ORDER BY decision.decided_at, d.id LIMIT 8""",
-            (company_id, allow_buy),
+            (
+                company_id,
+                allow_buy,
+                account.account_id,
+                account.instrument_rules_digest,
+            ),
         ).fetchall()
     pending = []
     for row in rows:
@@ -245,27 +265,41 @@ def settle_paper_decision(
         ):
             raise DutyRefused("Unknown or changed paper decision receipt")
         if receipt.decision.action == "buy":
-            matching_fill = connection.execute(
-                """SELECT fill.fill_id FROM paper_fill fill
-                   JOIN paper_order o ON o.order_id = fill.order_id
-                   JOIN duty_run r ON r.run_id = o.run_id
-                   WHERE r.duty_id = ? AND o.action_id = ?""",
-                (claim.duty_id, receipt.decision_id),
-            ).fetchone()
-            if result.kind != "paper_position" or matching_fill != (
-                result.resource_id,
-            ):
+            observation = None
+            if result.kind == "paper_no_fill":
+                order = connection.execute(
+                    """SELECT o.order_id FROM paper_order o JOIN duty_run r ON r.run_id=o.run_id
+                       WHERE r.duty_id=? AND o.action_id=?""",
+                    (claim.duty_id, receipt.decision_id),
+                ).fetchone()
+                if order == (result.resource_id,):
+                    observation = read_no_fill(
+                        connection, claim.company_id, result.resource_id
+                    )
+            elif result.kind == "paper_position":
+                matching_fill = connection.execute(
+                    f"""SELECT fill.fill_id FROM paper_fill fill
+                       JOIN paper_order o ON o.order_id = fill.order_id
+                       JOIN duty_run r ON r.run_id = o.run_id
+                       WHERE r.duty_id = ? AND o.action_id = ? AND {resolved_order_sql(connection)}
+                       ORDER BY fill.rowid DESC LIMIT 1""",
+                    (claim.duty_id, receipt.decision_id),
+                ).fetchone()
+                if matching_fill == (result.resource_id,):
+                    observation = read_position(
+                        connection, claim.company_id, result.resource_id
+                    )
+            if observation is None:
                 raise DutyRefused(
-                    "The original order has no confirmed fill for settlement"
+                    "The original order has no confirmed book result for settlement"
                 )
-            observation = read_position(
-                connection, claim.company_id, result.resource_id
-            )
             if (observation.revision, observation.available_at) != (
                 result.revision,
                 result.available_at,
             ):
-                raise DutyRefused("The follow-up result does not match the booked fill")
+                raise DutyRefused(
+                    "The follow-up result does not match the booked order"
+                )
         elif result != follow_up.result:
             raise DutyRefused("No new book result was produced by this decision")
         next_due = receipt.decided_at + receipt.decision.next_check_seconds

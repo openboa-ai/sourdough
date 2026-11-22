@@ -1,0 +1,30 @@
+{
+  "source": "verification-two-quote-cuts",
+  "terms": {
+    "symbol": "BTCUSDT",
+    "base_currency": "BTC",
+    "quote_currency": "USDT",
+    "price_increment": "0.01",
+    "quantity_increment": "0.00001",
+    "minimum_quantity": "0.00001",
+    "minimum_notional": "5"
+  },
+  "quotes": [
+    {
+      "event_ns": 1700000000000000000,
+      "available_ns": 1700000000100000000,
+      "bid": "49999.99",
+      "ask": "50000.00",
+      "bid_size": "0.1",
+      "ask_size": "0.1"
+    },
+    {
+      "event_ns": 1700000001000000000,
+      "available_ns": 1700000001100000000,
+      "bid": "69999.99",
+      "ask": "70000.00",
+      "bid_size": "0.1",
+      "ask_size": "0.1"
+    }
+  ]
+}
