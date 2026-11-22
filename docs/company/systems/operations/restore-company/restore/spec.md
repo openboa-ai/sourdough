@@ -26,6 +26,8 @@ After retirement, use a private staging alias derived from the exact restore req
 
 Commit the retirement receipt and a reserved, unsupported schema marker in the same transaction. This also refuses startup by earlier product builds that only check their supported schema set. The retirement-aware reader obtains the original schema from the authenticated local store's receipt for inspection; the marker is not a migration of company records. Manual SQLite writes or independently copied files outside the managed service are not covered by this fence.
 
+The managed paper supervisor holds the original venue sender lock before checking company admission, through worker startup and any supervised replacement, and until shutdown/drain completes. The worker inherits that exact lock descriptor and corroborates the journal identity; a second file open cannot claim the same sender. A restore reconciler must hold that same lock before consulting the original venue and retiring the old company store. This closes the preflight-to-start gap for the qualified supervisor. Unmanaged or legacy pending launches must be fenced outside this contract before a restore is authorized.
+
 **Concern for the responsible component:** Pin checkpoint retention, recovery objectives and fencing method before the drill. If lost local authority or obligations cannot be reconstructed, remain isolated.
 
 ## Functional and quality requirements
