@@ -9,6 +9,7 @@ from time import time
 from uuid import uuid4
 
 from .agent_desk import save_draft
+from .company_assets import shared_asset_for
 from .company import _connect
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, resolve_run
 from .harness import ScopedWorkflow, tool
@@ -20,6 +21,7 @@ from .work import (
     read_follow_up_result,
     schedule_follow_up,
 )
+from .work_handoff import accepted_handoff, shared_revision
 from .writer_lease import WriterLease
 
 
@@ -401,6 +403,17 @@ def read_assessment_result(
     writer.verify_for(writer.store, claim.company_id)
 
     def project(connection, reference):
+        if reference.kind == "shared_asset":
+            asset = shared_asset_for(
+                connection, claim.founder_id, reference.resource_id
+            )
+            if reference.revision != shared_revision(asset):
+                raise DutyRefused("Shared handoff evidence revision changed")
+            result = {"revision": reference.revision, "shared_evidence": asdict(asset)}
+            handoff = accepted_handoff(connection, claim, asset.asset_id)
+            if handoff is not None:
+                result["handoff"] = handoff
+            return result
         if reference.kind != "company_assessment":
             raise DutyRefused("This review does not reference a company assessment")
         row = connection.execute(

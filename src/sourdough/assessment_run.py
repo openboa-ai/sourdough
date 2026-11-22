@@ -103,6 +103,7 @@ def run_assessment_company(
                         claim,
                         ASSESSMENT_WORKFLOW,
                         lambda name, args: invoke_assessment(writer, claim, name, args),
+                        clock=lambda: int(time()),
                     ),
                 )
             except TradeRefused:
@@ -188,7 +189,13 @@ def _run_review(
         committed = AssessmentReview(work.claim, decision, next_duty)
         return asdict(committed)
 
-    run = company_work_run(writer, work.claim, ASSESSMENT_REVIEW_WORKFLOW, invoke)
+    run = company_work_run(
+        writer,
+        work.claim,
+        ASSESSMENT_REVIEW_WORKFLOW,
+        invoke,
+        clock=lambda: int(time()),
+    )
     try:
         employee.run_scoped("assessment_review", run)
     except TradeRefused:

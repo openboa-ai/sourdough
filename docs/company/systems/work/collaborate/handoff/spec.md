@@ -14,6 +14,10 @@ Input contracts: [Record a decision and its next condition](../../discover-work/
 
 Use an offered-to-accepted transition instead of clearing the original owner as soon as a message is sent.
 
+The first local transition supports company assessment review. The sender offers its next follow-up during a review; the offer becomes actionable only after that exact review commits its decision and follow-up. The sender's follow-up stays scheduled under its original owner until accepted. The recipient can discover an actionable offer in a separate authorized turn. Acceptance must win against the sender claiming that follow-up: atomically retire the still-scheduled duty and schedule one successor for the recipient, referencing the selected shared evidence. It does not inherit the sender's private record, standing grant or unresolved trading effect.
+
+The accepted expected result is part of the successor's authorized work-result read, with the offer ID and sender. A new provider session does not need to reconstruct the offer from chat or private notes.
+
 **Concern for the responsible component:** Verify receiver access to evidence before transfer; stale acceptance must not be able to resurrect a superseded assignment.
 
 ## Functional and quality requirements
@@ -27,7 +31,7 @@ Use an offered-to-accepted transition instead of clearing the original owner as 
 
 | Case | Setup, action and expected observation |
 | --- | --- |
-| Normal | Have the recipient accept, produce a result and link its use in a later decision. Inspect each distinct event. |
+| Normal | In one company activation, have the sender offer and settle a review, the recipient discover and accept the offer in its own turn, then the recipient cite the shared result in a fresh review. Inspect separate run IDs and the original and successor queue entries. |
 | Failure or contention | Reject an unavailable reference or stale assignment. A declined or expired request leaves the previous owner and schedules follow-up. A predecessor's late callback cannot act after acceptance; an unresolved external effect remains with its original domain reconciler. |
 
 ## Operations and change review
