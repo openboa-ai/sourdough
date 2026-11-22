@@ -17,7 +17,7 @@ class PaperVenueTests(unittest.TestCase):
             "account", "local-v1", "rules", "USD", 5000, "paper"
         )
         self.venue = FixedQuoteVenue(self.journal)
-        self.venue.provision(self.account, 100)
+        self.account = self.venue.provision(self.account, 100)
         self.intent = PaperIntent("action", "rules", 2, 110)
 
     def test_fill_has_one_durable_destination_identity(self):

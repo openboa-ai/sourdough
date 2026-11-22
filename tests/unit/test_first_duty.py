@@ -48,6 +48,16 @@ class FirstDutyTests(unittest.TestCase):
                 [(self.receipt.due_work_id, claims[0].run_id)],
             )
 
+    def test_read_only_grant_cannot_consume_paper_duty(self):
+        with closing(sqlite3.connect(self.store)) as db, db:
+            db.execute("UPDATE standing_grant SET scope = 'read'")
+        with self.assertRaises(DutyRefused):
+            self.claim()
+        self.assertEqual(
+            reopen(self.store, self.receipt.company_id).due_work_ids,
+            (self.receipt.due_work_id,),
+        )
+
     def test_authority_is_checked_again_at_use(self):
         claim = self.claim()
         with closing(sqlite3.connect(self.store)) as db, db:

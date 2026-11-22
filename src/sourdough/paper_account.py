@@ -20,6 +20,7 @@ class PaperAccount:
     currency: str
     starting_minor_units: int
     environment: str
+    destination_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -42,11 +43,12 @@ _CREATE_BINDING = """CREATE TABLE IF NOT EXISTS paper_binding (
     account_id TEXT NOT NULL, connector_revision TEXT NOT NULL,
     instrument_rules_digest TEXT NOT NULL, currency TEXT NOT NULL,
     starting_minor_units INTEGER NOT NULL,
-    environment TEXT NOT NULL CHECK (environment = 'paper')
+    environment TEXT NOT NULL CHECK (environment = 'paper'),
+    destination_id TEXT NOT NULL
 )"""
 _SELECT_BINDING = """SELECT revision, company_id, charter_revision,
     exposure_limit_minor_units, account_id, connector_revision,
-    instrument_rules_digest, currency, starting_minor_units, environment
+    instrument_rules_digest, currency, starting_minor_units, environment, destination_id
     FROM paper_binding WHERE singleton = 1"""
 
 
@@ -67,6 +69,7 @@ def bind(store: Path, mandate: PaperMandate, observer: AccountObserver) -> Paper
                 account.connector_revision,
                 account.instrument_rules_digest,
                 account.currency,
+                account.destination_id,
             )
         )
     ):
@@ -95,10 +98,11 @@ def bind(store: Path, mandate: PaperMandate, observer: AccountObserver) -> Paper
             account.currency,
             account.starting_minor_units,
             account.environment,
+            account.destination_id,
         )
         if existing is None:
             connection.execute(
-                "INSERT INTO paper_binding VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO paper_binding VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 terms,
             )
         elif existing != terms:

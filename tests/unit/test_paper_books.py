@@ -8,7 +8,7 @@ from sourdough.company import FoundingTerms, found
 from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused, position_quantity, post_confirmed_fill
-from sourdough.paper_order import PaperIntent, submit_paper_order
+from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
 
 
@@ -23,7 +23,7 @@ class PaperBooksTests(unittest.TestCase):
         self.company_id = founder.company_id
         self.venue = FixedQuoteVenue(self.journal)
         account = PaperAccount("account", "local-v1", "rules", "USD", 5000, "paper")
-        self.venue.provision(account, 100)
+        account = self.venue.provision(account, 100)
         bind(
             self.store,
             PaperMandate("mandate", self.company_id, "charter", account, 1000),
@@ -79,3 +79,20 @@ class PaperBooksTests(unittest.TestCase):
         with self.assertRaises(PostingRefused):
             self.post("not-admitted")
         self.assertEqual(position_quantity(self.store, self.company_id), 0)
+
+    def test_replacement_journal_cannot_inherit_dispatch_authority(self):
+        replacement = FixedQuoteVenue(self.journal.with_name("replacement.sqlite"))
+        replacement.provision(
+            PaperAccount("account", "local-v1", "rules", "USD", 5000, "paper"), 50
+        )
+        with self.assertRaises(OrderRefused):
+            submit_paper_order(
+                self.store,
+                self.claim,
+                PaperIntent("action", "rules", 2, 110),
+                replacement,
+            )
+        with closing(sqlite3.connect(replacement.journal)) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM venue_execution").fetchone(), (0,)
+            )

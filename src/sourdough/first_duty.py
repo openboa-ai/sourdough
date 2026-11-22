@@ -34,11 +34,11 @@ def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> Du
                JOIN founder f ON r.founder_id = f.id AND r.company_id = f.company_id
                JOIN standing_grant g ON r.grant_id = g.id AND g.founder_id = f.id
                JOIN duty d ON r.due_work_id = d.id AND d.founder_id = f.id
-               WHERE r.company_id = ? AND d.state = 'due'""",
+               WHERE r.company_id = ? AND d.state = 'due' AND g.scope = 'paper'""",
             (company_id,),
         ).fetchone()
         if row is None or not execution_profile or row[3] != execution_profile:
-            raise DutyRefused("No due founder work for this execution profile")
+            raise DutyRefused("No authorized paper duty for this execution profile")
         claim = DutyClaim(company_id, *row[:3], uuid4().hex, row[3])
         connection.execute(
             """CREATE TABLE IF NOT EXISTS first_duty_claim (
@@ -55,14 +55,14 @@ def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> Du
         return claim
 
 
-def require_paper_authority(connection: sqlite3.Connection, claim: DutyClaim) -> None:
+def _resolve_claim(connection: sqlite3.Connection, claim: DutyClaim) -> tuple:
     row = connection.execute(
-        """SELECT g.scope
+        """SELECT g.scope, d.state
            FROM first_duty_claim q
            JOIN duty d ON q.duty_id = d.id
            JOIN founder f ON d.founder_id = f.id
            JOIN standing_grant g ON g.founder_id = f.id
-           WHERE q.duty_id = ? AND q.run_id = ? AND d.state = 'running'
+           WHERE q.duty_id = ? AND q.run_id = ?
              AND f.company_id = ? AND f.id = ? AND g.id = ?
              AND f.execution_profile = ?""",
         (
@@ -74,5 +74,15 @@ def require_paper_authority(connection: sqlite3.Connection, claim: DutyClaim) ->
             claim.execution_profile,
         ),
     ).fetchone()
-    if row != ("paper",):
+    if row is None:
+        raise DutyRefused("Duty claim identity mismatch")
+    return row
+
+
+def require_historical_claim(connection: sqlite3.Connection, claim: DutyClaim) -> None:
+    _resolve_claim(connection, claim)
+
+
+def require_paper_authority(connection: sqlite3.Connection, claim: DutyClaim) -> None:
+    if _resolve_claim(connection, claim) != ("paper", "running"):
         raise DutyRefused("Current duty lacks paper authority")

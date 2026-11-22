@@ -7,7 +7,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from .company import _connect
-from .first_duty import DutyClaim, require_paper_authority
+from .first_duty import DutyClaim, require_historical_claim, require_paper_authority
 from .paper_account import PaperAccount, reopen_binding
 
 
@@ -35,6 +35,24 @@ class PaperDestination(Protocol):
     def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None: ...
 
 
+def _historical_receipt(connection, claim, intent):
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_order'"
+    ).fetchone():
+        return None
+    previous = connection.execute(
+        """SELECT order_id, instrument_rules_digest, quantity, limit_minor_units
+           FROM paper_order WHERE run_id = ? AND action_id = ?""",
+        (claim.run_id, intent.action_id),
+    ).fetchone()
+    if previous is None:
+        return None
+    require_historical_claim(connection, claim)
+    if previous[1:] != astuple(intent)[1:]:
+        raise OrderRefused("Action identity reused with different terms")
+    return OrderReceipt(previous[0], False)
+
+
 def submit_paper_order(
     store: Path, claim: DutyClaim, intent: PaperIntent, destination: PaperDestination
 ) -> OrderReceipt:
@@ -46,12 +64,20 @@ def submit_paper_order(
         or min(intent.quantity, intent.limit_minor_units) <= 0
     ):
         raise OrderRefused("Invalid paper order terms")
+    with closing(_connect(store, "ro")) as connection:
+        connection.execute("BEGIN")
+        receipt = _historical_receipt(connection, claim, intent)
+        if receipt is not None:
+            return receipt
     observed_binding = reopen_binding(store, claim.company_id)
     account = observed_binding.account
     if destination.observe_account(account.account_id) != account:
         raise OrderRefused("Paper destination mismatch")
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
+        receipt = _historical_receipt(connection, claim, intent)
+        if receipt is not None:
+            return receipt
         require_paper_authority(connection, claim)
         if reopen_binding(store, claim.company_id) != observed_binding:
             raise OrderRefused("Paper binding changed")
@@ -71,16 +97,6 @@ def submit_paper_order(
                 UNIQUE (run_id, action_id)
             )"""
         )
-        previous = connection.execute(
-            """SELECT order_id, mandate_revision, instrument_rules_digest,
-                      quantity, limit_minor_units FROM paper_order
-               WHERE run_id = ? AND action_id = ?""",
-            (claim.run_id, intent.action_id),
-        ).fetchone()
-        if previous is not None:
-            if previous[1:] != (observed_binding.revision, *astuple(intent)[1:]):
-                raise OrderRefused("Action identity reused with different terms")
-            return OrderReceipt(previous[0], False)
         reservation = intent.quantity * intent.limit_minor_units
         pending = connection.execute(
             """SELECT COALESCE(SUM(reserved_minor_units), 0)
