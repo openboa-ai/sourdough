@@ -18,6 +18,12 @@ Query the original submission instead of replacing an order after an ambiguous t
 
 **Concern for the responsible component:** Require a documented exclusion of delayed acceptance before closing an absent order. Missing that guarantee, keep risk reserved even if a lookup is empty.
 
+### First full-fill recovery slice
+
+Start after writer acquisition and before a result-dependent turn can launch. Verify the bound destination instance and read pending reservations by original order ID. Ask the same independent venue for the original order and its fill evidence. Reuse the posting transaction for all financial writes; do not translate an empty reply into either absence or permission to call submit. Persist the original lookup duty and a finite retry deadline if evidence is unavailable. Resolve it automatically when conclusive evidence arrives. Unsupported release capabilities remain explicit; they do not qualify the sealed-absent or partial-fill cases.
+
+The prospective test includes two delivery paths for the same fill: original-order history and account sync. They must normalize to the same identity. After both observations, independently compute position, fee and reservation from the venue's declared terms and signed execution evidence. Commit the original work disposition and its distinct saved follow-up once the resulting book revision is available. If the company cannot read a trustworthy fill or fee required by the test contract, report incomplete and keep the affected exposure contained.
+
 ## Functional and quality requirements
 
 - **FR.** Pass confirmed fills to the investment subledger using the original venue/account/fill key. Only its posting transaction applies quantity, fee and fill-related reservation changes. Record its durable receipt (or recover it by the same key after response loss) before reporting this fill as reconciled to Work. Release any remaining reservation only against definitive terminal evidence; persist the next query and owner if unknown.
