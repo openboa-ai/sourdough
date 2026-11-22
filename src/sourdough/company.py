@@ -1,0 +1,167 @@
+"""Own the company's first persisted transition and its reopen check."""
+
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+from uuid import uuid4
+
+
+SCHEMA_REVISION = 1
+SCHEMA = (
+    """CREATE TABLE company (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        id TEXT NOT NULL UNIQUE, schema_revision INTEGER NOT NULL,
+        charter_revision TEXT NOT NULL
+    )""",
+    """CREATE TABLE founder (
+        id TEXT PRIMARY KEY NOT NULL, company_id TEXT NOT NULL UNIQUE REFERENCES company(id),
+        execution_profile TEXT NOT NULL
+    )""",
+    """CREATE TABLE standing_grant (
+        id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL UNIQUE REFERENCES founder(id),
+        scope TEXT NOT NULL
+    )""",
+    """CREATE TABLE duty (
+        id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL UNIQUE REFERENCES founder(id),
+        state TEXT NOT NULL
+    )""",
+    """CREATE TABLE founding_receipt (
+        setup_identity TEXT PRIMARY KEY NOT NULL,
+        company_id TEXT NOT NULL UNIQUE REFERENCES company(id),
+        founder_id TEXT NOT NULL UNIQUE REFERENCES founder(id),
+        grant_id TEXT NOT NULL UNIQUE REFERENCES standing_grant(id),
+        due_work_id TEXT NOT NULL UNIQUE REFERENCES duty(id)
+    )""",
+)
+
+
+class FoundingRefused(Exception):
+    """The founding or reopen command could not be admitted."""
+
+
+@dataclass(frozen=True)
+class FoundingTerms:
+    setup_identity: str
+    charter_revision: str
+    founder_scope: str
+    execution_profile: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in (
+                self.setup_identity,
+                self.charter_revision,
+                self.founder_scope,
+                self.execution_profile,
+            )
+        ):
+            raise FoundingRefused("Founding terms must be nonempty strings")
+
+
+@dataclass(frozen=True)
+class FoundingReceipt:
+    company_id: str
+    founder_id: str
+    grant_id: str
+    due_work_id: str
+
+
+@dataclass(frozen=True)
+class OpenCompany:
+    company_id: str
+    due_work_ids: tuple[str, ...]
+
+
+def _connect(store: Path, mode: str) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        f"{store.absolute().as_uri()}?mode={mode}", uri=True, timeout=3
+    )
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def _identity(connection: sqlite3.Connection) -> str:
+    row = connection.execute(
+        "SELECT id, schema_revision FROM company WHERE singleton = 1"
+    ).fetchone()
+    if row is None or row[1] != SCHEMA_REVISION:
+        raise FoundingRefused("Unsupported company store schema")
+    return row[0]
+
+
+def found(store: Path, terms: FoundingTerms) -> FoundingReceipt:
+    """Explicit setup may initialize a store. SQLite serializes setup and replay."""
+    with closing(_connect(store, "rwc")) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone():
+            _identity(connection)
+            return _replay(connection, terms)
+
+        for statement in SCHEMA:
+            connection.execute(statement)
+        receipt = FoundingReceipt(*(uuid4().hex for _ in range(4)))
+        connection.execute(
+            "INSERT INTO company VALUES (1, ?, ?, ?)",
+            (receipt.company_id, SCHEMA_REVISION, terms.charter_revision),
+        )
+        connection.execute(
+            "INSERT INTO founder VALUES (?, ?, ?)",
+            (receipt.founder_id, receipt.company_id, terms.execution_profile),
+        )
+        connection.execute(
+            "INSERT INTO standing_grant VALUES (?, ?, ?)",
+            (receipt.grant_id, receipt.founder_id, terms.founder_scope),
+        )
+        connection.execute(
+            "INSERT INTO duty VALUES (?, ?, 'due')",
+            (receipt.due_work_id, receipt.founder_id),
+        )
+        connection.execute(
+            "INSERT INTO founding_receipt VALUES (?, ?, ?, ?, ?)",
+            (
+                terms.setup_identity,
+                receipt.company_id,
+                receipt.founder_id,
+                receipt.grant_id,
+                receipt.due_work_id,
+            ),
+        )
+    return receipt
+
+
+def _replay(connection: sqlite3.Connection, terms: FoundingTerms) -> FoundingReceipt:
+    row = connection.execute(
+        """SELECT c.charter_revision, g.scope, f.execution_profile,
+                  r.company_id, r.founder_id, r.grant_id, r.due_work_id
+           FROM founding_receipt r
+           JOIN company c ON c.id = r.company_id
+           JOIN founder f ON f.id = r.founder_id
+           JOIN standing_grant g ON g.id = r.grant_id
+           WHERE r.setup_identity = ?""",
+        (terms.setup_identity,),
+    ).fetchone()
+    if row is None or row[:3] != (
+        terms.charter_revision,
+        terms.founder_scope,
+        terms.execution_profile,
+    ):
+        raise FoundingRefused("Founding terms conflict with the existing company")
+    return FoundingReceipt(*row[3:])
+
+
+def reopen(store: Path, expected_company_id: str) -> OpenCompany:
+    """Check compatibility and inventory due work in one read-only snapshot."""
+    try:
+        connection = _connect(store, "ro")
+    except sqlite3.OperationalError as error:
+        raise FoundingRefused("Expected company store could not be opened") from error
+    with closing(connection), connection:
+        connection.execute("BEGIN")
+        if _identity(connection) != expected_company_id:
+            raise FoundingRefused("Company identity mismatch")
+        rows = connection.execute(
+            "SELECT id FROM duty WHERE state = 'due' ORDER BY id"
+        ).fetchall()
+        return OpenCompany(expected_company_id, tuple(row[0] for row in rows))
