@@ -12,7 +12,7 @@ from time import time
 from typing import TYPE_CHECKING
 
 from .company import _connect, _identity
-from .paper_account import reopen_binding
+from .paper_account import read_applied_binding, reopen_binding
 from .paper_execution import observe_bound_position
 
 if TYPE_CHECKING:
@@ -70,6 +70,35 @@ class NoFillObservation:
     @property
     def revision(self) -> str:
         return sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BindingPosition:
+    binding_revision: str
+    account_id: str
+    instrument_rules_digest: str
+    available_at: int
+    position_quantity: int = 0
+    position_units: str = "instrument_units"
+
+    @property
+    def revision(self) -> str:
+        return sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
+
+
+def read_binding_position(
+    connection: sqlite3.Connection, company_id: str, revision: str
+) -> BindingPosition | None:
+    evidence = read_applied_binding(connection, company_id, revision)
+    if evidence is None:
+        return None
+    account, effective_ns = evidence
+    return BindingPosition(
+        revision,
+        account.account_id,
+        account.instrument_rules_digest,
+        (effective_ns + 10**9 - 1) // 10**9,
+    )
 
 
 _FILL_SCHEMA = """(
@@ -281,7 +310,11 @@ def read_booked_no_fill(
 
 def read_book_observation(
     connection: sqlite3.Connection, company_id: str, kind: str, resource_id: str
-) -> PositionObservation | NoFillObservation:
+) -> PositionObservation | NoFillObservation | BindingPosition:
+    if kind == "paper_binding":
+        baseline = read_binding_position(connection, company_id, resource_id)
+        if baseline is not None:
+            return baseline
     if kind == "paper_position":
         return read_position(connection, company_id, resource_id)
     if kind == "paper_no_fill":

@@ -9,6 +9,7 @@ from uuid import uuid4
 from .company import _connect
 from .duty_run import PAPER_EXECUTION, DutyClaim, DutyRefused
 from .first_duty import FIRST_DUTY_SCOPE
+from .paper_account import reopen_binding
 from .paper_books import (
     read_book_observation,
     read_no_fill,
@@ -101,6 +102,7 @@ def persist_paper_decision(
         if scope != FIRST_DUTY_SCOPE or follow_up.result.kind not in (
             "paper_position",
             "paper_no_fill",
+            "paper_binding",
         ):
             raise DutyRefused("Duty is not authorized for this paper decision")
         connection.execute(
@@ -212,19 +214,26 @@ def reopen_unsubmitted_decisions(
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_decision'"
         ).fetchone():
             return ()
+        account = reopen_binding(store, company_id).account
         rows = connection.execute(
             """SELECT a.id, r.grant_id, d.id, r.run_id, a.execution_profile
                FROM paper_decision decision
                JOIN duty_run r ON r.run_id = decision.run_id AND r.is_current = 1
                JOIN duty d ON d.id = decision.duty_id AND d.id = r.duty_id AND d.state = 'running'
                JOIN agent a ON a.id = d.agent_id AND a.company_id = ?
-               WHERE (? OR decision.action != 'buy')
+               WHERE (decision.action != 'buy' OR (? AND decision.account_id=?
+                      AND decision.instrument_rules_digest=?))
                  AND NOT EXISTS (
                      SELECT 1 FROM paper_order o JOIN duty_run original ON original.run_id = o.run_id
                      WHERE original.duty_id = d.id
                  )
                ORDER BY decision.decided_at, d.id LIMIT 8""",
-            (company_id, allow_buy),
+            (
+                company_id,
+                allow_buy,
+                account.account_id,
+                account.instrument_rules_digest,
+            ),
         ).fetchall()
     pending = []
     for row in rows:

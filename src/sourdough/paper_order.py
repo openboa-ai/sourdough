@@ -115,6 +115,7 @@ def submit_paper_order(
             intent.action_id,
             intent.quantity,
             intent.limit_minor_units,
+            account=account,
         ):
             raise OrderRefused(
                 "Opening order requires its committed research decision and exact terms"
@@ -126,6 +127,7 @@ def submit_paper_order(
             intent.action_id,
             intent.quantity,
             intent.limit_minor_units,
+            account=account,
         ):
             raise OrderRefused(
                 "First hired order requires acceptance, research and a separate request"

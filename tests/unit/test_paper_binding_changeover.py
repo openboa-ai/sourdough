@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time_ns
 
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import claim_first_duty
+from sourdough.first_duty import DutyRefused, claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.paper_account import (
@@ -23,6 +23,11 @@ from sourdough.paper_account import (
 )
 from sourdough.paper_execution import PaperIntent, VenueRefused
 from sourdough.paper_order import OrderRefused, submit_paper_order
+from sourdough.paper_research import (
+    ResearchTools,
+    find_unsubmitted_opening,
+    stage_research_inputs,
+)
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -30,21 +35,38 @@ REOPEN = """
 import json, sys
 from dataclasses import asdict
 from pathlib import Path
+from time import time
 from types import SimpleNamespace
-from sourdough.company_run import run_paper_company
+import sourdough.company_run as company_run
 from sourdough.nautilus_paper import NautilusPaperVenue
 
 def review(read):
     result = read()
+    if repeat:
+        assert result["account_id"] == "old"
+        assert result["current_observation"]["account_id"] is None
     return {
-        "tool": "record_review_decision", "call_id": "next-duty", "action": "hold",
+        "tool": "record_review_decision",
+        "call_id": "historical-review" if repeat else "next-duty", "action": "hold",
         "rationale": "Handle the original cleared order.", "next_check_seconds": 300,
         "observation_revision": result["revision"],
     }
-store, company_id, journal, idle = sys.argv[1:]
-result = run_paper_company(
+def trade(read):
+    result = read()
+    assert result["account_id"] == "new" and result["position_quantity"] == 0
+    assert result["binding_revision"] == "revision-b"
+    return {
+        "tool": "record_paper_decision", "call_id": "new-account-decision", "action": "hold",
+        "rationale": "Use the verified baseline and the current account only.",
+        "next_check_seconds": 300, "observation_revision": result["revision"],
+    }
+store, company_id, journal, idle, offset, repeat = sys.argv[1:]
+repeat = repeat == "True"
+company_run.time = lambda: time() + int(offset)
+result = company_run.run_paper_company(
     Path(store), company_id, NautilusPaperVenue(Path(journal)),
-    SimpleNamespace(profile="employee", review=review), turn_budget=1, idle_seconds=int(idle),
+    SimpleNamespace(profile="employee", review=review, trade=trade),
+    turn_budget=1, idle_seconds=int(idle), repeat_paper=repeat,
 )
 print(json.dumps(asdict(result)))
 """
@@ -127,7 +149,7 @@ class ManagedPaperChangeover(unittest.TestCase):
                 self.assertEqual(pending.result(timeout=2).order_id, command.order_id)
             return command.order_id
 
-    def reopen_process(self, venue, *, check=True, idle=0):
+    def reopen_process(self, venue, *, check=True, idle=0, offset=0, repeat=False):
         process = subprocess.run(
             [
                 sys.executable,
@@ -138,12 +160,15 @@ class ManagedPaperChangeover(unittest.TestCase):
                 self.company_id,
                 str(venue.journal),
                 str(idle),
+                str(offset),
+                str(repeat),
             ],
             capture_output=True,
             text=True,
             timeout=10,
-            check=check,
         )
+        if check:
+            self.assertEqual(process.returncode, 0, process.stderr)
         return json.loads(process.stdout) if check else process
 
     def test_pending_switch_preserves_the_original_order_until_its_scope_is_drained(
@@ -201,6 +226,18 @@ class ManagedPaperChangeover(unittest.TestCase):
         self.assertEqual(
             rows(self.old.journal, "SELECT count(*) FROM sandbox_order"), [(1,)]
         )
+        historical = self.reopen_process(self.new, offset=400, repeat=True)
+        self.assertEqual(
+            historical["review"]["next_duty"]["result"]["kind"], "paper_binding"
+        )
+        self.assertEqual(
+            historical["review"]["next_duty"]["result"]["resource_id"], "revision-b"
+        )
+        active = self.reopen_process(self.new, offset=900, repeat=True)
+        [new_duty] = active["later_trades"]
+        self.assertEqual(new_duty["claim"]["founder_id"], claim.founder_id)
+        self.assertEqual(new_duty["decision"]["decision"]["action"], "hold")
+        self.assertIsNone(new_duty["order_id"])
 
     def test_clean_switch_leaves_only_the_new_account_eligible_for_new_work(self):
         self.assertIsNotNone(self.switch().effective_at_ns)
@@ -236,3 +273,114 @@ class ManagedPaperChangeover(unittest.TestCase):
                     writer, self.current.revision, self.target, self.new, self.new
                 )
         self.assertEqual(reopen_binding(self.store, self.company_id), self.current)
+
+    @staticmethod
+    def observations(prefix):
+        return [
+            {
+                "observation_id": f"{prefix}-first",
+                "price_minor_units": 90,
+                "observed_at": 60,
+                "available_at": 61,
+            },
+            {
+                "observation_id": f"{prefix}-last",
+                "price_minor_units": 100,
+                "observed_at": 70,
+                "available_at": 71,
+            },
+        ]
+
+    def test_old_research_receipt_cannot_authorize_risk_on_the_new_account(self):
+        original_plan = stage_research_inputs(
+            self.store, self.company_id, self.observations("old")
+        )
+        claim = claim_first_duty(self.store, self.company_id, "employee")
+        tools = ResearchTools(self.store, claim, 100, 0, 800)
+        inputs = tools.invoke("read_research_inputs", {}, now=100)
+        finding = tools.invoke(
+            "publish_research_finding",
+            {
+                "snapshot_revision": inputs["revision"],
+                "hypothesis": "The observed increase exceeds the quoted synthetic costs.",
+                "start_id": "old-first",
+                "end_id": "old-last",
+                "gross_change_minor_units": 10,
+                "round_trip_fee_minor_units": 0,
+                "net_change_minor_units": 10,
+                "uncertainty": "No future price guarantee.",
+            },
+            now=101,
+        )
+        decision = tools.invoke(
+            "record_research_decision",
+            {
+                "finding_id": finding["finding_id"],
+                "finding_revision": finding["revision"],
+                "call_id": "original-decision",
+                "action": "buy",
+                "quantity": 2,
+                "limit_minor_units": 110,
+                "next_check_seconds": 60,
+                "rationale": "Bound the experiment.",
+            },
+            now=102,
+        )
+        self.assertIsNotNone(self.switch().effective_at_ns)
+        self.assertIsNone(find_unsubmitted_opening(self.store, self.company_id))
+        with self.assertRaisesRegex(DutyRefused, "another binding"):
+            tools.invoke("read_research_inputs", {}, now=103)
+        current_plan = stage_research_inputs(
+            self.store, self.company_id, self.observations("new")
+        )
+        self.assertNotEqual(current_plan["revision"], original_plan["revision"])
+        with self.assertRaises(OrderRefused):
+            submit_paper_order(
+                self.store,
+                claim,
+                PaperIntent(decision["decision_id"], self.terms.revision, 2, 110),
+                self.new,
+            )
+        self.assertEqual(
+            rows(self.new.journal, "SELECT count(*) FROM sandbox_order"), [(0,)]
+        )
+        self.assertEqual(
+            rows(
+                self.store,
+                "SELECT account_id,revision FROM paper_research_plan ORDER BY account_id",
+            ),
+            [("new", current_plan["revision"]), ("old", original_plan["revision"])],
+        )
+
+    def test_recognizes_legacy_plan_and_reseals_only_the_new_scope(self):
+        old_plan = stage_research_inputs(
+            self.store, self.company_id, self.observations("old")
+        )
+        with closing(sqlite3.connect(self.store)) as database, database:
+            database.execute("ALTER TABLE paper_research_plan RENAME TO seeded_plan")
+            database.execute(
+                "CREATE TABLE paper_research_plan (company_id TEXT PRIMARY KEY, revision TEXT, inputs TEXT)"
+            )
+            database.execute(
+                "INSERT INTO paper_research_plan SELECT company_id,revision,inputs FROM seeded_plan"
+            )
+            database.execute("DROP TABLE seeded_plan")
+        self.assertIsNotNone(self.switch().effective_at_ns)
+        new_plan = stage_research_inputs(
+            self.store, self.company_id, self.observations("new")
+        )
+        claim = claim_first_duty(self.store, self.company_id, "employee")
+        snapshot = ResearchTools(self.store, claim, 100, 0, 800).invoke(
+            "read_research_inputs", {}, now=100
+        )
+        self.assertEqual(
+            (snapshot["account_id"], snapshot["source_plan_revision"]),
+            ("new", new_plan["revision"]),
+        )
+        self.assertEqual(
+            rows(
+                self.store,
+                "SELECT account_id,revision FROM paper_research_plan ORDER BY account_id",
+            ),
+            [("new", new_plan["revision"]), ("old", old_plan["revision"])],
+        )

@@ -32,6 +32,7 @@ from .paper_books import (
     Posting,
     PostingRefused,
     capture_position,
+    read_binding_position,
     read_book_observation,
     read_booked_no_fill,
     read_captured_position,
@@ -62,6 +63,9 @@ from .work import (
     reopen_follow_up,
     settle_review,
 )
+
+
+_PAPER_RESULTS = ("paper_position", "paper_no_fill", "paper_binding")
 
 
 @dataclass(frozen=True)
@@ -142,6 +146,7 @@ def _operate(
             )
         turn_budget = max(0, turn_budget - consumed)
     idle_deadline = monotonic() + idle_seconds
+    active_account = reopen_binding(store, company_id).account
     with closing(_connect(store, "ro")) as connection:
         switching = has_pending_binding_change(connection)
     repeat_paper = repeat_paper and not switching
@@ -213,6 +218,16 @@ def _operate(
         reconciliation, blocked = _refresh_recovery(
             writer, venue, next_purpose, reconciliation
         )
+
+    def eligible(connection, reference):
+        if reference.kind not in _PAPER_RESULTS:
+            return False
+        evidence = _read_paper_observation(connection, reference, company_id)
+        return (evidence["account_id"], evidence["instrument_rules_digest"]) == (
+            active_account.account_id,
+            active_account.instrument_rules_digest,
+        )
+
     while turn_budget or reconciliation.next_query_at is not None:
         if (
             reconciliation.next_query_at is not None
@@ -241,6 +256,7 @@ def _operate(
                 now=int(time()),
                 allow_paper_execution=repeat_paper
                 and not (reconciliation.unresolved or blocked),
+                eligible_paper_result=eligible,
             )
         if follow_up is None:
             if not turn_budget and reconciliation.next_query_at is None:
@@ -418,7 +434,7 @@ def _review(
         writer.verify()
         quote = (
             observe_review_quote(store, follow_up.claim.company_id, venue)
-            if follow_up.result.kind in ("paper_position", "paper_no_fill")
+            if follow_up.result.kind in _PAPER_RESULTS
             else None
         )
 
@@ -440,14 +456,36 @@ def _review(
     try:
         decision = ReviewDecision.from_proposal(runtime.review(read_result))
         writer.verify()
+        successor = None
+        purpose = (
+            next_purpose if follow_up.result.kind in _PAPER_RESULTS else POSITION_REVIEW
+        )
+        if purpose == PAPER_EXECUTION:
+            binding = reopen_binding(store, writer.company_id)
+            with closing(_connect(store, "ro")) as connection:
+                prior = _read_paper_observation(
+                    connection, follow_up.result, writer.company_id
+                )
+                if prior["account_id"] != binding.account.account_id:
+                    baseline = read_binding_position(
+                        connection, writer.company_id, binding.revision
+                    )
+                    if baseline is None:
+                        purpose = POSITION_REVIEW
+                    else:
+                        successor = ResultReference(
+                            "paper_binding",
+                            baseline.binding_revision,
+                            baseline.revision,
+                            baseline.available_at,
+                        )
         next_duty = settle_review(
             store,
             follow_up,
             decision,
             now=int(time()),
-            successor_purpose=next_purpose
-            if follow_up.result.kind in ("paper_position", "paper_no_fill")
-            else POSITION_REVIEW,
+            successor_purpose=purpose,
+            successor_result=successor,
         )
     except (DutyRefused, TradeRefused):
         try:

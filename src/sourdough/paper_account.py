@@ -187,6 +187,23 @@ def _previous_change(connection, revision: str):
     ).fetchone()
 
 
+def was_applied_binding_change(connection, revision: str) -> bool:
+    saved = _previous_change(connection, revision)
+    return saved is not None and saved[4] is not None
+
+
+def read_applied_binding(
+    connection, company_id: str, revision: str
+) -> tuple[PaperAccount, int] | None:
+    saved = _previous_change(connection, revision)
+    if saved is None or saved[4] is None:
+        return None
+    terms = json.loads(saved[2])
+    if terms[1] != company_id:
+        raise BindingRefused("Binding receipt belongs to another company")
+    return PaperAccount(*terms[4:]), saved[4]
+
+
 def _require_new_identity(connection, mandate: PaperMandate) -> None:
     for revision, old_terms in connection.execute(
         "SELECT previous_revision,old_terms FROM paper_binding_change"
