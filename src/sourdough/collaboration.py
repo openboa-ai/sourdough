@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 
 from .company_assets import (
     Selection,
+    discover_shared_assets,
     project_access,
     publish_selection,
     read_shared_asset,
@@ -55,7 +56,11 @@ def company_work_run(
                 "projects": [
                     asdict(project)
                     for project in project_access(writer, claim, workflow.purpose)
-                ]
+                ],
+                "shared_assets": [
+                    asdict(asset)
+                    for asset in discover_shared_assets(writer, claim, workflow.purpose)
+                ],
             }
         if name == "read_shared_asset":
             return asdict(

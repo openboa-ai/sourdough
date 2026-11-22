@@ -171,6 +171,36 @@ class ProjectAccess:
     can_publish: bool
 
 
+@dataclass(frozen=True)
+class SharedAssetReference:
+    asset_id: str
+    project_id: str
+    author_id: str
+    duty_id: str
+
+
+def discover_shared_assets(
+    writer: WriterLease,
+    claim: DutyClaim,
+    purpose: str,
+) -> tuple[SharedAssetReference, ...]:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "ro")) as database:
+        database.execute("BEGIN")
+        require_desk(database, claim, purpose)
+        return tuple(
+            SharedAssetReference(*row)
+            for row in database.execute(
+                """SELECT a.asset_id,a.project_id,a.author_id,a.duty_id
+                   FROM shared_publication a JOIN shared_project p ON p.project_id=a.project_id
+                   WHERE EXISTS (SELECT 1 FROM json_each(p.members) WHERE value=?)
+                     AND EXISTS (SELECT 1 FROM json_each(a.audience) WHERE value=?)
+                   ORDER BY a.rowid DESC LIMIT 32""",
+                (claim.founder_id, claim.founder_id),
+            )
+        )
+
+
 def project_access(
     writer: WriterLease,
     claim: DutyClaim,
@@ -243,8 +273,8 @@ def publish_selection(
         ).fetchone()
         if draft is None or selection.end > len(draft[0]):
             raise DutyRefused("Current private draft or selected range is unavailable")
-        excerpt = draft[0][selection.start : selection.end].strip()
-        if not excerpt:
+        excerpt = draft[0][selection.start : selection.end]
+        if not excerpt.strip():
             raise DutyRefused("Cannot publish an empty selection")
         asset = SharedAsset(
             uuid4().hex, selection.project_id, claim.founder_id, claim.duty_id, excerpt

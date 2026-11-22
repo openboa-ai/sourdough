@@ -81,7 +81,8 @@ class CompanyAssets(unittest.TestCase):
             ),
             self.project,
         )
-        content = "Private notes\nReviewed conclusion\nUnshared attachment details"
+        excerpt = "    Reviewed conclusion\n"
+        content = f"Private notes\n{excerpt}Unshared attachment details"
         draft = save_draft(
             self.writer,
             self.claims["author"],
@@ -90,7 +91,7 @@ class CompanyAssets(unittest.TestCase):
             content=content,
             expected_revision=None,
         )
-        start = content.index("Reviewed")
+        start = content.index(excerpt)
         selection = Selection(
             "selection",
             draft.name,
@@ -99,10 +100,10 @@ class CompanyAssets(unittest.TestCase):
             self.project,
             ("peer",),
             start,
-            start + len("Reviewed conclusion"),
+            start + len(excerpt),
         )
         asset = self.publish(selection)
-        self.assertEqual(asset.content, "Reviewed conclusion")
+        self.assertEqual(asset.content, excerpt)
         self.assertEqual(self.publish(selection), asset)
         self.assertNotIn(draft.name, str(asdict(asset)))
         self.assertEqual(
@@ -192,11 +193,29 @@ class CompanyAssets(unittest.TestCase):
             "end": 16,
         }
         published = author.call("publish_draft_selection", request)
+        [listed] = peer.call("read_project_assignments", {})["shared_assets"]
+        self.assertEqual(listed["asset_id"], published["asset_id"])
+        self.assertNotIn("content", listed)
         self.assertEqual(
-            peer.call("read_shared_asset", {"asset_id": published["asset_id"]})[
-                "content"
-            ],
+            peer.call("read_shared_asset", {"asset_id": listed["asset_id"]})["content"],
             "Share only this.",
         )
         with self.assertRaisesRegex(DutyRefused, "not available to this run"):
             peer.call("publish_draft_selection", request)
+        outsider = company_work_run(
+            self.writer,
+            self.claims["outsider"],
+            workflow,
+            lambda *_: {"finished": True},
+        )
+        self.assertEqual(
+            outsider.call("read_project_assignments", {})["shared_assets"], []
+        )
+        assign_project(
+            self.writer,
+            self.manager,
+            ("author", "outsider"),
+            publishers=("author",),
+            expected_revision=self.project,
+        )
+        self.assertEqual(peer.call("read_project_assignments", {})["shared_assets"], [])
