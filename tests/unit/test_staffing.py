@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import time
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sourdough.assessment_run import run_assessment_company
 from sourdough.company import FoundingTerms, found
@@ -23,8 +23,14 @@ from sourdough.company_assessment import (
     seal_assessment_source,
     settle_assessment,
 )
-from sourdough.duty_run import ASSESSMENT_REVIEW, DutyRefused, count_company_runs
+from sourdough.duty_run import (
+    ASSESSMENT_REVIEW,
+    PAPER_EXECUTION,
+    DutyRefused,
+    count_company_runs,
+)
 from sourdough.first_trade import TradeRefused
+from sourdough.hiring_run import run_hiring
 from sourdough.onboarding import (
     accept_first_duty,
     claim_hired_first,
@@ -40,11 +46,19 @@ from sourdough.staffing import (
     admit_hire,
     claim_staffing,
     read_need,
+    read_staffing_outcome,
     record_choice,
     stage_staffing,
 )
 from sourdough.staffing_tools import StaffingTools
-from sourdough.work import ReviewDecision, claim_assessment_review, settle_review
+from sourdough.work import (
+    ResultReference,
+    ReviewDecision,
+    claim_assessment_review,
+    claim_follow_up,
+    finish_first_duty,
+    settle_review,
+)
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -63,9 +77,9 @@ class Staffing(unittest.TestCase):
         )
         self.now = int(time())
 
-    def rows(self, query):
+    def rows(self, query, arguments=()):
         with closing(sqlite3.connect(self.store.as_uri() + "?mode=ro", uri=True)) as db:
-            return db.execute(query).fetchall()
+            return db.execute(query, arguments).fetchall()
 
     def stage(self, name):
         return stage_staffing(
@@ -357,7 +371,7 @@ class Staffing(unittest.TestCase):
         )
         self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
 
-    def arrange_due_assessment(self, turns):
+    def arrange_hire(self, turns):
         manager, choice = self.ready("initial-staffing")
         choice_id = record_choice(
             self.writer,
@@ -366,11 +380,21 @@ class Staffing(unittest.TestCase):
                 choice, evidence_revision=read_need(self.writer, manager)["revision"]
             ),
         )
-        hire = admit_hire(
+        return manager, admit_hire(
             self.writer,
             manager,
-            HireRequest("hire", choice_id, "reviewer", "profile", "assessment", turns),
+            HireRequest(
+                "hire",
+                choice_id,
+                "reviewer",
+                "profile",
+                self.authority.allowed_scope,
+                turns,
+            ),
         )
+
+    def arrange_due_assessment(self, turns):
+        _, hire = self.arrange_hire(turns)
         provision_hire(
             self.writer, hire.agent_id, "assessment", lambda _: True, now=self.now
         )
@@ -491,6 +515,119 @@ class Staffing(unittest.TestCase):
         self.assertEqual(later.hiring.manager_claim.duty_id, "next-staffing")
         self.assertIsNone(later.review)
         employee.review_assessment.assert_called_once()
+
+    def test_general_paper_scheduler_cannot_claim_beyond_a_hire_allocation(self):
+        self.authority = replace(self.authority, allowed_scope="paper")
+        _, hire = self.arrange_hire(turns=1)
+        provision_hire(
+            self.writer, hire.agent_id, PAPER_EXECUTION, lambda _: True, now=self.now
+        )
+        started = claim_hired_first(self.writer, hire.agent_id, "profile")
+        first = read_first_duty(self.writer, started)
+        accept_first_duty(self.writer, started, first["revision"], "Review the market.")
+        due = finish_first_duty(
+            self.store,
+            started,
+            ResultReference("paper_position", "original", "position", self.now),
+            due_at=self.now,
+            purpose=PAPER_EXECUTION,
+        )
+        self.assertIsNone(
+            claim_follow_up(
+                self.store,
+                self.founding.company_id,
+                "profile",
+                now=self.now,
+                allow_paper_execution=True,
+            )
+        )
+        self.assertEqual(
+            self.rows("SELECT state FROM duty WHERE id=?", (due.duty_id,)),
+            [("scheduled",)],
+        )
+        self.assertEqual(count_company_runs(self.store, self.founding.company_id), 2)
+
+    def resume_hiring(self):
+        self.lease.close()
+        employee = Mock(profile="profile")
+
+        def accept(invoke):
+            first = invoke("read_first_duty", {})
+            return invoke(
+                "accept_first_duty",
+                {
+                    "revision": first["revision"],
+                    "rationale": "Accept the original work.",
+                },
+            )
+
+        employee.onboarding.side_effect = accept
+        result = run_hiring(
+            self.store, self.founding.company_id, employee, first_purpose="assessment"
+        )
+        employee.staffing.assert_not_called()
+        self.assertTrue(result.accepted)
+        self.assertEqual(self.rows("SELECT count(*) FROM hire_receipt"), [(1,)])
+        self.assertEqual(self.rows("SELECT count(*) FROM private_desk"), [(1,)])
+        return result
+
+    def test_committed_hire_resumes_before_another_staffing_turn(self):
+        original, hire = self.arrange_hire(turns=2)
+        self.stage("second-need")
+        result = self.resume_hiring()
+        self.assertEqual(result.manager_claim, original)
+        self.assertEqual(result.choice.hire, hire)
+        self.assertEqual(result.hire_claim.founder_id, hire.agent_id)
+        self.assertEqual(
+            self.rows("SELECT state FROM duty WHERE id='second-need'"), [("due",)]
+        )
+
+    def test_interrupted_first_claim_is_fenced_and_reopens_the_same_desk(self):
+        _, hire = self.arrange_hire(turns=2)
+        provision_hire(
+            self.writer, hire.agent_id, "assessment", lambda _: True, now=self.now
+        )
+        departed = claim_hired_first(self.writer, hire.agent_id, "profile")
+        before = read_first_duty(self.writer, departed)
+        replacement = self.resume_hiring().hire_claim
+        self.assertEqual(replacement.duty_id, departed.duty_id)
+        self.assertEqual(replacement.founder_id, departed.founder_id)
+        self.assertNotEqual(replacement.run_id, departed.run_id)
+        self.assertEqual(
+            self.rows("SELECT run_id, revision FROM onboarding_acceptance"),
+            [(replacement.run_id, before["revision"])],
+        )
+        self.assertIn(
+            (departed.run_id, 0), self.rows("SELECT run_id,is_current FROM duty_run")
+        )
+
+    def test_non_hiring_judgment_atomically_arms_one_later_review(self):
+        first, choice = self.ready("staffing")
+        evidence = read_need(self.writer, first)
+        judgment = replace(
+            choice,
+            evidence_revision=evidence["revision"],
+            action="defer",
+            rationale="Re-check available capacity before spending.",
+            alternatives=("hire", "reassign"),
+        )
+        with patch("sourdough.staffing.time", return_value=self.now):
+            original = record_choice(self.writer, first, judgment)
+        self.assertEqual(record_choice(self.writer, first, judgment), original)
+        outcome = read_staffing_outcome(self.writer, first)
+        self.assertIsNone(outcome.hire)
+        self.assertIsNone(
+            claim_staffing(self.writer, "profile", now=outcome.next_due_at - 1)
+        )
+        resumed = claim_staffing(self.writer, "profile", now=outcome.next_due_at)
+        self.assertNotEqual(resumed.duty_id, first.duty_id)
+        self.assertEqual(resumed.founder_id, first.founder_id)
+        self.assertEqual(read_need(self.writer, resumed)["available_at"], self.now)
+        self.assertEqual(
+            self.rows("SELECT previous_duty_id,duty_id FROM staffing_follow_up"),
+            [(first.duty_id, resumed.duty_id)],
+        )
+        self.assertEqual(self.rows("SELECT count(*) FROM agent"), [(1,)])
 
     def test_manager_sees_only_staffing_tools_and_requires_a_separate_hire(self):
         manager, _ = self.ready("need")

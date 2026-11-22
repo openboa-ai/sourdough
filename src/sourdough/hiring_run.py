@@ -12,6 +12,7 @@ from .onboarding import (
     claim_hired_first,
     first_duty_accepted,
     invoke_onboarding,
+    pending_onboarding,
     provision_hire,
 )
 from .staffing import StaffingOutcome, claim_staffing, read_staffing_outcome
@@ -47,18 +48,27 @@ def run_hiring(
 
 
 def prepare_hiring(
-    writer: WriterLease, runtime: EmployeeProcess, *, first_purpose: str
+    writer: WriterLease,
+    runtime: EmployeeProcess,
+    *,
+    first_purpose: str,
+    allow_staffing: bool = True,
 ) -> HiringRun:
-    runtime.check_ready()
-    manager = claim_staffing(writer, runtime.profile, now=int(time()))
+    manager = pending_onboarding(writer, runtime.profile, first_purpose)
+    resumed = manager is not None
     if manager is None:
-        return HiringRun(None, None)
-    manager_tools = StaffingTools(writer, manager)
-    try:
-        runtime.staffing(manager_tools.invoke)
-    except TradeRefused:
-        if read_staffing_outcome(writer, manager) is None:
-            raise
+        if not allow_staffing:
+            return HiringRun(None, None)
+        runtime.check_ready()
+        manager = claim_staffing(writer, runtime.profile, now=int(time()))
+        if manager is None:
+            return HiringRun(None, None)
+        manager_tools = StaffingTools(writer, manager)
+        try:
+            runtime.staffing(manager_tools.invoke)
+        except TradeRefused:
+            if read_staffing_outcome(writer, manager) is None:
+                raise
     outcome = read_staffing_outcome(writer, manager)
     if outcome is None or outcome.hire is None:
         return HiringRun(manager, outcome)
@@ -84,5 +94,8 @@ def prepare_hiring(
             sleep(min(wait, remaining))
         status = provision_hire(writer, hire_id, first_purpose, ready, now=int(time()))
     return HiringRun(
-        manager, outcome, status, claim_hired_first(writer, hire_id, runtime.profile)
+        manager,
+        outcome,
+        status,
+        claim_hired_first(writer, hire_id, runtime.profile, resume=resumed),
     )

@@ -191,8 +191,13 @@ def run_hired_paper_company(
             store, company_id, employee.profile, POSITION_REVIEW
         )
         hiring = None
-        if opening is None and agent_id is None and remaining >= 2:
-            hiring = prepare_hiring(writer, employee, first_purpose=PAPER_EXECUTION)
+        if opening is None and agent_id is None:
+            hiring = prepare_hiring(
+                writer,
+                employee,
+                first_purpose=PAPER_EXECUTION,
+                allow_staffing=remaining >= 2,
+            )
             claim = hiring.hire_claim
             if claim is None:
                 return HiredPaperRun(hiring, None, reconciled, None)
@@ -201,7 +206,9 @@ def run_hired_paper_company(
             agent_id = owed_hired_follow_up_owner(
                 store, company_id, employee.profile, POSITION_REVIEW
             )
-            remaining -= 2
+            remaining = turn_budget - (
+                count_company_runs(store, company_id) - budget_from
+            )
         if agent_id is None or not remaining:
             return HiredPaperRun(hiring, research, reconciled, None)
         while True:

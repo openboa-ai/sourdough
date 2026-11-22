@@ -44,6 +44,21 @@ class RunAuthority:
             raise DutyRefused("Duty claim or grant is no longer current")
 
 
+def has_turn_capacity(connection: sqlite3.Connection, agent_id: str) -> bool:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name = 'hire_receipt' AND type = 'table'"
+    ).fetchone():
+        return True
+    row = connection.execute(
+        """SELECT h.allocated_turns > (
+               SELECT count(*) FROM duty owned JOIN duty_run spent ON spent.duty_id=owned.id
+               WHERE owned.agent_id=h.agent_id
+           ) FROM hire_receipt h WHERE h.agent_id=?""",
+        (agent_id,),
+    ).fetchone()
+    return row != (0,)
+
+
 def start_run(
     connection: sqlite3.Connection,
     company_id: str,
@@ -55,12 +70,15 @@ def start_run(
     purpose: str,
     grant_scope: str,
 ) -> DutyClaim:
+    if not has_turn_capacity(connection, founder_id):
+        raise DutyRefused("Agent has no remaining turn allocation")
     claim = DutyClaim(
         company_id, founder_id, grant_id, duty_id, uuid4().hex, execution_profile
     )
     changed = connection.execute(
-        "UPDATE duty SET state = 'running' WHERE id = ? AND state IN ('due', 'scheduled')",
-        (duty_id,),
+        """UPDATE duty SET state = 'running'
+           WHERE id = ? AND agent_id = ? AND state IN ('due', 'scheduled')""",
+        (duty_id, founder_id),
     )
     if changed.rowcount != 1:
         raise DutyRefused("Duty is not eligible for a new run")
