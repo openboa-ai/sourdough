@@ -5,10 +5,12 @@ from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from sqlite3 import Connection
+from time import time
 from uuid import uuid4
 
 from .company import _connect
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, resolve_run
+from .onboarding import invoke_onboarding
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -355,3 +357,17 @@ def read_assessment_result(
     return read_follow_up_result(
         writer.store, work, now=now, read=project, purpose=ASSESSMENT_REVIEW
     )
+
+
+def invoke_assessment(
+    writer: WriterLease, claim: DutyClaim, name: str, arguments: dict
+) -> dict:
+    if name == "read_assessment_inputs" and arguments == {}:
+        return read_assessment_inputs(writer, claim, now=int(time()))
+    if name == "publish_assessment" and isinstance(arguments, dict):
+        try:
+            proposal = AssessmentProposal(**arguments)
+        except TypeError as error:
+            raise DutyRefused("Unexpected assessment publication fields") from error
+        return asdict(publish_assessment(writer, claim, proposal, now=int(time())))
+    return invoke_onboarding(writer, claim, name, arguments)

@@ -7,7 +7,9 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from sourdough.assessment_run import run_assessment_company
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
+from sourdough.company_assessment import SourceRecord, seal_assessment_source
 from sourdough.company_run import run_paper_company
 from sourdough.duty_run import count_company_runs
 from sourdough.employee_process import EmployeeProcess
@@ -36,14 +38,15 @@ def _store_key(value: str) -> tuple[int, int]:
 
 
 def _start_supervisor(args):
+    assessment = args.command == "supervise-assessment"
     command = [
         sys.executable,
         "-I",
         "-m",
         "sourdough.cli",
-        "_paper-worker",
+        "_assessment-worker" if assessment else "_paper-worker",
         str(args.store),
-        str(args.journal),
+        *([] if assessment else [str(args.journal)]),
         "--company-id",
         args.company_id,
         "--employee",
@@ -55,7 +58,7 @@ def _start_supervisor(args):
         "--budget-from",
         str(count_company_runs(args.store, args.company_id)),
     ]
-    if args.repeat_paper:
+    if not assessment and args.repeat_paper:
         command.append("--repeat-paper")
     return supervise_worker(
         command,
@@ -109,6 +112,25 @@ def main() -> int:
     staffing.add_argument("store", type=Path)
     staffing.add_argument("envelope", type=Path)
     staffing.add_argument("--company-id", required=True)
+    source = commands.add_parser("stage-assessment-source")
+    source.add_argument("store", type=Path)
+    source.add_argument("records", type=Path)
+    source.add_argument("--company-id", required=True)
+    for command in ("supervise-assessment", "_assessment-worker"):
+        managed = commands.add_parser(command)
+        managed.add_argument("store", type=Path)
+        managed.add_argument("--company-id", required=True)
+        managed.add_argument("--employee", type=Path, required=True)
+        managed.add_argument("--turn-budget", type=int, default=3)
+        managed.add_argument("--idle-seconds", type=int, default=140)
+        if command == "supervise-assessment":
+            managed.add_argument("--max-restarts", type=int, default=1)
+            managed.add_argument("--startup-seconds", type=int, default=35)
+            managed.add_argument("--max-seconds", type=int, default=360)
+        else:
+            managed.add_argument("--ready-fd", type=int, required=True)
+            managed.add_argument("--store-key", type=_store_key, required=True)
+            managed.add_argument("--budget-from", type=int, required=True)
     hiring = commands.add_parser("operate-hiring")
     hiring.add_argument("store", type=Path)
     hiring.add_argument("--company-id", required=True)
@@ -208,7 +230,7 @@ def main() -> int:
                 )
             print(json.dumps(result))
             return 0
-        elif args.command == "supervise-paper":
+        elif args.command in ("supervise-paper", "supervise-assessment"):
             result = _start_supervisor(args)
             print(json.dumps(asdict(result)))
             return 0 if result.completed else 1
@@ -227,6 +249,30 @@ def main() -> int:
                 revision = stage_staffing(writer, authority, need)
             print(json.dumps({"evidence_revision": revision}))
             return 0
+        elif args.command == "stage-assessment-source":
+            with args.records.open("rb") as source:
+                content = source.read(64_001)
+            if len(content) > 64_000:
+                raise DutyRefused("Assessment source exceeds its size limit")
+            try:
+                records = tuple(SourceRecord(**item) for item in json.loads(content))
+            except (ValueError, TypeError, KeyError) as error:
+                raise DutyRefused("Invalid company assessment source") from error
+            with hold_company_writer(args.store, args.company_id) as writer:
+                revision = seal_assessment_source(writer, records)
+            print(json.dumps({"source_revision": revision}))
+            return 0
+        elif args.command == "_assessment-worker":
+            result = run_assessment_company(
+                args.store,
+                args.company_id,
+                lambda: EmployeeProcess(args.employee),
+                turn_budget=args.turn_budget,
+                idle_seconds=args.idle_seconds,
+                budget_from=args.budget_from,
+                store_key=args.store_key,
+                on_ready=lambda lease: announce_ready(args.ready_fd, lease),
+            )
         elif args.command == "operate-hiring":
             result = run_hiring(
                 args.store,

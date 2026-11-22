@@ -183,6 +183,31 @@ ONBOARDING_TOOLS = [
 ]
 
 
+ASSESSMENT_TOOLS = [
+    *ONBOARDING_TOOLS,
+    scoped_tool(
+        "read_assessment_inputs", "Read company records for your accepted duty.", {}
+    ),
+    scoped_tool(
+        "publish_assessment",
+        "Publish one attributed assessment for the permitted audience.",
+        {
+            "source_revision": {"type": "string"},
+            "record_id": {"type": "string"},
+            "disposition": {"enum": ["recommend_change", "no_change", "investigate"]},
+            "rationale": {"type": "string", "maxLength": 2000},
+            "next_check_seconds": {"type": "integer", "minimum": 60, "maximum": 86400},
+        },
+    ),
+]
+SCOPED_MODES = {
+    "--mcp-research": (RESEARCH_TOOLS, "record_research_decision"),
+    "--mcp-staffing": (STAFFING_TOOLS, "record_staffing_choice"),
+    "--mcp-onboarding": (ONBOARDING_TOOLS, "accept_first_duty"),
+    "--mcp-assessment": (ASSESSMENT_TOOLS, "publish_assessment"),
+}
+
+
 def tool_output(value, *, denied=False):
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
     return {"isError": denied, "content": [{"type": "text", "text": text}]}
@@ -196,7 +221,7 @@ def read_result(address):
             return json.load(stream)
 
 
-def scoped_call(address, name, args, outbox, tools):
+def scoped_call(address, name, args, outbox, tools, terminal_tool):
     if not isinstance(args, dict) or name not in (tool["name"] for tool in tools):
         return tool_output("Tool is unavailable for this duty.", denied=True)
     if name == "record_research_decision":
@@ -214,11 +239,7 @@ def scoped_call(address, name, args, outbox, tools):
         return tool_output("Scoped service is unavailable.", denied=True)
     if "error" in result:
         return tool_output(result["error"], denied=True)
-    if name in (
-        "record_research_decision",
-        "record_staffing_choice",
-        "accept_first_duty",
-    ):
+    if name == terminal_tool:
         try:
             with outbox.open("x") as stream:
                 json.dump(result, stream)
@@ -254,12 +275,12 @@ def decision_args(args, proposal, revision):
     )
 
 
-def serve(outbox, address=None, *, trading=False, scoped_tools=None):
+def serve(outbox, address=None, *, trading=False, scoped_mode=None):
     revision = None
     proposal = PROPOSE_TRADE if trading else PROPOSE_DECISION
     tools = [PAPER_BUY] if address is None else [READ_RESULT, proposal]
-    if scoped_tools is not None:
-        tools = scoped_tools
+    if scoped_mode is not None:
+        tools, terminal_tool = scoped_mode
     for line in sys.stdin:
         message = json.loads(line)
         if "id" not in message:
@@ -277,8 +298,8 @@ def serve(outbox, address=None, *, trading=False, scoped_tools=None):
             params = message["params"]
             args = params.get("arguments", {})
             name = params["name"]
-            if scoped_tools is not None:
-                result = scoped_call(address, name, args, outbox, scoped_tools)
+            if scoped_mode is not None:
+                result = scoped_call(address, name, args, outbox, tools, terminal_tool)
             elif address is not None and name == "read_work_result" and args == {}:
                 try:
                     observation = read_result(address)
@@ -338,19 +359,13 @@ def main():
     if len(sys.argv) == 4 and sys.argv[1] in (
         "--mcp-review",
         "--mcp-trade",
-        "--mcp-research",
-        "--mcp-staffing",
-        "--mcp-onboarding",
+        *SCOPED_MODES,
     ):
         serve(
             Path(sys.argv[3]),
             sys.argv[2],
             trading=sys.argv[1] == "--mcp-trade",
-            scoped_tools={
-                "--mcp-research": RESEARCH_TOOLS,
-                "--mcp-staffing": STAFFING_TOOLS,
-                "--mcp-onboarding": ONBOARDING_TOOLS,
-            }.get(sys.argv[1]),
+            scoped_mode=SCOPED_MODES.get(sys.argv[1]),
         )
         return
     request = json.load(sys.stdin)
@@ -412,6 +427,8 @@ def main():
             "research_duty",
             "staffing_duty",
             "onboarding_duty",
+            "assessment_duty",
+            "assessment_review",
         )
         or not ready
     ):
@@ -420,7 +437,27 @@ def main():
         outbox = Path(directory) / "proposal.json"
         decision = Path(directory) / "decision.txt"
         tool_args = [str(Path(__file__).resolve())]
-        if operation == "onboarding_duty":
+        if operation == "assessment_duty":
+            tool_args += ["--mcp-assessment", request["read_endpoint"], str(outbox)]
+            tool_names = [tool["name"] for tool in ASSESSMENT_TOOLS]
+            prompt = (
+                "You are a newly hired Sourdough Agent. Read your assignment with read_first_duty. "
+                "Accept it explicitly if in scope, then read the records with read_assessment_inputs. "
+                "Choose a record and compare what was reported with what was observed. "
+                "Publish one assessment tied to what you read. Recommend a correction, no change or "
+                "investigation as appropriate. Explain the evidence and select a next check in 60 to "
+                "120 seconds. You cannot change source records; no shell or external access."
+            )
+        elif operation == "assessment_review":
+            tool_args += ["--mcp-review", request["read_endpoint"], str(outbox)]
+            tool_names = ["read_work_result", "record_review_decision"]
+            prompt = (
+                "Review your previous company assessment. Read that result and current records via "
+                "read_work_result. Explain what the current records support and relate it to the "
+                "original assessment. Decide whether to hold, investigate or recommend a change. "
+                "Record the new decision and next responsibility. No shell or external access."
+            )
+        elif operation == "onboarding_duty":
             tool_args += ["--mcp-onboarding", request["read_endpoint"], str(outbox)]
             tool_names = [tool["name"] for tool in ONBOARDING_TOOLS]
             prompt = (
@@ -529,7 +566,7 @@ def main():
             env=env,
             cwd=directory,
             stdout=sys.stderr,
-            timeout=80 if operation == "research_duty" else 50,
+            timeout=80 if operation in ("research_duty", "assessment_duty") else 50,
             check=True,
         )
         if outbox.exists():
