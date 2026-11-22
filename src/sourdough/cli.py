@@ -31,8 +31,15 @@ from sourdough.paper_books import PostingRefused
 from sourdough.paper_execution import VenueRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
+from sourdough.paper_statement_store import (
+    StatementRequest,
+    read_retained_statement,
+    retain_paper_statement,
+)
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.paper_valuation import ValuationRefused
 from sourdough.paper_window import WindowPlan, WindowRefused
+from sourdough.paper_window_statement import read_paper_statement
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.trading_engine import EngineRefused, prepare_engine
@@ -156,6 +163,20 @@ def main() -> int:
     seal.add_argument("directory", type=Path)
     seal.add_argument("--company-id", required=True)
     seal.add_argument("--plan", required=True, type=Path)
+    for command in ("inspect-paper-window", "close-paper-window"):
+        statement = commands.add_parser(command)
+        statement.add_argument("store", type=Path)
+        statement.add_argument("directory", type=Path)
+        statement.add_argument("--company-id", required=True)
+        statement.add_argument("--window-id", required=True)
+        if command == "inspect-paper-window":
+            lookup = statement.add_mutually_exclusive_group()
+            lookup.add_argument("--accounting-close")
+            lookup.add_argument("--report-id")
+        else:
+            statement.add_argument("--accounting-close")
+            statement.add_argument("--request-id", required=True)
+            statement.add_argument("--supersedes")
     engine = commands.add_parser("prepare-trading-engine")
     engine.add_argument("store", type=Path)
     engine.add_argument("directory", type=Path)
@@ -288,6 +309,34 @@ def main() -> int:
             result = reopen(args.store, args.company_id)
         elif args.command == "inspect-work":
             print(json.dumps(read_local_board_timeline(args.store, args.company_id)))
+            return 0
+        elif args.command == "inspect-paper-window":
+            if args.report_id is not None:
+                saved = read_retained_statement(
+                    args.store, args.company_id, args.report_id
+                )
+                if saved is None or saved.request.window_id != args.window_id:
+                    raise WindowRefused(
+                        "No retained statement for the requested window"
+                    )
+                report = saved.as_receipt()
+            else:
+                report = read_paper_statement(
+                    args.store,
+                    args.company_id,
+                    args.directory,
+                    args.window_id,
+                    close_id=args.accounting_close,
+                ).as_report()
+            print(json.dumps(report))
+            return 0
+        elif args.command == "close-paper-window":
+            request = StatementRequest(
+                args.request_id, args.window_id, args.accounting_close, args.supersedes
+            )
+            with hold_company_writer(args.store, args.company_id) as writer:
+                saved = retain_paper_statement(writer, args.directory, request)
+            print(json.dumps(saved.as_receipt()))
             return 0
         elif args.command == "seal-paper-window":
             with args.plan.open("rb") as source:
@@ -541,6 +590,7 @@ def main() -> int:
         VenueRefused,
         SupervisionRefused,
         WriterRefused,
+        ValuationRefused,
         WindowRefused,
         sqlite3.Error,
         OSError,
