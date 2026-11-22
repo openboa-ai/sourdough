@@ -23,11 +23,12 @@ elif request["operation"] == "ready":
 else:
     assert request["operation"] == "first_duty"
     ask = request["context"]["quote_minor_units"]
+    step = request["context"]["order_sizing"]["price_step_per_lot"]
     reply = {
         "tool": "paper_buy",
         "call_id": "bounded-paper-verification",
         "quantity": 20,
-        "limit_minor_units": ask + (ask // 400 // 10) * 10,
+        "limit_minor_units": ask + (ask // 400 // 10) * 10 if crosses_quote else ask - step,
     }
 print(json.dumps(reply))
 """
@@ -74,7 +75,9 @@ def observe(
         raise ValueError("Engine restart observation requires a current-market binding")
     output.mkdir(mode=0o700)
     employee = output / "employee"
-    employee.write_text(f"#!{sys.executable}\n" + EMPLOYEE)
+    employee.write_text(
+        f"#!{sys.executable}\ncrosses_quote = {expected_lots > 0!r}\n" + EMPLOYEE
+    )
     employee.chmod(0o700)
     store, engine = output / "company.sqlite", output / "engine"
     profile = cli("employee-profile", employee)["execution_profile"]
@@ -186,30 +189,37 @@ def observe(
     order = result["first_trade"]["order"]
     posting = order["posting"]
     assert result["first_trade"]["position_quantity"] == expected_lots
-    (witnessed,) = rows(
+    witnessed_rows = rows(
         venue,
         "SELECT fill_id,order_id,quantity,price_atoms,fee_atoms FROM sandbox_fill_observation",
     )
-    (book,) = rows(
+    book_rows = rows(
         store, "SELECT fill_id,order_id,quantity,price_minor_units FROM paper_fill"
     )
-    assert (
-        witnessed[:4]
-        == book
-        == (
-            posting["fill_id"],
-            order["order_id"],
-            expected_lots,
-            posting["price_minor_units"],
+    if expected_lots:
+        (witnessed,) = witnessed_rows
+        assert (
+            [witnessed[:4]]
+            == book_rows
+            == [
+                (
+                    posting["fill_id"],
+                    order["order_id"],
+                    expected_lots,
+                    posting["price_minor_units"],
+                )
+            ]
         )
-    )
-    assert posting["fee_minor_units"] == witnessed[4] == 0
+        assert posting["fee_minor_units"] == witnessed[4] == 0
+    else:
+        assert posting is None and witnessed_rows == book_rows == []
+    booked_notional = expected_lots * posting["price_minor_units"] if posting else 0
     position, cash = rows(
         venue, "SELECT position_lots,cash_atoms FROM sandbox_account_observation"
     )[0]
     assert (position, cash) == (
         expected_lots,
-        1000 * 10**8 - expected_lots * posting["price_minor_units"],
+        1000 * 10**8 - booked_notional,
     )
     assert rows(venue, "SELECT count(*) FROM sandbox_order") == [(1,)]
     assert rows(store, "SELECT count(*) FROM paper_order") == [(1,)]
@@ -226,16 +236,19 @@ def observe(
         [(admitted, remaining_reservation)] = rows(
             store, "SELECT quantity,reserved_minor_units FROM paper_order"
         )
-        assert (
-            admitted == 20
-            and remaining_reservation == filled * posting["price_minor_units"]
-        )
+        assert admitted == 20 and remaining_reservation == booked_notional
         cancellation = {
             "original_order_id": original,
             "filled_lots": filled,
             "cancelled_lots": admitted - filled,
             "reserved_atoms": remaining_reservation,
         }
+        if expected_lots == 0:
+            assert rows(
+                store,
+                """SELECT f.result_kind,f.result_id,d.state
+                   FROM work_follow_up f JOIN duty d ON d.id=f.duty_id""",
+            ) == [("paper_no_fill", original, "scheduled")]
     if restarted is not None:
         exits = [
             json.loads(line)
@@ -276,7 +289,7 @@ def observe(
         "cancellation": cancellation,
         "engine_worker_pid": ready["pid"],
         "replacement_worker_pid": restarted["pid"] if restarted else None,
-        "scope": "virtual cash; zero test fee; one full fill",
+        "scope": "virtual cash; zero test fee; one admitted order",
         "posting": posting,
         "sandbox_account": {"position_lots": position, "cash_atoms": cash},
         "verified_after_engine_exit": True,

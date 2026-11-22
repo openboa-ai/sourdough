@@ -10,7 +10,7 @@ from .abandoned_work import requeue_uncommitted_work
 from .company import _connect, upgrade_work_schema
 from .company_run import (
     PositionReview,
-    _book_reference,
+    _order_reference,
     _recover,
     _retry_reconciliation,
     _review,
@@ -62,10 +62,13 @@ def _settle_opening(
     claim: DutyClaim,
     receipt: ResearchDecisionReceipt,
     posting: Posting | None = None,
+    order_id: str | None = None,
 ) -> None:
     writer.verify_for(writer.store, claim.company_id)
-    if posting is not None:
-        result = _book_reference(writer.store, claim.company_id, posting)
+    if order_id is not None:
+        result = _order_reference(writer.store, claim.company_id, order_id, posting)
+        if result is None:
+            return
     elif receipt.decision.action != "buy":
         result = ResultReference(
             "research_finding",
@@ -145,7 +148,7 @@ def _hired_research(
         decision.limit_minor_units,
     )
     order = _apply_paper_order(writer.store, claim, intent, venue, writer)
-    _settle_opening(writer, claim, receipt, order.posting)
+    _settle_opening(writer, claim, receipt, order.posting, order.order_id)
     return receipt
 
 
@@ -186,7 +189,8 @@ def run_hired_paper_company(
         research = opening.research if opening is not None else None
         if opening is not None and research is not None:
             posting = opening.order.posting if opening.order is not None else None
-            _settle_opening(writer, opening.claim, research, posting)
+            order_id = opening.order.order_id if opening.order is not None else None
+            _settle_opening(writer, opening.claim, research, posting, order_id)
         if not remaining:
             return HiredPaperRun(None, research, reconciled, None)
         employee = runtime()

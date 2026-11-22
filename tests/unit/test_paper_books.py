@@ -306,9 +306,11 @@ class PaperBooksTests(unittest.TestCase):
 
         venue = TerminalVenue(self.journal)
         outcome = reconcile_paper_orders(self.store, self.company_id, venue, now=100)
+        self.assertEqual((outcome.unresolved, outcome.next_query_at), (0, None))
+        [recovered] = outcome.recovered
+        self.assertIsNone(recovered.posting)
         self.assertEqual(
-            (outcome.recovered, outcome.unresolved, outcome.next_query_at),
-            ((), 0, None),
+            (recovered.no_fill.order_id, recovered.no_fill.fill_quantity), (order_id, 0)
         )
         self.assertIsNone(read_booked_fill(self.store, self.company_id, order_id))
         self.assertEqual(position_quantity(self.store, self.company_id), 0)

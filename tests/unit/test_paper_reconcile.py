@@ -10,6 +10,7 @@ from sourdough.company_run import run_paper_company
 from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused, post_confirmed_fill
+from sourdough.paper_execution import VenueCancellation
 from sourdough.paper_order import PaperIntent, submit_paper_order
 from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
@@ -146,6 +147,78 @@ class ReconcilePaper(unittest.TestCase):
             self.rows(self.store, "SELECT reserved_minor_units FROM paper_order"),
             [(220,)],
         )
+
+    def test_reopened_company_assigns_same_agent_a_review_after_zero_fill(self):
+        store = self.store.with_name("cancelled-company.sqlite")
+        journal = self.journal.with_name("cancelled-venue.sqlite")
+        company = found(
+            store, FoundingTerms("cancelled", "charter", "paper", "runtime")
+        )
+        original = FixedQuoteVenue(journal)
+        account = original.provision(self.account, 100)
+        bind(
+            store,
+            PaperMandate("mandate", company.company_id, "charter", account, 1000),
+            original,
+        )
+        claim = claim_first_duty(store, company.company_id, "runtime")
+        order_id = submit_paper_order(
+            store, claim, PaperIntent("no-fill", "rules", 2, 99), original
+        ).order_id
+
+        class TerminalView(RecoveryView):
+            def read_cancellation(self, account_id, order_id, *, account_sync=False):
+                return VenueCancellation(
+                    order_id, account_id, "rules", "original-cancel", 0
+                )
+
+        post_confirmed_fill(store, company.company_id, order_id, TerminalView(journal))
+        self.assertEqual(
+            self.rows(store, "SELECT count(*) FROM work_follow_up"), [(0,)]
+        )
+        observed = []
+
+        def review(read_result):
+            result = read_result()
+            observed.append(result)
+            return {
+                "tool": "record_review_decision",
+                "call_id": "next",
+                "observation_revision": result["revision"],
+                "action": "hold",
+                "rationale": "No fill; check again next shift.",
+                "next_check_seconds": 300,
+            }
+
+        replaced_venue = TerminalView(journal)
+        result = run_paper_company(
+            store,
+            company.company_id,
+            replaced_venue,
+            SimpleNamespace(profile="runtime", review=review),
+            turn_budget=1,
+        )
+        self.assertEqual(result.blocked_work, ())
+        self.assertEqual(result.review.claim.founder_id, claim.founder_id)
+        self.assertNotEqual(result.review.claim.run_id, claim.run_id)
+        self.assertEqual(result.review.next_duty.result.kind, "paper_no_fill")
+        [receipt] = observed
+        self.assertEqual(
+            (
+                receipt["order_id"],
+                receipt["event_id"],
+                receipt["fill_quantity"],
+                receipt["position_quantity"],
+                receipt["status"],
+            ),
+            (order_id, "original-cancel", 0, 0, "cancelled"),
+        )
+        self.assertEqual(replaced_venue.reads, [])
+        self.assertEqual(
+            self.rows(journal, "SELECT order_id,fill_id FROM venue_execution"),
+            [(order_id, None)],
+        )
+        self.assertEqual(self.rows(store, "SELECT count(*) FROM paper_fill"), [(0,)])
 
     def test_alternate_destination_cannot_recover_the_original_order(self):
         other = FixedQuoteVenue(self.journal.with_name("other.sqlite"))
