@@ -83,7 +83,8 @@ class EmployeeProcess:
                 capture_output=True,
                 text=True,
                 timeout=100
-                if request["operation"] in ("research_duty", "assessment_duty")
+                if request["operation"]
+                in ("research_duty", "assessment_duty", "hired_research_duty")
                 else 60,
                 check=True,
                 cwd="/",
@@ -141,6 +142,9 @@ class EmployeeProcess:
 
     def assess(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("assessment_duty", _ToolEndpoint, invoke)
+
+    def research_hired(self, invoke: Callable[[str, dict], dict]) -> dict:
+        return self._scoped_exchange("hired_research_duty", _ToolEndpoint, invoke)
 
     def review_assessment(self, read_result: Callable[[], dict]) -> dict:
         return self._follow_up("assessment_review", read_result)

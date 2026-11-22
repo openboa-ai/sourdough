@@ -53,7 +53,7 @@ raise SystemExit(cli.main())
 def observe(output, employee):
     compile(WITHHELD_RESOURCES, "withheld hire transport", "exec")
     output.mkdir(mode=0o700)
-    company, identity, trial = prepare(output, employee, hiring_only=True)
+    company, identity, trial = prepare(output, employee, scenario="hiring-only")
     deliveries, workspace = (
         output / name for name in ("hire-deliveries.jsonl", "workspace-cut")
     )

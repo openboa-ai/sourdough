@@ -224,6 +224,27 @@ def claim_assessment_review(
     )
 
 
+def claim_bound_position_review(
+    store: Path, company_id: str, agent_id: str, execution_profile: str, *, now: int
+) -> FollowUpClaim | None:
+    return _claim_follow_up(
+        store, company_id, execution_profile, now, (POSITION_REVIEW,), agent_id=agent_id
+    )
+
+
+def owed_follow_up_owner(store: Path, company_id: str, purpose: str) -> str | None:
+    with closing(_connect(store, "ro")) as connection:
+        _check_store(connection, company_id)
+        row = connection.execute(
+            """SELECT a.id FROM work_follow_up w
+               JOIN duty d ON d.id=w.duty_id AND d.state='scheduled'
+               JOIN agent a ON a.id=d.agent_id AND a.company_id=?
+               WHERE w.purpose=? ORDER BY w.due_at,d.id LIMIT 1""",
+            (company_id, purpose),
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
 def _claim_follow_up(
     store: Path,
     company_id: str,

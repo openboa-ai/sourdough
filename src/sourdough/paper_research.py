@@ -12,6 +12,7 @@ from uuid import uuid4
 from .company import _connect, _identity
 from .duty_run import DutyClaim, DutyRefused
 from .first_duty import require_historical_claim, require_paper_authority
+from .onboarding import has_hired_acceptance
 from .paper_account import reopen_binding
 from .paper_decision import PaperDecision
 from .writer_lease import WriterLease
@@ -425,6 +426,64 @@ def allows_research_order(
         receipt.decision.quantity,
         receipt.decision.limit_minor_units,
     ) == (action_id, "buy", quantity, limit)
+
+
+def authorize_hired_research_order(
+    writer: WriterLease, claim: DutyClaim, decision_id: str
+) -> dict:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "rw")) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        require_paper_authority(connection, claim)
+        receipt = _research_decision(connection, claim)
+        if (
+            not has_hired_acceptance(connection, claim)
+            or receipt is None
+            or receipt.decision_id != decision_id
+            or receipt.decision.action != "buy"
+        ):
+            raise DutyRefused(
+                "A hired order must request the original authorized research decision"
+            )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS hired_research_order_request (
+                duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
+                run_id TEXT NOT NULL REFERENCES duty_run(run_id),
+                decision_id TEXT NOT NULL UNIQUE REFERENCES paper_research_decision(decision_id)
+            )"""
+        )
+        terms = (claim.duty_id, claim.run_id, decision_id)
+        connection.execute(
+            "INSERT OR IGNORE INTO hired_research_order_request VALUES (?, ?, ?)", terms
+        )
+        saved = connection.execute(
+            "SELECT duty_id,run_id,decision_id FROM hired_research_order_request WHERE duty_id=?",
+            (claim.duty_id,),
+        ).fetchone()
+        if saved != terms:
+            raise DutyRefused("Order request conflicts with its original receipt")
+        return {"decision_id": decision_id, "disposition": "requested"}
+
+
+def allows_hired_research_order(
+    connection: Connection,
+    claim: DutyClaim,
+    decision_id: str,
+    quantity: int,
+    limit: int,
+) -> bool:
+    return (
+        has_hired_acceptance(connection, claim)
+        and _table(connection, "hired_research_order_request")
+        and connection.execute(
+            """SELECT 1 FROM hired_research_order_request
+               WHERE duty_id=? AND run_id=? AND decision_id=?""",
+            (claim.duty_id, claim.run_id, decision_id),
+        ).fetchone()
+        is not None
+        and requires_research(connection, claim.company_id)
+        and allows_research_order(connection, claim, decision_id, quantity, limit)
+    )
 
 
 def read_research_result(

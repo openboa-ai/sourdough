@@ -200,11 +200,21 @@ ASSESSMENT_TOOLS = [
         },
     ),
 ]
+HIRED_RESEARCH_TOOLS = [
+    *ONBOARDING_TOOLS,
+    *RESEARCH_TOOLS,
+    scoped_tool(
+        "request_research_order",
+        "Ask Trading to admit the exact paper order from a prior buy decision.",
+        {"decision_id": {"type": "string"}},
+    ),
+]
 SCOPED_MODES = {
     "--mcp-research": (RESEARCH_TOOLS, "record_research_decision"),
     "--mcp-staffing": (STAFFING_TOOLS, "record_staffing_choice"),
     "--mcp-onboarding": (ONBOARDING_TOOLS, "accept_first_duty"),
     "--mcp-assessment": (ASSESSMENT_TOOLS, "publish_assessment"),
+    "--mcp-hired-research": (HIRED_RESEARCH_TOOLS, "record_research_decision"),
 }
 
 
@@ -434,6 +444,7 @@ def main():
             "onboarding_duty",
             "assessment_duty",
             "assessment_review",
+            "hired_research_duty",
         )
         or not ready
     ):
@@ -442,7 +453,21 @@ def main():
         outbox = Path(directory) / "proposal.json"
         decision = Path(directory) / "decision.txt"
         tool_args = [str(Path(__file__).resolve())]
-        if operation == "assessment_duty":
+        if operation == "hired_research_duty":
+            tool_args += ["--mcp-hired-research", request["read_endpoint"], str(outbox)]
+            tool_names = [tool["name"] for tool in HIRED_RESEARCH_TOOLS]
+            prompt = (
+                "You are newly hired for a bounded synthetic paper execution verification, not for live trading or forecasting. "
+                "Read your desk and responsibility with read_first_duty and explicitly accept it if authorized. "
+                "Then read_research_inputs, choose your own comparison question and evaluate two observed prices. "
+                "Publish the signed later-minus-earlier change, the sum of the two fees "
+                "(price times fee_bps divided by 10000, rounded half up for each), their difference and uncertainty. "
+                "Use record_research_decision to explain how the immutable finding changes your choice. "
+                "A feasible bounded verification buy, a hold or investigation is valid. Choose a follow-up of 60 to 120 seconds. "
+                "If you choose a buy, separately call request_research_order with the returned decision_id. "
+                "A recorded research decision is not an order or a fill. No shell, external account or live funds."
+            )
+        elif operation == "assessment_duty":
             tool_args += ["--mcp-assessment", request["read_endpoint"], str(outbox)]
             tool_names = [tool["name"] for tool in ASSESSMENT_TOOLS]
             prompt = (
@@ -571,7 +596,9 @@ def main():
             env=env,
             cwd=directory,
             stdout=sys.stderr,
-            timeout=80 if operation in ("research_duty", "assessment_duty") else 50,
+            timeout=80
+            if operation in ("research_duty", "assessment_duty", "hired_research_duty")
+            else 50,
             check=True,
         )
         if outbox.exists():
