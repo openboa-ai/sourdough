@@ -104,6 +104,7 @@ async def serve(
     from nautilus_trader.config import InstrumentProviderConfig, LoggingConfig
     from nautilus_trader.live.config import LiveExecEngineConfig, TradingNodeConfig
     from nautilus_trader.live.node import TradingNode
+    from nautilus_trader.model.enums import TimeInForce
     from nautilus_trader.model.identifiers import InstrumentId
     from nautilus_trader.model.instruments import CurrencyPair
     from nautilus_trader.trading.strategy import Strategy
@@ -171,6 +172,25 @@ async def serve(
                 stamp = spot_trade_time_ns(tick.ts_event)
                 if stamp <= time_ns():
                     self.trade_ns = max(self.trade_ns, stamp)
+            except Exception as error:
+                if not failure.done():
+                    failure.set_result(error)
+
+        def on_order_accepted(self, event):
+            loop.call_soon(self.complete_ioc, event.client_order_id)
+
+        def complete_ioc(self, order_id):
+            if failure.done():
+                return
+            try:
+                order = self.cache.order(order_id)
+                if (
+                    order is not None
+                    and order.time_in_force == TimeInForce.IOC
+                    and order.is_open
+                    and not order.is_pending_cancel
+                ):
+                    self.cancel_order(order)
             except Exception as error:
                 if not failure.done():
                     failure.set_result(error)

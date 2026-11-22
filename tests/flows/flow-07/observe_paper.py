@@ -62,7 +62,10 @@ else:
         "tool": "paper_buy",
         "call_id": "bounded-paper-verification",
         "quantity": 20,
-        "limit_minor_units": ask + (ask // 400 // 10) * 10 if crosses_quote else ask - step,
+        "limit_minor_units": (
+            ask + (ask // 400 // 10) * 10 if crosses_quote
+            else max(step, (ask * 99 // 100 // step) * step)
+        ),
     }
 print(json.dumps(reply))
 """
