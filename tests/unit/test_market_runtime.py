@@ -13,7 +13,9 @@ from sourdough.market_worker import (
     MarketRefused,
     MarketScope,
     MarketTrade,
+    SpotInstrumentTerms,
     append_trade,
+    bind_spot_terms,
     journal_key,
     register,
     reopen,
@@ -31,6 +33,9 @@ class MarketObservation(unittest.TestCase):
             self.store, FoundingTerms("setup", "charter", "paper", "profile")
         )
         self.scope = MarketScope(self.company.company_id, "1" * 64, "BTCUSDT", 15)
+        self.terms = SpotInstrumentTerms(
+            "BTCUSDT", "BTC", "USDT", "0.01", "0.00001", "0.00001", "5"
+        )
         self.trade = MarketTrade("123", "30000.25", "0.1000", 10**10, 11 * 10**9)
 
     def test_exchange_milliseconds_survive_sdk_float_conversion(self):
@@ -90,6 +95,15 @@ class MarketObservation(unittest.TestCase):
             self.assertEqual(
                 set(options["environment"]), {"HOME", "PATH", "PIP_CONFIG_FILE"}
             )
+            key = journal_key(journal)
+            bind_spot_terms(journal, key, self.scope, self.terms)
+            with self.assertRaisesRegex(MarketRefused, "changed from the registered"):
+                bind_spot_terms(
+                    journal,
+                    key,
+                    self.scope,
+                    replace(self.terms, price_increment="0.02"),
+                )
             append_trade(
                 journal, journal_key(journal), self.scope, self.trade, command[5], 10
             )
@@ -113,4 +127,6 @@ class MarketObservation(unittest.TestCase):
             )
         self.assertFalse(prepare.call_args.kwargs["allow_install"])
         self.assertTrue(result.completed)
+        self.assertEqual(result.instrument, self.terms)
+        self.assertEqual(result.instrument_revision, self.terms.revision)
         self.assertEqual(result.observations, (self.trade,))

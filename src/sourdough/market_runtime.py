@@ -13,7 +13,9 @@ from .market_worker import (
     MarketRefused,
     MarketScope,
     MarketTrade,
+    SpotInstrumentTerms,
     journal_key,
+    read_spot_terms,
     register,
 )
 from .paper_execution import require_separate_journal
@@ -27,6 +29,8 @@ class MarketObservation:
     activation_id: str
     source: str
     symbol: str
+    instrument: SpotInstrumentTerms | None
+    instrument_revision: str | None
     observations: tuple[MarketTrade, ...]
     attempts: tuple[ChildAttempt, ...]
     completed: bool
@@ -90,11 +94,14 @@ def observe_market(
                 (activation_id, successful_pid, successful_pid),
             )
         )
+    instrument = read_spot_terms(journal)
     return MarketObservation(
         activation_id,
         SOURCE,
         symbol,
+        instrument,
+        instrument.revision if instrument is not None else None,
         observations,
         trial.attempts,
-        trial.completed and len(observations) == samples,
+        trial.completed and len(observations) == samples and instrument is not None,
     )

@@ -10,8 +10,9 @@ import sqlite3
 import stat
 import sys
 from contextlib import closing
-from dataclasses import astuple, dataclass
+from dataclasses import asdict, astuple, dataclass
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from time import time_ns
 
@@ -22,6 +23,49 @@ _NANOS_PER_MILLISECOND = 1_000_000
 
 class MarketRefused(Exception):
     """The market source or its evidence did not match the registered scope."""
+
+
+def _positive_decimal(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9]{1,24}(?:\.[0-9]{1,18})?", value) is not None
+        and Decimal(value) > 0
+    )
+
+
+@dataclass(frozen=True)
+class SpotInstrumentTerms:
+    symbol: str
+    base_currency: str
+    quote_currency: str
+    price_increment: str
+    quantity_increment: str
+    minimum_quantity: str | None
+    minimum_notional: str | None
+
+    def __post_init__(self) -> None:
+        if (
+            not all(
+                isinstance(label, str) and re.fullmatch(r"[A-Z0-9]{2,24}", label)
+                for label in (self.symbol, self.base_currency, self.quote_currency)
+            )
+            or self.symbol != self.base_currency + self.quote_currency
+            or not _positive_decimal(self.price_increment)
+            or not _positive_decimal(self.quantity_increment)
+            or any(
+                value is not None and not _positive_decimal(value)
+                for value in (self.minimum_quantity, self.minimum_notional)
+            )
+        ):
+            raise MarketRefused("Invalid spot sizing and currency terms")
+
+    @property
+    def revision(self) -> str:
+        return sha256(_terms_body(self).encode()).hexdigest()
+
+
+def _terms_body(terms: SpotInstrumentTerms) -> str:
+    return json.dumps(asdict(terms), separators=(",", ":"), sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -63,11 +107,7 @@ class MarketTrade:
         ):
             raise MarketRefused("Trade has invalid source identity or event times")
         for amount in (self.price, self.quantity):
-            if (
-                not isinstance(amount, str)
-                or not re.fullmatch(r"[0-9]{1,24}(?:\.[0-9]{1,18})?", amount)
-                or Decimal(amount) <= 0
-            ):
+            if not _positive_decimal(amount):
                 raise MarketRefused("Invalid fixed-precision trade amount")
 
 
@@ -137,6 +177,47 @@ def register(journal: Path, scope: MarketScope) -> None:
                  activation_id TEXT NOT NULL, worker_pid INTEGER NOT NULL
                )"""
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS spot_instrument_terms (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+                 revision TEXT NOT NULL, terms TEXT NOT NULL
+               )"""
+        )
+
+
+def bind_spot_terms(
+    journal: Path, key: tuple[int, int], scope: MarketScope, terms: SpotInstrumentTerms
+) -> None:
+    if terms.symbol != scope.symbol or journal_key(journal) != key:
+        raise MarketRefused("Instrument terms do not match the registered market")
+    with _connection(journal, "rw") as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute(
+            "SELECT revision,terms FROM spot_instrument_terms WHERE singleton=1"
+        ).fetchone()
+        receipt = terms.revision, _terms_body(terms)
+        if existing is not None and existing != receipt:
+            raise MarketRefused("Instrument terms changed from the registered revision")
+        if existing is None:
+            connection.execute(
+                "INSERT INTO spot_instrument_terms VALUES (1, ?, ?)", receipt
+            )
+
+
+def read_spot_terms(journal: Path) -> SpotInstrumentTerms | None:
+    with _connection(journal, "ro") as connection:
+        row = connection.execute(
+            "SELECT revision,terms FROM spot_instrument_terms WHERE singleton=1"
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        terms = SpotInstrumentTerms(**json.loads(row[1]))
+    except (TypeError, ValueError) as error:
+        raise MarketRefused("Instrument terms receipt is invalid") from error
+    if terms.revision != row[0]:
+        raise MarketRefused("Instrument terms do not match their receipt")
+    return terms
 
 
 def reopen(journal: Path, company_id: str) -> MarketScope:
@@ -196,6 +277,7 @@ async def _collect(
     from nautilus_trader.live.config import LiveExecEngineConfig, TradingNodeConfig
     from nautilus_trader.live.node import TradingNode
     from nautilus_trader.model.identifiers import InstrumentId
+    from nautilus_trader.model.instruments import CurrencyPair
 
     loop = asyncio.get_running_loop()
     completed = loop.create_future()
@@ -206,7 +288,27 @@ async def _collect(
         count = 0
 
         def on_start(self):
-            self.subscribe_trade_ticks(instrument)
+            try:
+                metadata = self.cache.instrument(instrument)
+                if not isinstance(metadata, CurrencyPair):
+                    raise MarketRefused("Public spot instrument was not loaded")
+                terms = SpotInstrumentTerms(
+                    str(metadata.raw_symbol),
+                    str(metadata.base_currency),
+                    str(metadata.quote_currency),
+                    str(metadata.price_increment),
+                    str(metadata.size_increment),
+                    str(metadata.min_quantity)
+                    if metadata.min_quantity is not None
+                    else None,
+                    format(metadata.min_notional.as_decimal(), "f")
+                    if metadata.min_notional is not None
+                    else None,
+                )
+                bind_spot_terms(journal, key, scope, terms)
+                self.subscribe_trade_ticks(instrument)
+            except (MarketRefused, sqlite3.Error, OSError) as error:
+                completed.set_exception(error)
 
         def on_trade_tick(self, tick):
             if completed.done():
