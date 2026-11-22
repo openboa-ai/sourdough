@@ -14,6 +14,10 @@ Input contracts: [Supervisor](../../../work/resume-work/supervise/spec.md), comp
 
 Restore into an isolated candidate instead of overwriting the last good copy in place.
 
+The first local checkpoint command requires the original company writer lease. If an existing worker holds it, refuse to capture instead of copying a changing database. Take an SQLite snapshot, reopen that copy read-only and verify the company identity, supported schema and database integrity. Publish an immutable named archive without replacing an existing path. Store only the company database and a manifest identifying its company, schema, capture time, byte size and content digest. The archive itself is not a runnable company store or a copy of a venue journal.
+
+Inspection copies the single expected database member into a private temporary scope, verifies size and digest against the manifest, then independently reopens it read-only. It does not establish event replay, fence an external sender, create an active store, or promote the archive. Those steps require separate known evidence and remain restore prerequisites.
+
 **Concern for the responsible component:** Pin checkpoint retention, recovery objectives and fencing method before the drill. If lost local authority or obligations cannot be reconstructed, remain isolated.
 
 ## Functional and quality requirements
@@ -30,6 +34,7 @@ Restore into an isolated candidate instead of overwriting the last good copy in 
 | --- | --- |
 | Normal | Restore a checkpoint predating a shared-asset handoff. Compare company, grants, custody and next duty to independent receipts. In the quant case additionally restore across a fill and verify position and fees. |
 | Failure or contention | Withhold a journal segment, corrupt the checkpoint, or leave the old sender active. Do not promote the candidate; retain the surviving copy and a scoped incident. A venue balance alone cannot reconstruct a lost grant. |
+| Local checkpoint boundary | Hold the original company writer lease and verify checkpoint creation is refused. After release, acquire one snapshot, retain an independent copy of the source history, and verify a scoped read-only reopen. Later original changes must not modify the archive; corruption, wrong company and accidental overwrite must be refused. |
 
 ## Operations and change review
 
