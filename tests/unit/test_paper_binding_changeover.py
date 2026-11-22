@@ -55,6 +55,17 @@ def trade(read):
     result = read()
     assert result["account_id"] == "new" and result["position_quantity"] == 0
     assert result["binding_revision"] == "revision-b"
+    assert result["position_units"] == "lots"
+    assert result["quote_units"] == "quote_minor_units_per_lot"
+    assert result["order_sizing"] == {
+        "instrument": "BTCUSD",
+        "base_units_per_lot": "0.000001",
+        "quote_currency": "USD",
+        "quote_units_per_whole": 100_000_000,
+        "price_step_per_lot": 1,
+        "minimum_lots": 1,
+        "minimum_notional": 100,
+    }
     return {
         "tool": "record_paper_decision", "call_id": "new-account-decision", "action": "hold",
         "rationale": "Use the verified baseline and the current account only.",
