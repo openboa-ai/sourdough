@@ -10,11 +10,11 @@ RUNNER = Path(__file__).with_name("run_required_tests.py")
 
 
 class RequiredTestsTest(unittest.TestCase):
-    def run_suite(self, body):
+    def run_suite(self, body, *extra):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "test_sample.py")
             path.write_text("import unittest\n" + textwrap.dedent(body), encoding="utf-8")
-            return subprocess.run([sys.executable, "-I", str(RUNNER), directory],
+            return subprocess.run([sys.executable, "-I", str(RUNNER), directory, *extra],
                                   capture_output=True, text=True, check=False)
 
     def test_passing_tests(self):
@@ -24,6 +24,13 @@ class RequiredTestsTest(unittest.TestCase):
                     self.assertEqual(2 + 2, 4)
         """)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_different_passing_test_cannot_replace_the_flow(self):
+        suite = "class Sample(unittest.TestCase):\n    def test_smoke(self): pass\n"
+        self.assertEqual(self.run_suite(suite, "test_sample.Sample.test_smoke").returncode, 0)
+        missing = self.run_suite(suite, "test_sample.Sample.test_end_to_end")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("Missing required case", missing.stderr)
 
     def test_empty_failure_and_import_error(self):
         failure = """
