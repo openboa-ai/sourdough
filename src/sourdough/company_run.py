@@ -16,7 +16,12 @@ from .duty_run import (
     count_company_runs,
 )
 from .employee_process import EmployeeProcess
-from .first_trade import TradeRefused, TradeResult, run_first_trade
+from .first_trade import (
+    TradeRefused,
+    TradeResult,
+    resume_opening_research,
+    run_first_trade,
+)
 from .paper_account import reopen_binding
 from .paper_books import (
     Posting,
@@ -34,6 +39,7 @@ from .paper_decision import (
 )
 from .paper_order import PaperIntent, reserved_exposure, submit_paper_order
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
+from .paper_research import read_research_result, reopen_research_decision
 from .paper_venue import FixedQuoteVenue
 from .writer_lease import WriterLease, hold_company_writer
 from .work import (
@@ -130,23 +136,41 @@ def _operate(
     reconciliation, blocked = _recover(writer, venue, next_purpose)
     if on_ready is not None:
         on_ready(writer)
-    first = None
+    first = (
+        None if reconciliation.unresolved else resume_opening_research(writer, venue)
+    )
     if (
-        turn_budget
+        first is None
+        and turn_budget
         and not reconciliation.unresolved
         and reopen(store, company_id).due_work_ids
     ):
         first = run_first_trade(store, company_id, venue, runtime, writer=writer)
         turn_budget -= 1
-        if first.order is None or first.order.posting is None:
+    if first is not None:
+        research = first.research
+        writer.verify()
+        if first.order is not None and first.order.posting is not None:
+            result = _book_reference(store, company_id, first.order.posting)
+            finish_first_duty(
+                store,
+                first.claim,
+                result,
+                due_at=research.next_due_at if research else result.available_at,
+                purpose=next_purpose,
+            )
+        elif research is not None and research.decision.action != "buy":
+            result = ResultReference(
+                "research_finding",
+                research.finding_id,
+                research.decision.observation_revision,
+                research.decided_at,
+            )
+            finish_first_duty(store, first.claim, result, due_at=research.next_due_at)
+        else:
             return CompanyRun(
                 first, None, reconciliation=reconciliation, blocked_work=blocked
             )
-        writer.verify()
-        result = _book_reference(store, company_id, first.order.posting)
-        finish_first_duty(
-            store, first.claim, result, due_at=result.available_at, purpose=next_purpose
-        )
 
     review = None
     trades = []
@@ -206,8 +230,13 @@ def _recover(
         claim = original.original_claim
         try:
             if claim.duty_id == first_duty_id:
+                research = reopen_research_decision(store, claim)
                 finish_first_duty(
-                    store, claim, result, due_at=result.available_at, purpose=purpose
+                    store,
+                    claim,
+                    result,
+                    due_at=research.next_due_at if research else result.available_at,
+                    purpose=purpose,
                 )
             else:
                 work = reopen_follow_up(store, claim)
@@ -231,6 +260,8 @@ def _book_reference(store: Path, company_id: str, posting: Posting) -> ResultRef
 def _read_paper_observation(
     connection: Connection, reference: ResultReference, company_id: str
 ) -> dict:
+    if reference.kind == "research_finding":
+        return read_research_result(connection, company_id, reference.resource_id)
     if reference.kind != "paper_position":
         raise DutyRefused("This duty does not reference a paper position")
     try:
@@ -267,7 +298,9 @@ def _review(
             follow_up,
             decision,
             now=int(time()),
-            successor_purpose=next_purpose,
+            successor_purpose=next_purpose
+            if follow_up.result.kind == "paper_position"
+            else POSITION_REVIEW,
         )
     except (DutyRefused, TradeRefused):
         try:

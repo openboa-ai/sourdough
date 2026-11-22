@@ -16,6 +16,7 @@ from sourdough.first_trade import TradeRefused, run_first_trade
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
 from sourdough.paper_order import OrderRefused
+from sourdough.paper_research import stage_research_inputs
 from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.writer_lease import WriterRefused, hold_company_writer
@@ -92,6 +93,10 @@ def main() -> int:
     for name in ("starting-minor-units", "exposure-minor-units", "quote-minor-units"):
         paper.add_argument(f"--{name}", required=True, type=int)
     paper.add_argument("--fee-bps", type=int, default=0)
+    inputs = commands.add_parser("stage-paper-observations")
+    inputs.add_argument("store", type=Path)
+    inputs.add_argument("observations", type=Path)
+    inputs.add_argument("--company-id", required=True)
     for command in ("first-duty", "operate-paper", "supervise-paper", "_paper-worker"):
         running = commands.add_parser(command)
         running.add_argument("store", type=Path)
@@ -163,6 +168,24 @@ def main() -> int:
                     ),
                     venue,
                 )
+        elif args.command == "stage-paper-observations":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                writer.verify()
+                with args.observations.open("rb") as source:
+                    content = source.read(64_001)
+                if len(content) > 64_000:
+                    raise DutyRefused(
+                        "Research observation input exceeds its size limit"
+                    )
+                try:
+                    observations = json.loads(content)
+                except (UnicodeError, ValueError) as error:
+                    raise DutyRefused("Invalid research observation input") from error
+                result = stage_research_inputs(
+                    args.store, args.company_id, observations
+                )
+            print(json.dumps(result))
+            return 0
         elif args.command == "supervise-paper":
             result = _start_supervisor(args)
             print(json.dumps(asdict(result)))

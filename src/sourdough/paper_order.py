@@ -12,6 +12,7 @@ from .duty_run import DutyClaim
 from .first_duty import require_historical_claim, require_paper_authority
 from .paper_account import PaperAccount, reopen_binding
 from .paper_decision import has_matching_paper_decision
+from .paper_research import allows_research_order
 from .writer_lease import WriterLease
 
 
@@ -109,6 +110,16 @@ def submit_paper_order(
             "SELECT 1 FROM founding_receipt WHERE company_id = ? AND due_work_id = ?",
             (claim.company_id, claim.duty_id),
         ).fetchone()
+        if first is not None and not allows_research_order(
+            connection,
+            claim,
+            intent.action_id,
+            intent.quantity,
+            intent.limit_minor_units,
+        ):
+            raise OrderRefused(
+                "Opening order requires its committed research decision and exact terms"
+            )
         if first is None and not has_matching_paper_decision(
             connection,
             claim,

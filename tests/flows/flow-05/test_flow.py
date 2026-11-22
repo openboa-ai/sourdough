@@ -8,11 +8,21 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 
 
 class ConnectedFlow(unittest.TestCase):
-    def prepare(self, *, skip_read=False, limit=100, later_action="buy", fee_bps=0):
+    def prepare(
+        self,
+        *,
+        skip_read=False,
+        limit=100,
+        later_action="buy",
+        fee_bps=0,
+        research_action="buy",
+        research_reply="complete",
+        long_finding=False,
+    ):
         directory = Path(self.enterContext(TemporaryDirectory()))
         self.store = directory / "company.sqlite"
         self.venue = directory / "venue.sqlite"
@@ -22,7 +32,10 @@ class ConnectedFlow(unittest.TestCase):
             f"skip_read = {skip_read}\n"
             f"limit = {limit}\n"
             f"later_action = {later_action!r}\n"
-            """import json, socket, sys
+            f"research_action = {research_action!r}\n"
+            f"research_reply = {research_reply!r}\n"
+            f"long_finding = {long_finding}\n"
+            """import json, os, signal, socket, sys
 request = json.load(sys.stdin)
 operation = request["operation"]
 if operation == "identify":
@@ -31,6 +44,39 @@ elif operation == "ready":
     result = {"ready": True}
 elif operation == "first_duty":
     result = {"tool": "paper_buy", "call_id": "first", "quantity": 2, "limit_minor_units": limit}
+elif operation == "research_duty":
+    def invoke(name, args):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(request["read_endpoint"])
+            client.sendall(json.dumps({"name":name,"arguments":args}).encode()+b"\\n")
+            with client.makefile() as stream:
+                reply = json.load(stream)
+        assert "error" not in reply, reply
+        return reply
+    snapshot = invoke("read_research_inputs", {})
+    start, end = snapshot["observations"]
+    prices = (start["price_minor_units"], end["price_minor_units"])
+    gross = prices[1] - prices[0]
+    fees = sum((value * snapshot["fee_bps"] + 5000) // 10000 for value in prices)
+    finding = invoke("publish_research_finding", {
+        "snapshot_revision":snapshot["revision"],"hypothesis":"🧪" * 2000 if long_finding else "Compare move and synthetic costs",
+        "start_id":start["observation_id"],"end_id":end["observation_id"],
+        "gross_change_minor_units":gross,"round_trip_fee_minor_units":fees,"net_change_minor_units":gross-fees,
+        "uncertainty":"証" * 2000 if long_finding else "A fixture does not provide market evidence.",
+    })
+    proposal = {
+        "finding_id":finding["finding_id"],"finding_revision":finding["revision"],"call_id":"research-decision",
+        "action":research_action,"next_check_seconds":60,
+        "rationale":f"The measured move {gross} after fees {fees} is {gross-fees} in the fixture.",
+    }
+    if research_action == "buy":
+        proposal.update(quantity=2, limit_minor_units=100)
+    result = invoke("record_research_decision", proposal)
+    if research_reply == "exit":
+        raise SystemExit(37)
+    if research_reply == "kill":
+        os.kill(os.getppid(), signal.SIGKILL)
+        raise SystemExit(38)
 elif operation in ("review_duty", "trade_duty"):
     revision = "invented"
     rationale = "No result was read."
@@ -432,3 +478,154 @@ raise SystemExit(0 if bound.completed else 1)
             worker["review"]["claim"]["founder_id"], self.company["founder_id"]
         )
         self.assertEqual(self.read(self.store, "SELECT count(*) FROM duty_run"), [(2,)])
+
+    def stage_observations(self):
+        now = int(time())
+        source = self.store.with_name("observations.json")
+        source.write_text(
+            json.dumps(
+                [
+                    {
+                        "observation_id": "earlier",
+                        "price_minor_units": 90,
+                        "observed_at": now - 100,
+                        "available_at": now - 95,
+                    },
+                    {
+                        "observation_id": "latest",
+                        "price_minor_units": 100,
+                        "observed_at": now - 50,
+                        "available_at": now - 45,
+                    },
+                    {
+                        "observation_id": "not_available",
+                        "price_minor_units": 110,
+                        "observed_at": now - 20,
+                        "available_at": now + 300,
+                    },
+                ]
+            )
+        )
+        self.success("stage-paper-observations", self.store, source, *self.identity)
+
+    def test_opening_research_finding_is_cited_before_order_and_sets_follow_up(self):
+        self.prepare(fee_bps=50)
+        self.stage_observations()
+        command = self.operate()
+        self.assertEqual(command.returncode, 0, command.stderr)
+        trace = json.loads(command.stdout)
+        self.assertIsNone(trace["review"])
+        first = trace["first_trade"]
+        self.assertEqual(first["order"]["posting"]["quantity"], 2)
+        receipt = first["research"]
+        (chain,) = self.read(
+            self.store,
+            "SELECT f.published_at, d.decided_at, f.finding_id, d.decision_id, "
+            "o.action_id, w.due_at, f.content FROM paper_research_finding f "
+            "JOIN paper_research_decision d ON d.run_id = f.run_id AND d.finding_id = f.finding_id "
+            "JOIN paper_order o ON o.run_id = d.run_id JOIN work_follow_up w ON w.previous_duty_id = d.duty_id",
+        )
+        self.assertLessEqual(chain[0], chain[1])
+        self.assertEqual(
+            chain[2:5],
+            (receipt["finding_id"], receipt["decision_id"], receipt["decision_id"]),
+        )
+        self.assertEqual(chain[5], chain[1] + 60)
+        finding = json.loads(chain[6])
+        self.assertEqual(
+            (
+                finding["gross_change_minor_units"],
+                finding["round_trip_fee_minor_units"],
+                finding["net_change_minor_units"],
+            ),
+            (10, 1, 9),
+        )
+
+    def test_research_investigation_without_order_arms_a_read_only_follow_up(self):
+        self.prepare(fee_bps=50, research_action="investigate")
+        self.stage_observations()
+        completed = self.operate("--repeat-paper")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        first = json.loads(completed.stdout)["first_trade"]
+        self.assertIsNone(first["order"])
+        result = first["research"]
+        self.assertEqual(result["decision"]["action"], "investigate")
+        (pending,) = self.read(
+            self.store,
+            "SELECT result_kind, result_id, purpose, due_at FROM work_follow_up",
+        )
+        self.assertEqual(
+            pending,
+            (
+                "research_finding",
+                result["finding_id"],
+                "position_review",
+                result["decided_at"] + 60,
+            ),
+        )
+        self.assertEqual(
+            self.read(self.venue, "SELECT count(*) FROM venue_execution"), [(0,)]
+        )
+
+    def test_research_commit_survives_employee_exit_and_full_unicode_payload(self):
+        self.prepare(
+            research_action="investigate", research_reply="exit", long_finding=True
+        )
+        self.stage_observations()
+        result = self.operate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (body,) = self.read(self.store, "SELECT content FROM paper_research_finding")
+        finding = json.loads(body[0])
+        self.assertEqual(finding["hypothesis"], "🧪" * 2000)
+        self.assertEqual(finding["uncertainty"], "証" * 2000)
+        self.assertEqual(self.read(self.store, "SELECT count(*) FROM duty_run"), [(1,)])
+        self.assertEqual(
+            self.read(self.store, "SELECT count(*) FROM work_follow_up"), [(1,)]
+        )
+        self.assertEqual(
+            self.read(self.venue, "SELECT count(*) FROM venue_execution"), [(0,)]
+        )
+
+    def test_company_reopens_committed_research_without_a_second_agent_turn(self):
+        for action, expected_orders in (("investigate", 0), ("buy", 1)):
+            with self.subTest(action=action):
+                self.prepare(research_action=action, research_reply="kill")
+                self.stage_observations()
+                cut = self.operate()
+                self.assertEqual(cut.returncode, -signal.SIGKILL, cut.stderr)
+                original = self.read(
+                    self.store,
+                    "SELECT run_id, decision_id FROM paper_research_decision",
+                )
+                self.assertEqual(len(original), 1)
+                self.assertEqual(
+                    self.read(self.venue, "SELECT count(*) FROM venue_execution"),
+                    [(0,)],
+                )
+                self.success(
+                    "operate-paper",
+                    self.store,
+                    self.venue,
+                    *self.identity,
+                    "--employee",
+                    self.peer,
+                    "--turn-budget",
+                    "1",
+                )
+                self.assertEqual(
+                    self.read(
+                        self.store,
+                        "SELECT run_id, decision_id FROM paper_research_decision",
+                    ),
+                    original,
+                )
+                self.assertEqual(
+                    self.read(self.store, "SELECT count(*) FROM duty_run"), [(1,)]
+                )
+                self.assertEqual(
+                    self.read(self.venue, "SELECT count(*) FROM venue_execution"),
+                    [(expected_orders,)],
+                )
+                self.assertEqual(
+                    self.read(self.store, "SELECT count(*) FROM work_follow_up"), [(1,)]
+                )
