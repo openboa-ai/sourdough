@@ -149,6 +149,9 @@ class FixedQuoteVenue:
             raise VenueRefused("Unknown destination account")
         return row[0]
 
+    def observe_order_sizing(self, account_id: str) -> None:
+        self.observe_account(account_id)
+
     def observe_fee_bps(self, account_id: str) -> int:
         with self._open("ro") as db:
             db.execute("BEGIN")

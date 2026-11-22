@@ -9,7 +9,12 @@ from unittest.mock import Mock
 from sourdough.company import FoundingTerms, found
 from sourdough.company_run import run_paper_company
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_execution import VenueExecution, VenueRefused
+from sourdough.paper_execution import (
+    PaperExecution,
+    PaperOrderSizing,
+    VenueExecution,
+    VenueRefused,
+)
 from sourdough.paper_venue import FixedQuoteVenue
 
 
@@ -27,17 +32,11 @@ class ExecutionPort(unittest.TestCase):
         )
         execution = None
         reservations_at_send = []
-        venue = Mock(
-            spec_set=[
-                "require_independent_from",
-                "observe_account",
-                "observe_quote",
-                "submit",
-                "observe_execution",
-            ]
-        )
+        venue = Mock(spec_set=PaperExecution)
         venue.observe_account.return_value = account
         venue.observe_quote.return_value = 100
+        sizing = PaperOrderSizing("EXAMPLE", "0.1", "USD", 100, 1, 1, 50)
+        venue.observe_order_sizing.return_value = sizing
 
         def submit(order_id, account_id, intent):
             nonlocal execution
@@ -74,6 +73,7 @@ class ExecutionPort(unittest.TestCase):
             self.store, self.company.company_id, venue, employee, turn_budget=1
         )
         venue.require_independent_from.assert_called_with(self.store)
+        self.assertEqual(employee.run.call_args.args[0].order_sizing, sizing)
         venue.submit.assert_called_once()
         order = result.first_trade.order
         self.assertEqual(reservations_at_send, [(order.order_id, 100)])

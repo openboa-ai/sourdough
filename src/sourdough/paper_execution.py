@@ -20,6 +20,17 @@ class PaperIntent:
 
 
 @dataclass(frozen=True)
+class PaperOrderSizing:
+    instrument: str
+    base_units_per_lot: str
+    quote_currency: str
+    quote_units_per_whole: int
+    price_step_per_lot: int
+    minimum_lots: int
+    minimum_notional: int
+
+
+@dataclass(frozen=True)
 class VenueExecution:
     order_id: str
     account_id: str
@@ -39,6 +50,8 @@ class PaperExecution(PaperDestination, Protocol):
     def require_independent_from(self, company_store: Path) -> None: ...
 
     def observe_quote(self, account_id: str) -> int: ...
+
+    def observe_order_sizing(self, account_id: str) -> PaperOrderSizing | None: ...
 
     def observe_fee_bps(self, account_id: str) -> int: ...
 

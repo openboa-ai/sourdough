@@ -79,6 +79,8 @@ def _start_supervisor(args):
     ]
     if getattr(args, "repeat_paper", False):
         command.append("--repeat-paper")
+    if getattr(args, "managed_engine", False):
+        command.append("--managed-engine")
     return supervise_worker(
         command,
         args.store,
@@ -87,6 +89,20 @@ def _start_supervisor(args):
         startup_seconds=args.startup_seconds,
         max_seconds=args.max_seconds,
         emit=lambda event: print(json.dumps(event), file=sys.stderr, flush=True),
+    )
+
+
+def _paper_destination(args):
+    if getattr(args, "managed_engine", False):
+        return paper_venue(args.store, args.journal)
+    return FixedQuoteVenue(args.journal)
+
+
+def _managed_destination_flag(command):
+    command.add_argument(
+        "--managed-engine",
+        action="store_true",
+        help="Use the original managed engine directory instead of a fixture journal",
     )
 
 
@@ -184,6 +200,7 @@ def main() -> int:
         managed.add_argument("store", type=Path)
         if "hired-paper" in command:
             managed.add_argument("journal", type=Path)
+            _managed_destination_flag(managed)
         managed.add_argument("--company-id", required=True)
         managed.add_argument("--employee", type=Path, required=True)
         managed.add_argument("--turn-budget", type=int, default=3)
@@ -210,6 +227,7 @@ def main() -> int:
         running.add_argument("--company-id", required=True)
         running.add_argument("--employee", type=Path, required=True)
         if command != "first-duty":
+            _managed_destination_flag(running)
             running.add_argument("--repeat-paper", action="store_true")
             running.add_argument("--turn-budget", type=int, default=2)
             running.add_argument("--idle-seconds", type=int, default=0)
@@ -405,7 +423,7 @@ def main() -> int:
             result = run_hired_paper_company(
                 args.store,
                 args.company_id,
-                FixedQuoteVenue(args.journal),
+                _paper_destination(args),
                 lambda: EmployeeProcess(args.employee),
                 turn_budget=args.turn_budget,
                 idle_seconds=args.idle_seconds,
@@ -424,7 +442,7 @@ def main() -> int:
             inputs = (
                 args.store,
                 args.company_id,
-                FixedQuoteVenue(args.journal),
+                _paper_destination(args),
                 EmployeeProcess(args.employee),
             )
             if args.command == "first-duty":
