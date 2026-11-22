@@ -108,6 +108,15 @@ class FixedQuoteVenue:
                 (order_id, *terms, fill_id, price),
             )
 
+    def observe_quote(self, account_id: str) -> int:
+        with self._open("ro") as db:
+            row = db.execute(
+                "SELECT quote FROM venue_account WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        if row is None:
+            raise VenueRefused("Unknown destination account")
+        return row[0]
+
     def observe_execution(self, order_id: str) -> VenueExecution | None:
         with self._open("ro") as db:
             row = db.execute(
