@@ -9,12 +9,23 @@ from time import time
 from uuid import uuid4
 
 from .company import _connect, upgrade_work_schema
-from .duty_run import DutyClaim, DutyRefused, RunAuthority, resolve_run, start_run
+from .duty_run import (
+    DutyClaim,
+    DutyRefused,
+    RunAuthority,
+    has_turn_capacity,
+    resolve_run,
+    start_run,
+)
 from .writer_lease import WriterLease
 
 
 STAFFING_REVIEW = "staffing_review"
 CHOICES = frozenset(("hire", "reassign", "defer"))
+_CREATE_FOLLOW_UP = """CREATE TABLE IF NOT EXISTS staffing_follow_up (
+    previous_duty_id TEXT PRIMARY KEY NOT NULL REFERENCES staffing_assignment(duty_id),
+    duty_id TEXT NOT NULL UNIQUE REFERENCES staffing_assignment(duty_id)
+)"""
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS staffing_authority (
         grant_id TEXT PRIMARY KEY NOT NULL REFERENCES standing_grant(id),
@@ -48,6 +59,7 @@ SCHEMA = (
         allocated_turns INTEGER NOT NULL CHECK (allocated_turns > 0),
         terms TEXT NOT NULL, hired_at INTEGER NOT NULL
     )""",
+    _CREATE_FOLLOW_UP,
 )
 
 
@@ -174,7 +186,7 @@ def claim_staffing(
             "SELECT 1 FROM sqlite_schema WHERE name = 'staffing_assignment'"
         ).fetchone():
             return None
-        row = connection.execute(
+        candidates = connection.execute(
             """SELECT d.agent_id, g.id, d.id, a.execution_profile, g.scope
                FROM staffing_assignment s
                JOIN duty d ON d.id = s.duty_id AND d.state = 'due'
@@ -183,9 +195,17 @@ def claim_staffing(
                JOIN staffing_authority delegation ON delegation.grant_id = g.id
                     AND delegation.manager_scope = g.scope
                WHERE a.company_id = ? AND a.execution_profile = ? AND s.available_at <= ?
-               ORDER BY s.available_at, d.id LIMIT 1""",
+               ORDER BY s.available_at, d.id""",
             (writer.company_id, execution_profile, now),
-        ).fetchone()
+        )
+        row = next(
+            (
+                candidate
+                for candidate in candidates
+                if has_turn_capacity(connection, candidate[0])
+            ),
+            None,
+        )
         if row is None:
             return None
         return start_run(
@@ -285,7 +305,7 @@ def record_choice(writer: WriterLease, claim: DutyClaim, choice: StaffingChoice)
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        _assignment(connection, claim)
+        evidence, _, authority = _staffing_run(connection, claim)
         observed = connection.execute(
             "SELECT revision FROM staffing_read WHERE run_id = ?",
             (claim.run_id,),
@@ -303,12 +323,47 @@ def record_choice(writer: WriterLease, claim: DutyClaim, choice: StaffingChoice)
                     "Staffing choice conflicts with the original judgment"
                 )
             return prior[1]
+        authority.require_current(STAFFING_REVIEW)
+        if authority.duty_state != "running":
+            raise DutyRefused("Staffing decision requires an active assigned manager")
         choice_id = uuid4().hex
+        decided_at = int(time())
         connection.execute(
             "INSERT INTO staffing_choice VALUES (?, ?, ?, ?, ?)",
-            (claim.duty_id, claim.run_id, choice_id, body, int(time())),
+            (claim.duty_id, claim.run_id, choice_id, body, decided_at),
         )
+        if choice.action != "hire":
+            _schedule_staffing_review(
+                connection, claim, evidence, decided_at + choice.next_check_seconds
+            )
         return choice_id
+
+
+def _schedule_staffing_review(
+    connection: Connection, claim: DutyClaim, evidence: str, due_at: int
+) -> None:
+    connection.execute(_CREATE_FOLLOW_UP)
+    successor = uuid4().hex
+    carried = _canonical(json.loads(evidence) | {"duty_id": successor})
+    connection.execute(
+        "INSERT INTO duty VALUES (?, ?, 'due')", (successor, claim.founder_id)
+    )
+    connection.execute(
+        "INSERT INTO staffing_assignment VALUES (?, ?, ?, ?, ?)",
+        (
+            successor,
+            claim.grant_id,
+            carried,
+            sha256(carried.encode()).hexdigest(),
+            due_at,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO staffing_follow_up VALUES (?, ?)", (claim.duty_id, successor)
+    )
+    connection.execute(
+        "UPDATE duty SET state = 'settled' WHERE id = ?", (claim.duty_id,)
+    )
 
 
 def _remaining(connection: Connection, manager_grant_id: str) -> tuple[int, int]:
@@ -444,5 +499,8 @@ def admit_hire(
                 terms,
                 int(time()),
             ),
+        )
+        connection.execute(
+            "UPDATE duty SET state = 'settled' WHERE id = ?", (claim.duty_id,)
         )
         return HireReceipt(agent_id, grant_id, request.turns)

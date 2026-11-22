@@ -10,12 +10,20 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from .company import _connect
-from .duty_run import DutyClaim, DutyRefused, resolve_run, start_run
+from .duty_run import (
+    PAPER_EXECUTION,
+    DutyClaim,
+    DutyRefused,
+    has_turn_capacity,
+    resolve_run,
+    start_run,
+)
 from .writer_lease import WriterLease
 
 
 MAX_PROVISIONING_ATTEMPTS = 3
 PROVISIONING_RETRY_SECONDS = 60
+_SCOPE = {"assessment": "assessment", PAPER_EXECUTION: "paper"}
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS hire_onboarding (
         agent_id TEXT PRIMARY KEY NOT NULL REFERENCES hire_receipt(agent_id),
@@ -51,9 +59,9 @@ class OnboardingStatus:
 
 def _active_hire(
     connection: Connection, company_id: str, agent_id: str
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     row = connection.execute(
-        """SELECT a.execution_profile, g.id FROM hire_receipt h
+        """SELECT a.execution_profile, g.id, g.scope FROM hire_receipt h
            JOIN agent a ON a.id = h.agent_id AND a.company_id = ?
            JOIN standing_grant g ON g.id = h.grant_id AND g.agent_id = a.id
            WHERE a.id = ? AND g.scope = json_extract(h.terms, '$.scope')
@@ -63,6 +71,60 @@ def _active_hire(
     if row is None:
         raise DutyRefused("No current hire matches the committed authority")
     return row
+
+
+def pending_onboarding(
+    writer: WriterLease, execution_profile: str, purpose: str
+) -> DutyClaim | None:
+    if purpose not in _SCOPE:
+        raise DutyRefused("Unsupported first duty purpose")
+    writer.verify()
+    with closing(_connect(writer.store, "ro")) as connection:
+        connection.execute("BEGIN")
+        tables = {
+            name
+            for (name,) in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name IN ('hire_receipt','hire_onboarding')"
+            )
+        }
+        if "hire_receipt" not in tables:
+            return None
+        join = ""
+        active = ""
+        arguments = [writer.company_id, execution_profile, _SCOPE[purpose]]
+        if "hire_onboarding" in tables:
+            join = "LEFT JOIN hire_onboarding o ON o.agent_id=h.agent_id"
+            active = """AND (o.agent_id IS NULL OR (
+                o.purpose=? AND o.state != 'accepted'
+                AND (o.state != 'blocked' OR o.retry_at IS NOT NULL)
+            ))"""
+            arguments.append(purpose)
+        candidates = connection.execute(
+            f"""SELECT a.id, manager.id, r.grant_id, r.duty_id, r.run_id,
+                       manager.execution_profile
+                FROM hire_receipt h
+                JOIN agent a ON a.id=h.agent_id
+                JOIN standing_grant g ON g.id=h.grant_id AND g.agent_id=a.id
+                JOIN staffing_choice choice ON choice.choice_id=h.choice_id
+                JOIN duty_run r ON r.run_id=choice.run_id
+                JOIN duty d ON d.id=r.duty_id
+                JOIN agent manager ON manager.id=d.agent_id AND manager.company_id=a.company_id
+                {join}
+                WHERE a.company_id=? AND a.execution_profile=? AND g.scope=?
+                  AND a.execution_profile=json_extract(h.terms,'$.execution_profile')
+                  AND g.scope=json_extract(h.terms,'$.scope')
+                  {active}
+                ORDER BY h.hired_at,h.request_id""",
+            arguments,
+        )
+        return next(
+            (
+                DutyClaim(writer.company_id, *identity)
+                for agent_id, *identity in candidates
+                if has_turn_capacity(connection, agent_id)
+            ),
+            None,
+        )
 
 
 def _status(connection: Connection, agent_id: str) -> OnboardingStatus:
@@ -95,7 +157,9 @@ def provision_hire(
     with closing(_connect(writer.store, "rw")) as connection:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
-            profile, _ = _active_hire(connection, writer.company_id, agent_id)
+            profile, _, scope = _active_hire(connection, writer.company_id, agent_id)
+            if _SCOPE.get(purpose) != scope:
+                raise DutyRefused("First duty purpose does not match the hire scope")
             for statement in SCHEMA:
                 connection.execute(statement)
             connection.execute(
@@ -174,7 +238,7 @@ def provision_hire(
 
 
 def claim_hired_first(
-    writer: WriterLease, agent_id: str, execution_profile: str
+    writer: WriterLease, agent_id: str, execution_profile: str, *, resume: bool = False
 ) -> DutyClaim | None:
     writer.verify()
     with closing(_connect(writer.store, "rw")) as connection, connection:
@@ -183,19 +247,32 @@ def claim_hired_first(
             "SELECT 1 FROM sqlite_schema WHERE name = 'hire_onboarding' AND type = 'table'"
         ).fetchone():
             return None
-        profile, grant_id = _active_hire(connection, writer.company_id, agent_id)
+        profile, grant_id, scope = _active_hire(connection, writer.company_id, agent_id)
         row = connection.execute(
-            """SELECT d.id, o.purpose, g.scope
+            """SELECT d.id, o.purpose, d.state
                FROM hire_onboarding o
                JOIN duty d ON d.id = o.first_duty_id AND d.agent_id = o.agent_id
                JOIN private_desk desk ON desk.agent_id = o.agent_id
-               JOIN standing_grant g ON g.id = ? AND g.agent_id = d.agent_id
-               WHERE o.agent_id = ? AND o.state = 'ready' AND d.state = 'due'""",
-            (grant_id, agent_id),
+               WHERE o.agent_id = ? AND o.state = 'ready'""",
+            (agent_id,),
         ).fetchone()
-        if row is None or execution_profile != profile:
+        if (
+            row is None
+            or execution_profile != profile
+            or not has_turn_capacity(connection, agent_id)
+        ):
             return None
-        duty_id, purpose, scope = row
+        duty_id, purpose, state = row
+        if _SCOPE.get(purpose) != scope:
+            raise DutyRefused("First duty purpose does not match the hire scope")
+        if state == "running" and resume:
+            connection.execute(
+                "UPDATE duty_run SET is_current = 0 WHERE duty_id = ? AND is_current = 1",
+                (duty_id,),
+            )
+            connection.execute("UPDATE duty SET state = 'due' WHERE id = ?", (duty_id,))
+        elif state != "due":
+            return None
         return start_run(
             connection,
             writer.company_id,

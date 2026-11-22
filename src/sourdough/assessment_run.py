@@ -78,8 +78,13 @@ def run_assessment_company(
         )
         hiring = None
         publication = None
-        if agent_id is None and remaining >= 2:
-            hiring = prepare_hiring(writer, employee, first_purpose=ASSESSMENT)
+        if agent_id is None:
+            hiring = prepare_hiring(
+                writer,
+                employee,
+                first_purpose=ASSESSMENT,
+                allow_staffing=remaining >= 2,
+            )
             claim = hiring.hire_claim
             if claim is None:
                 return AssessmentRun(hiring, None, tuple(restored), None)
@@ -103,7 +108,9 @@ def run_assessment_company(
             agent_id = owed_hired_follow_up_owner(
                 store, company_id, employee.profile, ASSESSMENT_REVIEW
             )
-            remaining -= 2
+            remaining = turn_budget - (
+                count_company_runs(store, company_id) - budget_from
+            )
 
         review = (
             _review(writer, employee, agent_id, idle_seconds)

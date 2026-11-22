@@ -14,6 +14,7 @@ from .duty_run import (
     POSITION_REVIEW,
     DutyClaim,
     DutyRefused,
+    has_turn_capacity,
     resolve_run,
     start_run,
 )
@@ -241,21 +242,24 @@ def owed_hired_follow_up_owner(
             "SELECT 1 FROM sqlite_schema WHERE name='hire_receipt' AND type='table'"
         ).fetchone():
             return None
-        row = connection.execute(
+        candidates = connection.execute(
             """SELECT a.id FROM work_follow_up w
                JOIN duty d ON d.id=w.duty_id AND d.state='scheduled'
                JOIN agent a ON a.id=d.agent_id AND a.company_id=?
                JOIN hire_receipt h ON h.agent_id=a.id AND h.grant_id=w.grant_id
                JOIN standing_grant g ON g.id=h.grant_id AND g.agent_id=a.id
                WHERE w.purpose=? AND a.execution_profile=? AND g.scope=w.grant_scope
-                 AND h.allocated_turns > (
-                     SELECT count(*) FROM duty owned
-                     JOIN duty_run spent ON spent.duty_id=owned.id WHERE owned.agent_id=a.id
-                 )
-               ORDER BY max(w.due_at,w.available_at),d.id LIMIT 1""",
+               ORDER BY max(w.due_at,w.available_at),d.id""",
             (company_id, purpose, execution_profile),
-        ).fetchone()
-    return row[0] if row is not None else None
+        )
+        return next(
+            (
+                agent_id
+                for (agent_id,) in candidates
+                if has_turn_capacity(connection, agent_id)
+            ),
+            None,
+        )
 
 
 def _claim_follow_up(
@@ -272,7 +276,7 @@ def _claim_follow_up(
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _check_store(connection, company_id)
-        row = connection.execute(
+        candidates = connection.execute(
             f"""SELECT d.id, f.id, g.id, w.grant_scope, w.purpose,
                       w.result_kind, w.result_id, w.result_revision, w.available_at
                FROM work_follow_up w
@@ -283,7 +287,7 @@ def _claim_follow_up(
                  AND g.scope = w.grant_scope AND f.execution_profile = ?
                  AND (? IS NULL OR f.id = ?)
                  AND w.purpose IN ({placeholders})
-               ORDER BY w.due_at, d.id LIMIT 1""",
+               ORDER BY w.due_at, d.id""",
             (
                 company_id,
                 now,
@@ -293,7 +297,15 @@ def _claim_follow_up(
                 agent_id,
                 *purposes,
             ),
-        ).fetchone()
+        )
+        row = next(
+            (
+                candidate
+                for candidate in candidates
+                if has_turn_capacity(connection, candidate[1])
+            ),
+            None,
+        )
         if row is None:
             return None
         duty_id, founder_id, grant_id, scope, purpose, *stored_result = row
