@@ -1,14 +1,16 @@
 import json
 import sqlite3
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 from unittest.mock import patch
 
-from sourdough.company import FoundingTerms, found
+from sourdough.company import FoundingTerms, _connect, found
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.paper_window import (
@@ -77,10 +79,10 @@ class ProspectiveWindowTests(unittest.TestCase):
             [False, False, True, True, False],
         )
         with closing(sqlite3.connect(self.store)) as database:
-            [(raw, revision)] = database.execute(
-                "SELECT contract,revision FROM paper_operating_window"
+            [(raw, committed_ns, revision)] = database.execute(
+                "SELECT contract,committed_ns,revision FROM paper_operating_window"
             ).fetchall()
-        self.assertEqual(sha256(raw.encode()).hexdigest(), revision)
+        self.assertEqual(sha256(f"{committed_ns}:{raw}".encode()).hexdigest(), revision)
         self.assertEqual(json.loads(raw)["account"]["starting_minor_units"], 1000)
         with self.assertRaisesRegex(WindowRefused, "original registration"):
             self.register(
@@ -114,3 +116,52 @@ class ProspectiveWindowTests(unittest.TestCase):
             ):
                 register_window(writer, self.plan)
         self.assertIsNone(read_window(self.store, self.company, "first"))
+
+    def test_reader_holding_first_commit_across_open_cannot_publish_a_seal(self):
+        commit_started = Event()
+
+        def connect(store, mode):
+            connection = _connect(store, mode)
+            if mode == "rw":
+                connection.set_trace_callback(
+                    lambda statement: commit_started.set()
+                    if statement == "COMMIT"
+                    else None
+                )
+            return connection
+
+        def clock():
+            return self.plan.opens_ns if commit_started.is_set() else 90
+
+        def register():
+            with hold_company_writer(self.store, self.company) as writer:
+                return register_window(writer, self.plan)
+
+        with (
+            ThreadPoolExecutor(max_workers=1) as pool,
+            closing(sqlite3.connect(self.store)) as reader,
+            patch("sourdough.paper_window._connect", side_effect=connect),
+            patch("sourdough.paper_window.time_ns", side_effect=clock),
+        ):
+            reader.execute("BEGIN")
+            self.assertIsNotNone(reader.execute("SELECT id FROM company").fetchone())
+            attempt = pool.submit(register)
+            try:
+                self.assertTrue(commit_started.wait(2))
+                self.assertFalse(attempt.done())
+            finally:
+                reader.rollback()
+            with self.assertRaisesRegex(
+                WindowRefused, "before the registration committed"
+            ):
+                attempt.result(timeout=2)
+        self.assertIsNone(read_window(self.store, self.company, "first"))
+        with self.assertRaisesRegex(WindowRefused, "before it opens"):
+            self.register(self.plan, now=100)
+        with closing(sqlite3.connect(self.store)) as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT committed_ns,revision FROM paper_operating_window"
+                ).fetchone(),
+                (None, None),
+            )

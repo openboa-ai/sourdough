@@ -96,13 +96,19 @@ class RegisteredWindow:
         )
 
 
-def _decode(contract: str, revision: str) -> RegisteredWindow:
-    if sha256(contract.encode()).hexdigest() != revision:
+def _seal_revision(contract: str, committed_ns: int) -> str:
+    return sha256(f"{committed_ns}:{contract}".encode()).hexdigest()
+
+
+def _decode(contract: str, committed_ns: int, revision: str) -> RegisteredWindow:
+    if _seal_revision(contract, committed_ns) != revision:
         raise WindowRefused("Window no longer matches its original seal")
     fields = json.loads(contract)
     fields["plan"] = WindowPlan(**fields["plan"])
     fields["account"] = PaperAccount(**fields["account"])
-    return RegisteredWindow(**fields, revision=revision)
+    if not 0 < committed_ns < fields["plan"].opens_ns:
+        raise WindowRefused("Window seal does not precede its opening")
+    return RegisteredWindow(**fields, registered_ns=committed_ns, revision=revision)
 
 
 def _read(database: Connection, window_id: str) -> RegisteredWindow | None:
@@ -111,7 +117,8 @@ def _read(database: Connection, window_id: str) -> RegisteredWindow | None:
     ).fetchone():
         return None
     row = database.execute(
-        "SELECT contract,revision FROM paper_operating_window WHERE window_id=?",
+        """SELECT contract,committed_ns,revision FROM paper_operating_window
+           WHERE window_id=? AND revision IS NOT NULL""",
         (window_id,),
     ).fetchone()
     if row is None:
@@ -153,41 +160,64 @@ def register_window(writer: WriterLease, plan: WindowPlan) -> RegisteredWindow:
             or plan.max_exposure_minor > binding.exposure_limit_minor_units
         ):
             raise WindowRefused("Window does not fit the existing paper mandate")
-        registered = time_ns()
-        if not 0 < registered < plan.opens_ns:
+        if not 0 < time_ns() < plan.opens_ns:
             raise WindowRefused("Register the window before it opens")
         database.execute(
             """CREATE TABLE IF NOT EXISTS paper_operating_window (
                 window_id TEXT PRIMARY KEY NOT NULL, contract TEXT NOT NULL,
-                revision TEXT NOT NULL UNIQUE
+                committed_ns INTEGER, revision TEXT UNIQUE,
+                CHECK ((committed_ns IS NULL) = (revision IS NULL))
             )"""
         )
-        if database.execute(
-            """SELECT 1 FROM paper_operating_window
-               WHERE json_extract(contract,'$.account.destination_id')=?
-                 AND json_extract(contract,'$.plan.opens_ns')<=?
-                 AND json_extract(contract,'$.plan.closes_ns')>=? LIMIT 1""",
-            (binding.account.destination_id, plan.closes_ns, plan.opens_ns),
-        ).fetchone():
-            raise WindowRefused("The paper account already has an overlapping window")
         contract = json.dumps(
             {
                 "company_id": writer.company_id,
                 "plan": asdict(plan),
                 "account": asdict(binding.account),
-                "registered_ns": registered,
             },
             sort_keys=True,
             separators=(",", ":"),
         )
-        revision = sha256(contract.encode()).hexdigest()
         database.execute(
-            "INSERT INTO paper_operating_window VALUES (?,?,?)",
-            (plan.window_id, contract, revision),
+            """INSERT INTO paper_operating_window (window_id,contract) VALUES (?,?)
+               ON CONFLICT(window_id) DO NOTHING""",
+            (plan.window_id, contract),
         )
-        if time_ns() >= plan.opens_ns:
+        if database.execute(
+            "SELECT contract FROM paper_operating_window WHERE window_id=?",
+            (plan.window_id,),
+        ).fetchone() != (contract,):
+            raise WindowRefused(
+                "Window request conflicts with its original registration"
+            )
+        writer.verify()
+        database.commit()
+        committed_ns = time_ns()
+        if not 0 < committed_ns < plan.opens_ns:
             raise WindowRefused("Window opened before the registration committed")
+
+        database.execute("BEGIN IMMEDIATE")
+        writer.verify()
+        existing = _read(database, plan.window_id)
+        if existing is not None:
+            return existing
+        if reopen_binding(writer.store, writer.company_id) != binding:
+            raise WindowRefused("Paper binding changed before the window was sealed")
+        if database.execute(
+            """SELECT 1 FROM paper_operating_window WHERE revision IS NOT NULL
+               AND json_extract(contract,'$.account.destination_id')=?
+               AND json_extract(contract,'$.plan.opens_ns')<=?
+               AND json_extract(contract,'$.plan.closes_ns')>=? LIMIT 1""",
+            (binding.account.destination_id, plan.closes_ns, plan.opens_ns),
+        ).fetchone():
+            raise WindowRefused("The paper account already has an overlapping window")
+        revision = _seal_revision(contract, committed_ns)
+        database.execute(
+            """UPDATE paper_operating_window SET committed_ns=?,revision=?
+               WHERE window_id=? AND revision IS NULL""",
+            (committed_ns, revision, plan.window_id),
+        )
         writer.verify()
     return RegisteredWindow(
-        writer.company_id, plan, binding.account, registered, revision
+        writer.company_id, plan, binding.account, committed_ns, revision
     )
