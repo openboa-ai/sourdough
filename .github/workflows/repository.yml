@@ -101,7 +101,10 @@ jobs:
     name: Product checks
     needs: naming
     if: ${{ needs.naming.outputs.scope != 'none' }}
-    runs-on: ${{ needs.naming.outputs.scope == 'unit' && 'ubuntu-24.04' || 'macos-15' }}
+    runs-on: >-
+      ${{ needs.naming.outputs.scope == 'unit' && 'ubuntu-24.04'
+          || needs.naming.outputs.scope == 'flow-07' && 'macos-26'
+          || 'macos-15' }}
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
