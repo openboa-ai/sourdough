@@ -17,11 +17,13 @@ Start at the [implementation architecture](../implementation-architecture.md) fo
 
 ## Implementation defaults
 
-**Stack.** Start with one Python package under `src/sourdough/` and a transactional SQLite store. The company owns identity, grants and work; the fund owns paper accounts, orders and positions. Neither the Agent nor the Client writes directly to the books. Keep the trading SDK behind the company-managed execution adapter; use Yogurt only in the Client build. Separate the macOS supervisor when implementing recovery, not as a prerequisite for the first trade.
+**Stack.** Start with one Python package under `src/sourdough/` and a transactional SQLite store. The company owns identity, grants and work; the fund owns trading admission, reservations and accounting records. The bound execution runtime is the authority for execution facts and account state. Neither the Agent nor the Client writes directly to the books. Keep the trading SDK behind the company-managed execution adapter; use Yogurt only in the Client build. Separate the macOS supervisor when implementing recovery, not as a prerequisite for the first trade.
 
 **First package.** Pin a tested CPython patch in `.python-version`. Declare the package, entry point and build backend in `pyproject.toml`. Pin Ruff, the backend and other CI tools with hashes in `requirements-dev.lock`. Use the standard library for founding. Add modules with their first use; do not create a service per spec.
 
 **Code.** Use glossary terms, `snake_case` for Python modules/functions and `PascalCase` for types. Type public commands and results, validate input at the adapter boundary, give each business action a stable ID and represent amounts with units and explicit precision.
+
+**Design review.** Keep code that changes together at its owner. Put policy in the owning application or domain component; let adapters translate protocols and storage rather than decide policy. Use a typed boundary when callers need to distinguish identities, units, or missing results. Do not add pass-through layers or copy a model just to satisfy a pattern. Test changes through the calling boundary and assert the effect independently.
 
 **Branches and handoff.** Follow [Contributing](../../../CONTRIBUTING.md): `<type>/<kebab-slug>` for topics (e.g. `feat/7-book-paper-fill`), `codex/<kebab-slug>` for managed worktrees, and conventional PR titles such as `feat(trading): book the first paper fill`. Base a unit PR on the current tip of `feat/flow-01-04`, not on `main`. Fix review findings on the same PR; recheck the new head. Only the same-repository aggregate goes from `feat/flow-<slug>` to `main` for product delivery. An automation must honor the same branch, target and title contract or leave publication to the normal contributor path.
 

@@ -10,6 +10,7 @@ from .paper_account import PaperAccount
 from .paper_execution import (
     PaperIntent,
     VenueExecution,
+    VenuePosition,
     VenueRefused,
     require_separate_journal,
 )
@@ -196,6 +197,22 @@ class FixedQuoteVenue:
         self, account_id: str, order_id: str, *, account_sync: bool = False
     ) -> None:
         return None
+
+    def read_order_position(
+        self, account_id: str, order_id: str
+    ) -> VenuePosition | None:
+        with self._open("ro") as db:
+            row = db.execute(
+                """SELECT target.rules, COALESCE(SUM(booked.quantity), 0)
+                   FROM venue_execution target
+                   LEFT JOIN venue_execution booked ON booked.account_id=target.account_id
+                     AND booked.rules=target.rules AND booked.rowid<=target.rowid
+                     AND booked.fill_id IS NOT NULL
+                   WHERE target.account_id=? AND target.order_id=?
+                   GROUP BY target.order_id""",
+                (account_id, order_id),
+            ).fetchone()
+        return VenuePosition(order_id, account_id, *row) if row else None
 
     @staticmethod
     def _fee_rate(db: sqlite3.Connection) -> int:

@@ -13,9 +13,15 @@ from typing import TYPE_CHECKING
 
 from .company import _connect, _identity
 from .paper_account import reopen_binding
+from .paper_execution import observe_bound_position
 
 if TYPE_CHECKING:
-    from .paper_execution import PaperExecution, VenueCancellation, VenueExecution
+    from .paper_execution import (
+        PaperExecution,
+        VenueCancellation,
+        VenueExecution,
+        VenuePosition,
+    )
     from .writer_lease import WriterLease
 
 
@@ -175,6 +181,7 @@ def _apply_cancellation(
     order_id: str,
     order: tuple,
     evidence: VenueCancellation | None,
+    position: VenuePosition | None,
 ) -> None:
     if evidence is not None:
         if (
@@ -236,16 +243,10 @@ def _apply_cancellation(
         db.execute(
             "UPDATE paper_cancellation SET released=1 WHERE order_id=?", (order_id,)
         )
-    if booked == cumulative == 0 and available_at is None:
-        (position,) = db.execute(
-            """SELECT COALESCE(SUM(f.quantity),0) FROM paper_fill f
-               JOIN paper_order o USING(order_id)
-               WHERE o.account_id=? AND o.instrument_rules_digest=?""",
-            order[1:3],
-        ).fetchone()
+    if booked == cumulative == 0 and available_at is None and position is not None:
         db.execute(
             "UPDATE paper_cancellation SET position_quantity=?,available_at=? WHERE order_id=?",
-            (position, int(time()), order_id),
+            (position.position_quantity, int(time()), order_id),
         )
 
 
@@ -317,6 +318,11 @@ def post_confirmed_fill(
     )
     if not observations and cancellation is None:
         return None
+    position = (
+        observe_bound_position(venue, binding.account, order_id)
+        if cancellation is not None and cancellation.filled_quantity == 0
+        else None
+    )
     with closing(_connect(store, "rw")) as db, db:
         legacy = _has_legacy_order_index(db)
         if legacy:
@@ -345,7 +351,7 @@ def post_confirmed_fill(
             ):
                 raise PostingRefused("Fill does not match admitted order")
             _post_fill(db, order_id, observed)
-        _apply_cancellation(db, order_id, order, cancellation)
+        _apply_cancellation(db, order_id, order, cancellation, position)
         if legacy and db.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise PostingRefused("Legacy fill migration did not retain its references")
         return _completed_posting(db, order_id)
@@ -394,7 +400,7 @@ def read_booked_fill(store: Path, company_id: str, order_id: str) -> Posting | N
 
 
 def capture_position(
-    store: Path, company_id: str, fill_id: str, *, now: int
+    store: Path, company_id: str, fill_id: str, source: VenuePosition, *, now: int
 ) -> PositionObservation:
     with closing(_connect(store, "rw")) as db, db:
         db.execute("BEGIN IMMEDIATE")
@@ -409,18 +415,37 @@ def capture_position(
         )
         db.execute(
             """INSERT INTO paper_position_observation
-               SELECT target.fill_id, SUM(booked.quantity), ?
+               SELECT target.fill_id, ?, ?
                FROM paper_fill target
                JOIN paper_order source ON source.order_id = target.order_id
-               JOIN paper_order related ON related.account_id = source.account_id
-                   AND related.instrument_rules_digest = source.instrument_rules_digest
-               JOIN paper_fill booked ON booked.order_id = related.order_id
-               WHERE target.fill_id = ?
-               GROUP BY target.fill_id
+               WHERE target.fill_id = ? AND source.order_id = ? AND source.account_id = ?
+                 AND source.instrument_rules_digest = ?
                ON CONFLICT(fill_id) DO NOTHING""",
-            (now, fill_id),
+            (
+                source.position_quantity,
+                now,
+                fill_id,
+                source.order_id,
+                source.account_id,
+                source.instrument_rules_digest,
+            ),
         )
-        return read_position(db, company_id, fill_id)
+        recorded = read_position(db, company_id, fill_id)
+        if (
+            recorded.order_id,
+            recorded.account_id,
+            recorded.instrument_rules_digest,
+            recorded.position_quantity,
+        ) != (
+            source.order_id,
+            source.account_id,
+            source.instrument_rules_digest,
+            source.position_quantity,
+        ):
+            raise PostingRefused(
+                "Position evidence conflicts with the recorded observation"
+            )
+        return recorded
 
 
 def read_position(

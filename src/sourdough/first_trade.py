@@ -9,8 +9,13 @@ from typing import Protocol
 from .company import _connect, founding_execution_profile
 from .first_duty import DutyClaim, claim_first_duty
 from .paper_account import reopen_binding
-from .paper_books import Posting, position_quantity, post_confirmed_fill
-from .paper_execution import PaperExecution, PaperIntent, PaperOrderSizing
+from .paper_books import Posting, post_confirmed_fill
+from .paper_execution import (
+    PaperExecution,
+    PaperIntent,
+    PaperOrderSizing,
+    observe_bound_position,
+)
 from .paper_order import submit_paper_order
 from .paper_research import (
     ResearchDecisionReceipt,
@@ -59,7 +64,7 @@ class EmployeeRuntime(Protocol):
 class TradeResult:
     claim: DutyClaim
     order: ToolResult | None
-    position_quantity: int
+    position_quantity: int | None
     research: ResearchDecisionReceipt | None = None
 
 
@@ -135,7 +140,7 @@ def run_first_trade(
             )
     else:
         runtime.run(context, order_tool)
-    return TradeResult(claim, result, position_quantity(store, company_id), research)
+    return _trade_result(store, claim, result, venue, research)
 
 
 def resume_opening_research(
@@ -157,7 +162,26 @@ def resume_opening_research(
             research.decision.limit_minor_units,
         )
         result = _apply_paper_order(store, claim, intent, venue, writer)
-    return TradeResult(claim, result, position_quantity(store, company_id), research)
+    return _trade_result(store, claim, result, venue, research)
+
+
+def _trade_result(
+    store: Path,
+    claim: DutyClaim,
+    result: ToolResult | None,
+    venue: PaperExecution,
+    research: ResearchDecisionReceipt | None,
+) -> TradeResult:
+    position = None
+    if result is not None:
+        account = reopen_binding(store, claim.company_id).account
+        position = observe_bound_position(venue, account, result.order_id)
+    return TradeResult(
+        claim,
+        result,
+        position.position_quantity if position is not None else None,
+        research,
+    )
 
 
 def _apply_paper_order(

@@ -208,12 +208,15 @@ class PaperBooksTests(unittest.TestCase):
                 "INSERT INTO paper_fill_fee VALUES (?,?)",
                 (original.fill_id, original.fee_minor_units),
             )
+        source = self.venue.read_order_position("account", order_id)
         before = capture_position(
-            self.store, self.company_id, original.fill_id, now=101
+            self.store, self.company_id, original.fill_id, source, now=101
         )
         self.assertEqual(self.post(order_id).fill_id, original.fill_id)
         self.assertEqual(
-            capture_position(self.store, self.company_id, original.fill_id, now=102),
+            capture_position(
+                self.store, self.company_id, original.fill_id, source, now=102
+            ),
             before,
         )
         with closing(sqlite3.connect(self.store)) as book:
@@ -324,10 +327,11 @@ class PaperBooksTests(unittest.TestCase):
     def test_book_observation_is_scoped_and_replays_the_captured_revision(self):
         order_id = self.submit(110)
         posting = self.post(order_id)
+        source = self.venue.read_order_position("account", order_id)
         with self.assertRaisesRegex(PostingRefused, "does not exist"):
-            capture_position(self.store, self.company_id, "unposted", now=101)
+            capture_position(self.store, self.company_id, "unposted", source, now=101)
         observation = capture_position(
-            self.store, self.company_id, posting.fill_id, now=101
+            self.store, self.company_id, posting.fill_id, source, now=101
         )
         self.assertEqual(observation.account_id, "account")
         self.assertEqual(observation.instrument_rules_digest, "rules")
@@ -335,11 +339,23 @@ class PaperBooksTests(unittest.TestCase):
         self.assertEqual(observation.position_quantity, 2)
         self.assertEqual(observation.fill_quantity, 2)
         self.assertEqual(observation.available_at, 101)
-        replay = capture_position(self.store, self.company_id, posting.fill_id, now=102)
+        replay = capture_position(
+            self.store, self.company_id, posting.fill_id, source, now=102
+        )
         self.assertEqual(replay, observation)
         self.assertEqual(replay.revision, observation.revision)
         with self.assertRaisesRegex(PostingRefused, "identity mismatch"):
-            capture_position(self.store, "other-company", posting.fill_id, now=102)
+            capture_position(
+                self.store, "other-company", posting.fill_id, source, now=102
+            )
+        with self.assertRaisesRegex(PostingRefused, "conflicts"):
+            capture_position(
+                self.store,
+                self.company_id,
+                posting.fill_id,
+                replace(source, position_quantity=3),
+                now=102,
+            )
 
     def test_replacement_journal_cannot_inherit_dispatch_authority(self):
         replacement = FixedQuoteVenue(self.journal.with_name("replacement.sqlite"))

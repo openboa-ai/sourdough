@@ -13,6 +13,7 @@ from sourdough.paper_execution import (
     PaperExecution,
     PaperOrderSizing,
     VenueExecution,
+    VenuePosition,
     VenueRefused,
 )
 from sourdough.paper_venue import FixedQuoteVenue
@@ -58,6 +59,11 @@ class ExecutionPort(unittest.TestCase):
             )
 
         venue.submit.side_effect = submit
+        venue.read_order_position.side_effect = (
+            lambda account_id, order_id: VenuePosition(
+                order_id, account_id, account.instrument_rules_digest, 7
+            )
+        )
         venue.read_fills.side_effect = lambda account_id, order_id, **_: (
             (execution,)
             if execution is not None
@@ -84,7 +90,74 @@ class ExecutionPort(unittest.TestCase):
         self.assertEqual(reservations_at_send, [(order.order_id, 100)])
         self.assertEqual(order.posting.fill_id, "fill-at-destination")
         self.assertEqual(order.posting.price_minor_units, 99)
-        self.assertEqual(result.first_trade.position_quantity, 1)
+        self.assertEqual(result.first_trade.position_quantity, 7)
+        with closing(sqlite3.connect(self.store)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT fill_id,position_quantity FROM paper_position_observation"
+                ).fetchall(),
+                [("fill-at-destination", 7)],
+            )
+
+    def test_unavailable_position_does_not_finish_the_duty_or_resubmit(self):
+        class PendingPosition(FixedQuoteVenue):
+            position_available = False
+            sends = 0
+
+            def submit(self, order_id, account_id, intent):
+                self.sends += 1
+                super().submit(order_id, account_id, intent)
+
+            def read_order_position(self, account_id, order_id):
+                if self.position_available:
+                    return super().read_order_position(account_id, order_id)
+                return None
+
+        venue = PendingPosition(self.root / "venue.sqlite")
+        account = venue.provision(
+            PaperAccount("account", "fixture", "rules", "USD", 1000, "paper"), 100
+        )
+        company_id = self.company.company_id
+        bind(
+            self.store,
+            PaperMandate("mandate", company_id, "charter", account, 500),
+            venue,
+        )
+        employee = Mock(profile="employee")
+        employee.run.side_effect = lambda context, order: order("action", 1, 100)
+
+        waiting = run_paper_company(
+            self.store, company_id, venue, employee, turn_budget=1
+        )
+        original = waiting.first_trade
+        self.assertIsNotNone(original.order.posting)
+        self.assertIsNone(original.position_quantity)
+        self.assertEqual(waiting.blocked_work, (original.claim.duty_id,))
+        employee.review.assert_not_called()
+
+        venue.position_available = True
+
+        def review(read):
+            observation = read()
+            self.assertEqual(observation["order_id"], original.order.order_id)
+            self.assertEqual(observation["position_quantity"], 1)
+            return {
+                "tool": "record_review_decision",
+                "call_id": "next",
+                "action": "hold",
+                "observation_revision": observation["revision"],
+                "rationale": "The original exposure is confirmed.",
+                "next_check_seconds": 60,
+            }
+
+        employee.review.side_effect = review
+        resumed = run_paper_company(
+            self.store, company_id, venue, employee, turn_budget=1
+        )
+        self.assertEqual(resumed.blocked_work, ())
+        self.assertEqual(resumed.review.claim.founder_id, original.claim.founder_id)
+        self.assertEqual(venue.sends, 1)
+        employee.run.assert_called_once()
 
     def test_fixture_cannot_share_the_company_store_even_through_an_alias(self):
         symbolic = self.root / "symbolic.sqlite"
