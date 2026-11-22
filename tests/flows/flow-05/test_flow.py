@@ -87,6 +87,8 @@ elif operation in ("review_duty", "trade_duty"):
                 observation = json.load(stream)
         revision = observation["revision"]
         rationale = f"Investigate the existing exposure: {observation['position_quantity']} units."
+        if operation == "review_duty" and "current_observation" in observation:
+            rationale += f" Current quote: {observation['current_observation']['quote_minor_units']} minor units."
     result = {
         "tool": "record_review_decision", "call_id": "next", "action": "investigate",
         "rationale": rationale, "observation_revision": revision, "next_check_seconds": 600,
@@ -211,6 +213,13 @@ print(json.dumps(result))
         self.assertEqual(read[:2], (review_claim["duty_id"], review_claim["run_id"]))
         self.assertLessEqual(read[3], saved[3])
         self.assertIn("2 units", saved[4])
+        self.assertIn("Current quote: 100 minor units", saved[4])
+        (quote,) = self.read(
+            self.store,
+            "SELECT run_id, account_id, quote_minor_units, observed_at FROM paper_review_quote",
+        )
+        self.assertEqual(quote[:3], (review_claim["run_id"], "account", 100))
+        self.assertLessEqual(quote[3], read[3])
         next_duty = review["next_duty"]
         self.assertEqual(next_duty["due_at"], saved[3] + 600)
         (pending,) = self.read(
