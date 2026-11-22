@@ -160,7 +160,7 @@ def supervise_paper(
             engine, venue, terms = _prepared(writer, directory)
             tape_revision = None
             worker = "sourdough.nautilus_paper_worker"
-            argument = str(seconds)
+            arguments = [str(seconds)]
         else:
             tape = ReplayTape.load(tape_path)
             installation = prepare_engine(writer, directory, allow_install=False)
@@ -170,7 +170,7 @@ def supervise_paper(
             venue = paper_venue(writer.store, directory, replay=True)
             terms, tape_revision = tape.terms, tape.revision
             worker = "sourdough.nautilus_replay_worker"
-            argument = str(tape_path.resolve())
+            arguments = [str(tape_path.resolve()), str(seconds)]
         _, plan = venue.configuration()
         if (
             plan.company_id != writer.company_id
@@ -188,7 +188,7 @@ def supervise_paper(
             str(Path(__file__).resolve().parents[1]),
             worker,
             str(venue.journal),
-            argument,
+            *arguments,
         ],
         venue.journal,
         company_id,

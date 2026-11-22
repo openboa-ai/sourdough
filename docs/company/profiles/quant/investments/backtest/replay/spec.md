@@ -26,4 +26,8 @@ Replay is historical, not prospective. A passing replay cannot satisfy a current
 
 The managed runtime can bind an isolated replay account to a supplied quote tape by its exact content digest. The tape specifies instrument terms, quote event times and later availability times; missing, unordered or off-increment observations are refused rather than corrected. NautilusTrader's offline backtest engine drives the replay clock and executes the same company-admitted order contract as the forward sandbox. The replay receipt preserves the observed event and decision availability cut, original fill and independent virtual account totals.
 
+Opening research reads the price and the replay generation's sealed availability in one observation. The company selects only research records available at that instant, rounding down when the research source expresses availability in whole seconds. Persist the tape revision, event time and exact availability cut alongside the sealed inputs. A missing or inconsistent replay cut fails closed; the wall clock is not an alternative for selecting historical observations. The wall clock still records operational receipt times and does not authorize a later historical strategy decision.
+
+The offline worker holds the sealed cut while it waits for a command, bounded by the configured activation duration. Live market freshness rules still apply to live-paper observations, not to a paused historical tick. Pausing does not advance simulated time, import another quote or authorize a command from another generation.
+
 The first bounded observation uses one decision, one spot instrument, a full fill and an explicit zero-fee test policy. It does not qualify a complete evaluation window, operating costs or an economic result.

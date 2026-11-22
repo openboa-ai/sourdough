@@ -14,12 +14,46 @@ from time import monotonic, sleep
 
 
 EMPLOYEE = """
-import json, sys
+import json, socket, sys
 request = json.load(sys.stdin)
 if request["operation"] == "identify":
     reply = {"provider": "verification", "model": "one-paper-limit", "revision": "1"}
 elif request["operation"] == "ready":
     reply = {"ready": True}
+elif request["operation"] == "research_duty":
+    def invoke(name, arguments):
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.connect(request["read_endpoint"])
+            connection.sendall(json.dumps({"name": name, "arguments": arguments}).encode() + b"\\n")
+            with connection.makefile() as reader:
+                return json.load(reader)
+
+    inputs = invoke("read_research_inputs", {})
+    first, last = inputs["observations"]
+    assert (first["observation_id"], last["observation_id"]) == ("previous", "available")
+    change = last["price_minor_units"] - first["price_minor_units"]
+    finding = {
+        "snapshot_revision": inputs["revision"],
+        "hypothesis": "Compare two observations available at the sealed cut.",
+        "start_id": first["observation_id"],
+        "end_id": last["observation_id"],
+        "gross_change_minor_units": change,
+        "round_trip_fee_minor_units": 0,
+        "net_change_minor_units": change,
+        "uncertainty": "Historical evidence does not predict a future fill.",
+    }
+    assert "error" in invoke("publish_research_finding", finding | {"end_id": "later"})
+    admitted = invoke("publish_research_finding", finding)
+    reply = invoke("record_research_decision", {
+        "finding_id": admitted["finding_id"],
+        "finding_revision": admitted["revision"],
+        "call_id": "sealed-replay-research",
+        "action": "buy",
+        "quantity": 20,
+        "limit_minor_units": inputs["quote_minor_units"],
+        "next_check_seconds": 60,
+        "rationale": "Exercise the bounded order contract using the recorded research.",
+    })
 else:
     assert request["operation"] == "first_duty"
     ask = request["context"]["quote_minor_units"]
@@ -70,6 +104,7 @@ def observe(
     *,
     restart_engine: bool = False,
     expected_lots: int = 20,
+    research_inputs: list[dict] | None = None,
 ) -> dict:
     if restart_engine and tape is not None:
         raise ValueError("Engine restart observation requires a current-market binding")
@@ -137,7 +172,7 @@ def observe(
                 str(engine),
                 *scope,
                 "--seconds",
-                "22",
+                "22" if tape is None else "60",
                 *source,
             ],
             stdout=stdout,
@@ -161,6 +196,10 @@ def observe(
             )
             assert binding["account"]["environment"] == "paper"
             assert binding["account"]["destination_id"] == prepared["destination_id"]
+            if research_inputs is not None:
+                inputs_path = output / "research.json"
+                inputs_path.write_text(json.dumps(research_inputs))
+                cli("stage-paper-observations", store, inputs_path, *scope)
             result = cli(
                 "operate-nautilus-paper",
                 store,
@@ -286,6 +325,11 @@ def observe(
         "instrument_revision": binding["account"]["instrument_rules_digest"],
         "connector": binding["account"]["connector_revision"],
         "replay_cut": replay_cut,
+        "research_snapshot": (
+            json.loads(rows(store, "SELECT inputs FROM paper_research_snapshot")[0][0])
+            if research_inputs is not None
+            else None
+        ),
         "cancellation": cancellation,
         "engine_worker_pid": ready["pid"],
         "replacement_worker_pid": restarted["pid"] if restarted else None,

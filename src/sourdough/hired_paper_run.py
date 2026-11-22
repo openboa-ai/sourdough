@@ -94,14 +94,16 @@ def _hired_research(
 ) -> tuple[ResearchDecisionReceipt, bool]:
     binding = reopen_binding(writer.store, claim.company_id)
     account = binding.account
+    quote, replay_cut = venue.observe_research_quote(account.account_id)
     research = ResearchTools(
         writer.store,
         claim,
-        venue.observe_quote(account.account_id),
+        quote,
         venue.observe_fee_bps(account.account_id),
         binding.exposure_limit_minor_units,
         writer,
         sizing=venue.observe_order_sizing(account.account_id),
+        replay_cut=replay_cut,
     )
 
     def invoke(name: str, arguments: dict) -> dict:

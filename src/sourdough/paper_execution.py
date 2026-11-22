@@ -31,6 +31,13 @@ class PaperOrderSizing:
 
 
 @dataclass(frozen=True)
+class ReplayAvailability:
+    tape_revision: str
+    event_ns: int
+    available_ns: int
+
+
+@dataclass(frozen=True)
 class VenueExecution:
     order_id: str
     account_id: str
@@ -72,6 +79,10 @@ class PaperExecution(PaperDestination, Protocol):
     def require_independent_from(self, company_store: Path) -> None: ...
 
     def observe_quote(self, account_id: str) -> int: ...
+
+    def observe_research_quote(
+        self, account_id: str
+    ) -> tuple[int, ReplayAvailability | None]: ...
 
     def observe_order_sizing(self, account_id: str) -> PaperOrderSizing | None: ...
 

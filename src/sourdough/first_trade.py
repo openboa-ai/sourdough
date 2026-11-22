@@ -81,11 +81,15 @@ def run_first_trade(
     account = binding.account
     if venue.observe_account(account.account_id) != account:
         raise TradeRefused("Paper destination does not match the bound account")
-    quote = venue.observe_quote(account.account_id)
     sizing = venue.observe_order_sizing(account.account_id)
     with closing(_connect(store, "ro")) as db:
         configured = founding_execution_profile(db, company_id)
         research_required = requires_research(db, company_id)
+    quote, replay_cut = (
+        venue.observe_research_quote(account.account_id)
+        if research_required
+        else (venue.observe_quote(account.account_id), None)
+    )
     if configured != runtime.profile:
         raise TradeRefused("Employee process does not match the configured profile")
     runtime.check_ready()
@@ -124,6 +128,7 @@ def run_first_trade(
             binding.exposure_limit_minor_units,
             writer,
             sizing=sizing,
+            replay_cut=replay_cut,
         )
         try:
             runtime.research(tools.invoke)

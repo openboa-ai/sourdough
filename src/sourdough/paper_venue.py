@@ -162,6 +162,9 @@ class FixedQuoteVenue:
             raise VenueRefused("Unknown destination account")
         return row[0]
 
+    def observe_research_quote(self, account_id: str) -> tuple[int, None]:
+        return self.observe_quote(account_id), None
+
     def observe_order_sizing(self, account_id: str) -> None:
         self.observe_account(account_id)
 
