@@ -7,28 +7,25 @@ from pathlib import Path
 from time import monotonic, sleep, time
 
 from .company import _connect, upgrade_work_schema
-from .company_run import PositionReview, _book_reference, _review
+from .company_run import PositionReview, _book_reference, _recover, _review
 from .duty_run import (
     PAPER_EXECUTION,
     POSITION_REVIEW,
     DutyClaim,
     DutyRefused,
     count_company_runs,
-    resolve_run,
 )
 from .employee_process import EmployeeProcess
-from .first_duty import FIRST_DUTY_SCOPE
 from .first_trade import TradeRefused, _apply_paper_order
 from .hiring_run import HiringRun, prepare_hiring
 from .onboarding import (
     first_duty_accepted,
-    has_hired_acceptance,
     has_hired_turn,
     invoke_onboarding,
 )
 from .paper_account import reopen_binding
 from .paper_order import PaperIntent
-from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
+from .paper_reconcile import PaperReconciliation
 from .paper_research import (
     ResearchDecisionReceipt,
     ResearchTools,
@@ -41,8 +38,8 @@ from .work import (
     FollowUp,
     ResultReference,
     claim_bound_position_review,
+    finish_first_duty,
     owed_follow_up_owner,
-    schedule_follow_up,
 )
 from .writer_lease import WriterLease, hold_company_writer
 
@@ -53,6 +50,7 @@ class HiredPaperRun:
     research: ResearchDecisionReceipt | None
     reconciliation: PaperReconciliation
     review: PositionReview | None
+    blocked_work: tuple[str, ...] = ()
 
 
 def _settle_opening(
@@ -62,38 +60,7 @@ def _settle_opening(
     result: ResultReference,
 ) -> FollowUp:
     writer.verify_for(writer.store, claim.company_id)
-    with closing(_connect(writer.store, "rw")) as connection, connection:
-        connection.execute("BEGIN IMMEDIATE")
-        authority = resolve_run(connection, claim)
-        if (
-            not authority.is_current
-            or authority.purpose != PAPER_EXECUTION
-            or authority.issued_scope != FIRST_DUTY_SCOPE
-            or not has_hired_acceptance(connection, claim)
-        ):
-            raise DutyRefused("Paper result does not belong to the admitted hired duty")
-        if authority.duty_state == "settled":
-            existing = connection.execute(
-                """SELECT duty_id, due_at, purpose, result_kind, result_id, result_revision, available_at
-                   FROM work_follow_up WHERE previous_duty_id=?""",
-                (claim.duty_id,),
-            ).fetchone()
-            if (
-                existing is not None
-                and (existing[1], existing[2]) == (receipt.next_due_at, POSITION_REVIEW)
-                and ResultReference(*existing[3:]) == result
-            ):
-                return FollowUp(existing[0], existing[1], result, POSITION_REVIEW)
-        if authority.duty_state != "running":
-            raise DutyRefused("Hired paper duty cannot be settled")
-        return schedule_follow_up(
-            connection,
-            claim,
-            FIRST_DUTY_SCOPE,
-            result,
-            receipt.next_due_at,
-            purpose=POSITION_REVIEW,
-        )
+    return finish_first_duty(writer.store, claim, result, due_at=receipt.next_due_at)
 
 
 def _hired_research(
@@ -190,15 +157,7 @@ def run_hired_paper_company(
         raise TradeRefused("Company store and venue journal must be separate")
     with hold_company_writer(store, company_id, expected_store_key=store_key) as writer:
         upgrade_work_schema(store, company_id)
-        reconciled = reconcile_paper_orders(
-            store, company_id, venue, now=int(time()), writer=writer
-        )
-        for original in reconciled.recovered:
-            receipt = reopen_research_decision(store, original.original_claim)
-            if receipt is None:
-                raise DutyRefused("Recovered hired order has no authored decision")
-            result = _book_reference(store, company_id, original.posting)
-            _settle_opening(writer, original.original_claim, receipt, result)
+        reconciled, blocked = _recover(writer, venue, POSITION_REVIEW)
         on_ready(writer)
         used = count_company_runs(store, company_id) - budget_from
         if used < 0:
@@ -206,9 +165,11 @@ def run_hired_paper_company(
                 "Company run history is behind the hired paper activation"
             )
         remaining = max(0, turn_budget - used)
-        if not remaining or reconciled.unresolved:
-            return HiredPaperRun(None, None, reconciled, None)
-        agent_id = owed_follow_up_owner(store, company_id, POSITION_REVIEW)
+        if not remaining or reconciled.unresolved or blocked:
+            return HiredPaperRun(None, None, reconciled, None, blocked)
+        agent_id = owed_follow_up_owner(
+            store, company_id, POSITION_REVIEW, hired_only=True
+        )
         employee = runtime()
         hiring = None
         research = None
@@ -219,7 +180,9 @@ def run_hired_paper_company(
                 return HiredPaperRun(hiring, None, reconciled, None)
             research = _hired_research(writer, claim, venue, employee)
             hiring = replace(hiring, accepted=True)
-            agent_id = owed_follow_up_owner(store, company_id, POSITION_REVIEW)
+            agent_id = owed_follow_up_owner(
+                store, company_id, POSITION_REVIEW, hired_only=True
+            )
             remaining -= 2
         if agent_id is None or not remaining:
             return HiredPaperRun(hiring, research, reconciled, None)

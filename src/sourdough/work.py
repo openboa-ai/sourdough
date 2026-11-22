@@ -232,13 +232,23 @@ def claim_bound_position_review(
     )
 
 
-def owed_follow_up_owner(store: Path, company_id: str, purpose: str) -> str | None:
+def owed_follow_up_owner(
+    store: Path, company_id: str, purpose: str, *, hired_only: bool = False
+) -> str | None:
     with closing(_connect(store, "ro")) as connection:
         _check_store(connection, company_id)
+        join = ""
+        if hired_only:
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE name='hire_receipt' AND type='table'"
+            ).fetchone():
+                return None
+            join = "JOIN hire_receipt h ON h.agent_id=a.id"
         row = connection.execute(
-            """SELECT a.id FROM work_follow_up w
+            f"""SELECT a.id FROM work_follow_up w
                JOIN duty d ON d.id=w.duty_id AND d.state='scheduled'
                JOIN agent a ON a.id=d.agent_id AND a.company_id=?
+               {join}
                WHERE w.purpose=? ORDER BY w.due_at,d.id LIMIT 1""",
             (company_id, purpose),
         ).fetchone()

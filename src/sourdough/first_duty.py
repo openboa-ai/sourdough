@@ -13,6 +13,7 @@ from .duty_run import (
     resolve_run,
     start_run,
 )
+from .onboarding import has_hired_acceptance
 
 
 FIRST_DUTY_SCOPE = "paper"
@@ -61,14 +62,14 @@ def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> Du
 
 def resolve_first_run(connection: sqlite3.Connection, claim: DutyClaim) -> RunAuthority:
     authority = resolve_run(connection, claim)
-    if (
-        authority.purpose != PAPER_EXECUTION
-        or not connection.execute(
-            "SELECT 1 FROM founding_receipt WHERE company_id = ? AND due_work_id = ?",
-            (claim.company_id, claim.duty_id),
-        ).fetchone()
+    founder = connection.execute(
+        "SELECT 1 FROM founding_receipt WHERE company_id = ? AND due_work_id = ?",
+        (claim.company_id, claim.duty_id),
+    ).fetchone()
+    if authority.purpose != PAPER_EXECUTION or (
+        founder is None and not has_hired_acceptance(connection, claim)
     ):
-        raise DutyRefused("Claim is not the original founding duty")
+        raise DutyRefused("Claim is not an admitted original paper duty")
     return authority
 
 
