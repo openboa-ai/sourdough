@@ -2,20 +2,26 @@
 
 Start at the [implementation architecture](../implementation-architecture.md) for dependency direction, transaction boundaries, version compatibility and operating limits. Change the owning spec if a decision changes; do not copy these rules into every unit.
 
-## Keeping a change maintainable
+## What blocks a change
 
-- **Localize the next edit.** Put a rule where its owner changes it. Fix derived views at their source and check the consumer's result. Keep a direct call unless a boundary hides a real dependency or enforces a guarantee; similar-looking code with different policies need not share a helper.
-- **Preserve meaning across implementations.** An adapter may change the transport, not what its caller can infer. An unanswered order is not a rejection. Run the same relevant contract cases against each supported adapter; declare unsupported operations instead of silently approximating them.
-- **Make effects easy to trace.** Keep the authority check, state transition and commit boundary visible. Commit related local facts together; never wait for an external call inside that transaction. Distinguish a safe replay from a new request with conflicting terms.
-- **Test what the next consumer sees.** Exercise the public entry point and inspect its result independently, not its helper-call sequence. For [founding](../../company/systems/organization/found-company/bootstrap/spec.md), lose the reply after commit and repeat setup: the receipt must identify the same company, founder, grant and duty, with no new records. Renaming a private helper must not break that test.
+1. **Change a decision at its owner.** Fix a derived view at its source and exercise its consumer. A limit that needs independent edits in Risk and the Client has two owners.
+2. **Keep the shortest path that preserves the guarantee.** Introduce a boundary to hide a real dependency or enforce a contract. Founding must not import a trading SDK; it does not need a pass-through service for every table either.
+3. **Preserve the caller's contract.** A new adapter must pass the shared cases for success, rejection, unknown outcomes and replay where supported. Report unsupported operations explicitly. A timeout is not a rejection.
+4. **Make each effect traceable.** Check authority at use; commit related local facts and their receipt together. Keep external waits outside that transaction. Replay the same identity only for matching terms; resolve an uncertain external effect before sending again.
+5. **Keep the judge independent.** Test the public entry point against separately observed effects. Tests can ship with code; skipping a failing case or relaxing its expected outcome to pass is not a fix. Change the owning spec explicitly if the contract itself must change.
+6. **Leave a reproducible handoff.** In the PR's existing Verification section, give the tested commit, command, expected and observed result, and anything not verified. A blocking finding must name the broken promise or concrete maintenance cost. Recheck the affected behavior on the final head, not settled style preferences or unrelated defects.
 
-Apply only the criteria the change touches. Block a broken guarantee or needless coupling, not a preference for another directory layout or design pattern.
+**Apply checks by risk.** Block authority bypass, wrong destinations, wrong amounts or units, duplicate effects, data loss and weakened acceptance from first use. Check an old store on a format change and check regeneration against its source when generated outputs are introduced. Turn recurring defects into the cheapest check that rejects a known bad change and accepts a sound one. Tune or remove noisy checks without dropping coverage of a required outcome.
+
+**First use — [founding](../../company/systems/organization/found-company/bootstrap/spec.md).** Lose the reply after commit and repeat setup. Independently reopen the store: there must be one company, founder, grant and first duty, each identified by the receipt. Returning the old receipt while inserting another duty must fail. Changing the terms under the same request ID must be rejected without changing those records. A private-helper rename alone must not break the test. This proves founding, not a trade.
+
+## Implementation defaults
 
 **Stack.** Start with one Python package under `src/sourdough/` and a transactional SQLite store. The company owns identity, grants and work; the fund owns paper accounts, orders and positions. Neither the Agent nor the Client writes directly to the books. Keep the trading SDK behind the company-managed execution adapter; use Yogurt only in the Client build. Separate the macOS supervisor when implementing recovery, not as a prerequisite for the first trade.
 
 **First package.** Pin a tested CPython patch in `.python-version`. Declare the package, entry point and build backend in `pyproject.toml`. Pin Ruff, the backend and other CI tools with hashes in `requirements-dev.lock`. Use the standard library for founding. Add modules with their first use; do not create a service per spec.
 
-**Code.** Use glossary terms, `snake_case` for Python modules/functions and `PascalCase` for types. Type public commands and results; distinguish rejected, unknown and confirmed effects. Validate input at the adapter boundary. Give each record one writer and each business action a stable ID. Represent amounts with units and explicit precision; never resubmit an order just because its result is unknown.
+**Code.** Use glossary terms, `snake_case` for Python modules/functions and `PascalCase` for types. Type public commands and results, validate input at the adapter boundary, give each business action a stable ID and represent amounts with units and explicit precision.
 
 **Branches and handoff.** Follow [Contributing](../../../CONTRIBUTING.md): `<type>/<kebab-slug>` for topics (e.g. `feat/7-book-paper-fill`), `codex/<kebab-slug>` for managed worktrees, and conventional PR titles such as `feat(trading): book the first paper fill`. Base a unit PR on the current tip of `feat/flow-01-04`, not on `main`. Fix review findings on the same PR; recheck the new head. Only the same-repository aggregate goes from `feat/flow-<slug>` to `main` for product delivery. An automation must honor the same branch, target and title contract or leave publication to the normal contributor path.
 
@@ -53,5 +59,3 @@ python -m ruff format --check src tests
 python -m ruff check src tests
 python -I .github/scripts/run_required_tests.py tests/unit
 ```
-
-**Review.** Who is permitted to act? Which record changed, and can the next consumer read the correct result? Can a retry duplicate an effect? Block missing authority, wrong destinations, false evidence and lost or duplicate postings. Leave unrelated naming preferences, future abstractions and later qualification work out of the feature PR. Verify required checks and owner reviews on the final head; never bypass branch protection.
