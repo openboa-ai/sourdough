@@ -101,6 +101,7 @@ def _hired_research(
         venue.observe_fee_bps(account.account_id),
         binding.exposure_limit_minor_units,
         writer,
+        sizing=venue.observe_order_sizing(account.account_id),
     )
 
     def invoke(name: str, arguments: dict) -> dict:
