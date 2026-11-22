@@ -48,9 +48,22 @@ class ConnectedFlow(unittest.TestCase):
 
     def test_end_to_end(self):
         tape = Path(__file__).with_name("causal-quotes.json")
+        research = [
+            {
+                "observation_id": identity,
+                "price_minor_units": price,
+                "observed_at": event,
+                "available_at": available,
+            }
+            for identity, price, event, available in (
+                ("previous", 49_000_000, 1699999998, 1699999999),
+                ("available", 50_000_000, 1700000000, 1700000000),
+                ("later", 70_000_000, 1700000001, 1700000002),
+            )
+        ]
         with TemporaryDirectory() as scratch:
             results = [
-                observe(Path(scratch) / name, None, tape)
+                observe(Path(scratch) / name, None, tape, research_inputs=research)
                 for name in ("first", "independent")
             ]
         expected_cut = {
@@ -63,6 +76,17 @@ class ConnectedFlow(unittest.TestCase):
             self.assertIsNone(result["market_activation"])
             self.assertEqual(result["connector"], "nautilus-offline-spot-replay-v1")
             self.assertEqual(result["replay_cut"], expected_cut)
+            snapshot = result["research_snapshot"]
+            self.assertEqual(snapshot["observations"], research[:2])
+            self.assertEqual(snapshot["cut_at"], 1700000000)
+            self.assertEqual(
+                snapshot["replay_cut"],
+                {
+                    key: item
+                    for key, item in expected_cut.items()
+                    if key != "price_atoms_per_lot"
+                },
+            )
             self.assertEqual(result["posting"]["price_minor_units"], 50_000_000)
             self.assertEqual(result["posting"]["fee_minor_units"], 0)
             self.assertEqual(

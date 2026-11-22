@@ -18,7 +18,9 @@ from .replay_tape import ReplayTape
 from .spot_cash import QUOTE_SCALE, SpotCashUnits
 
 
-def run(venue: NautilusPaperVenue, tape: ReplayTape, ready_fd: int) -> None:
+def run(
+    venue: NautilusPaperVenue, tape: ReplayTape, ready_fd: int, seconds: int
+) -> None:
     from nautilus_trader.backtest.engine import BacktestEngine
     from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
     from nautilus_trader.model.data import QuoteTick
@@ -100,7 +102,7 @@ def run(venue: NautilusPaperVenue, tape: ReplayTape, ready_fd: int) -> None:
                     "store_key": key,
                 }
                 os.write(ready_fd, json.dumps(payload).encode() + b"\n")
-                deadline = monotonic() + 10
+                deadline = monotonic() + seconds
                 while monotonic() < deadline:
                     command = venue.claim_command(generation)
                     if command is not None:
@@ -188,6 +190,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("journal", type=Path)
     parser.add_argument("tape", type=Path)
+    parser.add_argument("seconds", type=int)
     parser.add_argument("--ready-fd", required=True, type=int)
     parser.add_argument("--store-key", required=True)
     args = parser.parse_args()
@@ -203,11 +206,12 @@ def main() -> None:
         if (
             journal_key(lease_file) != (info.st_dev, info.st_ino)
             or args.store_key != f"{identity[0]}:{identity[1]}"
+            or not 1 <= args.seconds <= 600
         ):
             raise VenueRefused("Original replay journal does not match")
         venue = NautilusPaperVenue(args.journal)
         venue.start_generation()
-        run(venue, ReplayTape.load(args.tape), args.ready_fd)
+        run(venue, ReplayTape.load(args.tape), args.ready_fd, args.seconds)
     finally:
         os.close(args.ready_fd)
         os.close(descriptor)

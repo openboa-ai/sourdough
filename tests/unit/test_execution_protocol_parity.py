@@ -102,6 +102,9 @@ class WireVenue:
         self.observe_account(account_id)
         return self.call("account")["mark"]
 
+    def observe_research_quote(self, account_id):
+        return self.observe_quote(account_id), None
+
     def observe_fee_bps(self, account_id):
         self.observe_account(account_id)
         return self.call("account")["takerBps"]

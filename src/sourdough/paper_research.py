@@ -16,7 +16,7 @@ from .first_duty import require_historical_claim, require_paper_authority
 from .onboarding import has_hired_acceptance
 from .paper_account import PaperAccount, reopen_binding, was_applied_binding_change
 from .paper_decision import PaperDecision
-from .paper_execution import PaperOrderSizing
+from .paper_execution import PaperOrderSizing, ReplayAvailability
 from .writer_lease import WriterLease
 
 
@@ -199,6 +199,7 @@ class ResearchTools:
     exposure_limit_minor_units: int
     writer: WriterLease | None = None
     sizing: PaperOrderSizing | None = None
+    replay_cut: ReplayAvailability | None = None
 
     def invoke(self, name: str, arguments: dict, *, now: int | None = None) -> dict:
         if self.writer is not None:
@@ -219,6 +220,9 @@ class ResearchTools:
 
     def _snapshot(self, connection: Connection, now: int) -> dict:
         account = reopen_binding(self.store, self.claim.company_id).account
+        provenance = asdict(self.replay_cut) if self.replay_cut is not None else None
+        if self.replay_cut is not None:
+            now = self.replay_cut.available_ns // 10**9
         connection.execute(
             """CREATE TABLE IF NOT EXISTS paper_research_snapshot (
                 run_id TEXT PRIMARY KEY NOT NULL REFERENCES duty_run(run_id),
@@ -234,6 +238,10 @@ class ResearchTools:
             if _digest(row[1]) != row[0] or not _matches_account(snapshot, account):
                 raise DutyRefused(
                     "Original research snapshot belongs to another binding"
+                )
+            if snapshot.get("replay_cut") != provenance:
+                raise DutyRefused(
+                    "Original research snapshot belongs to a different replay cut"
                 )
             return snapshot | {"revision": row[0]}
         plan = _plan(connection, self.claim.company_id, account)
@@ -258,6 +266,8 @@ class ResearchTools:
         )
         if self.sizing is not None:
             inputs["order_sizing"] = asdict(self.sizing)
+        if provenance is not None:
+            inputs["replay_cut"] = provenance
         body = _json(inputs)
         revision = _digest(body)
         connection.execute(
@@ -300,6 +310,8 @@ class ResearchTools:
             or _digest(snapshot[1]) != snapshot[0]
         ):
             raise DutyRefused("Finding must cite this run's research input revision")
+        if self.replay_cut is not None:
+            self._snapshot(connection, now)
         inputs = json.loads(snapshot[1])
         observations = {item["observation_id"]: item for item in inputs["observations"]}
         start, end = (
@@ -362,6 +374,8 @@ class ResearchTools:
             or _digest(published[3]) != published[1]
         ):
             raise DutyRefused("Decision must cite the earlier finding from this run")
+        if self.replay_cut is not None:
+            self._snapshot(connection, now)
         fields = {
             key: value
             for key, value in proposal.items()

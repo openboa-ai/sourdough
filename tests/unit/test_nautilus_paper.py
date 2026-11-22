@@ -59,6 +59,20 @@ class NautilusPaperPort(unittest.TestCase):
         with self.assertRaisesRegex(VenueRefused, "original account"):
             reopened.provision(replace(self.plan, tape_revision="1" * 64))
 
+    def test_replay_quote_requires_sealed_cut_but_not_fresh_wall_time(self):
+        revision = "1" * 64
+        self.venue.provision(replace(self.plan, tape_revision=revision))
+        balance = self.venue.start_generation()
+        self.venue.prove_account("offline", "BINANCE-001", "USDT", balance)
+        self.venue.publish_quote("offline", 50_000_000, 100, 90)
+        with self.assertRaisesRegex(VenueRefused, "sealed availability cut"):
+            self.venue.observe_quote("paper")
+        self.venue.publish_replay_cut("offline", 50_000_000, 90, 101)
+        with patch("sourdough.nautilus_paper.time_ns", return_value=time_ns() + 10**12):
+            price, cut = self.venue.observe_research_quote("paper")
+        self.assertEqual((price, cut.tape_revision), (50_000_000, revision))
+        self.assertEqual((cut.event_ns, cut.available_ns), (90, 101))
+
     def test_invalid_managed_terms_never_reserve_or_reach_the_venue(self):
         store = self.venue.journal.with_name("company.sqlite")
         founded = found(store, FoundingTerms("setup", "charter", "paper", "runtime"))

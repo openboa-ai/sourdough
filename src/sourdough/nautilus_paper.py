@@ -15,6 +15,7 @@ from .paper_account import PaperAccount
 from .paper_execution import (
     PaperIntent,
     PaperOrderSizing,
+    ReplayAvailability,
     VenueCancellation,
     VenueExecution,
     VenuePosition,
@@ -217,9 +218,9 @@ class NautilusPaperVenue:
             identity,
         )
 
-    def _fresh_quote(
+    def _quote_observation(
         self, connection: sqlite3.Connection, generation: str | None = None
-    ) -> int:
+    ) -> tuple[int, ReplayAvailability | None]:
         row = connection.execute(
             """SELECT price_atoms_per_lot,received_ns,exchange_trade_ns,generation
                FROM sandbox_quote"""
@@ -228,23 +229,34 @@ class NautilusPaperVenue:
         _, plan = self._configuration(connection)
         if (
             row is None
-            or not 0 <= now - row[1] <= _STALE_NS
-            or (plan.tape_revision is None and not 0 <= now - row[2] <= _STALE_NS)
             or (generation is not None and row[3] != generation)
+            or (
+                plan.tape_revision is None
+                and not (
+                    0 <= now - row[1] <= _STALE_NS and 0 <= now - row[2] <= _STALE_NS
+                )
+            )
         ):
             raise VenueRefused(
                 "Sandbox has no fresh quote and supporting exchange trade"
             )
-        return row[0]
+        if plan.tape_revision is None:
+            return row[0], None
+        cut = connection.execute(
+            """SELECT event_ns,available_ns FROM replay_decision_cut
+               WHERE generation=? AND price_atoms_per_lot=? AND event_ns=?""",
+            (row[3], row[0], row[2]),
+        ).fetchone()
+        if cut is None or not 0 < cut[0] <= cut[1]:
+            raise VenueRefused("Replay requires the current sealed availability cut")
+        return row[0], ReplayAvailability(plan.tape_revision, *cut)
 
     def observe_account(self, account_id: str) -> PaperAccount:
         with self._connect("ro") as connection:
             return self._account(connection, account_id)
 
     def observe_quote(self, account_id: str) -> int:
-        with self._connect("ro") as connection:
-            self._account(connection, account_id)
-            return self._fresh_quote(connection)
+        return self.observe_research_quote(account_id)[0]
 
     def observe_order_sizing(self, account_id: str) -> PaperOrderSizing:
         with self._connect("ro") as connection:
@@ -261,6 +273,14 @@ class NautilusPaperVenue:
                 units.lots(Decimal(terms.minimum_quantity)),
                 units.quote_atoms(Decimal(terms.minimum_notional)),
             )
+
+    def observe_research_quote(
+        self, account_id: str
+    ) -> tuple[int, ReplayAvailability | None]:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            self._account(connection, account_id)
+            return self._quote_observation(connection)
 
     def observe_drained_account(self, account_id: str) -> PaperAccount | None:
         with self._connect("ro") as connection:
@@ -584,7 +604,7 @@ class NautilusPaperVenue:
             ).fetchone()
             if row is None:
                 return None
-            self._fresh_quote(connection, generation)
+            self._quote_observation(connection, generation)
             connection.execute(
                 "UPDATE sandbox_order SET state='dispatching',generation=? WHERE order_id=?",
                 (generation, row[0]),
