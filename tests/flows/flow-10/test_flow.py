@@ -211,8 +211,8 @@ def seed_assessment_reviews(store, company, profile, now):
                 )
 
 
-class CompanyShifts(unittest.TestCase):
-    def test_sequential_agents_offer_accept_and_review_with_the_client_closed(self):
+class ConnectedFlow(unittest.TestCase):
+    def test_end_to_end(self):
         with TemporaryDirectory() as scratch:
             root = Path(scratch)
             employee, store = root / "employee", root / "company.sqlite"
