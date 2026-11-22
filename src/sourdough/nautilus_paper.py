@@ -153,7 +153,7 @@ class NautilusPaperVenue:
                 "SELECT destination_id,plan FROM sandbox_config WHERE singleton=1"
             ).fetchone()
             if row is not None:
-                if row[1] != terms:
+                if self._read_plan(row[1]) != plan:
                     raise VenueRefused(
                         "Sandbox plan does not match the original account"
                     )
@@ -170,9 +170,13 @@ class NautilusPaperVenue:
         ).fetchone()
         if row is None:
             raise VenueRefused("Sandbox account has not been provisioned")
-        terms = json.loads(row[1])
+        return row[0], self._read_plan(row[1])
+
+    @staticmethod
+    def _read_plan(content: str) -> SandboxPlan:
+        terms = json.loads(content)
         terms["terms"] = SpotInstrumentTerms(**terms["terms"])
-        return row[0], SandboxPlan(**terms)
+        return SandboxPlan(**terms)
 
     def configuration(self) -> tuple[str, SandboxPlan]:
         with self._connect("ro") as connection:
