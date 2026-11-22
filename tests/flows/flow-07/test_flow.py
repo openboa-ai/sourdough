@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from observe_paper import observe
 
 
-class OfflineReplay(unittest.TestCase):
+class ConnectedFlow(unittest.TestCase):
     def test_zero_fill_schedules_the_original_agents_follow_up(self):
         tape = Path(__file__).with_name("causal-quotes.json")
         with TemporaryDirectory() as scratch:
@@ -46,7 +46,7 @@ class OfflineReplay(unittest.TestCase):
         )
         self.assertTrue(result["verified_after_engine_exit"])
 
-    def test_reproducible_first_decision_as_of_quote_availability(self):
+    def test_end_to_end(self):
         tape = Path(__file__).with_name("causal-quotes.json")
         with TemporaryDirectory() as scratch:
             results = [
