@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from time import time
+from time import monotonic, sleep, time
 
 from .duty_run import DutyClaim
 from .employee_process import EmployeeProcess
@@ -74,6 +74,15 @@ def prepare_hiring(
 
     hire_id = outcome.hire.agent_id
     status = provision_hire(writer, hire_id, first_purpose, ready, now=int(time()))
+    deadline = monotonic() + 125
+    while status.first_duty_id is None and status.retry_at is not None:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        wait = max(0, status.retry_at - time())
+        if wait:
+            sleep(min(wait, remaining))
+        status = provision_hire(writer, hire_id, first_purpose, ready, now=int(time()))
     return HiringRun(
         manager, outcome, status, claim_hired_first(writer, hire_id, runtime.profile)
     )

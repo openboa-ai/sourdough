@@ -28,6 +28,7 @@ from sourdough.first_trade import TradeRefused
 from sourdough.onboarding import (
     accept_first_duty,
     claim_hired_first,
+    invoke_onboarding,
     provision_hire,
     read_first_duty,
 )
@@ -253,6 +254,8 @@ class Staffing(unittest.TestCase):
         self.assertEqual(context["charter_revision"], "charter")
         self.assertEqual(context["assignment_summary"], "Investigate book exceptions")
         self.assertEqual(context["granted_scope"], "assessment")
+        with self.assertRaisesRegex(DutyRefused, "not available|unavailable"):
+            invoke_onboarding(self.writer, hire, "paper_buy", {"quantity": 1})
         self.assertEqual(read_first_duty(self.writer, hire), context)
         for attempt in range(2):
             self.assertEqual(
