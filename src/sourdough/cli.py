@@ -17,13 +17,24 @@ from sourdough.first_duty import DutyRefused
 from sourdough.first_trade import TradeRefused, run_first_trade
 from sourdough.hired_paper_run import run_hired_paper_company
 from sourdough.hiring_run import run_hiring
+from sourdough.market_runtime import observe_market
+from sourdough.market_worker import MarketRefused
+from sourdough.nautilus_runtime import bind_paper as bind_nautilus_paper
+from sourdough.nautilus_runtime import (
+    paper_venue,
+    prepare_paper,
+    supervise_paper,
+    switch_paper,
+)
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
+from sourdough.paper_execution import VenueRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
-from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
+from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
+from sourdough.trading_engine import EngineRefused, prepare_engine
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 from sourdough.work_projection import read_local_board_timeline
 
@@ -73,6 +84,8 @@ def _start_supervisor(args):
     ]
     if getattr(args, "repeat_paper", False):
         command.append("--repeat-paper")
+    if getattr(args, "managed_engine", False):
+        command.append("--managed-engine")
     return supervise_worker(
         command,
         args.store,
@@ -81,6 +94,20 @@ def _start_supervisor(args):
         startup_seconds=args.startup_seconds,
         max_seconds=args.max_seconds,
         emit=lambda event: print(json.dumps(event), file=sys.stderr, flush=True),
+    )
+
+
+def _paper_destination(args):
+    if getattr(args, "managed_engine", False):
+        return paper_venue(args.store, args.journal)
+    return FixedQuoteVenue(args.journal)
+
+
+def _managed_destination_flag(command):
+    command.add_argument(
+        "--managed-engine",
+        action="store_true",
+        help="Use the original managed engine directory instead of a fixture journal",
     )
 
 
@@ -110,6 +137,50 @@ def main() -> int:
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
     profile.add_argument("--sandbox", help="User-selected sandbox backend")
+    engine = commands.add_parser("prepare-trading-engine")
+    engine.add_argument("store", type=Path)
+    engine.add_argument("directory", type=Path)
+    engine.add_argument("--company-id", required=True)
+    engine.add_argument("--wheelhouse", type=Path)
+    market = commands.add_parser("observe-trading-market")
+    market.add_argument("store", type=Path)
+    market.add_argument("directory", type=Path)
+    market.add_argument("--company-id", required=True)
+    market.add_argument("--symbol", required=True)
+    market.add_argument("--max-age-seconds", type=int, default=15)
+    market.add_argument("--samples", type=int, default=3)
+    for command in (
+        "prepare-nautilus-paper",
+        "bind-nautilus-paper",
+        "switch-nautilus-paper",
+        "serve-nautilus-paper",
+        "operate-nautilus-paper",
+    ):
+        sandbox = commands.add_parser(command)
+        sandbox.add_argument("store", type=Path)
+        sandbox.add_argument("directory", type=Path)
+        sandbox.add_argument("--company-id", required=True)
+        if command == "prepare-nautilus-paper":
+            sandbox.add_argument("--account-id", required=True)
+            sandbox.add_argument("--starting-atoms", required=True, type=int)
+            sandbox.add_argument("--replay-tape", type=Path)
+        elif command in ("bind-nautilus-paper", "switch-nautilus-paper"):
+            sandbox.add_argument("--revision", required=True)
+            sandbox.add_argument("--charter-revision", required=True)
+            sandbox.add_argument("--exposure-atoms", required=True, type=int)
+            sandbox.add_argument("--replay", action="store_true")
+            if command == "switch-nautilus-paper":
+                sandbox.add_argument("--previous-directory", type=Path, required=True)
+                sandbox.add_argument("--previous-revision", required=True)
+                sandbox.add_argument("--from-replay", action="store_true")
+        elif command == "serve-nautilus-paper":
+            sandbox.add_argument("--seconds", type=int, default=60)
+            sandbox.add_argument("--replay-tape", type=Path)
+        else:
+            sandbox.add_argument("--employee", type=Path, required=True)
+            sandbox.add_argument("--turn-budget", type=int, default=1)
+            sandbox.add_argument("--idle-seconds", type=int, default=0)
+            sandbox.add_argument("--replay", action="store_true")
     paper = commands.add_parser("bind-paper")
     paper.add_argument("store", type=Path)
     paper.add_argument("journal", type=Path)
@@ -140,6 +211,7 @@ def main() -> int:
         managed.add_argument("store", type=Path)
         if "hired-paper" in command:
             managed.add_argument("journal", type=Path)
+            _managed_destination_flag(managed)
         managed.add_argument("--company-id", required=True)
         managed.add_argument("--employee", type=Path, required=True)
         managed.add_argument("--turn-budget", type=int, default=3)
@@ -166,6 +238,7 @@ def main() -> int:
         running.add_argument("--company-id", required=True)
         running.add_argument("--employee", type=Path, required=True)
         if command != "first-duty":
+            _managed_destination_flag(running)
             running.add_argument("--repeat-paper", action="store_true")
             running.add_argument("--turn-budget", type=int, default=2)
             running.add_argument("--idle-seconds", type=int, default=0)
@@ -206,12 +279,84 @@ def main() -> int:
                 selection["sandbox_backend"] = employee.sandbox_backend
             print(json.dumps(selection))
             return 0
+        elif args.command == "prepare-trading-engine":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                result = prepare_engine(
+                    writer, args.directory, wheelhouse=args.wheelhouse
+                )
+        elif args.command == "observe-trading-market":
+            result = observe_market(
+                args.store,
+                args.company_id,
+                args.directory,
+                symbol=args.symbol,
+                max_age_seconds=args.max_age_seconds,
+                samples=args.samples,
+                emit=lambda event: print(
+                    json.dumps(event), file=sys.stderr, flush=True
+                ),
+            )
+            print(json.dumps(asdict(result)))
+            return 0 if result.completed else 1
+        elif args.command == "prepare-nautilus-paper":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                identity = prepare_paper(
+                    writer,
+                    args.directory,
+                    args.account_id,
+                    args.starting_atoms,
+                    tape_path=args.replay_tape,
+                )
+            print(json.dumps({"destination_id": identity}))
+            return 0
+        elif args.command == "bind-nautilus-paper":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                result = bind_nautilus_paper(
+                    writer,
+                    args.directory,
+                    revision=args.revision,
+                    charter_revision=args.charter_revision,
+                    exposure_atoms=args.exposure_atoms,
+                    replay=args.replay,
+                )
+        elif args.command == "switch-nautilus-paper":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                result = switch_paper(
+                    writer,
+                    args.previous_directory,
+                    args.directory,
+                    previous_revision=args.previous_revision,
+                    revision=args.revision,
+                    charter_revision=args.charter_revision,
+                    exposure_atoms=args.exposure_atoms,
+                    from_replay=args.from_replay,
+                    replay=args.replay,
+                )
+        elif args.command == "serve-nautilus-paper":
+            result = supervise_paper(
+                args.store,
+                args.company_id,
+                args.directory,
+                seconds=args.seconds,
+                tape_path=args.replay_tape,
+                emit=lambda event: print(
+                    json.dumps(event), file=sys.stderr, flush=True
+                ),
+            )
+            print(json.dumps(asdict(result)))
+            return 0 if result.completed else 1
+        elif args.command == "operate-nautilus-paper":
+            result = run_paper_company(
+                args.store,
+                args.company_id,
+                paper_venue(args.store, args.directory, replay=args.replay),
+                EmployeeProcess(args.employee),
+                turn_budget=args.turn_budget,
+                idle_seconds=args.idle_seconds,
+            )
         elif args.command == "bind-paper":
-            if args.store.resolve() == args.journal.resolve() or (
-                args.journal.exists() and args.store.samefile(args.journal)
-            ):
-                raise TradeRefused("Company store and venue journal must be separate")
             venue = FixedQuoteVenue(args.journal)
+            venue.require_independent_from(args.store)
             account = PaperAccount(
                 args.account_id,
                 "fixed-quote-v1",
@@ -306,7 +451,7 @@ def main() -> int:
             result = run_hired_paper_company(
                 args.store,
                 args.company_id,
-                FixedQuoteVenue(args.journal),
+                _paper_destination(args),
                 lambda: EmployeeProcess(args.employee),
                 turn_budget=args.turn_budget,
                 idle_seconds=args.idle_seconds,
@@ -325,7 +470,7 @@ def main() -> int:
             inputs = (
                 args.store,
                 args.company_id,
-                FixedQuoteVenue(args.journal),
+                _paper_destination(args),
                 EmployeeProcess(args.employee),
             )
             if args.command == "first-duty":
@@ -353,6 +498,8 @@ def main() -> int:
         BindingRefused,
         DutyRefused,
         TradeRefused,
+        EngineRefused,
+        MarketRefused,
         OrderRefused,
         PostingRefused,
         VenueRefused,

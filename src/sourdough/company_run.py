@@ -22,17 +22,25 @@ from .first_duty import founding_duty_due
 from .first_trade import (
     TradeRefused,
     TradeResult,
+    _apply_paper_order,
     resume_opening_research,
     run_first_trade,
 )
 from .onboarding import is_hired_first_duty
-from .paper_account import reopen_binding
+from .paper_account import (
+    has_pending_binding_change,
+    is_retired_account_scope,
+    reopen_binding,
+)
 from .paper_books import (
+    NoFillObservation,
     Posting,
     PostingRefused,
     capture_position,
-    post_confirmed_fill,
-    read_position,
+    read_binding_position,
+    read_book_observation,
+    read_booked_no_fill,
+    read_captured_position,
 )
 from .paper_decision import (
     PaperDecision,
@@ -42,11 +50,11 @@ from .paper_decision import (
     reopen_unsubmitted_decisions,
     settle_paper_decision,
 )
-from .paper_order import PaperIntent, reserved_exposure, submit_paper_order
+from .paper_execution import PaperExecution, PaperIntent, observe_bound_position
+from .paper_order import reserved_exposure
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
 from .paper_review import bind_review_quote, observe_review_quote
-from .paper_venue import FixedQuoteVenue
 from .writer_lease import WriterLease, hold_company_writer
 from .work import (
     FollowUp,
@@ -60,6 +68,9 @@ from .work import (
     reopen_follow_up,
     settle_review,
 )
+
+
+_PAPER_RESULTS = ("paper_position", "paper_no_fill", "paper_binding")
 
 
 @dataclass(frozen=True)
@@ -91,7 +102,7 @@ class CompanyRun:
 def run_paper_company(
     store: Path,
     company_id: str,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeProcess,
     *,
     repeat_paper: bool = False,
@@ -103,6 +114,7 @@ def run_paper_company(
 ) -> CompanyRun:
     if not 1 <= turn_budget <= 8 or not 0 <= idle_seconds <= 900:
         raise TradeRefused("Invalid company turn or idle budget")
+    venue.require_independent_from(store)
     with hold_company_writer(
         store, company_id, expected_store_key=expected_store_key
     ) as writer:
@@ -120,7 +132,7 @@ def run_paper_company(
 
 def _operate(
     writer: WriterLease,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeProcess,
     repeat_paper: bool,
     turn_budget: int,
@@ -139,18 +151,26 @@ def _operate(
             )
         turn_budget = max(0, turn_budget - consumed)
     idle_deadline = monotonic() + idle_seconds
+    binding = reopen_binding(store, company_id)
+    active_scope = (binding.account.account_id, binding.account.instrument_rules_digest)
+    with closing(_connect(store, "ro")) as connection:
+        switching = has_pending_binding_change(connection)
+    repeat_paper = repeat_paper and not switching
     next_purpose = PAPER_EXECUTION if repeat_paper else POSITION_REVIEW
     reconciliation, blocked = _recover(writer, venue, next_purpose)
     fenced_runs = requeue_uncommitted_work(writer)
     if on_ready is not None:
         on_ready(writer)
     first = (
-        None if reconciliation.unresolved else resume_opening_research(writer, venue)
+        None
+        if reconciliation.unresolved or switching
+        else resume_opening_research(writer, venue)
     )
     if (
         first is None
         and turn_budget
         and not reconciliation.unresolved
+        and not switching
         and founding_duty_due(store, company_id)
     ):
         first = run_first_trade(store, company_id, venue, runtime, writer=writer)
@@ -158,8 +178,14 @@ def _operate(
     if first is not None:
         research = first.research
         writer.verify()
-        if first.order is not None and first.order.posting is not None:
-            result = _book_reference(store, company_id, first.order.posting)
+        result = (
+            _order_reference(
+                store, company_id, first.order.order_id, first.order.posting, venue
+            )
+            if first.order is not None
+            else None
+        )
+        if result is not None:
             finish_first_duty(
                 store,
                 first.claim,
@@ -175,38 +201,62 @@ def _operate(
                 research.decided_at,
             )
             finish_first_duty(store, first.claim, result, due_at=research.next_due_at)
-        else:
+        elif first.order is None:
             return CompanyRun(
                 first,
                 None,
                 reconciliation=reconciliation,
-                blocked_work=blocked,
+                blocked_work=(*blocked, first.claim.duty_id),
                 fenced_runs=fenced_runs,
+            )
+        else:
+            reconciliation, blocked = _refresh_recovery(
+                writer, venue, next_purpose, reconciliation
             )
 
     review = None
     trades = _resume_later_decisions(
-        writer, venue, allow_buy=repeat_paper and not reconciliation.unresolved
+        writer,
+        venue,
+        allow_buy=repeat_paper and not (reconciliation.unresolved or blocked),
     )
     if trades and trades[-1].next_duty is None:
-        return CompanyRun(
-            first, review, tuple(trades), reconciliation, blocked, fenced_runs
+        reconciliation, blocked = _refresh_recovery(
+            writer, venue, next_purpose, reconciliation
         )
+
+    def scope_of(connection, reference):
+        evidence = _read_paper_observation(connection, reference, company_id)
+        return evidence["account_id"], evidence["instrument_rules_digest"]
+
+    def eligible(connection, reference):
+        if reference.kind not in _PAPER_RESULTS:
+            return False
+        scope = scope_of(connection, reference)
+        return scope == active_scope or (
+            is_retired_account_scope(connection, company_id, *scope)
+            and read_binding_position(connection, company_id, binding.revision)
+            is not None
+        )
+
     while turn_budget or reconciliation.next_query_at is not None:
         if (
             reconciliation.next_query_at is not None
             and reconciliation.next_query_at <= int(time())
         ):
-            reconciliation, blocked = _recover(writer, venue, next_purpose)
-            trades.extend(
-                _resume_later_decisions(
-                    writer,
-                    venue,
-                    allow_buy=repeat_paper and not reconciliation.unresolved,
-                )
+            reconciliation, blocked = _refresh_recovery(
+                writer, venue, next_purpose, reconciliation
             )
-            if trades and trades[-1].next_duty is None:
-                break
+            resumed = _resume_later_decisions(
+                writer,
+                venue,
+                allow_buy=repeat_paper and not (reconciliation.unresolved or blocked),
+            )
+            trades.extend(resumed)
+            if resumed and resumed[-1].next_duty is None:
+                reconciliation, blocked = _refresh_recovery(
+                    writer, venue, next_purpose, reconciliation
+                )
         writer.verify()
         follow_up = None
         if turn_budget:
@@ -215,7 +265,9 @@ def _operate(
                 company_id,
                 runtime.profile,
                 now=int(time()),
-                allow_paper_execution=repeat_paper and not reconciliation.unresolved,
+                allow_paper_execution=repeat_paper
+                and not (reconciliation.unresolved or blocked),
+                eligible_paper_result=eligible,
             )
         if follow_up is None:
             if not turn_budget and reconciliation.next_query_at is None:
@@ -226,20 +278,28 @@ def _operate(
             sleep(min(remaining, 0.5))
             continue
         turn_budget -= 1
-        if follow_up.purpose == POSITION_REVIEW:
+        historical_execution = False
+        if follow_up.purpose == PAPER_EXECUTION:
+            with closing(_connect(store, "ro")) as connection:
+                historical_execution = (
+                    scope_of(connection, follow_up.result) != active_scope
+                )
+        if follow_up.purpose == POSITION_REVIEW or historical_execution:
             review = _review(writer, follow_up, venue, runtime, next_purpose)
         else:
             trade = _trade(writer, follow_up, venue, runtime)
             trades.append(trade)
             if trade.next_duty is None:
-                break
+                reconciliation, blocked = _refresh_recovery(
+                    writer, venue, next_purpose, reconciliation
+                )
     return CompanyRun(
         first, review, tuple(trades), reconciliation, blocked, fenced_runs
     )
 
 
 def _recover(
-    writer: WriterLease, venue: FixedQuoteVenue, purpose: str
+    writer: WriterLease, venue: PaperExecution, purpose: str
 ) -> tuple[PaperReconciliation, tuple[str, ...]]:
     store, company_id = writer.store, writer.company_id
     recovery = reconcile_paper_orders(
@@ -269,8 +329,15 @@ def _recover(
         claim = original.original_claim
         if claim.founder_id in archived:
             continue
-        result = _book_reference(store, company_id, original.posting)
         try:
+            if original.posting is not None:
+                result = _book_reference(store, company_id, original.posting, venue)
+                if result is None:
+                    raise DutyRefused("Position observation is not available")
+            elif original.no_fill is not None:
+                result = _no_fill_reference(original.no_fill)
+            else:
+                raise DutyRefused("Reconciled order has no book result")
             hired = claim.duty_id in hired_opening
             if claim.duty_id == first_duty_id or hired:
                 research = reopen_research_decision(store, claim)
@@ -296,13 +363,12 @@ def _recover(
 
 def _retry_reconciliation(
     writer: WriterLease,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     purpose: str,
     recovery: PaperReconciliation,
     blocked: tuple[str, ...],
     deadline: float,
 ) -> tuple[PaperReconciliation, tuple[str, ...]]:
-    recovered = list(recovery.recovered)
     while recovery.next_query_at is not None and not blocked:
         remaining = deadline - monotonic()
         delay = max(0, recovery.next_query_at - time())
@@ -310,13 +376,32 @@ def _retry_reconciliation(
             break
         if delay:
             sleep(delay)
-        recovery, blocked = _recover(writer, venue, purpose)
-        recovered.extend(recovery.recovered)
-    return replace(recovery, recovered=tuple(recovered)), blocked
+        recovery, blocked = _refresh_recovery(writer, venue, purpose, recovery)
+    return recovery, blocked
 
 
-def _book_reference(store: Path, company_id: str, posting: Posting) -> ResultReference:
-    observation = capture_position(store, company_id, posting.fill_id, now=int(time()))
+def _refresh_recovery(
+    writer: WriterLease,
+    venue: PaperExecution,
+    purpose: str,
+    previous: PaperReconciliation,
+) -> tuple[PaperReconciliation, tuple[str, ...]]:
+    recovery, blocked = _recover(writer, venue, purpose)
+    return replace(recovery, recovered=previous.recovered + recovery.recovered), blocked
+
+
+def _book_reference(
+    store: Path, company_id: str, posting: Posting, venue: PaperExecution
+) -> ResultReference | None:
+    observation = read_captured_position(store, company_id, posting.fill_id)
+    if observation is None:
+        account = reopen_binding(store, company_id).account
+        source = observe_bound_position(venue, account, posting.order_id)
+        if source is None:
+            return None
+        observation = capture_position(
+            store, company_id, posting.fill_id, source, now=int(time())
+        )
     return ResultReference(
         "paper_position",
         observation.fill_id,
@@ -325,15 +410,37 @@ def _book_reference(store: Path, company_id: str, posting: Posting) -> ResultRef
     )
 
 
+def _no_fill_reference(observation: NoFillObservation) -> ResultReference:
+    return ResultReference(
+        "paper_no_fill",
+        observation.order_id,
+        observation.revision,
+        observation.available_at,
+    )
+
+
+def _order_reference(
+    store: Path,
+    company_id: str,
+    order_id: str,
+    posting: Posting | None,
+    venue: PaperExecution,
+) -> ResultReference | None:
+    if posting is not None:
+        return _book_reference(store, company_id, posting, venue)
+    no_fill = read_booked_no_fill(store, company_id, order_id)
+    return _no_fill_reference(no_fill) if no_fill else None
+
+
 def _read_paper_observation(
     connection: Connection, reference: ResultReference, company_id: str
 ) -> dict:
     if reference.kind == "research_finding":
         return read_research_result(connection, company_id, reference.resource_id)
-    if reference.kind != "paper_position":
-        raise DutyRefused("This duty does not reference a paper position")
     try:
-        observation = read_position(connection, company_id, reference.resource_id)
+        observation = read_book_observation(
+            connection, company_id, reference.kind, reference.resource_id
+        )
     except PostingRefused as error:
         raise DutyRefused("Committed paper observation is unavailable") from error
     return asdict(observation) | {"revision": observation.revision}
@@ -342,7 +449,7 @@ def _read_paper_observation(
 def _review(
     writer: WriterLease,
     follow_up: FollowUpClaim,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeProcess,
     next_purpose: str,
 ) -> PositionReview:
@@ -352,7 +459,7 @@ def _review(
         writer.verify()
         quote = (
             observe_review_quote(store, follow_up.claim.company_id, venue)
-            if follow_up.result.kind == "paper_position"
+            if follow_up.result.kind in _PAPER_RESULTS
             else None
         )
 
@@ -369,19 +476,46 @@ def _review(
             follow_up,
             now=int(time()),
             read=project,
+            purpose=follow_up.purpose,
         )
 
     try:
         decision = ReviewDecision.from_proposal(runtime.review(read_result))
         writer.verify()
+        successor = None
+        purpose = (
+            next_purpose if follow_up.result.kind in _PAPER_RESULTS else POSITION_REVIEW
+        )
+        if purpose == PAPER_EXECUTION:
+            binding = reopen_binding(store, writer.company_id)
+            with closing(_connect(store, "ro")) as connection:
+                prior = _read_paper_observation(
+                    connection, follow_up.result, writer.company_id
+                )
+                if (prior["account_id"], prior["instrument_rules_digest"]) != (
+                    binding.account.account_id,
+                    binding.account.instrument_rules_digest,
+                ):
+                    baseline = read_binding_position(
+                        connection, writer.company_id, binding.revision
+                    )
+                    if baseline is None:
+                        purpose = POSITION_REVIEW
+                    else:
+                        successor = ResultReference(
+                            "paper_binding",
+                            baseline.binding_revision,
+                            baseline.revision,
+                            baseline.available_at,
+                        )
         next_duty = settle_review(
             store,
             follow_up,
             decision,
             now=int(time()),
-            successor_purpose=next_purpose
-            if follow_up.result.kind == "paper_position"
-            else POSITION_REVIEW,
+            successor_purpose=purpose,
+            successor_result=successor,
+            historical_paper=follow_up.purpose == PAPER_EXECUTION,
         )
     except (DutyRefused, TradeRefused):
         try:
@@ -396,7 +530,7 @@ def _review(
 def _trade(
     writer: WriterLease,
     follow_up: FollowUpClaim,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeProcess,
 ) -> LaterPaperTrade:
     store = writer.store
@@ -406,18 +540,35 @@ def _trade(
     if venue.observe_account(account.account_id) != account:
         raise TradeRefused("Paper destination does not match the bound account")
     quote = venue.observe_quote(account.account_id)
+    sizing = venue.observe_order_sizing(account.account_id)
+    sizing_context = (
+        {
+            "order_sizing": asdict(sizing),
+            "position_units": "lots",
+            "quote_units": "quote_minor_units_per_lot",
+        }
+        if sizing is not None
+        else {}
+    )
 
     def project(connection, reference):
         observation = _read_paper_observation(connection, reference, claim.company_id)
-        if observation["account_id"] != account.account_id:
+        if (observation["account_id"], observation["instrument_rules_digest"]) != (
+            account.account_id,
+            account.instrument_rules_digest,
+        ):
             raise DutyRefused("The position belongs to a different account")
         available = binding.exposure_limit_minor_units - reserved_exposure(
             connection, account.account_id
         )
-        return observation | {
-            "quote_minor_units": quote,
-            "available_exposure_minor_units": available,
-        }
+        return (
+            observation
+            | sizing_context
+            | {
+                "quote_minor_units": quote,
+                "available_exposure_minor_units": available,
+            }
+        )
 
     def read_result():
         writer.verify()
@@ -432,7 +583,7 @@ def _trade(
 
 
 def _resume_later_decisions(
-    writer: WriterLease, venue: FixedQuoteVenue, *, allow_buy: bool
+    writer: WriterLease, venue: PaperExecution, *, allow_buy: bool
 ) -> list[LaterPaperTrade]:
     writer.verify()
     resumed = []
@@ -449,7 +600,7 @@ def _resume_later_decisions(
 def _apply_later_decision(
     writer: WriterLease,
     follow_up: FollowUpClaim,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     receipt: PaperDecisionReceipt,
 ) -> LaterPaperTrade:
     writer.verify()
@@ -458,7 +609,7 @@ def _apply_later_decision(
         next_duty = settle_paper_decision(store, follow_up, receipt, follow_up.result)
         return LaterPaperTrade(claim, receipt, None, None, next_duty)
     account = reopen_binding(store, claim.company_id).account
-    order = submit_paper_order(
+    order = _apply_paper_order(
         store,
         claim,
         PaperIntent(
@@ -468,14 +619,13 @@ def _apply_later_decision(
             decision.limit_minor_units,
         ),
         venue,
-        writer=writer,
+        writer,
     )
-    posting = post_confirmed_fill(
-        store, claim.company_id, order.order_id, venue, writer=writer
+    result = _order_reference(
+        store, claim.company_id, order.order_id, order.posting, venue
     )
-    if posting is None:
-        return LaterPaperTrade(claim, receipt, order.order_id, None, None)
+    if result is None:
+        return LaterPaperTrade(claim, receipt, order.order_id, order.posting, None)
     writer.verify()
-    result = _book_reference(store, claim.company_id, posting)
     next_duty = settle_paper_decision(store, follow_up, receipt, result)
-    return LaterPaperTrade(claim, receipt, order.order_id, posting, next_duty)
+    return LaterPaperTrade(claim, receipt, order.order_id, order.posting, next_duty)

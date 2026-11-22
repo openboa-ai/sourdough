@@ -122,16 +122,19 @@ class WithheldFill(FixedQuoteVenue):
         result = super().submit(*args)
         if fault_site in ("after_fill", "after_fill_with_lookup_timeout"):
             interrupted()
+        if fault_site == "lost_reply":
+            marker.touch()
+            raise TimeoutError("Destination committed the original order without a reply")
         return result
 
     def observe_execution(self, order_id):
-        if fault_site == "after_fill_with_lookup_timeout" and not self.failed_history:
+        if fault_site in ("after_fill_with_lookup_timeout", "lost_reply") and not self.failed_history:
             self.failed_history = True
             raise TimeoutError("One missed history response")
         return super().observe_execution(order_id)
 
     def sync_account_execution(self, account_id, order_id):
-        if fault_site == "after_fill_with_lookup_timeout" and not self.failed_sync:
+        if fault_site in ("after_fill_with_lookup_timeout", "lost_reply") and not self.failed_sync:
             self.failed_sync = True
             raise TimeoutError("One missed account-sync response")
         return super().sync_account_execution(account_id, order_id)
@@ -220,6 +223,7 @@ class ConnectedFlow(unittest.TestCase):
             ("paper", True, "after_acceptance"),
             ("paper", True, "after_research_decision"),
             ("paper", True, "after_fill_with_lookup_timeout"),
+            ("paper", True, "lost_reply"),
             ("paper", True, "before_send"),
             ("paper", False, "none"),
         ):
@@ -351,7 +355,10 @@ class ConnectedFlow(unittest.TestCase):
                         "--employee",
                         str(employee),
                         "--idle-seconds",
-                        "6" if fault_site == "after_fill_with_lookup_timeout" else "2",
+                        "6"
+                        if fault_site
+                        in ("after_fill_with_lookup_timeout", "lost_reply")
+                        else "2",
                         "--turn-budget",
                         "4" if extra_run else "3",
                         "--max-restarts",
@@ -373,9 +380,24 @@ class ConnectedFlow(unittest.TestCase):
                         rows(venue, "SELECT count(*) FROM venue_execution"), [(0,)]
                     )
                     continue
-                original, resumed = supervisor["attempts"]
-                self.assertEqual(original["returncode"], -signal.SIGKILL)
-                self.assertLess(original["exited_at_ns"], resumed["ready_at_ns"])
+                if fault_site == "lost_reply":
+                    [worker] = supervisor["attempts"]
+                    self.assertEqual(worker["returncode"], 0)
+                    [recovered] = result["reconciliation"]["recovered"]
+                    self.assertEqual(result["reconciliation"]["unresolved"], 0)
+                    self.assertEqual(
+                        rows(venue, "SELECT order_id,fill_id FROM venue_execution"),
+                        [
+                            (
+                                recovered["posting"]["order_id"],
+                                recovered["posting"]["fill_id"],
+                            )
+                        ],
+                    )
+                else:
+                    original, resumed = supervisor["attempts"]
+                    self.assertEqual(original["returncode"], -signal.SIGKILL)
+                    self.assertLess(original["exited_at_ns"], resumed["ready_at_ns"])
                 claim = result["review"]["claim"]
                 ((agent_id, first_duty),) = rows(
                     store,

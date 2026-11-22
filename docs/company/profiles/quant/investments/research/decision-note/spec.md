@@ -14,6 +14,8 @@ Input contracts: [market-snapshot/snapshot](../../market-snapshot/snapshot/spec.
 
 The base work service stores opaque evidence references. Quant validates domain contents and admission consumes the finding; the note cannot reserve exposure.
 
+When the bound paper destination declares sizing rules, include its instrument, lot, quote scale, price increment and order minima in the immutable research snapshot. Decision and order prices use the same quote units per lot. This supplies verified constraints without prescribing a trade. The managed hired-Agent trial seals observations read from the runtime's original public-market journal before activation; the observer must not choose a finding, order, or next decision.
+
 **Concern for the responsible component:** A retrospective ID attached to an existing order is not evidence of decision-time use. Do not give the Agent expected labels, fault timing or a prepared recommendation.
 
 ## Functional and quality requirements

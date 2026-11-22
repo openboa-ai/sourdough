@@ -14,8 +14,9 @@ from .company import _connect, _identity
 from .duty_run import PAPER_EXECUTION, DutyClaim, DutyRefused
 from .first_duty import require_historical_claim, require_paper_authority
 from .onboarding import has_hired_acceptance
-from .paper_account import reopen_binding
+from .paper_account import PaperAccount, reopen_binding, was_applied_binding_change
 from .paper_decision import PaperDecision
+from .paper_execution import PaperOrderSizing, ReplayAvailability
 from .writer_lease import WriterLease
 
 
@@ -33,6 +34,58 @@ def _table(connection: Connection, name: str) -> bool:
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (name,)
         ).fetchone()
         is not None
+    )
+
+
+_PLAN_SCHEMA = """CREATE TABLE IF NOT EXISTS paper_research_plan (
+    company_id TEXT NOT NULL REFERENCES company(id), account_id TEXT NOT NULL,
+    revision TEXT NOT NULL, inputs TEXT NOT NULL, PRIMARY KEY(company_id,account_id)
+)"""
+
+
+def _account_scoped_plans(connection: Connection) -> bool:
+    return any(
+        column[1] == "account_id"
+        for column in connection.execute("PRAGMA table_info(paper_research_plan)")
+    )
+
+
+def _prepare_plans(connection: Connection) -> None:
+    if not _table(connection, "paper_research_plan") or _account_scoped_plans(
+        connection
+    ):
+        connection.execute(_PLAN_SCHEMA)
+        return
+    connection.execute(
+        "ALTER TABLE paper_research_plan RENAME TO paper_research_plan_legacy"
+    )
+    connection.execute(_PLAN_SCHEMA)
+    connection.execute(
+        """INSERT INTO paper_research_plan
+           SELECT company_id,json_extract(inputs,'$.account_id'),revision,inputs
+           FROM paper_research_plan_legacy"""
+    )
+    connection.execute("DROP TABLE paper_research_plan_legacy")
+
+
+def _plan(connection: Connection, company_id: str, account: PaperAccount):
+    if not _table(connection, "paper_research_plan"):
+        return None
+    if _account_scoped_plans(connection):
+        return connection.execute(
+            "SELECT revision,inputs FROM paper_research_plan WHERE company_id=? AND account_id=?",
+            (company_id, account.account_id),
+        ).fetchone()
+    return connection.execute(
+        "SELECT revision,inputs FROM paper_research_plan WHERE company_id=?",
+        (company_id,),
+    ).fetchone()
+
+
+def _matches_account(snapshot: dict, account: PaperAccount) -> bool:
+    return (snapshot.get("account_id"), snapshot.get("instrument_rules_digest")) == (
+        account.account_id,
+        account.instrument_rules_digest,
     )
 
 
@@ -70,7 +123,8 @@ def stage_research_inputs(store: Path, company_id: str, inputs: list[dict]) -> d
         raise DutyRefused("Invalid research input fields") from error
     if len({item.observation_id for item in observations}) != len(observations):
         raise DutyRefused("Observation identities must be unique")
-    account = reopen_binding(store, company_id).account
+    binding = reopen_binding(store, company_id)
+    account = binding.account
     body = _json(
         {
             "account_id": account.account_id,
@@ -86,18 +140,13 @@ def stage_research_inputs(store: Path, company_id: str, inputs: list[dict]) -> d
     revision = _digest(body)
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        if _identity(connection) != company_id:
-            raise DutyRefused("Company identity mismatch")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS paper_research_plan (
-                company_id TEXT PRIMARY KEY NOT NULL REFERENCES company(id),
-                revision TEXT NOT NULL, inputs TEXT NOT NULL
-            )"""
-        )
-        existing = connection.execute(
-            "SELECT revision, inputs FROM paper_research_plan WHERE company_id = ?",
-            (company_id,),
-        ).fetchone()
+        if (
+            _identity(connection) != company_id
+            or reopen_binding(store, company_id) != binding
+        ):
+            raise DutyRefused("Company or paper binding changed")
+        _prepare_plans(connection)
+        existing = _plan(connection, company_id, account)
         if existing is not None and existing != (revision, body):
             raise DutyRefused("Research plan cannot be replaced")
         if existing is None:
@@ -106,13 +155,15 @@ def stage_research_inputs(store: Path, company_id: str, inputs: list[dict]) -> d
                    WHERE f.company_id = ?""",
                 (company_id,),
             ).fetchone()
-            if opening != ("due",):
+            if opening != ("due",) and not was_applied_binding_change(
+                connection, binding.revision
+            ):
                 raise DutyRefused(
                     "Research inputs must be sealed before the opening duty"
                 )
             connection.execute(
-                "INSERT INTO paper_research_plan VALUES (?, ?, ?)",
-                (company_id, revision, body),
+                "INSERT INTO paper_research_plan VALUES (?, ?, ?, ?)",
+                (company_id, account.account_id, revision, body),
             )
     return {"company_id": company_id, "revision": revision}
 
@@ -147,6 +198,8 @@ class ResearchTools:
     fee_bps: int
     exposure_limit_minor_units: int
     writer: WriterLease | None = None
+    sizing: PaperOrderSizing | None = None
+    replay_cut: ReplayAvailability | None = None
 
     def invoke(self, name: str, arguments: dict, *, now: int | None = None) -> dict:
         if self.writer is not None:
@@ -166,6 +219,10 @@ class ResearchTools:
             raise DutyRefused("Tool is unavailable for research")
 
     def _snapshot(self, connection: Connection, now: int) -> dict:
+        account = reopen_binding(self.store, self.claim.company_id).account
+        provenance = asdict(self.replay_cut) if self.replay_cut is not None else None
+        if self.replay_cut is not None:
+            now = self.replay_cut.available_ns // 10**9
         connection.execute(
             """CREATE TABLE IF NOT EXISTS paper_research_snapshot (
                 run_id TEXT PRIMARY KEY NOT NULL REFERENCES duty_run(run_id),
@@ -177,14 +234,24 @@ class ResearchTools:
             (self.claim.run_id,),
         ).fetchone()
         if row is not None:
-            return json.loads(row[1]) | {"revision": row[0]}
-        plan = connection.execute(
-            "SELECT revision, inputs FROM paper_research_plan WHERE company_id = ?",
-            (self.claim.company_id,),
-        ).fetchone()
+            snapshot = json.loads(row[1])
+            if _digest(row[1]) != row[0] or not _matches_account(snapshot, account):
+                raise DutyRefused(
+                    "Original research snapshot belongs to another binding"
+                )
+            if snapshot.get("replay_cut") != provenance:
+                raise DutyRefused(
+                    "Original research snapshot belongs to a different replay cut"
+                )
+            return snapshot | {"revision": row[0]}
+        plan = _plan(connection, self.claim.company_id, account)
         if plan is None or _digest(plan[1]) != plan[0]:
             raise DutyRefused("Research plan is unavailable")
         inputs = json.loads(plan[1])
+        if not _matches_account(inputs, account):
+            raise DutyRefused(
+                "Research plan does not match the effective paper account"
+            )
         inputs["observations"] = [
             item for item in inputs["observations"] if item["available_at"] <= now
         ]
@@ -197,6 +264,10 @@ class ResearchTools:
             fee_bps=self.fee_bps,
             exposure_limit_minor_units=self.exposure_limit_minor_units,
         )
+        if self.sizing is not None:
+            inputs["order_sizing"] = asdict(self.sizing)
+        if provenance is not None:
+            inputs["replay_cut"] = provenance
         body = _json(inputs)
         revision = _digest(body)
         connection.execute(
@@ -239,6 +310,8 @@ class ResearchTools:
             or _digest(snapshot[1]) != snapshot[0]
         ):
             raise DutyRefused("Finding must cite this run's research input revision")
+        if self.replay_cut is not None:
+            self._snapshot(connection, now)
         inputs = json.loads(snapshot[1])
         observations = {item["observation_id"]: item for item in inputs["observations"]}
         start, end = (
@@ -301,6 +374,8 @@ class ResearchTools:
             or _digest(published[3]) != published[1]
         ):
             raise DutyRefused("Decision must cite the earlier finding from this run")
+        if self.replay_cut is not None:
+            self._snapshot(connection, now)
         fields = {
             key: value
             for key, value in proposal.items()
@@ -484,6 +559,12 @@ def find_unsubmitted_opening(
                     "Interrupted research decision has no matching finding"
                 )
             decision = receipt.decision
+            if decision.action == "buy" and not _decision_matches_account(
+                connection,
+                receipt.decision_id,
+                reopen_binding(store, company_id).account,
+            ):
+                continue
             if (
                 not hired
                 or decision.action != "buy"
@@ -499,18 +580,48 @@ def find_unsubmitted_opening(
     return None
 
 
+def _decision_matches_account(
+    connection: Connection, decision_id: str, account: PaperAccount
+) -> bool:
+    row = connection.execute(
+        """SELECT snapshot.revision,snapshot.inputs
+           FROM paper_research_decision decision
+           JOIN paper_research_snapshot snapshot ON snapshot.run_id=decision.run_id
+           WHERE decision.decision_id=?""",
+        (decision_id,),
+    ).fetchone()
+    return (
+        row is not None
+        and _digest(row[1]) == row[0]
+        and _matches_account(json.loads(row[1]), account)
+    )
+
+
 def allows_research_order(
-    connection: Connection, claim: DutyClaim, action_id: str, quantity: int, limit: int
+    connection: Connection,
+    claim: DutyClaim,
+    action_id: str,
+    quantity: int,
+    limit: int,
+    *,
+    account: PaperAccount | None = None,
 ) -> bool:
     if not requires_research(connection, claim.company_id):
         return True
     receipt = _research_decision(connection, claim)
-    return receipt is not None and (
-        receipt.decision_id,
-        receipt.decision.action,
-        receipt.decision.quantity,
-        receipt.decision.limit_minor_units,
-    ) == (action_id, "buy", quantity, limit)
+    return (
+        receipt is not None
+        and (
+            receipt.decision_id,
+            receipt.decision.action,
+            receipt.decision.quantity,
+            receipt.decision.limit_minor_units,
+        )
+        == (action_id, "buy", quantity, limit)
+        and (
+            account is None or _decision_matches_account(connection, action_id, account)
+        )
+    )
 
 
 def authorize_hired_research_order(
@@ -559,6 +670,8 @@ def allows_hired_research_order(
     decision_id: str,
     quantity: int,
     limit: int,
+    *,
+    account: PaperAccount | None = None,
 ) -> bool:
     return (
         has_hired_acceptance(connection, claim)
@@ -570,7 +683,9 @@ def allows_hired_research_order(
         ).fetchone()
         is not None
         and requires_research(connection, claim.company_id)
-        and allows_research_order(connection, claim, decision_id, quantity, limit)
+        and allows_research_order(
+            connection, claim, decision_id, quantity, limit, account=account
+        )
     )
 
 

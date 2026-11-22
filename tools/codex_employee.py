@@ -545,7 +545,9 @@ def main():
                 "Publish the signed later-minus-earlier change, the sum of the two fees "
                 "(price times fee_bps divided by 10000, rounded half up for each), their difference and uncertainty. "
                 "Use record_research_decision to explain how the immutable finding changes your choice. "
-                "Here the disclosed quote and cap are synthetic execution terms. A bounded simulation exercise "
+                "This account executes only in simulation. If the inputs include order_sizing, prices are integer quote "
+                "units per lot and quantity is a count of lots. Respect the minimum lots, minimum notional, price increment "
+                "and exposure cap. The quote is an observation, not a promise of the price at submission. A bounded simulation exercise "
                 "does not require evidence of live liquidity or profitable persistence; assess whether the disclosed "
                 "paper terms and the finding warrant exercising that path. "
                 "A feasible bounded verification buy, a hold or investigation is valid. Choose a follow-up of 60 to 120 seconds. "
@@ -626,9 +628,20 @@ def main():
                 "If the quoted terms permit a small order within the cap, decide its size and limit and propose it "
                 "using paper_buy. If a safe test is unsuitable, hold and end with exactly HOLD. "
                 "If the tool fails, report failure; do not claim a hold or a fill. Do not use the shell. "
-                f"Fixed quote per unit: {context['quote_minor_units']} minor units. "
+                f"Observed quote per order unit: {context['quote_minor_units']} integer quote units. "
                 f"Maximum exposure: {context['exposure_limit_minor_units']} minor units."
             )
+            sizing = context.get("order_sizing")
+            if sizing is not None:
+                prompt += (
+                    f" This is {sizing['instrument']} on a virtual account. Quantity is in whole lots "
+                    f"({sizing['base_units_per_lot']} base units per lot), not whole coins. "
+                    f"One {sizing['quote_currency']} equals {sizing['quote_units_per_whole']} integer quote units. "
+                    f"The price limit is per lot in those integer units and must be a multiple of "
+                    f"{sizing['price_step_per_lot']}. Minimum quantity is {sizing['minimum_lots']} lots "
+                    f"and quantity times limit must be at least {sizing['minimum_notional']} and within the exposure cap. "
+                    "The observed quote may move before arrival; a bounded limit is not a fill guarantee."
+                )
         cmd = [
             codex,
             *credential_store,
