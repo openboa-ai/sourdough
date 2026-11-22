@@ -7,14 +7,27 @@ from tempfile import TemporaryDirectory
 from sourdough.agent_desk import save_draft
 from sourdough.collaboration import company_work_run
 from sourdough.company import FoundingTerms, _connect, found
+from sourdough.company_assessment import read_assessment_result
 from sourdough.company_assets import (
     Selection,
     assign_project,
     publish_selection,
     read_shared_asset,
 )
-from sourdough.duty_run import DutyRefused, start_run
+from sourdough.duty_run import ASSESSMENT_REVIEW, DutyRefused, start_run
 from sourdough.harness import ScopedWorkflow, tool
+from sourdough.work import (
+    ReviewDecision,
+    claim_assessment_review,
+    read_follow_up_result,
+    settle_review,
+)
+from sourdough.work_handoff import (
+    HandoffOffer,
+    accept_handoff,
+    discover_handoffs,
+    offer_handoff,
+)
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -262,3 +275,149 @@ class CompanyAssets(unittest.TestCase):
             ],
             [],
         )
+
+    def test_explicit_acceptance_fences_the_old_owner_and_schedules_the_recipient(self):
+        with closing(_connect(self.writer.store, "rw")) as database, database:
+            database.execute(
+                "INSERT INTO duty VALUES ('review-due','author','scheduled')"
+            )
+            database.execute(
+                """INSERT INTO work_follow_up VALUES
+                   ('author-duty','review-due','author-grant','assessment',20,
+                    'fixture','report','original',20,?)""",
+                (ASSESSMENT_REVIEW,),
+            )
+        current = claim_assessment_review(
+            self.writer.store, self.writer.company_id, "author", "profile", now=20
+        )
+        sender = current.claim
+        draft = save_draft(
+            self.writer,
+            sender,
+            ASSESSMENT_REVIEW,
+            name="report",
+            content="Reviewed finding. Private notes.",
+            expected_revision=None,
+        )
+        asset = publish_selection(
+            self.writer,
+            sender,
+            ASSESSMENT_REVIEW,
+            Selection(
+                "share",
+                draft.name,
+                draft.revision,
+                "project",
+                self.project,
+                ("peer",),
+                0,
+                17,
+            ),
+        )
+        offered = HandoffOffer(
+            "offer", "peer", asset.asset_id, 160, "Recheck the finding."
+        )
+        offer_id = offer_handoff(self.writer, sender, offered, now=20)
+        self.assertEqual(offer_handoff(self.writer, sender, offered, now=21), offer_id)
+        target = self.claims["peer"]
+        self.assertEqual(
+            discover_handoffs(self.writer, target, "assessment", now=21), []
+        )
+        with self.assertRaisesRegex(DutyRefused, "offer is unavailable"):
+            accept_handoff(self.writer, target, "assessment", offer_id, now=21)
+        competing_id = offer_handoff(
+            self.writer, sender, replace(offered, request_id="competing"), now=21
+        )
+        expired_id = offer_handoff(
+            self.writer,
+            sender,
+            replace(offered, request_id="expiring", expires_at=22),
+            now=21,
+        )
+        read_follow_up_result(
+            self.writer.store,
+            current,
+            now=22,
+            read=lambda *_: {"revision": "original"},
+            purpose=ASSESSMENT_REVIEW,
+        )
+        original = settle_review(
+            self.writer.store,
+            current,
+            ReviewDecision(
+                "sender-review", "original", "hold", "Share this finding.", 60
+            ),
+            now=22,
+            successor_purpose=ASSESSMENT_REVIEW,
+        )
+        with closing(_connect(self.writer.store, "ro")) as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT agent_id,state FROM duty WHERE id=?", (original.duty_id,)
+                ).fetchone(),
+                ("author", "scheduled"),
+            )
+        self.assertEqual(
+            {
+                offer["offer_id"]
+                for offer in discover_handoffs(
+                    self.writer, target, "assessment", now=23
+                )
+            },
+            {offer_id, competing_id},
+        )
+        with self.assertRaisesRegex(DutyRefused, "offer is unavailable"):
+            accept_handoff(
+                self.writer, self.claims["outsider"], "assessment", offer_id, now=23
+            )
+        with self.assertRaisesRegex(DutyRefused, "not actionable"):
+            accept_handoff(self.writer, target, "assessment", expired_id, now=23)
+        successor = accept_handoff(self.writer, target, "assessment", offer_id, now=23)
+        self.assertEqual(
+            accept_handoff(self.writer, target, "assessment", offer_id, now=24),
+            successor,
+        )
+        with self.assertRaisesRegex(DutyRefused, "not actionable"):
+            accept_handoff(self.writer, target, "assessment", competing_id, now=24)
+        with self.assertRaisesRegex(DutyRefused, "current running duty"):
+            offer_handoff(self.writer, sender, offered, now=25)
+        self.assertIsNone(
+            claim_assessment_review(
+                self.writer.store, self.writer.company_id, "author", "profile", now=82
+            )
+        )
+        self.assertIsNone(
+            claim_assessment_review(
+                self.writer.store, self.writer.company_id, "peer", "profile", now=81
+            )
+        )
+        work = claim_assessment_review(
+            self.writer.store, self.writer.company_id, "peer", "profile", now=82
+        )
+        self.assertEqual(work.claim.duty_id, successor)
+        received = read_assessment_result(self.writer, work, now=82)
+        self.assertEqual(received["shared_evidence"]["content"], "Reviewed finding.")
+        self.assertEqual(received["shared_evidence"]["author_id"], "author")
+        self.assertEqual(work.claim.founder_id, "peer")
+        decision = ReviewDecision(
+            "new-owner-review",
+            received["revision"],
+            "hold",
+            "Verified the shared result.",
+            60,
+        )
+        follow_up = settle_review(
+            self.writer.store,
+            work,
+            decision,
+            now=83,
+            successor_purpose=ASSESSMENT_REVIEW,
+        )
+        self.assertEqual(follow_up.result.resource_id, asset.asset_id)
+        with closing(_connect(self.writer.store, "ro")) as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT agent_id,state FROM duty WHERE id=?", (follow_up.duty_id,)
+                ).fetchone(),
+                ("peer", "scheduled"),
+            )

@@ -10,9 +10,10 @@ from .company_assets import (
     publish_selection,
     read_shared_asset,
 )
-from .duty_run import DutyClaim, DutyRefused
+from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused
 from .harness import ScopedRun, ScopedWorkflow, tool
 from .writer_lease import WriterLease
+from .work_handoff import HandoffOffer, accept_handoff, discover_handoffs, offer_handoff
 
 
 PROJECTS = tool(
@@ -40,6 +41,24 @@ PUBLISH_DRAFT = tool(
         "end": {"type": "integer"},
     },
 )
+HANDOFF_INBOX = tool("read_handoff_offers", "Read offers for your current work.", {})
+OFFER_HANDOFF = tool(
+    "offer_handoff",
+    "Offer your next company review to an Agent in the audience of the shared result. "
+    "The offer becomes available after you finish this review.",
+    {
+        "request_id": {"type": "string"},
+        "recipient_id": {"type": "string"},
+        "asset_id": {"type": "string"},
+        "expires_at": {"type": "integer"},
+        "expected_result": {"type": "string"},
+    },
+)
+ACCEPT_HANDOFF = tool(
+    "accept_handoff",
+    "Accept responsibility for an offered review with shared evidence.",
+    {"offer_id": {"type": "string"}},
+)
 
 
 def company_work_run(
@@ -47,13 +66,44 @@ def company_work_run(
     claim: DutyClaim,
     workflow: ScopedWorkflow,
     invoke: Callable[[str, dict], dict],
+    *,
+    clock: Callable[[], int] | None = None,
 ) -> ScopedRun:
     projects = project_access(writer, claim, workflow.purpose)
     additional = (PROJECTS, READ_ASSET) if projects else ()
     if any(project.can_publish for project in projects):
         additional += (PUBLISH_DRAFT,)
+    if projects and clock is not None:
+        additional += (HANDOFF_INBOX, ACCEPT_HANDOFF)
+        if workflow.purpose == ASSESSMENT_REVIEW and any(
+            project.can_publish for project in projects
+        ):
+            additional += (OFFER_HANDOFF,)
 
     def dispatch(name: str, arguments: dict) -> dict:
+        if clock is not None:
+            if name == "read_handoff_offers":
+                return {
+                    "offers": discover_handoffs(
+                        writer, claim, workflow.purpose, now=clock()
+                    )
+                }
+            if name == "accept_handoff":
+                return {
+                    "duty_id": accept_handoff(
+                        writer,
+                        claim,
+                        workflow.purpose,
+                        arguments["offer_id"],
+                        now=clock(),
+                    )
+                }
+            if name == "offer_handoff":
+                return {
+                    "offer_id": offer_handoff(
+                        writer, claim, HandoffOffer(**arguments), now=clock()
+                    )
+                }
         if name == "read_project_assignments":
             assets, next_cursor = discover_shared_assets(
                 writer, claim, workflow.purpose, arguments["after"]

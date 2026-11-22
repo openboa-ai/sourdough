@@ -310,16 +310,18 @@ def read_shared_asset(
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
         require_desk(database, claim, purpose)
-        row = database.execute(
-            """SELECT asset_id,project_id,author_id,duty_id,content,audience
-               FROM shared_publication WHERE asset_id=?""",
-            (asset_id,),
-        ).fetchone()
-        if row is None:
-            raise DutyRefused("Shared asset is unavailable")
-        _, members, _ = _project(database, row[1])
-        if claim.founder_id not in members or claim.founder_id not in json.loads(
-            row[-1]
-        ):
-            raise DutyRefused("Shared asset is unavailable")
-        return SharedAsset(*row[:-1])
+        return shared_asset_for(database, claim.founder_id, asset_id)
+
+
+def shared_asset_for(database: Connection, agent_id: str, asset_id: str) -> SharedAsset:
+    row = database.execute(
+        """SELECT asset_id,project_id,author_id,duty_id,content,audience
+           FROM shared_publication WHERE asset_id=?""",
+        (asset_id,),
+    ).fetchone()
+    if row is None:
+        raise DutyRefused("Shared asset is unavailable")
+    _, members, _ = _project(database, row[1])
+    if agent_id not in members or agent_id not in json.loads(row[-1]):
+        raise DutyRefused("Shared asset is unavailable")
+    return SharedAsset(*row[:-1])
