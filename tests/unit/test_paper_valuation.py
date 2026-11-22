@@ -4,20 +4,29 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
+from datetime import date
+from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
 from time import monotonic, sleep, time_ns
 from unittest.mock import Mock, patch
 
+from sourdough.accounting_close import CloseRequest, ExpectedCost, close_period
 from sourdough.company import FoundingTerms, found
 from sourdough.first_duty import claim_first_duty
+from sourdough.general_ledger import JournalEntry, JournalLine, post_journal
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.nautilus_runtime import VALUATION_SOURCE_REVISION
 from sourdough.paper_account import PaperMandate, bind
 from sourdough.paper_execution import PaperIntent, VenueRefused
 from sourdough.paper_order import submit_paper_order
+from sourdough.paper_statement_store import (
+    StatementRequest,
+    read_retained_statement,
+    retain_paper_statement,
+)
 from sourdough.paper_valuation import (
     BEST_BID_POLICY,
     ValuationRefused,
@@ -31,7 +40,9 @@ from sourdough.paper_valuation import (
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.paper_window import WindowPlan, WindowRefused, register_window
 from sourdough.paper_window_movement import read_paper_movement
+from sourdough.paper_window_statement import read_paper_statement
 from sourdough.trading_engine import VERSION
+from sourdough.window_costs import CostInventory
 from sourdough.window_sampler import WindowSampler, register_managed_window
 from sourdough.writer_lease import hold_company_writer
 
@@ -365,3 +376,204 @@ class PaperValuationTests(unittest.TestCase):
             self.assertEqual(
                 [call.args[-1] for call in capture.call_args_list], [0, 0, 2]
             )
+
+    def test_closed_statement_uses_original_cash_and_deducts_only_operating_costs(self):
+        day = date(2027, 1, 15)
+        day_ns = 86_400 * 10**9
+        opens = (day - date(1970, 1, 1)).days * day_ns
+        closes = opens + day_ns - 1
+        units = 100_000_000
+        cost = ExpectedCost(
+            "service", "charge-1", "operations", "accounting", "invoice", 3
+        )
+        request = CloseRequest(
+            request_id="first-close",
+            company_id=self.company_id,
+            from_date=day,
+            through_date=day,
+            cash_account="operating-cash",
+            currency="USDT",
+            mapping_revision="operating-chart",
+            statement_revision="original-operator-statement",
+            opening_cash_minor=100,
+            statement_cash_minor=97,
+            expense_accounts=("operations",),
+            expected_costs=(cost,),
+            owner="accounting",
+            recheck_at_ns=closes + 10**9,
+            units_per_whole=units,
+        )
+        plan = replace(
+            self.plan(opens, closes, cadence=day_ns // 2),
+            cost_inventory_revision=CostInventory.for_close("first", request).revision,
+        )
+        with (
+            patch("sourdough.paper_window.time_ns", return_value=opens - 100),
+            hold_company_writer(self.store, self.company_id) as writer,
+        ):
+            window = register_managed_window(writer, self.engine, plan)
+
+        def sample(slot, stamp, bid):
+            self.venue.publish_quote(
+                "venue",
+                ask,
+                stamp,
+                stamp,
+                bid_atoms_per_lot=bid,
+            )
+            with (
+                patch("sourdough.nautilus_paper.time_ns", return_value=stamp + 1),
+                hold_company_writer(self.store, self.company_id) as writer,
+            ):
+                return capture_window_sample(writer, self.engine, plan.window_id, slot)
+
+        def statement(now, close_id=None):
+            with patch("sourdough.paper_window_statement.time_ns", return_value=now):
+                return read_paper_statement(
+                    self.store,
+                    self.company_id,
+                    self.engine,
+                    plan.window_id,
+                    close_id=close_id,
+                )
+
+        def retain(now, terms):
+            with (
+                patch("sourdough.paper_statement_store.time_ns", return_value=now),
+                patch("sourdough.paper_window_statement.time_ns", return_value=now),
+                hold_company_writer(self.store, self.company_id) as writer,
+            ):
+                return retain_paper_statement(writer, self.engine, terms)
+
+        period_request = StatementRequest("original-report", plan.window_id)
+        ask = 60_000_000
+        sample(0, opens + 10, ask - 10)
+        ongoing = statement(opens + 11)
+        self.assertIsNone(ongoing.trading.pnl_minor)
+        self.assertIn("window-still-open", ongoing.trading.missing)
+        self.assertIn("valuation-cadence", ongoing.company.missing)
+        with self.assertRaisesRegex(WindowRefused, "Wait for the registered window"):
+            retain(opens + 11, period_request)
+        self.assertIsNone(
+            read_retained_statement(self.store, self.company_id, "original-report")
+        )
+        claim = claim_first_duty(self.store, self.company_id, "profile")
+        with (
+            patch("sourdough.nautilus_paper.time_ns", return_value=opens + 13),
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            started = pool.submit(
+                submit_paper_order,
+                self.store,
+                claim,
+                PaperIntent("statement-order", self.terms.revision, 20, ask),
+                self.venue,
+            )
+            order = None
+            deadline = monotonic() + 4
+            while order is None and monotonic() < deadline:
+                order = self.venue.claim_command("venue")
+                sleep(0.01)
+            self.assertIsNotNone(order)
+            self.venue.record_fill(
+                "venue",
+                order.order_id,
+                "statement-fill",
+                20,
+                ask,
+                4,
+                effective_ns=opens + 13,
+            )
+            started.result(timeout=2)
+        actual_cash = self.initial - 20 * ask - 4
+        self.assertTrue(
+            self.venue.record_account("venue", order.order_id, 20, actual_cash)
+        )
+        self.venue.publish_quote(
+            "venue", ask + 50, closes - 4, closes - 4, bid_atoms_per_lot=ask + 30
+        )
+        with (
+            patch("sourdough.nautilus_paper.time_ns", return_value=closes - 3),
+            hold_company_writer(self.store, self.company_id) as writer,
+        ):
+            capture_window_sample(writer, self.engine, plan.window_id, 1)
+        self.venue.invalidate_quote()
+        incomplete = statement(closes + 1)
+        self.assertEqual(incomplete.trading.pnl_minor, 596)
+        self.assertIsNone(incomplete.company.pnl_minor)
+        self.assertIn("accounting-close", incomplete.company.missing)
+        retained_original = retain(closes + 1, period_request)
+        self.assertIsNone(
+            retained_original.as_receipt()["statement"]["company"]["pnl_minor"]
+        )
+        with (
+            patch("sourdough.accounting_close.time_ns", return_value=closes + 2),
+            hold_company_writer(self.store, self.company_id) as writer,
+        ):
+            post_journal(
+                writer,
+                JournalEntry(
+                    self.company_id,
+                    cost.source,
+                    cost.event_id,
+                    "invoice",
+                    day,
+                    "USDT",
+                    "operating-chart",
+                    (JournalLine("operations", 3), JournalLine("operating-cash", -3)),
+                    units_per_whole=units,
+                ),
+            )
+            close_period(writer, request)
+        completed = statement(closes + 3, request.request_id)
+        self.assertEqual(completed.window_revision, window.revision)
+        self.assertEqual(completed.trading.closing_minor, actual_cash + 20 * (ask + 30))
+        self.assertEqual(
+            (completed.venue_fees_atoms, completed.operating_cost_atoms), (4, 3)
+        )
+        self.assertEqual(completed.company.pnl_minor, 593)
+        self.assertEqual(
+            completed.company.time_weighted_return, Fraction(593, self.initial)
+        )
+        self.assertEqual(completed.company.missing, ())
+        self.assertEqual(
+            completed.as_report(), statement(closes + 4, request.request_id).as_report()
+        )
+        self.assertNotEqual(
+            completed.as_report()["revision"], incomplete.as_report()["revision"]
+        )
+        corrected_request = StatementRequest(
+            "corrected-report",
+            plan.window_id,
+            request.request_id,
+            period_request.request_id,
+        )
+        corrected = retain(closes + 4, corrected_request)
+        self.assertEqual(
+            corrected.as_receipt()["statement"]["company"]["pnl_minor"], 593
+        )
+        self.assertEqual(
+            read_retained_statement(
+                self.store, self.company_id, period_request.request_id
+            ),
+            retained_original,
+        )
+        with self.assertRaisesRegex(WindowRefused, "original receipt"):
+            retain(
+                closes + 4,
+                replace(period_request, accounting_close_id=request.request_id),
+            )
+        with self.assertRaisesRegex(WindowRefused, "latest report"):
+            retain(
+                closes + 4, replace(corrected_request, request_id="stale-correction")
+            )
+        with self.assertRaisesRegex(WindowRefused, "another company"):
+            read_retained_statement(
+                self.store, "unrelated", corrected_request.request_id
+            )
+        with closing(sqlite3.connect(self.venue.journal)) as db, db:
+            db.execute("UPDATE sandbox_account_observation SET cash_atoms=cash_atoms+1")
+        invalidated = statement(closes + 5, request.request_id)
+        self.assertIn("venue-close", invalidated.trading.missing)
+        self.assertIsNone(invalidated.company.pnl_minor)
+        self.assertEqual(retain(closes + 6, corrected_request), corrected)
