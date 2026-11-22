@@ -12,7 +12,7 @@ from time import monotonic, time_ns
 from uuid import uuid4
 
 from .market_worker import describe_spot_instrument, journal_key, spot_trade_time_ns
-from .nautilus_paper import NautilusPaperVenue, SandboxCommand
+from .nautilus_paper import NautilusPaperVenue, SandboxBalance, SandboxCommand
 from .paper_execution import VenueRefused
 from .spot_cash import QUOTE_SCALE, SpotCashUnits
 
@@ -51,7 +51,9 @@ def capture_fill(venue, generation: str, units: SpotCashUnits, event) -> str:
     return order_id
 
 
-async def serve(venue: NautilusPaperVenue, ready_fd: int, seconds: int) -> None:
+async def serve(
+    venue: NautilusPaperVenue, ready_fd: int, seconds: int, checkpoint: SandboxBalance
+) -> None:
     from nautilus_trader.adapters.binance import (
         BinanceDataClientConfig,
         BinanceLiveDataClientFactory,
@@ -139,7 +141,11 @@ async def serve(venue: NautilusPaperVenue, ready_fd: int, seconds: int) -> None:
         on_order_denied = on_order_rejected
         on_order_expired = on_order_rejected
 
-    cash = Decimal(plan.starting_atoms) / QUOTE_SCALE
+    cash = Decimal(checkpoint.cash_atoms) / QUOTE_SCALE
+    balances = [f"{cash:f} {currency}"]
+    if checkpoint.position_lots:
+        base = Decimal(plan.terms.quantity_increment) * checkpoint.position_lots
+        balances.append(f"{base:f} {plan.terms.base_currency}")
     config = TradingNodeConfig(
         data_clients={
             "BINANCE": BinanceDataClientConfig(
@@ -153,7 +159,7 @@ async def serve(venue: NautilusPaperVenue, ready_fd: int, seconds: int) -> None:
             "BINANCE": SandboxExecutionClientConfig(
                 venue="BINANCE",
                 account_type="CASH",
-                starting_balances=[f"{cash:f} {currency}"],
+                starting_balances=balances,
                 bar_execution=False,
                 trade_execution=False,
             )
@@ -191,10 +197,22 @@ async def serve(venue: NautilusPaperVenue, ready_fd: int, seconds: int) -> None:
                             "SDK did not create the scoped virtual cash account"
                         )
                     balance = account.balance_total(strategy.instrument.quote_currency)
+                    base_balance = account.balance_total(
+                        strategy.instrument.base_currency
+                    )
+                    base_amount = (
+                        base_balance.as_decimal()
+                        if base_balance is not None
+                        else Decimal(0)
+                    )
                     venue.prove_account(
+                        generation,
                         str(account.id),
                         currency,
-                        units.quote_atoms(balance.as_decimal()),
+                        SandboxBalance(
+                            0 if base_amount.is_zero() else units.lots(base_amount),
+                            units.quote_atoms(balance.as_decimal()),
+                        ),
                     )
                 if quote != last_quote:
                     venue.publish_quote(generation, *quote, strategy.trade_ns)
@@ -264,8 +282,8 @@ def main() -> None:
                 "Original sandbox journal or activation bounds do not match"
             )
         venue = NautilusPaperVenue(args.journal)
-        venue.start_generation()
-        asyncio.run(serve(venue, args.ready_fd, args.seconds))
+        checkpoint = venue.start_generation()
+        asyncio.run(serve(venue, args.ready_fd, args.seconds, checkpoint))
     finally:
         os.close(args.ready_fd)
         os.close(descriptor)

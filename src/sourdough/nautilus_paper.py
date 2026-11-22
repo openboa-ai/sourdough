@@ -70,6 +70,12 @@ class SandboxCommand:
     limit_minor_units: int
 
 
+@dataclass(frozen=True)
+class SandboxBalance:
+    position_lots: int
+    cash_atoms: int
+
+
 class NautilusPaperVenue:
     def __init__(self, journal: Path):
         self.journal = journal.resolve()
@@ -256,32 +262,95 @@ class NautilusPaperVenue:
             raise VenueRefused("Sandbox fee policy belongs to a different account")
         return plan.fee_bps
 
-    def start_generation(self) -> None:
+    def _checkpoint(
+        self, connection: sqlite3.Connection, plan: SandboxPlan
+    ) -> SandboxBalance:
+        orders = connection.execute(
+            """SELECT o.state, o.order_id, o.quantity, o.price_atoms, o.fee_atoms,
+                      f.order_id, f.quantity, f.price_atoms, f.fee_atoms,
+                      a.position_lots, a.cash_atoms
+               FROM sandbox_order o
+               LEFT JOIN sandbox_fill_observation f ON f.fill_id=o.fill_id
+               LEFT JOIN sandbox_account_observation a ON a.order_id=o.order_id
+               ORDER BY o.rowid"""
+        )
+        position, cash = 0, plan.starting_atoms
+        for (
+            state,
+            order_id,
+            quantity,
+            price,
+            fee,
+            original,
+            lots,
+            atoms,
+            charge,
+            held,
+            available,
+        ) in orders:
+            if plan.tape_revision is not None:
+                raise VenueRefused("Historical replay cannot reuse a prior activation")
+            if state == "queued":
+                continue
+            if state != "filled" or (original, lots, atoms, charge) != (
+                order_id,
+                quantity,
+                price,
+                fee,
+            ):
+                raise VenueRefused("Sandbox original effects remain unresolved")
+            position += quantity
+            cash -= quantity * price + fee
+            if cash < 0 or (held, available) != (position, cash):
+                raise VenueRefused(
+                    "Sandbox restart is missing a corroborated account checkpoint"
+                )
+        return SandboxBalance(position, cash)
+
+    def start_generation(self) -> SandboxBalance:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute("SELECT 1 FROM sandbox_order LIMIT 1").fetchone():
-                raise VenueRefused(
-                    "Sandbox restart with outstanding history requires recovery"
-                )
             connection.execute("DELETE FROM sandbox_quote")
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS sandbox_activation (
+                       generation TEXT PRIMARY KEY, venue_account_id TEXT NOT NULL,
+                       position_lots INTEGER NOT NULL, cash_atoms INTEGER NOT NULL
+                   )"""
+            )
+            connection.commit()
+            _, plan = self._configuration(connection)
+            return self._checkpoint(connection, plan)
 
     def prove_account(
-        self, sdk_account_id: str, currency: str, cash_atoms: int
+        self,
+        generation: str,
+        sdk_account_id: str,
+        currency: str,
+        observed: SandboxBalance,
     ) -> None:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             _, plan = self._configuration(connection)
-            observed = sdk_account_id, currency, cash_atoms
-            if observed != (
+            if (sdk_account_id, currency) != (
                 "BINANCE-001",
                 plan.terms.quote_currency,
-                plan.starting_atoms,
-            ):
+            ) or observed != self._checkpoint(connection, plan):
                 raise VenueRefused(
-                    "SDK account differs from the configured virtual cash account"
+                    "SDK virtual account differs from its original verified balances"
                 )
             connection.execute(
-                "INSERT OR IGNORE INTO sandbox_identity VALUES (1, ?, ?, ?)", observed
+                "INSERT OR IGNORE INTO sandbox_identity VALUES (1, ?, ?, ?)",
+                (sdk_account_id, currency, plan.starting_atoms),
+            )
+            self._account(connection, plan.account_id)
+            connection.execute(
+                "INSERT INTO sandbox_activation VALUES (?, ?, ?, ?)",
+                (
+                    generation,
+                    sdk_account_id,
+                    observed.position_lots,
+                    observed.cash_atoms,
+                ),
             )
 
     def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None:
