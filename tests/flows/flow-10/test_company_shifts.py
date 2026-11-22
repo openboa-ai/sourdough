@@ -79,7 +79,12 @@ else:
         asset = call("publish_draft_selection", {
             "request_id": "selected", "draft_name": draft["name"], "draft_revision": draft["revision"],
             "project_id": project["project_id"], "project_revision": project["revision"],
-            "audience": ["recipient"], "start": 0, "end": 20,
+            "audience": ["author", "recipient"], "start": 0, "end": 20,
+        })
+        call("post_project_message", {
+            "project_id": project["project_id"], "project_revision": project["revision"],
+            "request_id": "question", "body": "Can you check the discrepancy?",
+            "asset_id": asset["asset_id"],
         })
         call("offer_handoff", {
             "request_id": "transfer", "recipient_id": "recipient", "asset_id": asset["asset_id"],
@@ -87,6 +92,15 @@ else:
         })
         rationale = "Pass the check to another Agent."
     elif evidence["asset_id"] == "recipient-input":
+        [project] = call("read_project_assignments", {"after": ""})["projects"]
+        [message] = call("read_project_discussion", {
+            "project_id": project["project_id"], "after": "",
+        })["messages"]
+        assert message["sender_id"] == "author" and message["body"] == "Can you check the discrepancy?"
+        call("post_project_message", {
+            "project_id": project["project_id"], "project_revision": project["revision"],
+            "request_id": "answer", "body": "I will check the discrepancy.", "asset_id": "",
+        })
         [offer] = call("read_handoff_offers", {})["offers"]
         assert offer["sender_id"] == "author", offer
         call("accept_handoff", {"offer_id": offer["offer_id"]})
@@ -267,6 +281,24 @@ class CompanyShifts(unittest.TestCase):
             self.assertEqual(
                 rows(store, "SELECT successor_id,accepted_run FROM work_handoff"),
                 [(next_review["claim"]["duty_id"], recipient["claim"]["run_id"])],
+            )
+            self.assertEqual(
+                rows(
+                    store,
+                    "SELECT sender_id,run_id,body FROM project_message ORDER BY rowid",
+                ),
+                [
+                    (
+                        "author",
+                        sender["claim"]["run_id"],
+                        "Can you check the discrepancy?",
+                    ),
+                    (
+                        "recipient",
+                        recipient["claim"]["run_id"],
+                        "I will check the discrepancy.",
+                    ),
+                ],
             )
             self.assertEqual(
                 rows(

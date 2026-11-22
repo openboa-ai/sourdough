@@ -39,7 +39,7 @@ def _revision(value) -> str:
     return sha256(_json(value).encode()).hexdigest()
 
 
-def _project(
+def project_membership(
     database: Connection, project_id: str
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     row = database.execute(
@@ -252,7 +252,9 @@ def publish_selection(
     with closing(_connect(writer.store, "rw")) as database, database:
         database.execute("BEGIN IMMEDIATE")
         require_desk(database, claim, purpose)
-        revision, members, publishers = _project(database, selection.project_id)
+        revision, members, publishers = project_membership(
+            database, selection.project_id
+        )
         if (
             revision != selection.project_revision
             or claim.founder_id not in publishers
@@ -321,7 +323,7 @@ def shared_asset_for(database: Connection, agent_id: str, asset_id: str) -> Shar
     ).fetchone()
     if row is None:
         raise DutyRefused("Shared asset is unavailable")
-    _, members, _ = _project(database, row[1])
+    _, members, _ = project_membership(database, row[1])
     if agent_id not in members or agent_id not in json.loads(row[-1]):
         raise DutyRefused("Shared asset is unavailable")
     return SharedAsset(*row[:-1])

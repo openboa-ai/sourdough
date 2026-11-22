@@ -178,12 +178,20 @@ class CompanyAssets(unittest.TestCase):
                 "finish",
                 "read_project_assignments",
                 "read_shared_asset",
+                "read_project_discussion",
+                "post_project_message",
                 "publish_draft_selection",
             ],
         )
         self.assertEqual(
             [entry["name"] for entry in peer.manifest()["tools"]],
-            ["finish", "read_project_assignments", "read_shared_asset"],
+            [
+                "finish",
+                "read_project_assignments",
+                "read_shared_asset",
+                "read_project_discussion",
+                "post_project_message",
+            ],
         )
         [assigned] = author.call("read_project_assignments", {"after": ""})["projects"]
         self.assertTrue(assigned["can_publish"])
@@ -275,6 +283,96 @@ class CompanyAssets(unittest.TestCase):
             ],
             [],
         )
+
+    def test_discussion_reopens_in_order_without_transferring_work_or_asset_access(
+        self,
+    ):
+        workflow = ScopedWorkflow(
+            "assessment",
+            "Read current work.",
+            (tool("finish", "Commit.", {}),),
+            "finish",
+        )
+
+        def run(agent):
+            return company_work_run(
+                self.writer, self.claims[agent], workflow, lambda *_: {"finished": True}
+            )
+
+        author = run("author")
+        thread = {"project_id": "project", "after": ""}
+        self.assertEqual(author.call("read_project_discussion", thread)["messages"], [])
+        draft = save_draft(
+            self.writer,
+            self.claims["author"],
+            "assessment",
+            name="summary",
+            content="Approved fact. Private rationale.",
+            expected_revision=None,
+        )
+        asset = self.publish(
+            Selection(
+                "asset",
+                draft.name,
+                draft.revision,
+                "project",
+                self.project,
+                ("author", "peer"),
+                0,
+                14,
+            )
+        )
+        post = {
+            "project_id": "project",
+            "project_revision": self.project,
+            "request_id": "question",
+            "body": "Can you verify the record?",
+            "asset_id": asset.asset_id,
+        }
+        question = author.call("post_project_message", post)
+        self.assertEqual(run("author").call("post_project_message", post), question)
+        with self.assertRaisesRegex(DutyRefused, "original post"):
+            author.call("post_project_message", post | {"body": "Changed message."})
+        reply = run("peer").call(
+            "post_project_message",
+            post
+            | {"request_id": "answer", "body": "I will review it.", "asset_id": ""},
+        )
+        self.assertEqual(
+            run("peer").call("read_project_discussion", thread)["messages"],
+            [question, reply],
+        )
+        self.assertEqual(
+            run("peer").call(
+                "read_project_discussion", thread | {"after": question["message_id"]}
+            )["messages"],
+            [reply],
+        )
+        self.assertEqual(
+            run("outsider").call("read_project_discussion", thread)["messages"],
+            [question | {"asset_id": None}, reply],
+        )
+        peer = run("peer")
+        assign_project(
+            self.writer,
+            self.manager,
+            "project",
+            ("author", "outsider"),
+            publishers=("author",),
+            expected_revision=self.project,
+        )
+        with self.assertRaisesRegex(DutyRefused, "discussion is unavailable"):
+            peer.call("read_project_discussion", thread)
+        with closing(_connect(self.writer.store, "ro")) as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT agent_id,state FROM duty WHERE id='author-duty'"
+                ).fetchone(),
+                ("author", "running"),
+            )
+            self.assertEqual(
+                database.execute("SELECT count(*) FROM work_follow_up").fetchone(), (0,)
+            )
 
     def test_explicit_acceptance_fences_the_old_owner_and_schedules_the_recipient(self):
         with closing(_connect(self.writer.store, "rw")) as database, database:
