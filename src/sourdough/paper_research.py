@@ -395,7 +395,7 @@ def find_unsubmitted_opening(
         row = connection.execute(
             f"""SELECT f.id, s.grant_id, d.id, r.run_id, f.execution_profile
                 FROM founding_receipt s
-                JOIN founder f ON f.id = s.founder_id AND f.company_id = s.company_id
+                JOIN agent f ON f.id = s.founder_id AND f.company_id = s.company_id
                 JOIN duty d ON d.id = s.due_work_id AND d.state = 'running'
                 JOIN duty_run r ON r.duty_id = d.id AND r.is_current = 1
                 JOIN paper_research_decision decision
@@ -435,7 +435,7 @@ def read_research_result(
            FROM paper_research_finding f
            JOIN paper_research_decision j ON j.finding_id = f.finding_id AND j.run_id = f.run_id
            JOIN duty_run r ON r.run_id = f.run_id JOIN duty d ON d.id = r.duty_id
-           JOIN founder a ON a.id = d.founder_id
+           JOIN agent a ON a.id = d.agent_id
            WHERE f.finding_id = ? AND a.company_id = ?""",
         (finding_id, company_id),
     ).fetchone()

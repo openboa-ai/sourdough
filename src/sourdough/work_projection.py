@@ -46,10 +46,11 @@ def read_local_board_timeline(store: Path, company_id: str) -> dict:
             if "duty_run" in tables
             else ""
         )
+        owner_column = "agent_id" if "agent" in tables else "founder_id"
         duties = _rows(
             connection,
             f"""
-            SELECT d.id AS duty_id, d.founder_id AS owner_id, d.state,
+            SELECT d.id AS duty_id, d.{owner_column} AS owner_id, d.state,
                    {"wake.due_at" if next_join else "NULL"} AS due_at,
                    {"active.run_id" if run_join else "NULL"} AS run_id
             FROM duty d {next_join} {run_join}

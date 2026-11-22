@@ -206,8 +206,8 @@ def claim_follow_up(
                       w.result_kind, w.result_id, w.result_revision, w.available_at
                FROM work_follow_up w
                JOIN duty d ON d.id = w.duty_id AND d.state = 'scheduled'
-               JOIN founder f ON f.id = d.founder_id AND f.company_id = ?
-               JOIN standing_grant g ON g.id = w.grant_id AND g.founder_id = f.id
+               JOIN agent f ON f.id = d.agent_id AND f.company_id = ?
+               JOIN standing_grant g ON g.id = w.grant_id AND g.agent_id = f.id
                WHERE w.due_at <= ? AND w.available_at <= ?
                  AND g.scope = w.grant_scope AND f.execution_profile = ?
                  AND (w.purpose = ? OR (? AND w.purpose = ?))

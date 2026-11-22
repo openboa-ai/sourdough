@@ -63,7 +63,7 @@ def _open_recovery(
                 FROM paper_order o
                 JOIN duty_run e ON e.run_id = o.run_id
                 JOIN duty d ON d.id = e.duty_id
-                JOIN founder f ON f.id = d.founder_id
+                JOIN agent f ON f.id = d.agent_id
                 LEFT JOIN paper_reconciliation j ON j.order_id = o.order_id
                 WHERE o.account_id = ? AND f.company_id = ?
                   AND ({_missing_fill(db)} OR d.state = 'running')
