@@ -11,7 +11,17 @@ from tempfile import TemporaryDirectory
 from time import time
 
 from sourdough.company import FoundingTerms, found
-from sourdough.duty_run import DutyRefused
+from sourdough.company_assessment import (
+    AssessmentProposal,
+    SourceRecord,
+    pending_publications,
+    publish_assessment,
+    read_assessment_inputs,
+    read_assessment_result,
+    seal_assessment_source,
+    settle_assessment,
+)
+from sourdough.duty_run import ASSESSMENT_REVIEW, DutyRefused
 from sourdough.onboarding import (
     accept_first_duty,
     claim_hired_first,
@@ -30,6 +40,7 @@ from sourdough.staffing import (
     stage_staffing,
 )
 from sourdough.staffing_tools import StaffingTools
+from sourdough.work import ReviewDecision, claim_assessment_review, settle_review
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -255,6 +266,87 @@ class Staffing(unittest.TestCase):
         )
         self.assertEqual(
             self.rows("SELECT state FROM hire_onboarding"), [("accepted",)]
+        )
+        self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
+
+        seal_assessment_source(
+            self.writer,
+            (
+                SourceRecord("known", "Reviewed documents", 8, 6, self.now - 1),
+                SourceRecord("future", "Late review", 12, 11, self.now + 90),
+            ),
+        )
+        untouched = self.rows("SELECT * FROM assessment_source")
+        with self.assertRaises(DutyRefused):
+            read_assessment_inputs(self.writer, manager, now=self.now)
+        inputs = read_assessment_inputs(self.writer, hire, now=self.now)
+        self.assertEqual([row["record_id"] for row in inputs["records"]], ["known"])
+        proposal = AssessmentProposal(
+            inputs["revision"],
+            "known",
+            "recommend_change",
+            "Six verified documents rather than the eight reported.",
+            60,
+        )
+        with self.assertRaisesRegex(DutyRefused, "record read"):
+            publish_assessment(
+                self.writer, hire, replace(proposal, record_id="future"), now=self.now
+            )
+        published = publish_assessment(self.writer, hire, proposal, now=self.now)
+        self.assertEqual(
+            publish_assessment(self.writer, hire, proposal, now=self.now + 1), published
+        )
+        self.assertEqual(
+            self.rows("SELECT author_id, audience_id FROM assessment_publication"),
+            [(receipt.agent_id, manager.founder_id)],
+        )
+        self.assertEqual(self.rows("SELECT * FROM assessment_source"), untouched)
+        self.assertEqual(pending_publications(self.writer), ((hire, published),))
+        follow_up = settle_assessment(self.writer, hire, published)
+        self.assertEqual(settle_assessment(self.writer, hire, published), follow_up)
+        self.assertEqual(pending_publications(self.writer), ())
+        self.assertIsNone(
+            claim_assessment_review(
+                self.store,
+                hire.company_id,
+                receipt.agent_id,
+                "profile",
+                now=published.review_at - 1,
+            )
+        )
+        self.assertIsNone(
+            claim_assessment_review(
+                self.store,
+                hire.company_id,
+                manager.founder_id,
+                "profile",
+                now=self.now + 100,
+            )
+        )
+        next_turn = claim_assessment_review(
+            self.store, hire.company_id, receipt.agent_id, "profile", now=self.now + 100
+        )
+        self.assertNotEqual(next_turn.claim.duty_id, hire.duty_id)
+        self.assertEqual(next_turn.claim.founder_id, hire.founder_id)
+        evidence = read_assessment_result(self.writer, next_turn, now=self.now + 100)
+        self.assertEqual(evidence["assessment"]["record_id"], "known")
+        self.assertEqual(len(evidence["current_records"]), 2)
+        successor = settle_review(
+            self.store,
+            next_turn,
+            ReviewDecision(
+                "review",
+                evidence["revision"],
+                "investigate",
+                "The original discrepancy remains, and one new record is visible.",
+                60,
+            ),
+            now=self.now + 100,
+            successor_purpose=ASSESSMENT_REVIEW,
+        )
+        self.assertEqual(successor.due_at, self.now + 160)
+        self.assertEqual(
+            self.rows("SELECT count(*) FROM assessment_publication"), [(1,)]
         )
         self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
 

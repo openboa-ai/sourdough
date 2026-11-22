@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from .company import RESULT_READ_SCHEMA, SCHEMA_REVISION, _company_version, _connect
 from .duty_run import (
+    ASSESSMENT_REVIEW,
     PAPER_EXECUTION,
     POSITION_REVIEW,
     DutyClaim,
@@ -120,7 +121,7 @@ def schedule_follow_up(
     *,
     purpose: str = POSITION_REVIEW,
 ) -> FollowUp:
-    if purpose not in (POSITION_REVIEW, PAPER_EXECUTION):
+    if purpose not in (POSITION_REVIEW, PAPER_EXECUTION, ASSESSMENT_REVIEW):
         raise DutyRefused("Unsupported duty purpose")
     successor = FollowUp(uuid4().hex, due_at, result, purpose)
     connection.execute(
@@ -197,12 +198,48 @@ def claim_follow_up(
     now: int,
     allow_paper_execution: bool = False,
 ) -> FollowUpClaim | None:
+    purposes = (
+        (POSITION_REVIEW, PAPER_EXECUTION)
+        if allow_paper_execution
+        else (POSITION_REVIEW,)
+    )
+    return _claim_follow_up(store, company_id, execution_profile, now, purposes)
+
+
+def claim_assessment_review(
+    store: Path,
+    company_id: str,
+    agent_id: str,
+    execution_profile: str,
+    *,
+    now: int,
+) -> FollowUpClaim | None:
+    return _claim_follow_up(
+        store,
+        company_id,
+        execution_profile,
+        now,
+        (ASSESSMENT_REVIEW,),
+        agent_id=agent_id,
+    )
+
+
+def _claim_follow_up(
+    store: Path,
+    company_id: str,
+    execution_profile: str,
+    now: int,
+    purposes: tuple[str, ...],
+    *,
+    agent_id: str | None = None,
+) -> FollowUpClaim | None:
     _time(now)
+    placeholders = ", ".join("?" for _ in purposes)
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _check_store(connection, company_id)
         row = connection.execute(
-            """SELECT d.id, f.id, g.id, w.grant_scope, w.purpose,
+            f"""SELECT d.id, f.id, g.id, w.grant_scope, w.purpose,
                       w.result_kind, w.result_id, w.result_revision, w.available_at
                FROM work_follow_up w
                JOIN duty d ON d.id = w.duty_id AND d.state = 'scheduled'
@@ -210,16 +247,17 @@ def claim_follow_up(
                JOIN standing_grant g ON g.id = w.grant_id AND g.agent_id = f.id
                WHERE w.due_at <= ? AND w.available_at <= ?
                  AND g.scope = w.grant_scope AND f.execution_profile = ?
-                 AND (w.purpose = ? OR (? AND w.purpose = ?))
+                 AND (? IS NULL OR f.id = ?)
+                 AND w.purpose IN ({placeholders})
                ORDER BY w.due_at, d.id LIMIT 1""",
             (
                 company_id,
                 now,
                 now,
                 execution_profile,
-                POSITION_REVIEW,
-                allow_paper_execution,
-                PAPER_EXECUTION,
+                agent_id,
+                agent_id,
+                *purposes,
             ),
         ).fetchone()
         if row is None:
@@ -335,9 +373,14 @@ def settle_review(
     _time(now)
     next_due = _time(now + decision.next_check_seconds)
     claim = follow_up.claim
+    if follow_up.purpose not in (POSITION_REVIEW, ASSESSMENT_REVIEW) or (
+        (follow_up.purpose == ASSESSMENT_REVIEW)
+        != (successor_purpose == ASSESSMENT_REVIEW)
+    ):
+        raise DutyRefused("Review cannot cross into a different work domain")
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        state, scope = follow_up_state(connection, follow_up, POSITION_REVIEW)
+        state, scope = follow_up_state(connection, follow_up, follow_up.purpose)
         connection.execute(
             """CREATE TABLE IF NOT EXISTS work_review_decision (
                 duty_id TEXT PRIMARY KEY NOT NULL REFERENCES work_follow_up(duty_id),
