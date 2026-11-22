@@ -23,6 +23,7 @@ class VenueExecution:
     limit_minor_units: int
     fill_id: str | None
     fill_price_minor_units: int | None
+    fee_minor_units: int = 0
 
 
 class FixedQuoteVenue:
@@ -30,17 +31,23 @@ class FixedQuoteVenue:
         self.journal = journal
 
     def _open(self, mode: str):
-        return closing(
-            sqlite3.connect(f"{self.journal.absolute().as_uri()}?mode={mode}", uri=True)
+        connection = sqlite3.connect(
+            f"{self.journal.absolute().as_uri()}?mode={mode}", uri=True
         )
+        connection.execute("PRAGMA foreign_keys = ON")
+        return closing(connection)
 
-    def provision(self, account: PaperAccount, quote_minor_units: int) -> PaperAccount:
+    def provision(
+        self, account: PaperAccount, quote_minor_units: int, *, fee_bps: int = 0
+    ) -> PaperAccount:
         if (
             account.environment != "paper"
             or type(quote_minor_units) is not int
             or not 0 < quote_minor_units <= 2**63 - 1
+            or type(fee_bps) is not int
+            or not 0 <= fee_bps <= 10000
         ):
-            raise VenueRefused("Expected paper account and positive quote")
+            raise VenueRefused("Expected paper account, positive quote and valid fee")
         with self._open("rwc") as db, db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
@@ -59,6 +66,22 @@ class FixedQuoteVenue:
                    fill_price_minor_units INTEGER)"""
             )
             existing = db.execute("SELECT * FROM venue_account").fetchone()
+            if existing is not None and self._fee_rate(db) != fee_bps:
+                raise VenueRefused("Paper venue fee policy conflicts")
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS venue_fee_policy (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), basis_points INTEGER NOT NULL
+                )"""
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO venue_fee_policy VALUES (1, ?)", (fee_bps,)
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS venue_fill_fee (
+                    order_id TEXT PRIMARY KEY NOT NULL REFERENCES venue_execution(order_id),
+                    fee_minor_units INTEGER NOT NULL
+                )"""
+            )
             if existing is None:
                 if account.destination_id:
                     raise VenueRefused(
@@ -119,6 +142,11 @@ class FixedQuoteVenue:
                 "INSERT INTO venue_execution VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (order_id, *terms, fill_id, price),
             )
+            if fill_id is not None and (rate := self._fee_rate(db)):
+                fee = (intent.quantity * price * rate + 5000) // 10000
+                if fee > 2**63 - 1:
+                    raise VenueRefused("Paper venue fee is out of range")
+                db.execute("INSERT INTO venue_fill_fee VALUES (?, ?)", (order_id, fee))
 
     def observe_quote(self, account_id: str) -> int:
         with self._open("ro") as db:
@@ -129,9 +157,57 @@ class FixedQuoteVenue:
             raise VenueRefused("Unknown destination account")
         return row[0]
 
+    def observe_fee_bps(self, account_id: str) -> int:
+        with self._open("ro") as db:
+            db.execute("BEGIN")
+            if not db.execute(
+                "SELECT 1 FROM venue_account WHERE account_id = ?", (account_id,)
+            ).fetchone():
+                raise VenueRefused("Unknown destination account for fee terms")
+            return self._fee_rate(db)
+
     def observe_execution(self, order_id: str) -> VenueExecution | None:
         with self._open("ro") as db:
+            db.execute("BEGIN")
             row = db.execute(
                 "SELECT * FROM venue_execution WHERE order_id = ?", (order_id,)
             ).fetchone()
-        return None if row is None else VenueExecution(*row)
+            return self._execution_with_fee(db, row)
+
+    def sync_account_execution(
+        self, account_id: str, order_id: str
+    ) -> VenueExecution | None:
+        with self._open("ro") as db:
+            db.execute("BEGIN")
+            row = db.execute(
+                "SELECT * FROM venue_execution WHERE account_id = ? AND order_id = ?",
+                (account_id, order_id),
+            ).fetchone()
+            return self._execution_with_fee(db, row)
+
+    @staticmethod
+    def _fee_rate(db: sqlite3.Connection) -> int:
+        if not db.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'venue_fee_policy' AND type = 'table'"
+        ).fetchone():
+            return 0
+        row = db.execute(
+            "SELECT basis_points FROM venue_fee_policy WHERE singleton = 1"
+        ).fetchone()
+        if row is None or type(row[0]) is not int or not 0 <= row[0] <= 10000:
+            raise VenueRefused("Paper venue fee policy is unverified")
+        return row[0]
+
+    def _execution_with_fee(
+        self, db: sqlite3.Connection, row: tuple | None
+    ) -> VenueExecution | None:
+        if row is None:
+            return None
+        if row[-2] is None or self._fee_rate(db) == 0:
+            return VenueExecution(*row)
+        fee = db.execute(
+            "SELECT fee_minor_units FROM venue_fill_fee WHERE order_id = ?", (row[0],)
+        ).fetchone()
+        if fee is None or type(fee[0]) is not int or fee[0] < 0:
+            raise VenueRefused("Missing authoritative fee for confirmed paper fill")
+        return VenueExecution(*row, fee[0])

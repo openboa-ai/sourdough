@@ -7,7 +7,12 @@ from tempfile import TemporaryDirectory
 from sourdough.company import FoundingTerms, found
 from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_books import PostingRefused, position_quantity, post_confirmed_fill
+from sourdough.paper_books import (
+    PostingRefused,
+    capture_position,
+    position_quantity,
+    post_confirmed_fill,
+)
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
 
@@ -79,6 +84,26 @@ class PaperBooksTests(unittest.TestCase):
         with self.assertRaises(PostingRefused):
             self.post("not-admitted")
         self.assertEqual(position_quantity(self.store, self.company_id), 0)
+
+    def test_book_observation_is_scoped_and_replays_the_captured_revision(self):
+        order_id = self.submit(110)
+        posting = self.post(order_id)
+        with self.assertRaisesRegex(PostingRefused, "does not exist"):
+            capture_position(self.store, self.company_id, "unposted", now=101)
+        observation = capture_position(
+            self.store, self.company_id, posting.fill_id, now=101
+        )
+        self.assertEqual(observation.account_id, "account")
+        self.assertEqual(observation.instrument_rules_digest, "rules")
+        self.assertEqual(observation.order_id, order_id)
+        self.assertEqual(observation.position_quantity, 2)
+        self.assertEqual(observation.fill_quantity, 2)
+        self.assertEqual(observation.available_at, 101)
+        replay = capture_position(self.store, self.company_id, posting.fill_id, now=102)
+        self.assertEqual(replay, observation)
+        self.assertEqual(replay.revision, observation.revision)
+        with self.assertRaisesRegex(PostingRefused, "identity mismatch"):
+            capture_position(self.store, "other-company", posting.fill_id, now=102)
 
     def test_replacement_journal_cannot_inherit_dispatch_authority(self):
         replacement = FixedQuoteVenue(self.journal.with_name("replacement.sqlite"))
