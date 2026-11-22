@@ -4,14 +4,27 @@ import subprocess
 import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import time
+from unittest.mock import Mock
 
+from sourdough.assessment_run import run_assessment_company
 from sourdough.company import FoundingTerms, found
-from sourdough.duty_run import DutyRefused
+from sourdough.company_assessment import (
+    AssessmentProposal,
+    SourceRecord,
+    pending_publications,
+    publish_assessment,
+    read_assessment_inputs,
+    read_assessment_result,
+    seal_assessment_source,
+    settle_assessment,
+)
+from sourdough.duty_run import ASSESSMENT_REVIEW, DutyRefused, count_company_runs
+from sourdough.first_trade import TradeRefused
 from sourdough.onboarding import (
     accept_first_duty,
     claim_hired_first,
@@ -30,6 +43,7 @@ from sourdough.staffing import (
     stage_staffing,
 )
 from sourdough.staffing_tools import StaffingTools
+from sourdough.work import ReviewDecision, claim_assessment_review, settle_review
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -39,7 +53,8 @@ class Staffing(unittest.TestCase):
         self.founding = found(
             self.store, FoundingTerms("setup", "charter", "paper", "profile")
         )
-        self.writer = self.enterContext(
+        self.lease = self.enterContext(ExitStack())
+        self.writer = self.lease.enter_context(
             hold_company_writer(self.store, self.founding.company_id)
         )
         self.authority = StaffingAuthority(
@@ -257,6 +272,222 @@ class Staffing(unittest.TestCase):
             self.rows("SELECT state FROM hire_onboarding"), [("accepted",)]
         )
         self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
+
+        seal_assessment_source(
+            self.writer,
+            (
+                SourceRecord("known", "Reviewed documents", 8, 6, self.now - 1),
+                SourceRecord("future", "Late review", 12, 11, self.now + 90),
+            ),
+        )
+        untouched = self.rows("SELECT * FROM assessment_source")
+        with self.assertRaises(DutyRefused):
+            read_assessment_inputs(self.writer, manager, now=self.now)
+        inputs = read_assessment_inputs(self.writer, hire, now=self.now)
+        self.assertEqual([row["record_id"] for row in inputs["records"]], ["known"])
+        proposal = AssessmentProposal(
+            inputs["revision"],
+            "known",
+            "recommend_change",
+            "Six verified documents rather than the eight reported.",
+            60,
+        )
+        with self.assertRaisesRegex(DutyRefused, "record read"):
+            publish_assessment(
+                self.writer, hire, replace(proposal, record_id="future"), now=self.now
+            )
+        published = publish_assessment(self.writer, hire, proposal, now=self.now)
+        self.assertEqual(
+            publish_assessment(self.writer, hire, proposal, now=self.now + 1), published
+        )
+        self.assertEqual(
+            self.rows("SELECT author_id, audience_id FROM assessment_publication"),
+            [(receipt.agent_id, manager.founder_id)],
+        )
+        self.assertEqual(self.rows("SELECT * FROM assessment_source"), untouched)
+        self.assertEqual(pending_publications(self.writer), ((hire, published),))
+        follow_up = settle_assessment(self.writer, hire, published)
+        self.assertEqual(settle_assessment(self.writer, hire, published), follow_up)
+        self.assertEqual(pending_publications(self.writer), ())
+        self.assertIsNone(
+            claim_assessment_review(
+                self.store,
+                hire.company_id,
+                receipt.agent_id,
+                "profile",
+                now=published.review_at - 1,
+            )
+        )
+        self.assertIsNone(
+            claim_assessment_review(
+                self.store,
+                hire.company_id,
+                manager.founder_id,
+                "profile",
+                now=self.now + 100,
+            )
+        )
+        next_turn = claim_assessment_review(
+            self.store, hire.company_id, receipt.agent_id, "profile", now=self.now + 100
+        )
+        self.assertNotEqual(next_turn.claim.duty_id, hire.duty_id)
+        self.assertEqual(next_turn.claim.founder_id, hire.founder_id)
+        evidence = read_assessment_result(self.writer, next_turn, now=self.now + 100)
+        self.assertEqual(evidence["assessment"]["record_id"], "known")
+        self.assertEqual(len(evidence["current_records"]), 2)
+        successor = settle_review(
+            self.store,
+            next_turn,
+            ReviewDecision(
+                "review",
+                evidence["revision"],
+                "investigate",
+                "The original discrepancy remains, and one new record is visible.",
+                60,
+            ),
+            now=self.now + 100,
+            successor_purpose=ASSESSMENT_REVIEW,
+        )
+        self.assertEqual(successor.due_at, self.now + 160)
+        self.assertEqual(
+            self.rows("SELECT count(*) FROM assessment_publication"), [(1,)]
+        )
+        self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
+
+    def arrange_due_assessment(self, turns):
+        manager, choice = self.ready("initial-staffing")
+        choice_id = record_choice(
+            self.writer,
+            manager,
+            replace(
+                choice, evidence_revision=read_need(self.writer, manager)["revision"]
+            ),
+        )
+        hire = admit_hire(
+            self.writer,
+            manager,
+            HireRequest("hire", choice_id, "reviewer", "profile", "assessment", turns),
+        )
+        provision_hire(
+            self.writer, hire.agent_id, "assessment", lambda _: True, now=self.now
+        )
+        claim = claim_hired_first(self.writer, hire.agent_id, "profile")
+        context = read_first_duty(self.writer, claim)
+        accept_first_duty(
+            self.writer, claim, context["revision"], "Review the records."
+        )
+        cut = self.now - 61
+        seal_assessment_source(
+            self.writer, (SourceRecord("book", "Verified counts", 8, 6, cut),)
+        )
+        evidence = read_assessment_inputs(self.writer, claim, now=cut)
+        receipt = publish_assessment(
+            self.writer,
+            claim,
+            AssessmentProposal(
+                evidence["revision"], "book", "investigate", "A count differs.", 60
+            ),
+            now=cut,
+        )
+        return hire, settle_assessment(self.writer, claim, receipt)
+
+    def activate_assessment(self, employee, *, budget_from=0):
+        return run_assessment_company(
+            self.store,
+            self.founding.company_id,
+            lambda: employee,
+            turn_budget=4,
+            idle_seconds=0,
+            budget_from=budget_from,
+            store_key=self.writer.store_key,
+            on_ready=lambda _: None,
+        )
+
+    @staticmethod
+    def offer_review(read):
+        evidence = read()
+        return {
+            "tool": "record_review_decision",
+            "call_id": "review-call",
+            "observation_revision": evidence["revision"],
+            "action": "investigate",
+            "rationale": "The verified count still differs.",
+            "next_check_seconds": 60,
+        }
+
+    def test_interrupted_assessment_review_reclaims_its_duty_and_rereads(self):
+        hire, follow_up = self.arrange_due_assessment(turns=3)
+        self.lease.close()
+        employee = Mock(profile="profile")
+
+        def interrupted(read):
+            read()
+            raise TradeRefused("Lost employee session before review settlement")
+
+        employee.review_assessment.side_effect = interrupted
+        with self.assertRaisesRegex(TradeRefused, "Lost employee session"):
+            self.activate_assessment(employee)
+        (departed,) = self.rows(
+            "SELECT run_id, is_current FROM duty_run WHERE purpose='assessment_review'"
+        )
+        self.assertEqual(departed[1], 1)
+
+        employee.review_assessment.side_effect = self.offer_review
+        result = self.activate_assessment(employee)
+        replacement = result.review.claim
+        self.assertEqual(replacement.founder_id, hire.agent_id)
+        self.assertEqual(replacement.duty_id, follow_up.duty_id)
+        self.assertNotEqual(replacement.run_id, departed[0])
+        self.assertCountEqual(
+            self.rows(
+                "SELECT run_id, is_current FROM duty_run WHERE purpose='assessment_review'"
+            ),
+            [(departed[0], 0), (replacement.run_id, 1)],
+        )
+        self.assertCountEqual(
+            self.rows("SELECT run_id FROM work_result_read"),
+            [(departed[0],), (replacement.run_id,)],
+        )
+        self.assertEqual(
+            self.rows("SELECT run_id FROM work_review_decision"),
+            [(replacement.run_id,)],
+        )
+        self.assertEqual(
+            self.rows("SELECT count(*) FROM assessment_publication"), [(1,)]
+        )
+
+    def test_exhausted_hire_does_not_block_a_second_staffing_assignment(self):
+        self.authority = replace(self.authority, slots=2)
+        first, _ = self.arrange_due_assessment(turns=2)
+        self.stage("next-staffing")
+        self.lease.close()
+        employee = Mock(profile="profile")
+        employee.review_assessment.side_effect = self.offer_review
+        first_run = self.activate_assessment(employee)
+        self.assertEqual(first_run.review.claim.founder_id, first.agent_id)
+
+        def assess_capacity(invoke):
+            evidence = invoke("read_staffing_need", {})
+            self.assertEqual(evidence["available_slots"], 1)
+            return invoke(
+                "record_staffing_choice",
+                {
+                    "action": "defer",
+                    "alternatives": ["reassign", "hire"],
+                    "evidence_revision": evidence["revision"],
+                    "rationale": "Reassess before taking on more work.",
+                    "next_check_seconds": 60,
+                },
+            )
+
+        employee.staffing.side_effect = assess_capacity
+        later = self.activate_assessment(
+            employee,
+            budget_from=count_company_runs(self.store, self.founding.company_id),
+        )
+        self.assertEqual(later.hiring.manager_claim.duty_id, "next-staffing")
+        self.assertIsNone(later.review)
+        employee.review_assessment.assert_called_once()
 
     def test_manager_sees_only_staffing_tools_and_requires_a_separate_hire(self):
         manager, _ = self.ready("need")

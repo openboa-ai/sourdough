@@ -7,7 +7,9 @@ from .duty_run import DutyRefused
 from .writer_lease import WriterLease
 
 
-def requeue_uncommitted_work(writer: WriterLease) -> tuple[str, ...]:
+def requeue_uncommitted_work(
+    writer: WriterLease, *, purpose: str | None = None
+) -> tuple[str, ...]:
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         writer.verify()
@@ -43,10 +45,11 @@ def requeue_uncommitted_work(writer: WriterLease) -> tuple[str, ...]:
                 LEFT JOIN founding_receipt founding ON founding.due_work_id = d.id
                 LEFT JOIN work_follow_up follow_up ON follow_up.duty_id = d.id
                 WHERE d.state = 'running'
+                  AND (? IS NULL OR run.purpose = ?)
                   AND (founding.due_work_id IS NOT NULL OR follow_up.duty_id IS NOT NULL)
                 {exclusions}
                 ORDER BY d.rowid""",
-            (writer.company_id,),
+            (writer.company_id, purpose, purpose),
         ).fetchall()
         for duty_id, old_run, next_state in recovered:
             connection.execute(

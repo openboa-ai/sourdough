@@ -10,6 +10,7 @@ from .company import _connect, _identity
 
 PAPER_EXECUTION = "paper_execution"
 POSITION_REVIEW = "position_review"
+ASSESSMENT_REVIEW = "assessment_review"
 
 
 class DutyRefused(Exception):
