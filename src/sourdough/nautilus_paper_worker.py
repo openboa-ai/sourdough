@@ -51,6 +51,28 @@ def capture_fill(venue, generation: str, units: SpotCashUnits, event) -> str:
     return order_id
 
 
+def capture_cancellation(
+    venue, generation: str, units: SpotCashUnits, order, event
+) -> str:
+    from nautilus_trader.model.enums import OrderStatus
+
+    if (
+        order is None
+        or order.status != OrderStatus.CANCELED
+        or order.client_order_id != event.client_order_id
+    ):
+        raise VenueRefused("SDK did not corroborate its cancellation event")
+    order_id = str(event.client_order_id)
+    amount = order.filled_qty.as_decimal()
+    venue.record_cancellation(
+        generation,
+        order_id,
+        str(event.id),
+        0 if amount.is_zero() else units.lots(amount),
+    )
+    return order_id
+
+
 async def serve(
     venue: NautilusPaperVenue, ready_fd: int, seconds: int, checkpoint: SandboxBalance
 ) -> None:
@@ -137,7 +159,21 @@ async def serve(
         def on_order_rejected(self, event):
             venue.mark_unresolved(generation, str(event.client_order_id))
 
-        on_order_canceled = on_order_rejected
+        def on_order_canceled(self, event):
+            try:
+                pending_account.add(
+                    capture_cancellation(
+                        venue,
+                        generation,
+                        units,
+                        self.cache.order(event.client_order_id),
+                        event,
+                    )
+                )
+            except Exception as error:
+                if not failure.done():
+                    failure.set_result(error)
+
         on_order_denied = on_order_rejected
         on_order_expired = on_order_rejected
 
@@ -234,15 +270,19 @@ async def serve(
                     base_balance = account.balance_total(
                         strategy.instrument.base_currency
                     )
-                    if base_balance is not None and base_balance.as_decimal() > 0:
-                        for order_id in tuple(pending_account):
-                            if venue.record_account(
-                                generation,
-                                order_id,
-                                units.lots(base_balance.as_decimal()),
-                                units.quote_atoms(quote_cash.as_decimal()),
-                            ):
-                                pending_account.remove(order_id)
+                    base_amount = (
+                        base_balance.as_decimal()
+                        if base_balance is not None
+                        else Decimal(0)
+                    )
+                    for order_id in tuple(pending_account):
+                        if venue.record_account(
+                            generation,
+                            order_id,
+                            0 if base_amount.is_zero() else units.lots(base_amount),
+                            units.quote_atoms(quote_cash.as_decimal()),
+                        ):
+                            pending_account.remove(order_id)
                 command = venue.claim_command(generation)
                 if command is not None:
                     submit_limit(strategy, strategy.instrument, units, command)

@@ -15,6 +15,7 @@ from .paper_account import PaperAccount
 from .paper_execution import (
     PaperIntent,
     PaperOrderSizing,
+    VenueCancellation,
     VenueExecution,
     VenueRefused,
     require_separate_journal,
@@ -25,6 +26,10 @@ from .spot_cash import MAX_ATOMS, QUOTE_SCALE, SpotCashUnits
 CONNECTOR = "nautilus-spot-sandbox-v1"
 REPLAY_CONNECTOR = "nautilus-offline-spot-replay-v1"
 _STALE_NS = 15 * 10**9
+_CANCELLATION_SCHEMA = """CREATE TABLE IF NOT EXISTS sandbox_cancellation (
+    order_id TEXT PRIMARY KEY NOT NULL REFERENCES sandbox_order(order_id),
+    generation TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL
+)"""
 
 
 @dataclass(frozen=True)
@@ -156,6 +161,7 @@ class NautilusPaperVenue:
                        position_lots INTEGER NOT NULL, cash_atoms INTEGER NOT NULL
                    )"""
             )
+            connection.execute(_CANCELLATION_SCHEMA)
             terms = json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"))
             row = connection.execute(
                 "SELECT destination_id,plan FROM sandbox_config WHERE singleton=1"
@@ -266,22 +272,24 @@ class NautilusPaperVenue:
         self, connection: sqlite3.Connection, plan: SandboxPlan
     ) -> SandboxBalance:
         orders = connection.execute(
-            """SELECT o.state,o.quantity,SUM(f.quantity),SUM(f.quantity*f.price_atoms+f.fee_atoms),
-                      a.position_lots, a.cash_atoms
+            """SELECT o.state,o.quantity,c.filled_quantity,COALESCE(SUM(f.quantity),0),
+                      COALESCE(SUM(f.quantity*f.price_atoms+f.fee_atoms),0),a.position_lots,a.cash_atoms
                FROM sandbox_order o
                LEFT JOIN sandbox_fill_observation f ON f.order_id=o.order_id AND f.generation=o.generation
                LEFT JOIN sandbox_account_observation a ON a.order_id=o.order_id
+               LEFT JOIN sandbox_cancellation c ON c.order_id=o.order_id AND c.generation=o.generation
                GROUP BY o.order_id ORDER BY o.rowid"""
         )
         position, cash = 0, plan.starting_atoms
-        for state, quantity, filled, cost, held, available in orders:
+        for state, quantity, cancelled_total, filled, cost, held, available in orders:
             if plan.tape_revision is not None:
                 raise VenueRefused("Historical replay cannot reuse a prior activation")
             if state == "queued":
                 continue
-            if state != "filled" or filled != quantity or cost is None:
+            expected = quantity if state == "filled" else cancelled_total
+            if filled != expected:
                 raise VenueRefused("Sandbox original effects remain unresolved")
-            position += quantity
+            position += filled
             cash -= cost
             if cash < 0 or (held, available) != (position, cash):
                 raise VenueRefused(
@@ -292,6 +300,7 @@ class NautilusPaperVenue:
     def start_generation(self) -> SandboxBalance:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_CANCELLATION_SCHEMA)
             connection.execute("DELETE FROM sandbox_quote")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS sandbox_activation (
@@ -354,7 +363,11 @@ class NautilusPaperVenue:
             if not existing:
                 self._fresh_quote(connection)
                 if connection.execute(
-                    "SELECT 1 FROM sandbox_order WHERE state!='filled' LIMIT 1"
+                    """SELECT 1 FROM sandbox_order o WHERE state!='filled' AND NOT EXISTS (
+                         SELECT 1 FROM sandbox_cancellation c
+                         JOIN sandbox_account_observation a USING(order_id)
+                         WHERE c.order_id=o.order_id AND c.generation=o.generation
+                       ) LIMIT 1"""
                 ).fetchone():
                     raise VenueRefused(
                         "Outstanding sandbox action has no verified terminal result"
@@ -406,16 +419,47 @@ class NautilusPaperVenue:
                 )
             )
 
+    def read_cancellation(
+        self, account_id: str, order_id: str, *, account_sync: bool = False
+    ) -> VenueCancellation | None:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            account = self._account(connection, account_id)
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE name='sandbox_cancellation'"
+            ).fetchone():
+                return None
+            row = connection.execute(
+                """SELECT c.event_id,c.filled_quantity FROM sandbox_cancellation c
+                   JOIN sandbox_order o ON o.order_id=c.order_id AND o.generation=c.generation
+                   WHERE c.order_id=? AND (NOT ? OR EXISTS (
+                       SELECT 1 FROM sandbox_account_observation a WHERE a.order_id=c.order_id
+                   ))""",
+                (order_id, account_sync),
+            ).fetchone()
+            return (
+                VenueCancellation(
+                    order_id, account_id, account.instrument_rules_digest, *row
+                )
+                if row
+                else None
+            )
+
     def record_account(
         self, generation: str, order_id: str, position_lots: int, cash_atoms: int
     ) -> bool:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT state,generation FROM sandbox_order WHERE order_id=?",
-                (order_id,),
+                """SELECT CASE WHEN o.state='filled' THEN o.quantity ELSE c.filled_quantity END,
+                          COALESCE(SUM(f.quantity),0)
+                   FROM sandbox_order o
+                   LEFT JOIN sandbox_cancellation c ON c.order_id=o.order_id AND c.generation=o.generation
+                   LEFT JOIN sandbox_fill_observation f ON f.order_id=o.order_id AND f.generation=o.generation
+                   WHERE o.order_id=? AND o.generation=? GROUP BY o.order_id""",
+                (order_id, generation),
             ).fetchone()
-            if row != ("filled", generation):
+            if row is None or row[0] != row[1]:
                 return False
             observed = position_lots, cash_atoms
             prior = connection.execute(
@@ -427,10 +471,13 @@ class NautilusPaperVenue:
                 return prior == observed
             _, plan = self._configuration(connection)
             quantity, cost = connection.execute(
-                """SELECT SUM(f.quantity),SUM(f.quantity*f.price_atoms+f.fee_atoms)
+                """SELECT COALESCE(SUM(f.quantity),0),COALESCE(SUM(f.quantity*f.price_atoms+f.fee_atoms),0)
                    FROM sandbox_order o JOIN sandbox_fill_observation f
                      ON f.order_id=o.order_id AND f.generation=o.generation
-                   WHERE o.state='filled'"""
+                   WHERE o.state='filled' OR EXISTS (
+                        SELECT 1 FROM sandbox_cancellation c WHERE c.order_id=o.order_id
+                          AND c.generation=o.generation
+                   )"""
             ).fetchone()
             if observed != (quantity, plan.starting_atoms - cost):
                 return False
@@ -530,7 +577,11 @@ class NautilusPaperVenue:
                 "SELECT COALESCE(SUM(quantity),0) FROM sandbox_fill_observation WHERE order_id=?",
                 (order_id,),
             ).fetchone()
-            if booked + lots > row[0]:
+            terminal = connection.execute(
+                "SELECT filled_quantity FROM sandbox_cancellation WHERE order_id=?",
+                (order_id,),
+            ).fetchone()
+            if booked + lots > (terminal[0] if terminal else row[0]):
                 raise VenueRefused("Sandbox fills exceed the original order")
             connection.execute(
                 "INSERT INTO sandbox_fill_observation VALUES (?, ?, ?, ?, ?, ?)",
@@ -543,6 +594,41 @@ class NautilusPaperVenue:
                    WHERE order_id=?""",
                 (fill_id, price, fee, order_id),
             )
+
+    def record_cancellation(
+        self, generation: str, order_id: str, event_id: str, filled_quantity: int
+    ) -> None:
+        with self._connect("rw") as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            order = connection.execute(
+                """SELECT quantity,COALESCE((SELECT SUM(quantity) FROM sandbox_fill_observation
+                         WHERE order_id=o.order_id),0) FROM sandbox_order o
+                   WHERE order_id=? AND generation=? AND state IN ('dispatching','unresolved')""",
+                (order_id, generation),
+            ).fetchone()
+            if (
+                order is None
+                or not isinstance(event_id, str)
+                or not event_id
+                or type(filled_quantity) is not int
+                or not order[1] <= filled_quantity < order[0]
+            ):
+                raise VenueRefused(
+                    "Sandbox cancellation conflicts with the original order"
+                )
+            prior = connection.execute(
+                "SELECT * FROM sandbox_cancellation WHERE order_id=? OR event_id=?",
+                (order_id, event_id),
+            ).fetchall()
+            terms = (order_id, generation, event_id, filled_quantity)
+            if prior:
+                if prior != [terms]:
+                    raise VenueRefused("Sandbox cancellation replay changed its terms")
+                return
+            connection.execute(
+                "INSERT INTO sandbox_cancellation VALUES (?,?,?,?)", terms
+            )
+            self._mark_unresolved(connection, generation, order_id)
 
     def _mark_unresolved(
         self, connection: sqlite3.Connection, generation: str, order_id: str

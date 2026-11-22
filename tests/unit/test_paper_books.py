@@ -15,6 +15,7 @@ from sourdough.paper_books import (
     post_confirmed_fill,
     read_booked_fill,
 )
+from sourdough.paper_execution import VenueCancellation
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
 from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
@@ -59,11 +60,11 @@ class PaperBooksTests(unittest.TestCase):
         )
         self.claim = claim_first_duty(self.store, self.company_id, "runtime")
 
-    def submit(self, limit):
+    def submit(self, limit, quantity=2):
         return submit_paper_order(
             self.store,
             self.claim,
-            PaperIntent("action", "rules", 2, limit),
+            PaperIntent("action", "rules", quantity, limit),
             self.venue,
         ).order_id
 
@@ -243,6 +244,80 @@ class PaperBooksTests(unittest.TestCase):
         completed = post_confirmed_fill(self.store, self.company_id, order_id, history)
         self.assertEqual(completed.fill_id, "second")
         self.assertEqual(position_quantity(self.store, self.company_id), 2)
+
+    def test_cancel_release_waits_for_late_fill_and_is_idempotent(self):
+        order_id = self.submit(99, quantity=3)
+
+        class TerminalVenue(ObservedFillVenue):
+            def read_cancellation(self, account_id, order_id, *, account_sync=False):
+                return VenueCancellation(
+                    order_id, account_id, "rules", "cancel-event", 2
+                )
+
+        first = TerminalVenue(self.journal, "first", 1, 80, 1)
+        early = reconcile_paper_orders(self.store, self.company_id, first, now=100)
+        self.assertEqual((early.recovered, early.unresolved), ((), 1))
+        [position] = read_local_board_timeline(self.store, self.company_id)["paper"][
+            "orders"
+        ]
+        self.assertEqual(
+            (
+                position["reserved_minor_units"],
+                position["open_reservation_minor_units"],
+            ),
+            (278, 198),
+        )
+        late = TerminalVenue(self.journal, "late", 1, 90, 2)
+        recovered = reconcile_paper_orders(
+            self.store, self.company_id, late, now=early.next_query_at
+        )
+        self.assertEqual(recovered.unresolved, 0)
+        [completed] = recovered.recovered
+        self.assertEqual(completed.posting.fill_id, "late")
+        self.assertEqual(
+            post_confirmed_fill(self.store, self.company_id, order_id, first),
+            completed.posting,
+        )
+        [position] = read_local_board_timeline(self.store, self.company_id)["paper"][
+            "orders"
+        ]
+        self.assertEqual(
+            (
+                position["status"],
+                position["reserved_minor_units"],
+                position["open_reservation_minor_units"],
+                position["remaining_quantity"],
+            ),
+            ("cancelled", 170, 0, 1),
+        )
+        conflicting = TerminalVenue(self.journal, "extra", 1, 90, 0)
+        with self.assertRaisesRegex(PostingRefused, "exceeds recorded terminal"):
+            post_confirmed_fill(self.store, self.company_id, order_id, conflicting)
+        self.assertEqual(position_quantity(self.store, self.company_id), 2)
+
+    def test_cancel_with_zero_fills_releases_without_creating_a_fill(self):
+        order_id = self.submit(99)
+
+        class TerminalVenue(FixedQuoteVenue):
+            def read_cancellation(self, account_id, order_id, *, account_sync=False):
+                return VenueCancellation(
+                    order_id, account_id, "rules", "cancel-event", 0
+                )
+
+        venue = TerminalVenue(self.journal)
+        outcome = reconcile_paper_orders(self.store, self.company_id, venue, now=100)
+        self.assertEqual(
+            (outcome.recovered, outcome.unresolved, outcome.next_query_at),
+            ((), 0, None),
+        )
+        self.assertIsNone(read_booked_fill(self.store, self.company_id, order_id))
+        self.assertEqual(position_quantity(self.store, self.company_id), 0)
+        [order] = read_local_board_timeline(self.store, self.company_id)["paper"][
+            "orders"
+        ]
+        self.assertEqual(
+            (order["status"], order["reserved_minor_units"]), ("cancelled", 0)
+        )
 
     def test_book_observation_is_scoped_and_replays_the_captured_revision(self):
         order_id = self.submit(110)

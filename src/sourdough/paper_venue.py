@@ -192,6 +192,11 @@ class FixedQuoteVenue:
             (observed,) if observed is not None and observed.fill_id is not None else ()
         )
 
+    def read_cancellation(
+        self, account_id: str, order_id: str, *, account_sync: bool = False
+    ) -> None:
+        return None
+
     @staticmethod
     def _fee_rate(db: sqlite3.Connection) -> int:
         if not db.execute(

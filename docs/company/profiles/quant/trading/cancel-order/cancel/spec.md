@@ -14,6 +14,8 @@ Input contracts: [Resolve accepted, sealed-absent and unknown outcomes](../../re
 
 Address one original order instead of replacing or flattening the entire position as a shortcut.
 
+The local SDK bridge records a terminal cancellation event with the original order ID and cumulative filled quantity. The book releases the unfilled limit exposure only when its independently identified fills sum to that quantity. The terminal event and the release share one durable record; an incomplete observation leaves the reservation and lookup active. This applies to an SDK-initiated IOC cancellation and does not itself authorize a new cancel command.
+
 **Concern for the responsible component:** A cancellation response is not final fill history; obtain terminal evidence and account for late fills before releasing headroom.
 
 ## Functional and quality requirements
