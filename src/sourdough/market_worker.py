@@ -68,6 +68,20 @@ def _terms_body(terms: SpotInstrumentTerms) -> str:
     return json.dumps(asdict(terms), separators=(",", ":"), sort_keys=True)
 
 
+def describe_spot_instrument(metadata) -> SpotInstrumentTerms:
+    return SpotInstrumentTerms(
+        str(metadata.raw_symbol),
+        str(metadata.base_currency),
+        str(metadata.quote_currency),
+        str(metadata.price_increment),
+        str(metadata.size_increment),
+        str(metadata.min_quantity) if metadata.min_quantity is not None else None,
+        format(metadata.min_notional.as_decimal(), "f")
+        if metadata.min_notional is not None
+        else None,
+    )
+
+
 @dataclass(frozen=True)
 class MarketScope:
     company_id: str
@@ -292,19 +306,7 @@ async def _collect(
                 metadata = self.cache.instrument(instrument)
                 if not isinstance(metadata, CurrencyPair):
                     raise MarketRefused("Public spot instrument was not loaded")
-                terms = SpotInstrumentTerms(
-                    str(metadata.raw_symbol),
-                    str(metadata.base_currency),
-                    str(metadata.quote_currency),
-                    str(metadata.price_increment),
-                    str(metadata.size_increment),
-                    str(metadata.min_quantity)
-                    if metadata.min_quantity is not None
-                    else None,
-                    format(metadata.min_notional.as_decimal(), "f")
-                    if metadata.min_notional is not None
-                    else None,
-                )
+                terms = describe_spot_instrument(metadata)
                 bind_spot_terms(journal, key, scope, terms)
                 self.subscribe_trade_ticks(instrument)
             except (MarketRefused, sqlite3.Error, OSError) as error:

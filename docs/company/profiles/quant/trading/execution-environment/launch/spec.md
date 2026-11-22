@@ -53,3 +53,11 @@ The setup receipt establishes package identity and importability only. It author
 `sourdough observe-trading-market STORE ENGINE_DIRECTORY --company-id ID --symbol BTCUSDT` opens an already prepared engine and directs the public spot data client to an immutable, company-owned market journal separate from the company database. The readiness receipt requires verified spot currency and sizing terms and a fresh source event committed to the original journal. Instrument term drift blocks activation; repeated or excessive-age events do not count as readiness. The run is bounded, the worker receives no inherited provider credentials, and no execution client is configured.
 
 This observation uses exchange trade IDs and exchange trade times at the provider's millisecond precision, correcting only the pinned SDK's bounded float-conversion error. It is not a quote or order-book continuity guarantee, paper execution, testnet qualification, or evidence of any financial result.
+
+## Bounded virtual cash activation
+
+After observing the spot instrument, `prepare-nautilus-paper` seals the virtual account using the same engine installation. `serve-nautilus-paper` starts the sandbox separately from the company worker. It authenticates the virtual cash identity and waits for a fresh public quote and exchange trade before readiness. `bind-nautilus-paper` binds that account to the company; `operate-nautilus-paper` runs the existing company admission, work and book path against the bound venue.
+
+The supported initial verification is an IOC buy with a full observed fill, exact spot lot increments and quote atoms of (10^{-8}). The company records its reservation before queueing an original order ID. The sandbox worker records actual SDK fill evidence in a separate journal; account sync requires a matching, separately observed SDK position and cash balance. The package config runs only the public market data and sandbox execution factories and uses a declared zero test fee. It does not represent actual fees, slippage, depth or returns.
+
+An ambiguous or partial result is retained and does not permit new risk. Starting a fresh engine with existing order history is refused until engine-state recovery is verified. A succeeded bounded activation does not prove multi-fill, offline replay, portable restart, or testnet parity.
