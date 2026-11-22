@@ -39,6 +39,10 @@ class WriterLease:
     _lock_descriptor: int
     _lock_key: tuple[int, int]
 
+    @property
+    def store_key(self) -> tuple[int, int]:
+        return self._store_key
+
     def verify(self) -> None:
         try:
             opened = os.fstat(self._store_descriptor)
@@ -66,7 +70,11 @@ class WriterLease:
 
 @contextmanager
 def hold_company_writer(
-    store: Path, company_id: str, *, lease_directory: Path | None = None
+    store: Path,
+    company_id: str,
+    *,
+    lease_directory: Path | None = None,
+    expected_store_key: tuple[int, int] | None = None,
 ) -> Iterator[WriterLease]:
     store = store.absolute()
     with ExitStack() as stack:
@@ -80,6 +88,8 @@ def hold_company_writer(
             raise WriterRefused(
                 "A company store must be a regular file owned by this user"
             )
+        if expected_store_key is not None and _file_key(info) != expected_store_key:
+            raise WriterRefused("Store does not match the configured writer identity")
 
         directory = lease_directory or _lease_directory()
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
