@@ -23,73 +23,120 @@ PROFILE = {
 def handle(database, request):
     operation = request["op"]
     if operation == "initialize":
-        database.execute("CREATE TABLE visibility (withhold INTEGER NOT NULL)")
-        database.execute("INSERT INTO visibility VALUES (?)", (request["withhold"],))
+        database.execute(
+            "CREATE TABLE fixture (withhold INTEGER NOT NULL, partial INTEGER NOT NULL)"
+        )
+        database.execute(
+            "INSERT INTO fixture VALUES (?,?)",
+            (request["withhold"], request["partial"]),
+        )
         database.execute(
             """CREATE TABLE remote_order (
                    client_id TEXT PRIMARY KEY NOT NULL,
                    client_action TEXT NOT NULL,
                    amount INTEGER NOT NULL,
-                   ceiling INTEGER NOT NULL,
-                   execution_id TEXT NOT NULL,
-                   price INTEGER NOT NULL,
-                   charge INTEGER NOT NULL
+                   ceiling INTEGER NOT NULL
                )"""
         )
-        return {}
-    if operation == "account":
-        return PROFILE
-    if operation == "publish":
-        database.execute("UPDATE visibility SET withhold=0")
-        return {}
-    if request.get("ledger") != PROFILE["ledger"]:
-        raise ValueError("Fixture does not observe or accept another account")
-    (withheld,) = database.execute("SELECT withhold FROM visibility").fetchone()
-    if operation == "send":
-        if request.get("termsHash") != PROFILE["termsHash"] or request["ceiling"] < 100:
-            raise ValueError("Intent is outside the emulated common subset")
-        identity = request["clientId"]
-        amount = request["amount"]
-        fee = (amount * 100 * 50 + 5000) // 10000
         database.execute(
-            "INSERT INTO remote_order VALUES (?,?,?,?,?,?,?)",
-            (
-                identity,
-                request["clientAction"],
-                amount,
-                request["ceiling"],
-                "execution:" + identity,
-                100,
-                fee,
-            ),
+            """CREATE TABLE remote_fill (
+                   client_id TEXT NOT NULL, execution_id TEXT PRIMARY KEY,
+                   executed INTEGER NOT NULL, price INTEGER NOT NULL, charge INTEGER NOT NULL
+               )"""
+        )
+        database.execute(
+            "CREATE TABLE remote_cancel (client_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, executed INTEGER NOT NULL)"
+        )
+        return {}
+    withheld, partial = database.execute(
+        "SELECT withhold,partial FROM fixture"
+    ).fetchone()
+    profile = PROFILE | ({"takerBps": 0} if partial else {})
+    if operation == "account":
+        return profile
+    if operation == "publish":
+        database.execute("UPDATE fixture SET withhold=0")
+        return {}
+    if request.get("ledger") != profile["ledger"]:
+        raise ValueError("Fixture does not observe or accept another account")
+    identity = request["clientId"]
+    if operation == "send":
+        if (
+            request.get("termsHash") != profile["termsHash"]
+            or request["ceiling"] < profile["mark"]
+        ):
+            raise ValueError("Intent is outside the emulated common subset")
+        amount = request["amount"]
+        executed = 2 if partial else amount
+        fee = (executed * profile["mark"] * profile["takerBps"] + 5000) // 10000
+        database.execute(
+            "INSERT INTO remote_order VALUES (?,?,?,?)",
+            (identity, request["clientAction"], amount, request["ceiling"]),
+        )
+        database.execute(
+            "INSERT INTO remote_fill VALUES (?,?,?,?,?)",
+            (identity, "execution:" + identity, executed, profile["mark"], fee),
         )
         return {"ack": None if withheld else identity}
+    order = database.execute(
+        "SELECT amount FROM remote_order WHERE client_id=?", (identity,)
+    ).fetchone()
+    if partial and order and operation == "cancelFixture":
+        database.execute(
+            "INSERT INTO remote_cancel VALUES (?,?,?)",
+            (identity, "cancel:" + identity, 3),
+        )
+        return {}
+    if partial and order and operation == "lateFillFixture":
+        database.execute(
+            "INSERT INTO remote_fill VALUES (?,?,?,?,?)",
+            (identity, "late:" + identity, 1, profile["mark"], 0),
+        )
+        return {}
+    cancellation = database.execute(
+        "SELECT event_id,executed FROM remote_cancel WHERE client_id=?", (identity,)
+    ).fetchone()
+    (executed,) = database.execute(
+        "SELECT COALESCE(sum(executed),0) FROM remote_fill WHERE client_id=?",
+        (identity,),
+    ).fetchone()
+    corroborated = order and executed == (cancellation[1] if cancellation else order[0])
     if operation == "position":
-        row = database.execute(
-            "SELECT amount FROM remote_order WHERE client_id=?", (request["clientId"],)
-        ).fetchone()
-        return {"openLots": row[0]} if not withheld and row is not None else {}
+        return {"openLots": executed} if not withheld and corroborated else {}
+    if operation == "terminal":
+        if withheld or cancellation is None or (request["sync"] and not corroborated):
+            return {}
+        return {"eventId": cancellation[0], "cumExecuted": cancellation[1]}
     if operation in ("history", "accountSync"):
-        row = database.execute(
-            "SELECT client_id,amount,ceiling,execution_id,price,charge FROM remote_order WHERE client_id=?",
-            (request["clientId"],),
-        ).fetchone()
-        result = (
-            {}
-            if withheld or row is None
-            else dict(
-                zip(
-                    ("clientId", "amount", "ceiling", "executionId", "price", "charge"),
-                    row,
-                    strict=True,
+        facts = (
+            []
+            if withheld or (operation == "accountSync" and not corroborated)
+            else [
+                dict(
+                    zip(
+                        (
+                            "clientId",
+                            "amount",
+                            "ceiling",
+                            "executionId",
+                            "price",
+                            "charge",
+                            "executed",
+                        ),
+                        row,
+                        strict=True,
+                    )
                 )
-            )
+                for row in database.execute(
+                    """SELECT orders.client_id,orders.amount,orders.ceiling,
+                          fill.execution_id,fill.price,fill.charge,fill.executed
+                   FROM remote_order orders JOIN remote_fill fill USING(client_id)
+                   WHERE orders.client_id=? ORDER BY fill.rowid""",
+                    (identity,),
+                )
+            ]
         )
-        return (
-            {"trades": [result] if result else []}
-            if operation == "accountSync"
-            else result
-        )
+        return {"trades" if operation == "accountSync" else "history": facts}
     raise ValueError("Unsupported fixture operation")
 
 

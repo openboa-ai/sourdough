@@ -12,6 +12,8 @@ Pin one build digest, identical starting company state and grants except the env
 
 The local protocol fixture runs in a separate process with its own ledger and no network or credentials. Its private wire fields differ from the paper core's types. On an accepted request with a lost reply, the fixture witness can independently see the order while the company-facing history cannot yet see it. The harness advances only the venue's evidence visibility; it does not modify company orders, reservations or holdings.
 
+The partial-fill pair uses the managed paper adapter's independent journal and the wire fixture. In both cases a terminal cancellation arrives before the last identified fill. Keep the remainder reserved until the reported cumulative quantity matches unique fills; run reconciliation in a fresh company process at each cut and compare its original order, fees, exposure and final position with the independently persisted venue facts. This fixture does not replace an actual SDK observation.
+
 ## Scenarios and oracle
 
 | Case | Required comparison |

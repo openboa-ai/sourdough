@@ -1,18 +1,24 @@
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import monotonic, sleep, time_ns
 
 from sourdough.company import FoundingTerms, found
 from sourdough.first_duty import DutyRefused, claim_first_duty
+from sourdough.market_worker import SpotInstrumentTerms
+from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_execution import (
     PaperIntent,
+    VenueCancellation,
     VenueExecution,
     VenuePosition,
     VenueRefused,
@@ -28,9 +34,10 @@ FIXTURE = Path(__file__).resolve().parents[1] / "flows/flow-07/protocol_emulator
 
 
 class WireVenue:
-    def __init__(self, journal, withhold):
+    def __init__(self, journal, withhold=None, *, partial=False):
         self.journal = journal
-        self.call("initialize", withhold=withhold)
+        if withhold is not None:
+            self.call("initialize", withhold=withhold, partial=partial)
 
     def call(self, operation, **fields):
         response = subprocess.run(
@@ -103,8 +110,8 @@ class WireVenue:
             ledger=account_id,
             clientId=order_id,
         )
-        fact = next(iter(response["trades"]), None) if account_sync else response
-        if not fact:
+        facts = response["trades" if account_sync else "history"]
+        if not facts:
             return ()
         account = self.observe_account(account_id)
         return (
@@ -117,11 +124,25 @@ class WireVenue:
                 fact["executionId"],
                 fact["price"],
                 fact["charge"],
-            ),
+                fact["executed"],
+            )
+            for fact in facts
         )
 
     def read_cancellation(self, account_id, order_id, *, account_sync=False):
-        return None
+        event = self.call(
+            "terminal", ledger=account_id, clientId=order_id, sync=account_sync
+        )
+        if not event:
+            return None
+        account = self.observe_account(account_id)
+        return VenueCancellation(
+            order_id,
+            account_id,
+            account.instrument_rules_digest,
+            event["eventId"],
+            event["cumExecuted"],
+        )
 
     def read_order_position(self, account_id, order_id):
         response = self.call("position", ledger=account_id, clientId=order_id)
@@ -177,7 +198,7 @@ class ExecutionProtocolParity(unittest.TestCase):
         venue = (WireVenue if external else PaperFixture)(journal, withhold)
         if external:
             account = venue.observe_account("shadow-cash")
-            outside = "SELECT client_id,amount,execution_id FROM remote_order"
+            outside = "SELECT client_id,amount,execution_id FROM remote_order JOIN remote_fill USING(client_id)"
         else:
             account = venue.provision(
                 PaperAccount(
@@ -259,3 +280,140 @@ class ExecutionProtocolParity(unittest.TestCase):
         position = observe_bound_position(venue, account, order_id)
         self.assertIsNotNone(position)
         return booked_quantity, price, fee, remaining, position.position_quantity
+
+    def test_partial_then_late_fill_and_cancellation_across_company_restarts(self):
+        results = []
+        for adapter in ("managed", "wire"):
+            with self.subTest(adapter=adapter), TemporaryDirectory() as directory:
+                results.append(self.observe_partial(Path(directory), adapter))
+        self.assertEqual(results, [([(2, 100, 0), (1, 100, 0)], 300, 3)] * 2)
+
+    def observe_partial(self, root, adapter):
+        store, journal = root / "company.sqlite", root / "venue.sqlite"
+        company = found(store, FoundingTerms("partial", "charter", "paper", "employee"))
+        company_id = company.company_id
+        if adapter == "wire":
+            venue = WireVenue(journal, False, partial=True)
+            account = venue.observe_account("shadow-cash")
+            orders_sql = "SELECT client_id,amount FROM remote_order"
+            fills_sql = "SELECT execution_id,executed,price,charge FROM remote_fill ORDER BY rowid"
+            cancel_sql = "SELECT event_id,executed FROM remote_cancel"
+        else:
+            venue = NautilusPaperVenue(journal)
+            terms = SpotInstrumentTerms(
+                "BTCUSD", "BTC", "USD", "0.01", "0.000001", "0.000001", "0.000001"
+            )
+            venue.provision(SandboxPlan(company_id, "managed", terms, 1000, 0))
+            venue.prove_account(
+                "generation", "BINANCE-001", "USD", venue.start_generation()
+            )
+            stamp = time_ns()
+            venue.publish_quote("generation", 100, stamp, stamp)
+            account = venue.observe_account("managed")
+            orders_sql = "SELECT order_id,quantity FROM sandbox_order"
+            fills_sql = "SELECT fill_id,quantity,price_atoms,fee_atoms FROM sandbox_fill_observation ORDER BY rowid"
+            cancel_sql = "SELECT event_id,filled_quantity FROM sandbox_cancellation"
+        bind(store, PaperMandate("mandate", company_id, "charter", account, 800), venue)
+        claim = claim_first_duty(store, company_id, "employee")
+        intent = PaperIntent("partial-action", account.instrument_rules_digest, 5, 110)
+        if adapter == "wire":
+            order = submit_paper_order(store, claim, intent, venue).order_id
+        else:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(submit_paper_order, store, claim, intent, venue)
+                deadline = monotonic() + 4
+                command = venue.claim_command("generation")
+                while command is None and not pending.done() and monotonic() < deadline:
+                    sleep(0.01)
+                    command = venue.claim_command("generation")
+                self.assertIsNotNone(command)
+                venue.record_fill("generation", command.order_id, "first", 2, 100, 0)
+                venue.mark_unresolved("generation", command.order_id)
+                order = pending.result(timeout=2).order_id
+        self.assertEqual(rows(journal, orders_sql), [(order, 5)])
+
+        first = self.reconcile_reopened(store, company_id, journal, adapter, 100)
+        self.assertEqual(first["receipt"]["unresolved"], 1)
+        self.assertEqual(rows(store, "SELECT quantity FROM paper_fill"), [(2,)])
+        self.assertEqual(
+            rows(store, "SELECT reserved_minor_units FROM paper_order"), [(530,)]
+        )
+        if adapter == "wire":
+            venue.call("cancelFixture", ledger=account.account_id, clientId=order)
+        else:
+            venue.record_cancellation("generation", order, "terminal", 3)
+        [(terminal, reported_total)] = rows(journal, cancel_sql)
+        self.assertEqual(reported_total, 3)
+        awaiting = self.reconcile_reopened(store, company_id, journal, adapter, 102)
+        self.assertEqual(awaiting["receipt"]["unresolved"], 1)
+        self.assertEqual(rows(store, "SELECT count(*) FROM paper_fill"), [(1,)])
+        self.assertEqual(
+            rows(store, "SELECT reserved_minor_units FROM paper_order"), [(530,)]
+        )
+        self.assertEqual(
+            rows(store, "SELECT event_id,released FROM paper_cancellation"),
+            [(terminal, 0)],
+        )
+
+        if adapter == "wire":
+            venue.call("lateFillFixture", ledger=account.account_id, clientId=order)
+        else:
+            venue.record_fill("generation", order, "late", 1, 100, 0)
+            self.assertTrue(venue.record_account("generation", order, 3, 700))
+        final = self.reconcile_reopened(store, company_id, journal, adapter, 106)
+        self.assertEqual(final["receipt"]["unresolved"], 0)
+        self.assertEqual(
+            final["receipt"]["recovered"][0]["sources"], ["history", "account_sync"]
+        )
+        replay = self.reconcile_reopened(store, company_id, journal, adapter, 107)
+        self.assertEqual(
+            len({item["pid"] for item in (first, awaiting, final, replay)}), 4
+        )
+        self.assertEqual(
+            replay["receipt"]["recovered"][0]["posting"],
+            final["receipt"]["recovered"][0]["posting"],
+        )
+        self.assertEqual(
+            rows(store, "SELECT event_id,released FROM paper_cancellation"),
+            [(terminal, 1)],
+        )
+        internal = rows(
+            store,
+            """SELECT fill_id,quantity,price_minor_units,fee_minor_units
+                                  FROM paper_fill JOIN paper_fill_fee USING(fill_id) ORDER BY paper_fill.rowid""",
+        )
+        self.assertEqual(internal, rows(journal, fills_sql))
+        self.assertEqual(rows(journal, orders_sql), [(order, 5)])
+        [(reserved,)] = rows(store, "SELECT reserved_minor_units FROM paper_order")
+        position = observe_bound_position(venue, account, order)
+        return [fill[1:] for fill in internal], reserved, position.position_quantity
+
+    def reconcile_reopened(self, store, company_id, journal, adapter, now):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-IB",
+                __file__,
+                str(store),
+                company_id,
+                str(journal),
+                adapter,
+                str(now),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+            env={},
+        )
+        return json.loads(result.stdout)
+
+
+if __name__ == "__main__":
+    store_name, company_id, journal_name, adapter, clock = sys.argv[1:]
+    journal = Path(journal_name)
+    venue = (NautilusPaperVenue if adapter == "managed" else WireVenue)(journal)
+    receipt = reconcile_paper_orders(
+        Path(store_name), company_id, venue, now=int(clock)
+    )
+    print(json.dumps({"pid": os.getpid(), "receipt": asdict(receipt)}))
