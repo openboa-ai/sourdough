@@ -9,6 +9,7 @@ from uuid import uuid4
 from .agent_desk import require_desk
 from .company import _connect
 from .company_assets import project_membership, shared_asset_for
+from .conversation_delivery import enqueue_deliveries
 from .duty_run import DutyClaim, DutyRefused
 from .writer_lease import WriterLease
 
@@ -116,6 +117,7 @@ def append_message(
                 post.request_id,
             ),
         )
+        enqueue_deliveries(database, message.message_id, message.sender_id, members)
         writer.verify()
         return message
 

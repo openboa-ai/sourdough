@@ -180,6 +180,8 @@ class CompanyAssets(unittest.TestCase):
                 "read_shared_asset",
                 "read_project_discussion",
                 "post_project_message",
+                "read_project_inbox",
+                "acknowledge_project_delivery",
                 "publish_draft_selection",
             ],
         )
@@ -191,6 +193,8 @@ class CompanyAssets(unittest.TestCase):
                 "read_shared_asset",
                 "read_project_discussion",
                 "post_project_message",
+                "read_project_inbox",
+                "acknowledge_project_delivery",
             ],
         )
         [assigned] = author.call("read_project_assignments", {"after": ""})["projects"]
@@ -353,6 +357,31 @@ class CompanyAssets(unittest.TestCase):
             [question | {"asset_id": None}, reply],
         )
         peer = run("peer")
+        inbox = {"after": ""}
+        [delivery] = peer.call("read_project_inbox", inbox)["deliveries"]
+        self.assertEqual(delivery["message_id"], question["message_id"])
+        self.assertIsNone(delivery["read_run"])
+        self.assertNotIn("body", delivery)
+        self.assertNotIn("asset_id", delivery)
+        self.assertEqual(
+            peer.call("read_project_inbox", inbox)["deliveries"], [delivery]
+        )
+        with self.assertRaisesRegex(DutyRefused, "unavailable"):
+            author.call(
+                "acknowledge_project_delivery", {"delivery_id": delivery["delivery_id"]}
+            )
+        acknowledgment = {"delivery_id": delivery["delivery_id"]}
+        seen = peer.call("acknowledge_project_delivery", acknowledgment)
+        self.assertEqual(seen["read_run"], self.claims["peer"].run_id)
+        self.assertEqual(
+            run("peer").call("acknowledge_project_delivery", acknowledgment), seen
+        )
+        self.assertEqual(
+            peer.call("read_project_inbox", {"after": delivery["delivery_id"]})[
+                "deliveries"
+            ],
+            [],
+        )
         assign_project(
             self.writer,
             self.manager,
@@ -363,6 +392,9 @@ class CompanyAssets(unittest.TestCase):
         )
         with self.assertRaisesRegex(DutyRefused, "discussion is unavailable"):
             peer.call("read_project_discussion", thread)
+        self.assertEqual(peer.call("read_project_inbox", inbox)["deliveries"], [])
+        with self.assertRaisesRegex(DutyRefused, "unavailable"):
+            peer.call("acknowledge_project_delivery", acknowledgment)
         with closing(_connect(self.writer.store, "ro")) as database:
             self.assertEqual(
                 database.execute(
