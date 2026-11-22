@@ -103,11 +103,11 @@ Start with **what has changed for the company or its employees**, not an API, de
 
 <a id="departure"></a>
 
-## End employment without losing obligations
+## Archive a departed Agent
 
-**Company and Employee.** Withdraw authority at a known cutoff, keep assets in company custody and assign unfinished work explicitly. Historical authorship stays with the original worker. Stopping a process alone is not retirement.
+**Company and Employee.** Permanently remove the Agent from active use. Keep company assets, historical authorship, and the existing reconciliation path for already admitted effects. Archiving does not require a successor or schedule further work for the Agent.
 
-- Company → systems: [Retire and settle custody](company/systems/organization/offboard/intent.md).
+- Company → systems: [Archive a departed Agent](company/systems/organization/offboard/intent.md).
 
 <a id="accountability"></a>
 

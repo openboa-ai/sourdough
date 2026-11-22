@@ -44,7 +44,20 @@ class RunAuthority:
             raise DutyRefused("Duty claim or grant is no longer current")
 
 
+def employment_cutoff(connection: sqlite3.Connection, agent_id: str) -> int | None:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name='agent_archive' AND type='table'"
+    ).fetchone():
+        return None
+    row = connection.execute(
+        "SELECT cutoff FROM agent_archive WHERE agent_id=?", (agent_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
 def has_turn_capacity(connection: sqlite3.Connection, agent_id: str) -> bool:
+    if employment_cutoff(connection, agent_id) is not None:
+        return False
     if not connection.execute(
         "SELECT 1 FROM sqlite_schema WHERE name = 'hire_receipt' AND type = 'table'"
     ).fetchone():
@@ -71,6 +84,8 @@ def start_run(
     grant_scope: str,
 ) -> DutyClaim:
     if not has_turn_capacity(connection, founder_id):
+        if employment_cutoff(connection, founder_id) is not None:
+            raise DutyRefused("Agent employment is fenced")
         raise DutyRefused("Agent has no remaining turn allocation")
     claim = DutyClaim(
         company_id, founder_id, grant_id, duty_id, uuid4().hex, execution_profile
