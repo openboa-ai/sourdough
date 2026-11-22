@@ -45,6 +45,7 @@ from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.trading_engine import EngineRefused, prepare_engine
 from sourdough.window_sampler import WindowSampler, register_managed_window
+from sourdough.window_run import run_window
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 from sourdough.work_projection import read_local_board_timeline
 
@@ -66,7 +67,11 @@ def _agent_receipt(fields):
     return receipt
 
 
-def _start_supervisor(args):
+def _emit_event(event: dict) -> None:
+    print(json.dumps(event), file=sys.stderr, flush=True)
+
+
+def _start_supervisor(args, *, emit=_emit_event):
     assessment = args.command == "supervise-assessment"
     worker_name = {
         "supervise-assessment": "_assessment-worker",
@@ -109,6 +114,9 @@ def _start_supervisor(args):
                 command.extend(
                     ("--observe-through-ns", str(sampler.observe_through_ns))
                 )
+        work_cutoff = getattr(args, "start_work_before_ns", None)
+        if work_cutoff is not None:
+            command.extend(("--start-work-before-ns", str(work_cutoff)))
     return supervise_worker(
         command,
         args.store,
@@ -116,7 +124,41 @@ def _start_supervisor(args):
         max_restarts=args.max_restarts,
         startup_seconds=args.startup_seconds,
         max_seconds=args.max_seconds,
-        emit=lambda event: print(json.dumps(event), file=sys.stderr, flush=True),
+        emit=emit,
+    )
+
+
+def _run_paper_window(args):
+    def company(through_ns, work_before_ns, max_seconds):
+        options = argparse.Namespace(
+            **(
+                vars(args)
+                | {
+                    "command": "supervise-paper",
+                    "journal": args.directory,
+                    "managed_engine": True,
+                    "observe_window": args.window_id,
+                    "observe_through_ns": through_ns,
+                    "start_work_before_ns": work_before_ns,
+                    "idle_seconds": max(0, (work_before_ns - time_ns()) // 10**9),
+                    "startup_seconds": min(35, max_seconds),
+                    "max_seconds": max_seconds,
+                    "max_restarts": 1,
+                }
+            )
+        )
+        return _start_supervisor(
+            options, emit=lambda event: _emit_event(event | {"actor": "company"})
+        )
+
+    return run_window(
+        args.store,
+        args.company_id,
+        args.directory,
+        args.window_id,
+        company,
+        segment_seconds=args.segment_seconds,
+        emit=_emit_event,
     )
 
 
@@ -177,6 +219,15 @@ def main() -> int:
     seal.add_argument("directory", type=Path)
     seal.add_argument("--company-id", required=True)
     seal.add_argument("--plan", required=True, type=Path)
+    operating = commands.add_parser("run-paper-window")
+    operating.add_argument("store", type=Path)
+    operating.add_argument("directory", type=Path)
+    operating.add_argument("--company-id", required=True)
+    operating.add_argument("--employee", required=True, type=Path)
+    operating.add_argument("--window-id", required=True)
+    operating.add_argument("--segment-seconds", type=int, default=600)
+    operating.add_argument("--turn-budget", type=int, choices=range(1, 9), default=8)
+    operating.add_argument("--repeat-paper", action="store_true")
     for command in ("inspect-paper-window", "close-paper-window"):
         statement = commands.add_parser(command)
         statement.add_argument("store", type=Path)
@@ -305,6 +356,7 @@ def main() -> int:
             running.add_argument("--max-seconds", type=int, default=180)
         if command == "_paper-worker":
             running.add_argument("--observe-through-ns", type=int)
+            running.add_argument("--start-work-before-ns", type=int)
             running.add_argument("--ready-fd", type=int, required=True)
             running.add_argument("--store-key", type=_store_key, required=True)
             running.add_argument("--budget-from", type=int, required=True)
@@ -326,6 +378,10 @@ def main() -> int:
         elif args.command == "inspect-work":
             print(json.dumps(read_local_board_timeline(args.store, args.company_id)))
             return 0
+        elif args.command == "run-paper-window":
+            result = _run_paper_window(args)
+            print(json.dumps(asdict(result)))
+            return 0 if result.completed else 1
         elif args.command == "inspect-paper-window":
             if args.report_id is not None:
                 saved = read_retained_statement(
@@ -583,6 +639,7 @@ def main() -> int:
                     sampler=_paper_sampler(
                         args, args.journal, managed=args.managed_engine
                     ),
+                    start_work_before_ns=args.start_work_before_ns,
                 )
             else:
                 result = run_paper_company(
