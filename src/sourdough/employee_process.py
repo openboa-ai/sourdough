@@ -151,9 +151,6 @@ class EmployeeProcess:
     def research_hired(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("hired_research_duty", _ToolEndpoint, invoke)
 
-    def review_assessment(self, read_result: Callable[[], dict]) -> dict:
-        return self._follow_up("assessment_review", read_result)
-
     def _follow_up(self, operation: str, read_result: Callable[[], dict]) -> dict:
         return self._scoped_exchange(operation, _ResultEndpoint, read_result)
 

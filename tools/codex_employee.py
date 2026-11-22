@@ -450,7 +450,6 @@ def main():
             "research_duty",
             "staffing_duty",
             "onboarding_duty",
-            "assessment_review",
             "hired_research_duty",
         )
     ):
@@ -493,15 +492,6 @@ def main():
                 "A feasible bounded verification buy, a hold or investigation is valid. Choose a follow-up of 60 to 120 seconds. "
                 "If you choose a buy, separately call request_research_order with the returned decision_id. "
                 "A recorded research decision is not an order or a fill. No shell, external account or live funds."
-            )
-        elif operation == "assessment_review":
-            tool_args += ["--mcp-review", request["read_endpoint"], str(outbox)]
-            tool_names = ["read_work_result", "record_review_decision"]
-            prompt = (
-                "Review your previous company assessment. Read that result and current records via "
-                "read_work_result. Explain what the current records support and relate it to the "
-                "original assessment. Decide whether to hold, investigate or recommend a change. "
-                "Record the new decision and next responsibility. No shell or external access."
             )
         elif operation == "onboarding_duty":
             tool_args += ["--mcp-onboarding", request["read_endpoint"], str(outbox)]

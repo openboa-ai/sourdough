@@ -1,7 +1,7 @@
 """Run a hired assessment and its saved review without an execution venue."""
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import monotonic, sleep, time
 
@@ -9,6 +9,7 @@ from .abandoned_work import has_uncommitted_work, requeue_uncommitted_work
 from .company import upgrade_work_schema
 from .company_assessment import (
     ASSESSMENT,
+    ASSESSMENT_REVIEW_WORKFLOW,
     ASSESSMENT_WORKFLOW,
     AssessmentReceipt,
     invoke_assessment,
@@ -23,6 +24,7 @@ from .harness import ScopedRun
 from .hiring_run import HiringRun, prepare_hiring
 from .work import (
     FollowUp,
+    FollowUpClaim,
     ReviewDecision,
     claim_assessment_review,
     owed_hired_follow_up_owner,
@@ -44,6 +46,7 @@ class AssessmentRun:
     publication: AssessmentReceipt | None
     restored: tuple[AssessmentReceipt, ...]
     review: AssessmentReview | None
+    later_reviews: tuple[AssessmentReview, ...] = ()
 
 
 def run_assessment_company(
@@ -121,38 +124,71 @@ def run_assessment_company(
                 count_company_runs(store, company_id) - budget_from
             )
 
-        review = (
-            _review(writer, employee, agent_id, idle_seconds)
-            if agent_id and remaining
-            else None
+        reviews = []
+        deadline = monotonic() + idle_seconds
+        while agent_id and remaining > 0:
+            review = _review(writer, employee, agent_id, deadline)
+            if review is None:
+                break
+            reviews.append(review)
+            remaining -= 1
+            agent_id = owed_hired_follow_up_owner(
+                store, company_id, employee.profile, ASSESSMENT_REVIEW
+            )
+        return AssessmentRun(
+            hiring,
+            publication,
+            tuple(restored),
+            reviews[0] if reviews else None,
+            tuple(reviews[1:]),
         )
-        return AssessmentRun(hiring, publication, tuple(restored), review)
 
 
 def _review(
-    writer: WriterLease, employee: EmployeeProcess, agent_id: str, idle_seconds: int
+    writer: WriterLease, employee: EmployeeProcess, agent_id: str, deadline: float
 ) -> AssessmentReview | None:
-    deadline = monotonic() + idle_seconds
     while True:
         writer.verify()
         work = claim_assessment_review(
             writer.store, writer.company_id, agent_id, employee.profile, now=int(time())
         )
         if work is not None:
-            proposal = employee.review_assessment(
-                lambda: read_assessment_result(writer, work, now=int(time()))
-            )
-            decision = ReviewDecision.from_proposal(proposal)
-            writer.verify()
-            next_duty = settle_review(
-                writer.store,
-                work,
-                decision,
-                now=int(time()),
-                successor_purpose=ASSESSMENT_REVIEW,
-            )
-            return AssessmentReview(work.claim, decision, next_duty)
+            return _run_review(writer, employee, work)
         remaining = deadline - monotonic()
         if remaining <= 0:
             return None
         sleep(min(remaining, 0.5))
+
+
+def _run_review(
+    writer: WriterLease, employee: EmployeeProcess, work: FollowUpClaim
+) -> AssessmentReview:
+    committed = None
+
+    def invoke(name: str, arguments: dict) -> dict:
+        nonlocal committed
+        if name == "read_work_result":
+            return read_assessment_result(writer, work, now=int(time()))
+        if name != "record_review_decision":
+            raise DutyRefused("Tool is unavailable for this company review")
+        decision = ReviewDecision(call_id=f"review:{work.claim.run_id}", **arguments)
+        writer.verify()
+        next_duty = settle_review(
+            writer.store,
+            work,
+            decision,
+            now=int(time()),
+            successor_purpose=ASSESSMENT_REVIEW,
+        )
+        committed = AssessmentReview(work.claim, decision, next_duty)
+        return asdict(committed)
+
+    run = ScopedRun(writer, work.claim, ASSESSMENT_REVIEW_WORKFLOW, invoke)
+    try:
+        employee.run_scoped("assessment_review", run)
+    except TradeRefused:
+        if committed is None:
+            raise
+    if committed is None:
+        raise DutyRefused("Company review returned without a committed decision")
+    return committed

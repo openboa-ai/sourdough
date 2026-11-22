@@ -33,6 +33,7 @@ For the first company-only consumer, the company work service supplies the instr
 | Failure or contention | Remove access after pack creation; the later tool read must still deny it. Oversize optional history cannot evict an open-effect receipt or grant check. |
 | First claim | Assemble the founder's first context from its founding receipt, current claim and grants with no previous decision. Start a real bounded turn and observe its new decision; missing prior decision alone must not block it. |
 | System capability | Run a company-only duty through the manifest transport. Observe exactly the registered tool schemas in the process, one service-owned receipt, and denial of an invented tool or mismatched Desk/run. Substitute a different registered tool set without editing the adapter. Model judgment quality is a later evaluation. |
+| Continuing company work | In one bounded activation, run an assessment and successive due reviews through the same Harness. Each review reads its authorized result and commits a decision with the next due responsibility. Verify a distinct run, the same Agent and Desk binding, and no market or execution tools. The activation limit does not erase future work. |
 
 **Oracle:** Compare independently sealed ACL, duty and artifact inventories with what the runtime actually received. Exercise [W1](../../../../../acceptance/episodes.md#w1-personal-work) and [L1](../../../../../acceptance/episodes.md#l1-learning).
 
