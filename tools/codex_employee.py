@@ -110,6 +110,7 @@ def main():
     context = request["context"]
     with TemporaryDirectory() as directory:
         outbox = Path(directory) / "proposal.json"
+        decision = Path(directory) / "decision.txt"
         cmd = [
             codex,
             "-a",
@@ -122,6 +123,8 @@ def main():
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
+            "--output-last-message",
+            str(decision),
             "-c",
             f"mcp_servers.paper.command={json.dumps(sys.executable)}",
             "-c",
@@ -136,9 +139,10 @@ def main():
         ]
         prompt = (
             "You are a Sourdough employee running the first duty on a synthetic account. "
-            "Decide whether to hold or exercise the authorized paper execution path with a small "
-            "limit buy. Use only the paper_buy tool to propose an order; do not use the shell. "
-            "A proposal is not a fill. You may hold. "
+            "This is an operational check of the newly authorized paper execution path, not an investment recommendation. "
+            "If the quoted terms permit a small order within the cap, decide its size and limit and propose it "
+            "using paper_buy. If a safe test is unsuitable, hold and end with exactly HOLD. "
+            "If the tool fails, report failure; do not claim a hold or a fill. Do not use the shell. "
             f"Fixed quote per unit: {context['quote_minor_units']} minor units. "
             f"Maximum exposure: {context['exposure_limit_minor_units']} minor units."
         )
@@ -152,7 +156,12 @@ def main():
             timeout=50,
             check=True,
         )
-        print(outbox.read_text() if outbox.exists() else '{"action":"hold"}')
+        if outbox.exists():
+            print(outbox.read_text())
+        elif decision.exists() and decision.read_text().strip() == "HOLD":
+            print('{"action":"hold"}')
+        else:
+            raise SystemExit("Codex did not produce a proposal or an explicit hold")
 
 
 if __name__ == "__main__":
