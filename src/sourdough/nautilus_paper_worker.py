@@ -12,7 +12,12 @@ from time import monotonic, time_ns
 from uuid import uuid4
 
 from .market_worker import describe_spot_instrument, journal_key, spot_trade_time_ns
-from .nautilus_paper import NautilusPaperVenue, SandboxBalance, SandboxCommand
+from .nautilus_paper import (
+    NautilusPaperVenue,
+    SandboxBalance,
+    SandboxCommand,
+    current_quote_times,
+)
 from .paper_execution import VenueRefused
 from .spot_cash import QUOTE_SCALE, SpotCashUnits
 
@@ -125,11 +130,18 @@ async def serve(
 
         def on_quote_tick(self, quote):
             try:
-                if quote.instrument_id == instrument_id:
-                    self.quote = (
-                        units.price_per_lot(quote.ask_price.as_decimal()),
-                        time_ns(),
-                    )
+                event_ns, received_ns = quote.ts_event, quote.ts_init
+                if quote.instrument_id != instrument_id or not current_quote_times(
+                    event_ns, received_ns, time_ns()
+                ):
+                    return
+                if self.quote is not None and (event_ns, received_ns) <= self.quote[1:]:
+                    return
+                self.quote = (
+                    units.price_per_lot(quote.ask_price.as_decimal()),
+                    event_ns,
+                    received_ns,
+                )
             except Exception as error:
                 if not failure.done():
                     failure.set_result(error)
@@ -221,7 +233,12 @@ async def serve(
                 await task
                 raise VenueRefused("Sandbox stopped before completing its activation")
             quote = strategy.quote
-            if quote is not None and 0 < time_ns() - strategy.trade_ns <= 15 * 10**9:
+            now = time_ns()
+            if (
+                quote is not None
+                and current_quote_times(*quote[1:], now)
+                and 0 <= now - strategy.trade_ns <= 15 * 10**9
+            ):
                 if not ready:
                     account = strategy.portfolio.account(market_venue)
                     if account is None or not account.is_cash_account:
@@ -246,9 +263,13 @@ async def serve(
                             units.quote_atoms(balance.as_decimal()),
                         ),
                     )
-                if quote != last_quote:
-                    venue.publish_quote(generation, *quote, strategy.trade_ns)
-                    last_quote = quote
+                observation = (*quote, strategy.trade_ns)
+                if observation != last_quote:
+                    atoms, event_ns, received_ns, trade_ns = observation
+                    venue.publish_quote(
+                        generation, atoms, received_ns, trade_ns, event_ns=event_ns
+                    )
+                    last_quote = observation
                 if not ready:
                     payload = {
                         "pid": os.getpid(),

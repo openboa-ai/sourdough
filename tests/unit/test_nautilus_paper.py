@@ -73,6 +73,34 @@ class NautilusPaperPort(unittest.TestCase):
         self.assertEqual((price, cut.tape_revision), (50_000_000, revision))
         self.assertEqual((cut.event_ns, cut.available_ns), (90, 101))
 
+    def test_current_quote_cannot_be_refreshed_by_callback_or_new_trade(self):
+        self.venue.provision(self.plan)
+        self.venue.prove_account(
+            "current", "BINANCE-001", "USDT", self.venue.start_generation()
+        )
+        now = time_ns()
+        price = 50_000_000
+        with patch("sourdough.nautilus_paper.time_ns", return_value=now):
+            self.venue.publish_quote(
+                "current", price, now, now, event_ns=now - 60 * 10**9
+            )
+            with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
+                self.venue.observe_quote("paper")
+            self.venue.publish_quote(
+                "current", price, now - 2, now, event_ns=now - 10 * 10**9
+            )
+            self.assertEqual(self.venue.observe_quote("paper"), price)
+        with patch("sourdough.nautilus_paper.time_ns", return_value=now + 6 * 10**9):
+            with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
+                self.venue.observe_quote("paper")
+        with closing(sqlite3.connect(self.venue.journal)) as journal:
+            self.assertEqual(
+                journal.execute(
+                    "SELECT event_ns,received_ns,exchange_trade_ns FROM sandbox_quote"
+                ).fetchone(),
+                (now - 10 * 10**9, now - 2, now),
+            )
+
     def test_invalid_managed_terms_never_reserve_or_reach_the_venue(self):
         store = self.venue.journal.with_name("company.sqlite")
         founded = found(store, FoundingTerms("setup", "charter", "paper", "runtime"))
