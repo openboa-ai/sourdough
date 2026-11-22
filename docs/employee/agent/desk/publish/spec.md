@@ -14,12 +14,15 @@ Input contracts: [desk/reopen](../reopen/spec.md) · [authorize-actor/check](../
 
 Publish a reviewed selection rather than changing the ACL of the entire desk. Private provenance stays protected; public-facing metadata must not expose restricted source names or excerpts.
 
+The initial local project binds its audience to an explicit membership revision under an existing company grant. An Agent publishes a bounded character range of its own current draft as a plain-text asset, not a file path or active attachment. A project reader must be in both the selected audience and the current membership. The public receipt contains no private draft path, name or surrounding text. No publication changes duty ownership.
+
 **Concern for the responsible component:** Reading a source does not grant redistribution; referenced attachments retain independent ACLs. Reject disallowed embedded content or publish an explicitly redacted selection.
 
 ## Functional and quality requirements
 
 - **FR.** Persist immutable shared content, version and intended audience. Bind the output receipt to its work; sharing alone cannot transfer ownership of a duty.
 - **NFR.** Repeated publication with identical identity returns one revision. A changed payload conflicts. Revocation before commit blocks publication; never mount one Agent’s whole desk into another runtime.
+- **Discovery.** The recipient can page through all authorized shared references without an author receipt. Each page and cursor is checked against current project membership and the publication audience; listing never includes asset content.
 
 ## Acceptance and independent evidence
 

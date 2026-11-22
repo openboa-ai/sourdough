@@ -6,6 +6,7 @@ from pathlib import Path
 from time import monotonic, sleep, time
 
 from .abandoned_work import has_uncommitted_work, requeue_uncommitted_work
+from .collaboration import company_work_run
 from .company import upgrade_work_schema
 from .company_assessment import (
     ASSESSMENT,
@@ -21,7 +22,6 @@ from .company_assessment import (
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, count_company_runs
 from .employee_process import EmployeeProcess
 from .first_trade import TradeRefused
-from .harness import ScopedRun
 from .hiring_run import HiringRun, prepare_hiring
 from .work import (
     FollowUp,
@@ -98,7 +98,7 @@ def run_assessment_company(
             try:
                 employee.run_scoped(
                     "assessment_duty",
-                    ScopedRun(
+                    company_work_run(
                         writer,
                         claim,
                         ASSESSMENT_WORKFLOW,
@@ -188,7 +188,7 @@ def _run_review(
         committed = AssessmentReview(work.claim, decision, next_duty)
         return asdict(committed)
 
-    run = ScopedRun(writer, work.claim, ASSESSMENT_REVIEW_WORKFLOW, invoke)
+    run = company_work_run(writer, work.claim, ASSESSMENT_REVIEW_WORKFLOW, invoke)
     try:
         employee.run_scoped("assessment_review", run)
     except TradeRefused:
