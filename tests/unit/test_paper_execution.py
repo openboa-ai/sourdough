@@ -101,8 +101,7 @@ class ExecutionPort(unittest.TestCase):
 
     def test_unavailable_position_does_not_finish_the_duty_or_resubmit(self):
         class PendingPosition(FixedQuoteVenue):
-            position_available = False
-            position_offline = False
+            position_offline = True
             sends = 0
 
             def submit(self, order_id, account_id, intent):
@@ -112,9 +111,7 @@ class ExecutionPort(unittest.TestCase):
             def read_order_position(self, account_id, order_id):
                 if self.position_offline:
                     raise TimeoutError("Destination position lookup is offline")
-                if self.position_available:
-                    return super().read_order_position(account_id, order_id)
-                return None
+                return super().read_order_position(account_id, order_id)
 
         venue = PendingPosition(self.root / "venue.sqlite")
         account = venue.provision(
@@ -138,7 +135,7 @@ class ExecutionPort(unittest.TestCase):
         self.assertEqual(waiting.blocked_work, (original.claim.duty_id,))
         employee.review.assert_not_called()
 
-        venue.position_available = True
+        venue.position_offline = False
         with (
             patch(
                 "sourdough.company_run.finish_first_duty",

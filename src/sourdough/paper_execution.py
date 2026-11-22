@@ -89,9 +89,12 @@ class PaperExecution(PaperDestination, Protocol):
 def observe_bound_position(
     venue: PaperExecution, account: PaperAccount, order_id: str
 ) -> VenuePosition | None:
-    if venue.observe_account(account.account_id) != account:
-        raise VenueRefused("Position lookup requires the bound destination")
-    result = venue.read_order_position(account.account_id, order_id)
+    try:
+        if venue.observe_account(account.account_id) != account:
+            raise VenueRefused("Position lookup requires the bound destination")
+        result = venue.read_order_position(account.account_id, order_id)
+    except TimeoutError:
+        return None
     if result is not None and (
         (result.order_id, result.account_id, result.instrument_rules_digest)
         != (order_id, account.account_id, account.instrument_rules_digest)

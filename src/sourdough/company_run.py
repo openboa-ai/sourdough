@@ -329,10 +329,7 @@ def _book_reference(
     observation = read_captured_position(store, company_id, posting.fill_id)
     if observation is None:
         account = reopen_binding(store, company_id).account
-        try:
-            source = observe_bound_position(venue, account, posting.order_id)
-        except TimeoutError:
-            return None
+        source = observe_bound_position(venue, account, posting.order_id)
         if source is None:
             return None
         observation = capture_position(
