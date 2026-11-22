@@ -12,6 +12,23 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 
+ISOLATION_PROFILE = "sourdough-agent"
+
+
+def confinement_arguments() -> list[str]:
+    profile = ISOLATION_PROFILE
+    return [
+        "-c",
+        f"default_permissions={json.dumps(profile)}",
+        "-c",
+        f'permissions.{profile}.filesystem={{":root"="deny",":minimal"="read",":workspace_roots"={{"."="read"}}}}',
+        "-c",
+        f"permissions.{profile}.network.enabled=false",
+        "-c",
+        'web_search="disabled"',
+    ]
+
+
 PAPER_BUY = {
     "name": "paper_buy",
     "description": "Propose one paper-only limit buy for company admission.",
@@ -620,8 +637,9 @@ def main():
             model,
             "--ephemeral",
             "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
+            "--cd",
+            str(workspace),
+            *confinement_arguments(),
             "--output-last-message",
             str(decision),
             "-c",
