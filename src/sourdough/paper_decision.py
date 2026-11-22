@@ -9,7 +9,7 @@ from uuid import uuid4
 from .company import _connect
 from .duty_run import PAPER_EXECUTION, DutyClaim, DutyRefused
 from .first_duty import FIRST_DUTY_SCOPE
-from .paper_books import read_position
+from .paper_books import FILLED_QUANTITY, read_position
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -246,10 +246,11 @@ def settle_paper_decision(
             raise DutyRefused("Unknown or changed paper decision receipt")
         if receipt.decision.action == "buy":
             matching_fill = connection.execute(
-                """SELECT fill.fill_id FROM paper_fill fill
+                f"""SELECT fill.fill_id FROM paper_fill fill
                    JOIN paper_order o ON o.order_id = fill.order_id
                    JOIN duty_run r ON r.run_id = o.run_id
-                   WHERE r.duty_id = ? AND o.action_id = ?""",
+                   WHERE r.duty_id = ? AND o.action_id = ? AND {FILLED_QUANTITY}=o.quantity
+                   ORDER BY fill.rowid DESC LIMIT 1""",
                 (claim.duty_id, receipt.decision_id),
             ).fetchone()
             if result.kind != "paper_position" or matching_fill != (

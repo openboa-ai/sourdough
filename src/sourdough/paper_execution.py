@@ -40,6 +40,7 @@ class VenueExecution:
     fill_id: str | None
     fill_price_minor_units: int | None
     fee_minor_units: int = 0
+    filled_quantity: int | None = None
 
 
 class PaperDestination(AccountObserver, Protocol):

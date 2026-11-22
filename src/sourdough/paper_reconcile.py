@@ -8,7 +8,13 @@ from sqlite3 import Connection
 from .company import _connect, _identity
 from .duty_run import DutyClaim
 from .paper_account import reopen_binding
-from .paper_books import Posting, PostingRefused, post_confirmed_fill, read_booked_fill
+from .paper_books import (
+    FILLED_QUANTITY,
+    Posting,
+    PostingRefused,
+    post_confirmed_fill,
+    read_booked_fill,
+)
 from .paper_execution import PaperExecution
 from .writer_lease import WriterLease
 
@@ -76,7 +82,7 @@ def _open_recovery(
 
 def _missing_fill(connection: Connection) -> str:
     if _has_table(connection, "paper_fill"):
-        return "NOT EXISTS (SELECT 1 FROM paper_fill WHERE order_id = o.order_id)"
+        return f"{FILLED_QUANTITY} != o.quantity"
     return "1"
 
 
@@ -89,13 +95,22 @@ def _record_lookup(
     posting: Posting | None,
     sources: tuple[str, ...],
 ) -> None:
-    next_query = None
-    if posting is None and attempts < MAX_LOOKUP_ATTEMPTS:
-        next_query = now + min(60, 2**attempts)
     with closing(_connect(store, "rw")) as db, db:
         db.execute("BEGIN IMMEDIATE")
         if _identity(db) != company_id:
             raise PostingRefused("Company identity mismatch")
+        next_query = None
+        if posting is None:
+            has_partial = (
+                _has_table(db, "paper_fill")
+                and db.execute(
+                    f"SELECT 1 FROM paper_order o WHERE o.order_id=? AND {FILLED_QUANTITY}>0",
+                    (order_id,),
+                ).fetchone()
+                is not None
+            )
+            if attempts < MAX_LOOKUP_ATTEMPTS or has_partial:
+                next_query = now + min(60, 2 ** min(attempts, MAX_LOOKUP_ATTEMPTS))
         db.execute(
             """INSERT INTO paper_reconciliation VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(order_id) DO UPDATE SET

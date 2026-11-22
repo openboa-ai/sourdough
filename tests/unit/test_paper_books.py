@@ -1,6 +1,7 @@
 import sqlite3
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -12,9 +13,31 @@ from sourdough.paper_books import (
     capture_position,
     position_quantity,
     post_confirmed_fill,
+    read_booked_fill,
 )
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
+from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.work_projection import read_local_board_timeline
+
+
+class ObservedFillVenue(FixedQuoteVenue):
+    def __init__(self, journal, fill_id, quantity, price, fee):
+        super().__init__(journal)
+        self.terms = {
+            "fill_id": fill_id,
+            "filled_quantity": quantity,
+            "fill_price_minor_units": price,
+            "fee_minor_units": fee,
+        }
+
+    def observe_execution(self, order_id):
+        return replace(super().observe_execution(order_id), **self.terms)
+
+    def sync_account_execution(self, account_id, order_id):
+        return replace(
+            super().sync_account_execution(account_id, order_id), **self.terms
+        )
 
 
 class PaperBooksTests(unittest.TestCase):
@@ -84,6 +107,120 @@ class PaperBooksTests(unittest.TestCase):
         with self.assertRaises(PostingRefused):
             self.post("not-admitted")
         self.assertEqual(position_quantity(self.store, self.company_id), 0)
+
+    def test_partial_fills_resume_by_original_order_and_hold_the_unfilled_reservation(
+        self,
+    ):
+        order_id = self.submit(99)
+        first = ObservedFillVenue(self.journal, "first", 1, 80, 1)
+        initial = reconcile_paper_orders(self.store, self.company_id, first, now=100)
+        self.assertEqual(initial.recovered, ())
+        self.assertEqual(initial.unresolved, 1)
+        self.assertEqual(position_quantity(self.store, self.company_id), 1)
+        self.assertIsNone(read_booked_fill(self.store, self.company_id, order_id))
+        projection = read_local_board_timeline(self.store, self.company_id)["paper"]
+        [order] = projection["orders"]
+        self.assertEqual(
+            (
+                order["reserved_minor_units"],
+                order["open_reservation_minor_units"],
+                order["remaining_quantity"],
+            ),
+            (179, 99, 1),
+        )
+        self.assertEqual(projection["unresolved_orders"], 1)
+        for _attempt in range(MAX_LOOKUP_ATTEMPTS):
+            self.assertIsNotNone(initial.next_query_at)
+            initial = reconcile_paper_orders(
+                self.store, self.company_id, first, now=initial.next_query_at
+            )
+            self.assertEqual((initial.recovered, initial.unresolved), ((), 1))
+        self.assertIsNotNone(initial.next_query_at)
+        with self.assertRaisesRegex(PostingRefused, "exceed the admitted order"):
+            post_confirmed_fill(
+                self.store,
+                self.company_id,
+                order_id,
+                ObservedFillVenue(self.journal, "overfill", 2, 90, 1),
+            )
+        with self.assertRaisesRegex(PostingRefused, "conflicts"):
+            post_confirmed_fill(
+                self.store,
+                self.company_id,
+                order_id,
+                ObservedFillVenue(self.journal, "first", 1, 81, 1),
+            )
+        second = ObservedFillVenue(self.journal, "second", 1, 90, 2)
+        complete = reconcile_paper_orders(
+            self.store, self.company_id, second, now=initial.next_query_at
+        )
+        [recovered] = complete.recovered
+        self.assertEqual(
+            (recovered.posting.fill_id, complete.unresolved), ("second", 0)
+        )
+        self.assertEqual(recovered.sources, ("history", "account_sync"))
+        self.assertEqual(
+            post_confirmed_fill(self.store, self.company_id, order_id, first),
+            recovered.posting,
+        )
+        self.assertEqual(position_quantity(self.store, self.company_id), 2)
+        projection = read_local_board_timeline(self.store, self.company_id)["paper"]
+        [order] = projection["orders"]
+        self.assertEqual(
+            (
+                order["reserved_minor_units"],
+                order["open_reservation_minor_units"],
+                order["fee_minor_units"],
+            ),
+            (170, 0, 3),
+        )
+        self.assertEqual(projection["booked_position"], 2)
+        with closing(sqlite3.connect(self.journal)) as observed:
+            self.assertEqual(
+                observed.execute("SELECT order_id FROM venue_execution").fetchall(),
+                [(order_id,)],
+            )
+
+    def test_legacy_single_fill_preserves_posting_fees_and_position_snapshot(self):
+        order_id = self.submit(110)
+        original = self.venue.observe_execution(order_id)
+        with closing(sqlite3.connect(self.store)) as book, book:
+            book.execute(
+                """CREATE TABLE paper_fill (fill_id TEXT PRIMARY KEY NOT NULL,
+                   order_id TEXT UNIQUE NOT NULL REFERENCES paper_order(order_id),
+                   quantity INTEGER NOT NULL, price_minor_units INTEGER NOT NULL)"""
+            )
+            book.execute(
+                """CREATE TABLE paper_fill_fee (fill_id TEXT PRIMARY KEY NOT NULL
+                   REFERENCES paper_fill(fill_id), fee_minor_units INTEGER NOT NULL)"""
+            )
+            book.execute(
+                "INSERT INTO paper_fill VALUES (?,?,?,?)",
+                (
+                    original.fill_id,
+                    order_id,
+                    original.quantity,
+                    original.fill_price_minor_units,
+                ),
+            )
+            book.execute(
+                "INSERT INTO paper_fill_fee VALUES (?,?)",
+                (original.fill_id, original.fee_minor_units),
+            )
+        before = capture_position(
+            self.store, self.company_id, original.fill_id, now=101
+        )
+        self.assertEqual(self.post(order_id).fill_id, original.fill_id)
+        self.assertEqual(
+            capture_position(self.store, self.company_id, original.fill_id, now=102),
+            before,
+        )
+        with closing(sqlite3.connect(self.store)) as book:
+            self.assertEqual(book.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(
+                book.execute("SELECT * FROM paper_fill_fee").fetchall(),
+                [(original.fill_id, original.fee_minor_units)],
+            )
 
     def test_book_observation_is_scoped_and_replays_the_captured_revision(self):
         order_id = self.submit(110)

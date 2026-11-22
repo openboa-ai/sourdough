@@ -1,4 +1,4 @@
-"""Post a confirmed full fill from the first-trade paper destination."""
+"""Post identified paper fills and retain exposure on unfinished orders."""
 
 from __future__ import annotations
 
@@ -48,6 +48,58 @@ class PositionObservation:
         return sha256(encoded).hexdigest()
 
 
+_FILL_SCHEMA = """(
+    fill_id TEXT PRIMARY KEY NOT NULL,
+    order_id TEXT NOT NULL REFERENCES paper_order(order_id),
+    quantity INTEGER NOT NULL,
+    price_minor_units INTEGER NOT NULL
+)"""
+FILLED_QUANTITY = (
+    "COALESCE((SELECT SUM(quantity) FROM paper_fill WHERE order_id=o.order_id),0)"
+)
+
+
+def _has_table(connection: sqlite3.Connection, name: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _has_legacy_order_index(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            """SELECT 1 FROM pragma_index_list('paper_fill') indexes
+           JOIN pragma_index_info(indexes.name) columns
+           WHERE indexes.origin='u' AND columns.name='order_id'"""
+        ).fetchone()
+        is not None
+    )
+
+
+def _ensure_fill_schema(connection: sqlite3.Connection, legacy: bool) -> None:
+    if legacy and _has_legacy_order_index(connection):
+        connection.execute("CREATE TABLE paper_fill_next " + _FILL_SCHEMA)
+        connection.execute(
+            "INSERT INTO paper_fill_next SELECT * FROM paper_fill ORDER BY rowid"
+        )
+        connection.execute("DROP TABLE paper_fill")
+        connection.execute("ALTER TABLE paper_fill_next RENAME TO paper_fill")
+    else:
+        connection.execute("CREATE TABLE IF NOT EXISTS paper_fill " + _FILL_SCHEMA)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS paper_fill_by_order ON paper_fill(order_id)"
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS paper_fill_fee (
+            fill_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_fill(fill_id),
+            fee_minor_units INTEGER NOT NULL
+        )"""
+    )
+
+
 def post_confirmed_fill(
     store: Path,
     company_id: str,
@@ -68,12 +120,30 @@ def post_confirmed_fill(
     if observed is None or observed.fill_id is None:
         return None
     price = observed.fill_price_minor_units
-    if type(price) is not int or not 0 < price <= observed.limit_minor_units:
+    filled = (
+        observed.quantity
+        if observed.filled_quantity is None
+        else observed.filled_quantity
+    )
+    if (
+        type(observed.quantity) is not int
+        or type(filled) is not int
+        or not 0 < filled <= observed.quantity
+    ):
+        raise PostingRefused("Invalid fill quantity")
+    if (
+        type(observed.limit_minor_units) is not int
+        or type(price) is not int
+        or not 0 < price <= observed.limit_minor_units
+    ):
         raise PostingRefused("Invalid fill price")
     fee = observed.fee_minor_units
     if type(fee) is not int or not 0 <= fee <= 2**63 - 1:
         raise PostingRefused("Invalid fill fee")
     with closing(_connect(store, "rw")) as db, db:
+        legacy = _has_legacy_order_index(db)
+        if legacy:
+            db.execute("PRAGMA foreign_keys=OFF")
         db.execute("BEGIN IMMEDIATE")
         if writer is not None:
             writer.verify_for(store, company_id)
@@ -93,42 +163,41 @@ def post_confirmed_fill(
             observed.limit_minor_units,
         ):
             raise PostingRefused("Fill does not match admitted order")
-        db.execute(
-            """CREATE TABLE IF NOT EXISTS paper_fill (
-                fill_id TEXT PRIMARY KEY NOT NULL,
-                order_id TEXT UNIQUE NOT NULL REFERENCES paper_order(order_id),
-                quantity INTEGER NOT NULL,
-                price_minor_units INTEGER NOT NULL
-            )"""
-        )
-        db.execute(
-            """CREATE TABLE IF NOT EXISTS paper_fill_fee (
-                fill_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_fill(fill_id),
-                fee_minor_units INTEGER NOT NULL
-            )"""
-        )
-        terms = (observed.fill_id, order_id, observed.quantity, price)
+        _ensure_fill_schema(db, legacy)
+        terms = (observed.fill_id, order_id, filled, price)
         existing = db.execute(
-            "SELECT * FROM paper_fill WHERE order_id = ? OR fill_id = ?",
-            (order_id, observed.fill_id),
-        ).fetchall()
-        if not existing:
+            "SELECT * FROM paper_fill WHERE fill_id = ?", (observed.fill_id,)
+        ).fetchone()
+        if existing is None:
+            booked, spent = db.execute(
+                """SELECT COALESCE(SUM(quantity),0),COALESCE(SUM(quantity*price_minor_units),0)
+                   FROM paper_fill WHERE order_id=?""",
+                (order_id,),
+            ).fetchone()
+            remaining = observed.quantity - booked - filled
+            if remaining < 0:
+                raise PostingRefused("Cumulative fills exceed the admitted order")
             db.execute("INSERT INTO paper_fill VALUES (?, ?, ?, ?)", terms)
             db.execute(
                 "INSERT INTO paper_fill_fee VALUES (?, ?)", (observed.fill_id, fee)
             )
             db.execute(
                 "UPDATE paper_order SET reserved_minor_units = ? WHERE order_id = ?",
-                (observed.quantity * price, order_id),
+                (
+                    spent + filled * price + remaining * observed.limit_minor_units,
+                    order_id,
+                ),
             )
         else:
             prior_fee = db.execute(
                 "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id = ?",
                 (observed.fill_id,),
             ).fetchone()
-            if existing != [terms] or (prior_fee or (0,)) != (fee,):
+            if existing != terms or (prior_fee or (0,)) != (fee,):
                 raise PostingRefused("Fill conflicts with an existing posting")
-    return Posting(*terms, fee)
+        if legacy and db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise PostingRefused("Legacy fill migration did not retain its references")
+        return _completed_posting(db, order_id)
 
 
 def position_quantity(store: Path, company_id: str) -> int:
@@ -145,32 +214,32 @@ def position_quantity(store: Path, company_id: str) -> int:
         ).fetchone()[0]
 
 
+def _completed_posting(connection: sqlite3.Connection, order_id: str) -> Posting | None:
+    if not _has_table(connection, "paper_fill"):
+        return None
+    row = connection.execute(
+        f"""SELECT p.fill_id,p.order_id,p.quantity,p.price_minor_units
+            FROM paper_fill p JOIN paper_order o USING(order_id)
+            WHERE o.order_id=? AND {FILLED_QUANTITY}=o.quantity
+            ORDER BY p.rowid DESC LIMIT 1""",
+        (order_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    fee = None
+    if _has_table(connection, "paper_fill_fee"):
+        fee = connection.execute(
+            "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id=?", (row[0],)
+        ).fetchone()
+    return Posting(*row, fee[0] if fee else 0)
+
+
 def read_booked_fill(store: Path, company_id: str, order_id: str) -> Posting | None:
     with closing(_connect(store, "ro")) as db:
         db.execute("BEGIN")
         if _identity(db) != company_id:
             raise PostingRefused("Company identity mismatch")
-        tables = {
-            name
-            for (name,) in db.execute(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('paper_fill', 'paper_fill_fee')"
-            )
-        }
-        if "paper_fill" not in tables:
-            return None
-        row = db.execute(
-            "SELECT fill_id, order_id, quantity, price_minor_units FROM paper_fill WHERE order_id = ?",
-            (order_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        fee = None
-        if "paper_fill_fee" in tables:
-            fee = db.execute(
-                "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id = ?",
-                (row[0],),
-            ).fetchone()
-        return Posting(*row, fee[0] if fee else 0)
+        return _completed_posting(db, order_id)
 
 
 def capture_position(
