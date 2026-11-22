@@ -266,41 +266,23 @@ class NautilusPaperVenue:
         self, connection: sqlite3.Connection, plan: SandboxPlan
     ) -> SandboxBalance:
         orders = connection.execute(
-            """SELECT o.state, o.order_id, o.quantity, o.price_atoms, o.fee_atoms,
-                      f.order_id, f.quantity, f.price_atoms, f.fee_atoms,
+            """SELECT o.state,o.quantity,SUM(f.quantity),SUM(f.quantity*f.price_atoms+f.fee_atoms),
                       a.position_lots, a.cash_atoms
                FROM sandbox_order o
-               LEFT JOIN sandbox_fill_observation f ON f.fill_id=o.fill_id
+               LEFT JOIN sandbox_fill_observation f ON f.order_id=o.order_id AND f.generation=o.generation
                LEFT JOIN sandbox_account_observation a ON a.order_id=o.order_id
-               ORDER BY o.rowid"""
+               GROUP BY o.order_id ORDER BY o.rowid"""
         )
         position, cash = 0, plan.starting_atoms
-        for (
-            state,
-            order_id,
-            quantity,
-            price,
-            fee,
-            original,
-            lots,
-            atoms,
-            charge,
-            held,
-            available,
-        ) in orders:
+        for state, quantity, filled, cost, held, available in orders:
             if plan.tape_revision is not None:
                 raise VenueRefused("Historical replay cannot reuse a prior activation")
             if state == "queued":
                 continue
-            if state != "filled" or (original, lots, atoms, charge) != (
-                order_id,
-                quantity,
-                price,
-                fee,
-            ):
+            if state != "filled" or filled != quantity or cost is None:
                 raise VenueRefused("Sandbox original effects remain unresolved")
             position += quantity
-            cash -= quantity * price + fee
+            cash -= cost
             if cash < 0 or (held, available) != (position, cash):
                 raise VenueRefused(
                     "Sandbox restart is missing a corroborated account checkpoint"
@@ -397,37 +379,32 @@ class NautilusPaperVenue:
             sleep(0.05)
         raise TimeoutError("Sandbox order outcome remains unknown")
 
-    def observe_execution(self, order_id: str) -> VenueExecution | None:
+    def read_fills(
+        self, account_id: str, order_id: str, *, account_sync: bool = False
+    ) -> tuple[VenueExecution, ...]:
         with self._connect("ro") as connection:
-            _, plan = self._configuration(connection)
-            return self._execution(connection, plan.account_id, order_id)
-
-    def sync_account_execution(
-        self, account_id: str, order_id: str
-    ) -> VenueExecution | None:
-        with self._connect("ro") as connection:
-            self._account(connection, account_id)
-            if not connection.execute(
-                "SELECT 1 FROM sandbox_account_observation WHERE order_id=?",
-                (order_id,),
-            ).fetchone():
-                return None
-            return self._execution(connection, account_id, order_id)
-
-    def _execution(
-        self, connection: sqlite3.Connection, account_id: str, order_id: str
-    ) -> VenueExecution | None:
-        account = self._account(connection, account_id)
-        row = connection.execute(
-            """SELECT quantity,limit_atoms,fill_id,price_atoms,fee_atoms
-               FROM sandbox_order WHERE order_id=? AND state='filled'""",
-            (order_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return VenueExecution(
-            order_id, account_id, account.instrument_rules_digest, *row
-        )
+            connection.execute("BEGIN")
+            account = self._account(connection, account_id)
+            if (
+                account_sync
+                and not connection.execute(
+                    "SELECT 1 FROM sandbox_account_observation WHERE order_id=?",
+                    (order_id,),
+                ).fetchone()
+            ):
+                return ()
+            return tuple(
+                VenueExecution(
+                    order_id, account_id, account.instrument_rules_digest, *row
+                )
+                for row in connection.execute(
+                    """SELECT o.quantity,o.limit_atoms,f.fill_id,f.price_atoms,f.fee_atoms,f.quantity
+                       FROM sandbox_order o JOIN sandbox_fill_observation f
+                         ON f.order_id=o.order_id AND f.generation=o.generation
+                       WHERE o.order_id=? ORDER BY f.rowid""",
+                    (order_id,),
+                )
+            )
 
     def record_account(
         self, generation: str, order_id: str, position_lots: int, cash_atoms: int
@@ -450,8 +427,10 @@ class NautilusPaperVenue:
                 return prior == observed
             _, plan = self._configuration(connection)
             quantity, cost = connection.execute(
-                """SELECT sum(quantity),sum(quantity*price_atoms+fee_atoms)
-                   FROM sandbox_order WHERE state='filled'"""
+                """SELECT SUM(f.quantity),SUM(f.quantity*f.price_atoms+f.fee_atoms)
+                   FROM sandbox_order o JOIN sandbox_fill_observation f
+                     ON f.order_id=o.order_id AND f.generation=o.generation
+                   WHERE o.state='filled'"""
             ).fetchone()
             if observed != (quantity, plan.starting_atoms - cost):
                 return False
@@ -519,7 +498,7 @@ class NautilusPaperVenue:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT quantity,limit_atoms,state,generation,fill_id,price_atoms,fee_atoms
+                """SELECT quantity,limit_atoms,state,generation
                    FROM sandbox_order WHERE order_id=?""",
                 (order_id,),
             ).fetchone()
@@ -536,24 +515,28 @@ class NautilusPaperVenue:
                     raise VenueRefused("Sandbox fill replay changed its terms")
                 return
             if (
-                row[2] == "filled"
-                and row[4:] == (fill_id, price, fee)
-                and row[0] == lots
-            ):
-                return
-            if (
                 row[2] not in ("dispatching", "unresolved")
+                or not isinstance(fill_id, str)
                 or not fill_id
+                or type(lots) is not int
+                or not 0 < lots <= row[0]
+                or type(price) is not int
                 or not 0 < price <= row[1]
-                or fee < 0
+                or type(fee) is not int
+                or not 0 <= fee <= MAX_ATOMS
             ):
                 raise VenueRefused("Sandbox fill conflicts with its original order")
+            (booked,) = connection.execute(
+                "SELECT COALESCE(SUM(quantity),0) FROM sandbox_fill_observation WHERE order_id=?",
+                (order_id,),
+            ).fetchone()
+            if booked + lots > row[0]:
+                raise VenueRefused("Sandbox fills exceed the original order")
             connection.execute(
                 "INSERT INTO sandbox_fill_observation VALUES (?, ?, ?, ?, ?, ?)",
                 (fill_id, *observed),
             )
-            if lots != row[0] or row[2] == "unresolved":
-                self._mark_unresolved(connection, generation, order_id)
+            if booked + lots != row[0]:
                 return
             connection.execute(
                 """UPDATE sandbox_order SET state='filled',fill_id=?,price_atoms=?,fee_atoms=?

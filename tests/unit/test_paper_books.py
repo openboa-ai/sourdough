@@ -222,6 +222,28 @@ class PaperBooksTests(unittest.TestCase):
                 [(original.fill_id, original.fee_minor_units)],
             )
 
+    def test_history_batch_rolls_back_if_one_fill_conflicts(self):
+        order_id = self.submit(99)
+        unfilled = self.venue.observe_execution(order_id)
+
+        class History(FixedQuoteVenue):
+            def read_fills(self, account_id, order_id, *, account_sync=False):
+                return self.history
+
+        history = History(self.journal)
+        first = replace(
+            unfilled, fill_id="first", filled_quantity=1, fill_price_minor_units=80
+        )
+        second = replace(first, fill_id="second", fill_price_minor_units=90)
+        history.history = (first, replace(second, filled_quantity=2))
+        with self.assertRaisesRegex(PostingRefused, "exceed the admitted order"):
+            post_confirmed_fill(self.store, self.company_id, order_id, history)
+        self.assertEqual(position_quantity(self.store, self.company_id), 0)
+        history.history = (first, second)
+        completed = post_confirmed_fill(self.store, self.company_id, order_id, history)
+        self.assertEqual(completed.fill_id, "second")
+        self.assertEqual(position_quantity(self.store, self.company_id), 2)
+
     def test_book_observation_is_scoped_and_replays_the_captured_revision(self):
         order_id = self.submit(110)
         posting = self.post(order_id)

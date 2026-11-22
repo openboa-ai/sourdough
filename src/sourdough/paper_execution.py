@@ -56,11 +56,9 @@ class PaperExecution(PaperDestination, Protocol):
 
     def observe_fee_bps(self, account_id: str) -> int: ...
 
-    def observe_execution(self, order_id: str) -> VenueExecution | None: ...
-
-    def sync_account_execution(
-        self, account_id: str, order_id: str
-    ) -> VenueExecution | None: ...
+    def read_fills(
+        self, account_id: str, order_id: str, *, account_sync: bool = False
+    ) -> tuple[VenueExecution, ...]: ...
 
 
 def require_separate_journal(company_store: Path, venue_journal: Path) -> None:

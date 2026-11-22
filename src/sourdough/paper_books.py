@@ -14,7 +14,7 @@ from .company import _connect, _identity
 from .paper_account import reopen_binding
 
 if TYPE_CHECKING:
-    from .paper_execution import PaperExecution
+    from .paper_execution import PaperExecution, VenueExecution
     from .writer_lease import WriterLease
 
 
@@ -100,25 +100,9 @@ def _ensure_fill_schema(connection: sqlite3.Connection, legacy: bool) -> None:
     )
 
 
-def post_confirmed_fill(
-    store: Path,
-    company_id: str,
-    order_id: str,
-    venue: PaperExecution,
-    *,
-    account_sync: bool = False,
-    writer: WriterLease | None = None,
-) -> Posting | None:
-    binding = reopen_binding(store, company_id)
-    if venue.observe_account(binding.account.account_id) != binding.account:
-        raise PostingRefused("Destination account mismatch")
-    observed = (
-        venue.sync_account_execution(binding.account.account_id, order_id)
-        if account_sync
-        else venue.observe_execution(order_id)
-    )
-    if observed is None or observed.fill_id is None:
-        return None
+def _post_fill(db: sqlite3.Connection, order_id: str, observed: VenueExecution) -> None:
+    if not isinstance(observed.fill_id, str) or not observed.fill_id:
+        raise PostingRefused("Invalid fill identity")
     price = observed.fill_price_minor_units
     filled = (
         observed.quantity
@@ -140,6 +124,51 @@ def post_confirmed_fill(
     fee = observed.fee_minor_units
     if type(fee) is not int or not 0 <= fee <= 2**63 - 1:
         raise PostingRefused("Invalid fill fee")
+    terms = (observed.fill_id, order_id, filled, price)
+    existing = db.execute(
+        "SELECT * FROM paper_fill WHERE fill_id = ?", (observed.fill_id,)
+    ).fetchone()
+    if existing is not None:
+        prior_fee = db.execute(
+            "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id = ?",
+            (observed.fill_id,),
+        ).fetchone()
+        if existing != terms or (prior_fee or (0,)) != (fee,):
+            raise PostingRefused("Fill conflicts with an existing posting")
+        return
+    booked, spent = db.execute(
+        """SELECT COALESCE(SUM(quantity),0),COALESCE(SUM(quantity*price_minor_units),0)
+           FROM paper_fill WHERE order_id=?""",
+        (order_id,),
+    ).fetchone()
+    remaining = observed.quantity - booked - filled
+    if remaining < 0:
+        raise PostingRefused("Cumulative fills exceed the admitted order")
+    db.execute("INSERT INTO paper_fill VALUES (?, ?, ?, ?)", terms)
+    db.execute("INSERT INTO paper_fill_fee VALUES (?, ?)", (observed.fill_id, fee))
+    db.execute(
+        "UPDATE paper_order SET reserved_minor_units = ? WHERE order_id = ?",
+        (spent + filled * price + remaining * observed.limit_minor_units, order_id),
+    )
+
+
+def post_confirmed_fill(
+    store: Path,
+    company_id: str,
+    order_id: str,
+    venue: PaperExecution,
+    *,
+    account_sync: bool = False,
+    writer: WriterLease | None = None,
+) -> Posting | None:
+    binding = reopen_binding(store, company_id)
+    if venue.observe_account(binding.account.account_id) != binding.account:
+        raise PostingRefused("Destination account mismatch")
+    observations = venue.read_fills(
+        binding.account.account_id, order_id, account_sync=account_sync
+    )
+    if not observations:
+        return None
     with closing(_connect(store, "rw")) as db, db:
         legacy = _has_legacy_order_index(db)
         if legacy:
@@ -155,46 +184,17 @@ def post_confirmed_fill(
                FROM paper_order WHERE order_id = ?""",
             (order_id,),
         ).fetchone()
-        if observed.order_id != order_id or order != (
-            binding.revision,
-            observed.account_id,
-            observed.instrument_rules_digest,
-            observed.quantity,
-            observed.limit_minor_units,
-        ):
-            raise PostingRefused("Fill does not match admitted order")
         _ensure_fill_schema(db, legacy)
-        terms = (observed.fill_id, order_id, filled, price)
-        existing = db.execute(
-            "SELECT * FROM paper_fill WHERE fill_id = ?", (observed.fill_id,)
-        ).fetchone()
-        if existing is None:
-            booked, spent = db.execute(
-                """SELECT COALESCE(SUM(quantity),0),COALESCE(SUM(quantity*price_minor_units),0)
-                   FROM paper_fill WHERE order_id=?""",
-                (order_id,),
-            ).fetchone()
-            remaining = observed.quantity - booked - filled
-            if remaining < 0:
-                raise PostingRefused("Cumulative fills exceed the admitted order")
-            db.execute("INSERT INTO paper_fill VALUES (?, ?, ?, ?)", terms)
-            db.execute(
-                "INSERT INTO paper_fill_fee VALUES (?, ?)", (observed.fill_id, fee)
-            )
-            db.execute(
-                "UPDATE paper_order SET reserved_minor_units = ? WHERE order_id = ?",
-                (
-                    spent + filled * price + remaining * observed.limit_minor_units,
-                    order_id,
-                ),
-            )
-        else:
-            prior_fee = db.execute(
-                "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id = ?",
-                (observed.fill_id,),
-            ).fetchone()
-            if existing != terms or (prior_fee or (0,)) != (fee,):
-                raise PostingRefused("Fill conflicts with an existing posting")
+        for observed in observations:
+            if observed.order_id != order_id or order != (
+                binding.revision,
+                observed.account_id,
+                observed.instrument_rules_digest,
+                observed.quantity,
+                observed.limit_minor_units,
+            ):
+                raise PostingRefused("Fill does not match admitted order")
+            _post_fill(db, order_id, observed)
         if legacy and db.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise PostingRefused("Legacy fill migration did not retain its references")
         return _completed_posting(db, order_id)
