@@ -29,3 +29,7 @@ The [runtime integration qualification contract](../../execution-environment/qua
 | Model sensitivity | Replay identical recorded market observations with the sealed base and adverse spread, delay and fill assumptions. Report both net outcomes and source coverage independently; do not pick the favorable case as the only result or present observed public prints as proof the paper order really filled. |
 
 The first local fault test can use a fixed synthetic feed for repeatability; this spec's forward-market evidence requires an actual separately observed current feed and is not satisfied by that fixture.
+
+## Recovering the bounded spot cash worker
+
+The company supervises the sandbox independently of the Agent worker. On sandbox restart, discard the previous generation's quote. Reconcile all original completed orders against the durable fill and virtual balance receipts and start the same account from that verified cash and spot holding, not its configured initial capital. The replacement must independently observe those balances in the SDK and obtain a fresh current quote before readiness. A queued order never claimed by a sender retains its original identity. An order possibly sent without conclusive evidence, an unsupported partial result, or a missing balance receipt prevents activation and does not authorize resubmission. This is a cash-spot checkpoint, not recovery of a general-purpose matching engine or evidence of testnet behavior.

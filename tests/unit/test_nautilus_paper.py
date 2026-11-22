@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time_ns
 
 from sourdough.market_worker import SpotInstrumentTerms
-from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
+from sourdough.nautilus_paper import NautilusPaperVenue, SandboxBalance, SandboxPlan
 from sourdough.paper_execution import PaperIntent, VenueRefused
 from sourdough.spot_cash import SpotCashUnits
 
@@ -58,7 +58,9 @@ class NautilusPaperPort(unittest.TestCase):
         self.assertEqual(destination, self.venue.provision(self.plan))
         with self.assertRaisesRegex(VenueRefused, "witnessed"):
             self.venue.observe_account("paper")
-        self.venue.prove_account("BINANCE-001", "USDT", self.plan.starting_atoms)
+        opening = self.venue.start_generation()
+        self.assertEqual(opening, SandboxBalance(0, self.plan.starting_atoms))
+        self.venue.prove_account("current", "BINANCE-001", "USDT", opening)
         stamp = time_ns()
         price = self.units.price_per_lot(Decimal("59000"))
         self.venue.publish_quote("current", price, stamp, stamp)
@@ -88,6 +90,10 @@ class NautilusPaperPort(unittest.TestCase):
             ("fill", 20, 0),
         )
         self.assertIsNone(sender.sync_account_execution(account.account_id, "order"))
+        with self.assertRaisesRegex(VenueRefused, "missing a corroborated"):
+            sender.start_generation()
+        with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
+            sender.observe_quote(account.account_id)
         self.assertFalse(
             sender.record_account(
                 "departed", "order", 20, self.plan.starting_atoms - 20 * price
@@ -101,8 +107,14 @@ class NautilusPaperPort(unittest.TestCase):
         self.assertEqual(
             sender.sync_account_execution(account.account_id, "order"), posting
         )
-        with self.assertRaisesRegex(VenueRefused, "history requires recovery"):
-            sender.start_generation()
+        checkpoint = sender.start_generation()
+        self.assertEqual(
+            checkpoint, SandboxBalance(20, self.plan.starting_atoms - 20 * price)
+        )
+        with self.assertRaisesRegex(VenueRefused, "original verified balances"):
+            sender.prove_account("replacement", "BINANCE-001", "USDT", opening)
+        sender.prove_account("replacement", "BINANCE-001", "USDT", checkpoint)
+        self.assertEqual(sender.observe_account("paper"), account)
         with closing(sqlite3.connect(sender.journal)) as database:
             self.assertEqual(
                 database.execute("SELECT count(*) FROM sandbox_order").fetchone(), (1,)
@@ -112,4 +124,13 @@ class NautilusPaperPort(unittest.TestCase):
                     "SELECT count(*) FROM sandbox_fill_observation"
                 ).fetchone(),
                 (1,),
+            )
+            self.assertEqual(
+                database.execute(
+                    "SELECT position_lots,cash_atoms FROM sandbox_activation ORDER BY rowid"
+                ).fetchall(),
+                [
+                    (0, opening.cash_atoms),
+                    (checkpoint.position_lots, checkpoint.cash_atoms),
+                ],
             )

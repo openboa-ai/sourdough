@@ -11,7 +11,7 @@ from time import monotonic, sleep
 from uuid import uuid4
 
 from .market_worker import journal_key
-from .nautilus_paper import NautilusPaperVenue
+from .nautilus_paper import NautilusPaperVenue, SandboxBalance
 from .nautilus_paper_worker import capture_fill, submit_limit
 from .paper_execution import VenueRefused
 from .replay_tape import ReplayTape
@@ -81,7 +81,10 @@ def run(venue: NautilusPaperVenue, tape: ReplayTape, ready_fd: int) -> None:
                     raise VenueRefused("Backtest did not initialize its virtual cash")
                 initial = account.balance_total(quote)
                 venue.prove_account(
-                    str(account.id), str(quote), units.quote_atoms(initial.as_decimal())
+                    generation,
+                    str(account.id),
+                    str(quote),
+                    SandboxBalance(0, units.quote_atoms(initial.as_decimal())),
                 )
                 if self.clock.timestamp_ns() != tick.ts_init:
                     raise VenueRefused("Replay clock differs from quote availability")

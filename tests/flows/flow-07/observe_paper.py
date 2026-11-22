@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -49,17 +50,27 @@ def rows(store, query):
         return database.execute(query).fetchall()
 
 
-def wait_ready(worker, log, seconds=36):
+def wait_ready(worker, log, seconds=36, previous_pid=None):
     deadline = monotonic() + seconds
     while monotonic() < deadline and worker.poll() is None:
         for line in log.read_text().splitlines():
             if line.startswith('{"event": "worker_ready"'):
-                return json.loads(line)
+                ready = json.loads(line)
+                if ready["pid"] != previous_pid:
+                    return ready
         sleep(0.1)
     raise RuntimeError(f"Sandbox did not become ready: {log.read_text()}")
 
 
-def observe(output: Path, wheelhouse: Path | None, tape: Path | None = None) -> dict:
+def observe(
+    output: Path,
+    wheelhouse: Path | None,
+    tape: Path | None = None,
+    *,
+    restart_engine: bool = False,
+) -> dict:
+    if restart_engine and tape is not None:
+        raise ValueError("Engine restart observation requires a current-market binding")
     output.mkdir(mode=0o700)
     employee = output / "employee"
     employee.write_text(f"#!{sys.executable}\n" + EMPLOYEE)
@@ -106,6 +117,7 @@ def observe(output: Path, wheelhouse: Path | None, tape: Path | None = None) -> 
         / ("sandbox.sqlite" if tape is None else "replay.sqlite")
     )
     runtime_log = output / "engine.stderr"
+    restarted = None
     with (
         runtime_log.open("w") as events,
         (output / "engine.stdout").open("w") as stdout,
@@ -126,6 +138,7 @@ def observe(output: Path, wheelhouse: Path | None, tape: Path | None = None) -> 
             ],
             stdout=stdout,
             stderr=events,
+            start_new_session=True,
         )
         try:
             ready = wait_ready(worker, runtime_log)
@@ -155,10 +168,19 @@ def observe(output: Path, wheelhouse: Path | None, tape: Path | None = None) -> 
             )
             if tape is None:
                 assert worker.poll() is None
+            if restart_engine:
+                deadline = monotonic() + 6
+                while not rows(venue, "SELECT 1 FROM sandbox_account_observation"):
+                    assert monotonic() < deadline, (
+                        "No independent virtual balance to restore"
+                    )
+                    sleep(0.05)
+                os.kill(ready["pid"], signal.SIGKILL)
+                restarted = wait_ready(worker, runtime_log, previous_pid=ready["pid"])
             assert worker.wait(timeout=40) == 0
         finally:
             if worker.poll() is None:
-                worker.terminate()
+                os.killpg(worker.pid, signal.SIGTERM)
                 worker.wait(timeout=8)
     order = result["first_trade"]["order"]
     posting = order["posting"]
@@ -182,6 +204,20 @@ def observe(output: Path, wheelhouse: Path | None, tape: Path | None = None) -> 
     assert (position, cash) == (20, 1000 * 10**8 - 20 * posting["price_minor_units"])
     assert rows(venue, "SELECT count(*) FROM sandbox_order") == [(1,)]
     assert rows(store, "SELECT count(*) FROM paper_order") == [(1,)]
+    if restarted is not None:
+        exits = [
+            json.loads(line)
+            for line in runtime_log.read_text().splitlines()
+            if line.startswith('{"event": "worker_exited"')
+        ]
+        assert [(event["pid"], event["returncode"]) for event in exits] == [
+            (ready["pid"], -signal.SIGKILL),
+            (restarted["pid"], 0),
+        ]
+        assert rows(
+            venue,
+            "SELECT position_lots,cash_atoms FROM sandbox_activation ORDER BY rowid",
+        ) == [(0, 1000 * 10**8), (position, cash)]
     replay_cut = None
     if tape is not None:
         (cut,) = rows(
@@ -206,6 +242,7 @@ def observe(output: Path, wheelhouse: Path | None, tape: Path | None = None) -> 
         "connector": binding["account"]["connector_revision"],
         "replay_cut": replay_cut,
         "engine_worker_pid": ready["pid"],
+        "replacement_worker_pid": restarted["pid"] if restarted else None,
         "scope": "virtual cash; zero test fee; one full fill",
         "posting": posting,
         "sandbox_account": {"position_lots": position, "cash_atoms": cash},
@@ -218,8 +255,16 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--wheelhouse", type=Path)
     parser.add_argument("--replay-tape", type=Path)
+    parser.add_argument("--restart-engine", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
     print(
-        json.dumps(observe(args.output.absolute(), args.wheelhouse, args.replay_tape))
+        json.dumps(
+            observe(
+                args.output.absolute(),
+                args.wheelhouse,
+                args.replay_tape,
+                restart_engine=args.restart_engine,
+            )
+        )
     )
