@@ -20,6 +20,7 @@ from sourdough.paper_research import stage_research_inputs
 from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.writer_lease import WriterRefused, hold_company_writer
+from sourdough.work_projection import read_local_board_timeline
 
 
 def _store_key(value: str) -> tuple[int, int]:
@@ -83,6 +84,11 @@ def main() -> int:
     )
     opening.add_argument("store", type=Path)
     opening.add_argument("--company-id", required=True)
+    inspection = commands.add_parser(
+        "inspect-work", help="Inspect the local read-only company timeline"
+    )
+    inspection.add_argument("store", type=Path)
+    inspection.add_argument("--company-id", required=True)
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
     paper = commands.add_parser("bind-paper")
@@ -130,6 +136,9 @@ def main() -> int:
             )
         elif args.command == "reopen":
             result = reopen(args.store, args.company_id)
+        elif args.command == "inspect-work":
+            print(json.dumps(read_local_board_timeline(args.store, args.company_id)))
+            return 0
         elif args.command == "employee-profile":
             print(
                 json.dumps(
