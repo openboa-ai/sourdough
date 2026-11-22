@@ -10,7 +10,8 @@ from .company import _connect, founding_execution_profile
 from .first_duty import DutyClaim, claim_first_duty
 from .paper_account import reopen_binding
 from .paper_books import Posting, position_quantity, post_confirmed_fill
-from .paper_order import PaperIntent, submit_paper_order
+from .paper_execution import PaperExecution, PaperIntent
+from .paper_order import submit_paper_order
 from .paper_research import (
     ResearchDecisionReceipt,
     ResearchTools,
@@ -18,7 +19,6 @@ from .paper_research import (
     reopen_research_decision,
     requires_research,
 )
-from .paper_venue import FixedQuoteVenue
 from .writer_lease import WriterLease
 
 
@@ -65,15 +65,12 @@ class TradeResult:
 def run_first_trade(
     store: Path,
     company_id: str,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     runtime: EmployeeRuntime,
     *,
     writer: WriterLease | None = None,
 ) -> TradeResult:
-    if store.resolve() == venue.journal.resolve() or (
-        store.exists() and venue.journal.exists() and store.samefile(venue.journal)
-    ):
-        raise TradeRefused("Company store and venue journal must be separate")
+    venue.require_independent_from(store)
     binding = reopen_binding(store, company_id)
     account = binding.account
     if venue.observe_account(account.account_id) != account:
@@ -139,7 +136,7 @@ def run_first_trade(
 
 
 def resume_opening_research(
-    writer: WriterLease, venue: FixedQuoteVenue, *, hired: bool = False
+    writer: WriterLease, venue: PaperExecution, *, hired: bool = False
 ) -> TradeResult | None:
     writer.verify()
     store, company_id = writer.store, writer.company_id
@@ -164,7 +161,7 @@ def _apply_paper_order(
     store: Path,
     claim: DutyClaim,
     intent: PaperIntent,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     writer: WriterLease | None,
 ) -> ToolResult:
     receipt = submit_paper_order(store, claim, intent, venue, writer=writer)

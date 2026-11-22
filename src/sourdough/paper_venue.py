@@ -2,33 +2,25 @@
 
 import sqlite3
 from contextlib import closing
-from dataclasses import astuple, dataclass, replace
+from dataclasses import astuple, replace
 from pathlib import Path
 from uuid import uuid4
 
 from .paper_account import PaperAccount
-from .paper_order import PaperIntent
-
-
-class VenueRefused(Exception):
-    """The paper destination cannot accept the command."""
-
-
-@dataclass(frozen=True)
-class VenueExecution:
-    order_id: str
-    account_id: str
-    instrument_rules_digest: str
-    quantity: int
-    limit_minor_units: int
-    fill_id: str | None
-    fill_price_minor_units: int | None
-    fee_minor_units: int = 0
+from .paper_execution import (
+    PaperIntent,
+    VenueExecution,
+    VenueRefused,
+    require_separate_journal,
+)
 
 
 class FixedQuoteVenue:
     def __init__(self, journal: Path):
         self.journal = journal
+
+    def require_independent_from(self, company_store: Path) -> None:
+        require_separate_journal(company_store, self.journal)
 
     def _open(self, mode: str):
         connection = sqlite3.connect(

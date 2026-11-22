@@ -14,7 +14,7 @@ from .company import _connect, _identity
 from .paper_account import reopen_binding
 
 if TYPE_CHECKING:
-    from .paper_venue import FixedQuoteVenue
+    from .paper_execution import PaperExecution
     from .writer_lease import WriterLease
 
 
@@ -52,7 +52,7 @@ def post_confirmed_fill(
     store: Path,
     company_id: str,
     order_id: str,
-    venue: FixedQuoteVenue,
+    venue: PaperExecution,
     *,
     account_sync: bool = False,
     writer: WriterLease | None = None,
