@@ -1,4 +1,5 @@
 import json
+import runpy
 import subprocess
 import sys
 import unittest
@@ -8,8 +9,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 
+from sourdough.agent_desk import save_draft
 from sourdough.company import FoundingTerms, _connect, found
-from sourdough.duty_run import PAPER_EXECUTION, DutyRefused
+from sourdough.duty_run import PAPER_EXECUTION, DutyRefused, start_run
 from sourdough.employee_process import _ToolEndpoint
 from sourdough.first_duty import claim_first_duty
 from sourdough.harness import ScopedRun, ScopedWorkflow, tool
@@ -148,3 +150,70 @@ class ScopedHarness(unittest.TestCase):
         with self.assertRaisesRegex(DutyRefused, "no longer current"):
             current.call("record_note", {"record": "valid"})
         self.assertEqual(self.calls, [])
+
+    def test_durable_private_draft_is_mounted_only_for_the_original_agent(self):
+        def save(name, content, expected=None):
+            return save_draft(
+                self.writer,
+                self.claim,
+                PAPER_EXECUTION,
+                name=name,
+                content=content,
+                expected_revision=expected,
+            )
+
+        draft = save("comparison", "Use the independently confirmed count.")
+        self.assertEqual(draft, save("comparison", draft.content))
+        with self.assertRaisesRegex(DutyRefused, "revision changed"):
+            save("comparison", "A conflicting overwrite.")
+        with self.assertRaisesRegex(DutyRefused, "Invalid private draft"):
+            save("../AGENTS.md", "Not an authorized rule.")
+        with closing(_connect(self.store, "rw")) as database, database:
+            database.execute(
+                "INSERT INTO agent VALUES ('peer', ?, 'profile')",
+                (self.claim.company_id,),
+            )
+            database.execute(
+                "INSERT INTO standing_grant VALUES ('peer-grant', 'peer', 'paper')"
+            )
+            database.execute("INSERT INTO duty VALUES ('peer-duty', 'peer', 'due')")
+            database.execute("INSERT INTO private_desk VALUES ('peer', 'peer-desk')")
+            peer = start_run(
+                database,
+                self.claim.company_id,
+                "peer",
+                "peer-grant",
+                "peer-duty",
+                "profile",
+                purpose=PAPER_EXECUTION,
+                grant_scope="paper",
+            )
+        workflow = self.workflow("record_note")
+        original = ScopedRun(self.writer, self.claim, workflow, self.invoke).manifest()
+        outsider = ScopedRun(self.writer, peer, workflow, self.invoke).manifest()
+        self.assertEqual(outsider["drafts"], [])
+        self.assertEqual(
+            original["drafts"],
+            [
+                {
+                    "name": draft.name,
+                    "revision": draft.revision,
+                    "content": draft.content,
+                }
+            ],
+        )
+        prepare_workspace = runpy.run_path(str(ADAPTER))["prepare_workspace"]
+        workspace = prepare_workspace(self.root, original["drafts"])
+        self.assertEqual(
+            (workspace / "drafts/comparison.md").read_text(), draft.content
+        )
+        self.assertFalse((workspace / "AGENTS.md").exists())
+        self.assertEqual(
+            json.loads((workspace / "drafts/index.json").read_bytes()),
+            {"comparison": draft.revision},
+        )
+        prompt = runpy.run_path(str(ADAPTER))["scoped_work_prompt"]
+        self.assertIn("Do not use the shell", prompt(original))
+        original_data = prompt(original).split("\n")[-1]
+        self.assertEqual(json.loads(original_data), original["drafts"])
+        self.assertNotIn(draft.content, prompt(outsider))

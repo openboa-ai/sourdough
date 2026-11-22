@@ -3,12 +3,11 @@
 import json
 import re
 from collections.abc import Callable
-from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 
-from .company import _connect
-from .duty_run import DutyClaim, DutyRefused, resolve_run
+from .agent_desk import resolve_desk
+from .duty_run import DutyClaim, DutyRefused
 from .writer_lease import WriterLease
 
 
@@ -59,10 +58,16 @@ class ScopedRun:
         self._claim = claim
         self._purpose = workflow.purpose
         self._invoke = invoke
-        self._desk_revision = self._current_desk()
+        self._desk_revision, drafts = resolve_desk(
+            writer,
+            claim,
+            workflow.purpose,
+            include_drafts=True,
+        )
         manifest = {
             "run_id": claim.run_id,
             "desk_revision": self._desk_revision,
+            "drafts": [asdict(draft) for draft in drafts],
             "instruction": workflow.instruction,
             "tools": workflow.tools,
             "terminal_tool": workflow.terminal_tool,
@@ -76,27 +81,16 @@ class ScopedRun:
         }
 
     def _current_desk(self) -> str:
-        claim = self._claim
-        self._writer.verify_for(self._writer.store, claim.company_id)
-        with closing(_connect(self._writer.store, "ro")) as database:
-            database.execute("BEGIN")
-            authority = resolve_run(database, claim)
-            authority.require_current(self._purpose)
-            if authority.duty_state != "running":
-                raise DutyRefused("Scoped workflow requires the current running duty")
-            row = database.execute(
-                "SELECT manifest_revision FROM private_desk WHERE agent_id=?",
-                (claim.founder_id,),
-            ).fetchone()
-            if not row:
-                raise DutyRefused("The current Agent has no private Desk")
-            return row[0]
+        revision, _ = resolve_desk(self._writer, self._claim, self._purpose)
+        return revision
 
     @property
     def claim(self) -> DutyClaim:
         return self._claim
 
     def manifest(self) -> dict:
+        if self._current_desk() != self._desk_revision:
+            raise DutyRefused("The Agent Desk changed after the context was prepared")
         return json.loads(self._manifest) | {
             "revision": sha256(self._manifest.encode()).hexdigest()
         }
