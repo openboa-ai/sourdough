@@ -1,4 +1,7 @@
+import json
 import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -47,3 +50,38 @@ class BoardTimeline(unittest.TestCase):
             with self.assertRaisesRegex(FoundingRefused, "store owner"):
                 read_local_board_timeline(self.store, self.receipt.company_id)
         self.assertEqual(self.store.read_bytes(), before)
+
+    def test_client_query_checks_contract_separately_and_leaves_store_unchanged(self):
+        before = self.store.read_bytes()
+        command = (
+            sys.executable,
+            "-IB",
+            "-m",
+            "sourdough.cli",
+            "inspect-work",
+        )
+        scope = ("--company-id", self.receipt.company_id, "--contract-revision")
+        accepted = subprocess.run(
+            [*command, str(self.store), *scope, "work-timeline-v1"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        observed = json.loads(accepted.stdout)
+        self.assertEqual(observed["contract_revision"], "work-timeline-v1")
+        self.assertEqual(observed["company_id"], self.receipt.company_id)
+        self.assertEqual(observed["duties"][0]["duty_id"], self.receipt.due_work_id)
+        self.assertNotEqual(observed["revision"], observed["contract_revision"])
+        self.assertGreater(observed["as_of_ns"], 0)
+        unknown = subprocess.run(
+            [*command, str(self.store.parent / "absent"), *scope, "future"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("Unsupported work timeline contract", unknown.stderr)
+        self.assertEqual(unknown.stdout, "")
+        self.assertEqual(self.store.read_bytes(), before)
+        self.assertEqual(list(self.store.parent.iterdir()), [self.store])

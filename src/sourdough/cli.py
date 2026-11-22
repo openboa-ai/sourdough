@@ -25,7 +25,7 @@ from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.writer_lease import WriterRefused, hold_company_writer
-from sourdough.work_projection import read_local_board_timeline
+from sourdough.work_projection import WORK_TIMELINE_REVISION, read_local_board_timeline
 
 
 def _store_key(value: str) -> tuple[int, int]:
@@ -107,6 +107,7 @@ def main() -> int:
     )
     inspection.add_argument("store", type=Path)
     inspection.add_argument("--company-id", required=True)
+    inspection.add_argument("--contract-revision", default=WORK_TIMELINE_REVISION)
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
     paper = commands.add_parser("bind-paper")
@@ -192,7 +193,15 @@ def main() -> int:
         elif args.command == "reopen":
             result = reopen(args.store, args.company_id)
         elif args.command == "inspect-work":
-            print(json.dumps(read_local_board_timeline(args.store, args.company_id)))
+            print(
+                json.dumps(
+                    read_local_board_timeline(
+                        args.store,
+                        args.company_id,
+                        contract_revision=args.contract_revision,
+                    )
+                )
+            )
             return 0
         elif args.command == "employee-profile":
             print(
