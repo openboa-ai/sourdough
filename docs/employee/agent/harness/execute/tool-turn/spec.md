@@ -8,6 +8,8 @@ Design draft · Verification **UNRUN** · Responsible component: Runtime adapter
 
 Resolve each tool request against its current actor generation and the responsible company or enabled business service. External operations use the company connector boundary and its current destination-scoped authorization; the harness cannot authorize a trade, change its own grants or write a financial result.
 
+A skill, plug-in, memory entry or workspace instruction may guide a proposal. None is a grant. Only the responsible company service invokes an effectful connector after its own admission checks. A runtime adapter consumes the company-issued tool manifest and relays calls; it does not select financial or other business policy.
+
 Launch with provisioned consent, budget, workspace and a company-issued work/generation grant. Deliver the decision snapshot; return run ID, tool receipts, terminal status and observed usage.
 
 Input contracts: [Work generation](../../../../../company/systems/work/resume-work/recover-shift/spec.md) · [Registered runtime](../../adapters/register/spec.md) · [Scoped actor](../../../../../company/systems/authority/authorize-actor/check/spec.md) · [Scoped context manifest](../context-pack/spec.md).

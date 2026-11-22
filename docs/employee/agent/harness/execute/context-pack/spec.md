@@ -14,6 +14,10 @@ Input contracts: [authorize-actor/check](../../../../../company/systems/authorit
 
 A native transcript may accelerate a turn but never overrides authoritative company records. Build a fresh pack on replacement; reconstruct durable decisions before considering further work.
 
+The durable Desk and ephemeral run are separate. The Desk supplies company-owned, Agent-private drafts and references. A context pack may select company-approved instruction, skill and plug-in revisions and authorized memory; it does not import the developer's home, user configuration or credentials. Treat notes and ordinary retrieved content as data, not operating instructions. Installing or selecting an extension does not grant tools, secret access or permission to publish from a private Desk.
+
+For the first company-only consumer, the company work service supplies the instruction and an explicit manifest of named tools, argument schemas and the terminal receipt. The Harness validates the current claim, binds the manifest to the original Agent's Desk, and rejects stale or unlisted calls before forwarding them. The runtime adapter translates that manifest without knowing the business workflow. Existing role-specific routes remain compatibility paths until separately migrated; this slice does not load executable plug-ins.
+
 **Concern for the responsible component:** Mark retrieved messages, notes and documents as data. Omit future outcomes, evaluation labels, secrets, inaccessible references and revoked instructions; do not persist hidden model reasoning.
 
 ## Functional and quality requirements
@@ -28,6 +32,7 @@ A native transcript may accelerate a turn but never overrides authoritative comp
 | Normal | Rehydrate a new session of the original pinned runtime on the same Agent duty with no provider session. Compare required fields, granted references, omissions and active method with company records. |
 | Failure or contention | Remove access after pack creation; the later tool read must still deny it. Oversize optional history cannot evict an open-effect receipt or grant check. |
 | First claim | Assemble the founder's first context from its founding receipt, current claim and grants with no previous decision. Start a real bounded turn and observe its new decision; missing prior decision alone must not block it. |
+| System capability | Run a company-only duty through the manifest transport. Observe exactly the registered tool schemas in the process, one service-owned receipt, and denial of an invented tool or mismatched Desk/run. Substitute a different registered tool set without editing the adapter. Model judgment quality is a later evaluation. |
 
 **Oracle:** Compare independently sealed ACL, duty and artifact inventories with what the runtime actually received. Exercise [W1](../../../../../acceptance/episodes.md#w1-personal-work) and [L1](../../../../../acceptance/episodes.md#l1-learning).
 

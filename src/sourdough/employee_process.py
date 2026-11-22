@@ -14,6 +14,7 @@ from threading import Thread
 
 from .first_duty import DutyRefused
 from .first_trade import OrderTool, TradeRefused, TradingContext
+from .harness import ScopedRun
 from .writer_lease import WriterRefused
 
 MAX_TOOL_REQUEST_BYTES = 64 * 1024
@@ -140,8 +141,12 @@ class EmployeeProcess:
     def onboarding(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("onboarding_duty", _ToolEndpoint, invoke)
 
-    def assess(self, invoke: Callable[[str, dict], dict]) -> dict:
-        return self._scoped_exchange("assessment_duty", _ToolEndpoint, invoke)
+    def run_scoped(self, operation: str, run: ScopedRun) -> dict:
+        if run.claim.execution_profile != self.profile:
+            raise TradeRefused("Scoped run belongs to another execution profile")
+        return self._scoped_exchange(
+            operation, _ToolEndpoint, run.call, harness=run.manifest()
+        )
 
     def research_hired(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("hired_research_duty", _ToolEndpoint, invoke)
@@ -152,7 +157,9 @@ class EmployeeProcess:
     def _follow_up(self, operation: str, read_result: Callable[[], dict]) -> dict:
         return self._scoped_exchange(operation, _ResultEndpoint, read_result)
 
-    def _scoped_exchange(self, operation: str, endpoint_type, callback) -> dict:
+    def _scoped_exchange(
+        self, operation: str, endpoint_type, callback, *, harness: dict | None = None
+    ) -> dict:
         if self._profile() != self.profile:
             raise TradeRefused("Employee model binding changed")
         with TemporaryDirectory(prefix="sd-") as directory:
@@ -163,9 +170,10 @@ class EmployeeProcess:
                 )
                 thread.start()
                 try:
-                    return self._exchange(
-                        {"operation": operation, "read_endpoint": address}
-                    )
+                    request = {"operation": operation, "read_endpoint": address}
+                    if harness is not None:
+                        request["harness"] = harness
+                    return self._exchange(request)
                 finally:
                     endpoint.shutdown()
                     thread.join()

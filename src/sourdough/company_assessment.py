@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from .company import _connect
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, resolve_run
+from .harness import ScopedWorkflow, tool
 from .onboarding import has_hired_acceptance, invoke_onboarding
 from .work import (
     FollowUp,
@@ -22,6 +23,42 @@ from .writer_lease import WriterLease
 
 
 ASSESSMENT = "assessment"
+ASSESSMENT_WORKFLOW = ScopedWorkflow(
+    ASSESSMENT,
+    "Read your assignment and accept it if authorized. Compare the reported and observed "
+    "values in one accessible company record. Publish an assessment with your rationale "
+    "and a proposed next check. You cannot change the source records.",
+    (
+        tool("read_first_duty", "Read your assignment and private Desk reference.", {}),
+        tool(
+            "accept_first_duty",
+            "Explicitly accept the assignment you read.",
+            {
+                "revision": {"type": "string"},
+                "rationale": {"type": "string", "maxLength": 2000},
+            },
+        ),
+        tool("read_assessment_inputs", "Read the authorized company records.", {}),
+        tool(
+            "publish_assessment",
+            "Publish one assessment for the permitted audience.",
+            {
+                "source_revision": {"type": "string"},
+                "record_id": {"type": "string"},
+                "disposition": {
+                    "enum": ["recommend_change", "no_change", "investigate"]
+                },
+                "rationale": {"type": "string", "maxLength": 2000},
+                "next_check_seconds": {
+                    "type": "integer",
+                    "minimum": 60,
+                    "maximum": 86400,
+                },
+            },
+        ),
+    ),
+    "publish_assessment",
+)
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS assessment_source (
         company_id TEXT PRIMARY KEY NOT NULL REFERENCES company(id),

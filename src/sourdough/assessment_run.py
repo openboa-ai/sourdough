@@ -9,6 +9,7 @@ from .abandoned_work import has_uncommitted_work, requeue_uncommitted_work
 from .company import upgrade_work_schema
 from .company_assessment import (
     ASSESSMENT,
+    ASSESSMENT_WORKFLOW,
     AssessmentReceipt,
     invoke_assessment,
     pending_publications,
@@ -18,6 +19,7 @@ from .company_assessment import (
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, count_company_runs
 from .employee_process import EmployeeProcess
 from .first_trade import TradeRefused
+from .harness import ScopedRun
 from .hiring_run import HiringRun, prepare_hiring
 from .work import (
     FollowUp,
@@ -90,8 +92,14 @@ def run_assessment_company(
             if claim is None:
                 return AssessmentRun(hiring, None, tuple(restored), None)
             try:
-                employee.assess(
-                    lambda name, args: invoke_assessment(writer, claim, name, args)
+                employee.run_scoped(
+                    "assessment_duty",
+                    ScopedRun(
+                        writer,
+                        claim,
+                        ASSESSMENT_WORKFLOW,
+                        lambda name, args: invoke_assessment(writer, claim, name, args),
+                    ),
                 )
             except TradeRefused:
                 if not any(
