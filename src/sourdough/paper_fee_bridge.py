@@ -1,16 +1,25 @@
 """Deliver the booked paper fee through the company accounting boundary."""
 
+from __future__ import annotations
+
 import json
 import re
 from contextlib import closing
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, timedelta
 from hashlib import sha256
+from typing import TYPE_CHECKING
 
 from .company import _connect
 from .general_ledger import JournalEntry, JournalLine, JournalRefused, post_journal
 from .paper_books import read_fill_accounting_source
 from .writer_lease import WriterLease
+
+if TYPE_CHECKING:
+    from .nautilus_paper import NautilusPaperVenue
+
+
+PAPER_FILL_FEE_SOURCE = "paper-fill-fee"
 
 
 PAPER_FILL_FEE_SOURCE = "paper-fill-fee"
@@ -101,7 +110,11 @@ def _acknowledge(
 
 
 def deliver_paper_fee(
-    writer: WriterLease, verified: VerifiedFee, chart: FeeChart
+    writer: WriterLease,
+    verified: VerifiedFee,
+    chart: FeeChart,
+    *,
+    order_id: str | None = None,
 ) -> FeeDelivery:
     """Internal delivery; the caller supplies verified venue evidence and its admitted chart."""
     writer.verify()
@@ -122,6 +135,8 @@ def deliver_paper_fee(
         chart.source_mapping_revision,
     ):
         raise JournalRefused("Verified fee does not match its original paper source")
+    if order_id is not None and order_id != source.order_id:
+        raise JournalRefused("Verified fee does not match its original paper order")
     if (
         type(verified.fee_minor_units) is not int
         or type(verified.effective_date) is not date
@@ -171,3 +186,34 @@ def deliver_paper_fee(
     journal_id = post_journal(writer, entry) if entry is not None else None
     _acknowledge(writer, source.fill_id, delivery_digest, journal_id)
     return FeeDelivery(source_event, journal_id, amount)
+
+
+def deliver_managed_paper_fee(
+    writer: WriterLease,
+    venue: NautilusPaperVenue,
+    account_id: str,
+    fill_id: str,
+    chart: FeeChart,
+) -> FeeDelivery:
+    venue.require_independent_from(writer.store)
+    evidence = venue.read_fill_fee(account_id, fill_id)
+    if evidence is None:
+        raise JournalRefused("No independently timed current-paper fee evidence")
+    effective_date = date(1970, 1, 1) + timedelta(
+        days=evidence.effective_ns // (86400 * 10**9)
+    )
+    return deliver_paper_fee(
+        writer,
+        VerifiedFee(
+            evidence.destination_id,
+            evidence.account_id,
+            evidence.fill_id,
+            _digest(asdict(evidence)),
+            effective_date,
+            evidence.currency,
+            evidence.units_per_whole,
+            evidence.fee_atoms,
+        ),
+        chart,
+        order_id=evidence.order_id,
+    )

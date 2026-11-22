@@ -16,6 +16,12 @@ Input contracts: [Fill postings](../../book-fills/post/spec.md) · [Journal mapp
 
 Keep realized cash, marked exposure, external flows and operating costs separate rather than treating a change in balance as profit.
 
+The managed cash-spot valuation cut preserves the observed bid and ask separately. The period's pinned mark policy chooses the measure. The independent venue cash already reflects execution charges; do not deduct those charges again when joining the accounting close. An individual usable cut is not proof of coverage for the period.
+
+For an explicitly selected `spot-best-bid-v1` policy, value a cash-spot cut as original venue cash plus long lots times the observed bid per lot, in the venue's quote atoms. Pin the capture ID, binding revision, policy and exact independent observation in an immutable fund evidence receipt. Exact retry returns that receipt even if market prices advance. Do not relabel restarts, expired observations, or changed binding terms as the original cut. The receipt is historical measurement input, never a second source of current account state or proof of the final operating result.
+
+To use a cut in the first operating result, join it to the immutable window receipt. Require the same bound account, valuation policy and source revision (`binance-public-spot-quote-v1` for managed spot). The quote's original event and availability times, its supporting trade event and the account cut must all fall inside the window. Preserve the two receipt revisions on that input. One eligible cut does not attest to opening or closing coverage, feed continuity, or operating expenses.
+
 **Concern for the responsible component:** Choose valuation cut, cost currency and conversion source before comparing periods; missing costs prohibit a fully net claim.
 
 ## Functional and quality requirements

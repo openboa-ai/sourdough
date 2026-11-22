@@ -14,6 +14,8 @@ Input contracts: [Persist the founding charter](../../../../../systems/organizat
 
 Index by availability time as well as event time rather than rewriting a historic snapshot after late data.
 
+For the local cash-spot current-paper binding, capture one read-only valuation cut from the managed execution journal. It includes the bound account and instrument, exact lot and quote units, the corroborated cash and position, and bid/ask evidence with its original event and availability times and supporting trade. Read them in one journal snapshot. An uncorroborated original effect, expired quote, absent bid or replay binding cannot provide this current-market cut. No mark method or accounting entry is chosen at this boundary.
+
 **Concern for the responsible component:** Declare a freshness limit for each fixture stream before the trial; an unmeasured or missing source must remain unknown.
 
 ## Functional and quality requirements
