@@ -10,6 +10,12 @@ Paper, historical replay and external destinations must use the **same core arti
 
 Pin one build digest, identical starting company state and grants except the environment-scoped account and destination, instrument rules and policy revision. Set up two separately durable, independently observable destinations: the paper venue and an external-protocol emulator. Their common subset and deliberately differing capabilities are sealed in advance. Clone state into isolated trial companies/accounts; neither has access to actual external credentials or a live network destination. The observer, not the runtime, compares normalized records and destination histories.
 
+The local protocol fixture runs in a separate process with its own ledger and no network or credentials. Its private wire fields differ from the paper core's types. On an accepted request with a lost reply, the fixture witness can independently see the order while the company-facing history cannot yet see it. The harness advances only the venue's evidence visibility; it does not modify company orders, reservations or holdings.
+
+The partial-fill pair uses the managed paper adapter's independent journal and the wire fixture. In both cases a terminal cancellation arrives before the last identified fill. Keep the remainder reserved until the reported cumulative quantity matches unique fills; run reconciliation in a fresh company process at each cut and compare its original order, fees, exposure and final position with the independently persisted venue facts. This fixture does not replace an actual SDK observation.
+
+The unfenced-absence case differs from a lost reply to an already accepted order. The emulator retains a delayed submission separately from its order ledger, so an independent reader sees an empty order ledger before delivery. A limited retry budget may expire, but neither emptiness nor timeout may release the reservation or authorize another send. If the original becomes visible during the budget, recover that order once.
+
 ## Scenarios and oracle
 
 | Case | Required comparison |
@@ -23,3 +29,5 @@ Pin one build digest, identical starting company state and grants except the env
 **PASS:** every common-contract case matches independently computed expected invariants, zero unauthorized or cross-environment effects occur, all missing destination guarantees remain explicit, and one actual core digest appears in both traces. Capture configuration, account/binding revisions, command origin, action/order/fill IDs, time-ordered records, destination calls and unrun cases. A missing observation is **INCOMPLETE**, an invariant breach is **FAIL**, and an unexecuted case is **UNRUN**.
 
 The paper run and emulator establish only fixture-level parity. Record real adapter source/conformance, separately authorized testnet observations and any later live qualification as distinct evidence. The founder and newly hired Agent must each still pass their own uninterrupted paper integration; this suite cannot replace either.
+
+The required CI entry point runs on macOS 26 Arm64, as required by the pinned engine. It replays a sealed historical tape in two isolated stores and compares the causal quote and resulting fill and balance. The same suite covers zero fills and partial cancellation. It requires neither an Agent subscription nor Binance credentials. Current-market operation and process-cut observations remain separate acceptance evidence.
