@@ -94,9 +94,24 @@ def main():
         return
     request = json.load(sys.stdin)
     codex = "/opt/homebrew/bin/codex"
-    env = {"HOME": str(Path.home()), "PATH": "/usr/bin:/bin"}
+    codex_home = Path.home() / "Library/Application Support/Sourdough/Codex"
+    env = {
+        "HOME": str(Path.home()),
+        "CODEX_HOME": str(codex_home),
+        "PATH": "/usr/bin:/bin",
+    }
+    credential_store = ["-c", 'cli_auth_credentials_store="file"']
+    if not (codex_home / "auth.json").is_file():
+        if request["operation"] == "ready":
+            print('{"ready":false}')
+            return
+        raise SystemExit("Connect Codex in the Sourdough profile first")
     login = subprocess.run(
-        [codex, "login", "status"], env=env, capture_output=True, text=True, timeout=10
+        [codex, *credential_store, "login", "status"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     ready = (
         login.returncode == 0
@@ -113,6 +128,7 @@ def main():
         decision = Path(directory) / "decision.txt"
         cmd = [
             codex,
+            *credential_store,
             "-a",
             "never",
             "exec",
