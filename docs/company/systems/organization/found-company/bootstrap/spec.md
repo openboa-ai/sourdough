@@ -1,6 +1,6 @@
 # Persist the founding charter
 
-Design draft · Verification **UNRUN** · Responsible component: Company service
+Product-owner approval: 2026-11-22, requirements at `1fbf55d12dfdf6023869a70cb536d92f2c6147dc`. Implementation of this founding unit is admitted after the guide and approval record merge and the resulting main CI passes. Verification **UNRUN** · Responsible component: Company service
 
 [Feature intent](../intent.md) · [MVP map](../../../../../README.md) · [SDLC handoff](../../../../../engineering/lifecycle.md)
 
