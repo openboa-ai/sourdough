@@ -14,6 +14,8 @@ Before close, pin company/account, reporting currency, period, inclusive boundar
 
 The first operating-cost join binds the company, window ID, currency, dated cut, operating chart and declared cost-source identities into the sealed inventory revision. Later actual amounts and evidence revisions are not part of that inventory hash. Read the exact company accounting close and require a matching, nonempty inventory, the window currency and precisely matching coverage, assessed after the window closes. A dated accounting close proves only complete UTC accounting days; sub-day windows need a finer-cut accounting source. Paper fill fees already reflected in venue cash do not belong to this operating-cost inventory. A missing or incompatible close supplies no verified amount, and a matching incomplete close retains accounting's responsible owners and recheck evidence. This join does not assert valuation, FX, or total-return coverage.
 
+For costs joined to a valuation amount, the sealed inventory also binds the accounting scale. Convert covered amounts only to an exact integral count in the requested scale of the same currency. Unknown scale, nonintegral conversion, and different currencies are unavailable, not zero or an assumed exchange rate.
+
 ## Independent cases
 
 | Case | Evidence and expected result |

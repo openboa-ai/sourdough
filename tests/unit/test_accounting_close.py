@@ -141,6 +141,29 @@ class AccountingClose(unittest.TestCase):
         self.assertIsNone(receipt.verified_cost_minor)
         self.assertEqual(self.rows("SELECT count(*) FROM journal_entry"), [(1,)])
 
+    def test_explicit_scale_does_not_accept_same_currency_different_units(self):
+        self.post_cost(units_per_whole=100)
+        request = replace(
+            self.request,
+            statement_cash_minor=970,
+            units_per_whole=100,
+            expected_costs=(
+                replace(self.cost, evidence_revision="invoice-1", amount_minor=30),
+            ),
+        )
+        original = self.close(request)
+        self.assertEqual(original.verified_cost_minor, 30)
+        self.post_cost(source_event="different-unit", units_per_whole=1000)
+        correction = replace(
+            request, request_id="correction", supersedes=original.request_id
+        )
+        with self.assertRaisesRegex(CloseRefused, "change the chart or scale"):
+            self.close(replace(correction, units_per_whole=1000))
+        receipt = self.close(correction)
+        self.assertEqual([issue.reason for issue in receipt.issues], ["unit-mismatch"])
+        self.assertIsNone(receipt.verified_cost_minor)
+        self.assertEqual(self.close(request), original)
+
     def test_explicit_zero_and_mismatched_evidence_are_distinct(self):
         zero = replace(self.cost, evidence_revision="no-charge", amount_minor=0)
         self.assertEqual(

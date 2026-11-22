@@ -12,6 +12,7 @@ from .accounting_close import (
     ExpectedCost,
     read_period_close,
 )
+from .general_ledger import _valid_scale
 from .paper_fee_bridge import PAPER_FILL_FEE_SOURCE
 from .paper_window import WindowRefused, read_window
 
@@ -31,6 +32,7 @@ class CostInventory:
     mapping_revision: str
     expense_accounts: tuple[str, ...]
     expected_costs: tuple[ExpectedCost, ...]
+    units_per_whole: int | None = None
 
     @classmethod
     def for_close(cls, window_id: str, request: CloseRequest) -> "CostInventory":
@@ -44,25 +46,28 @@ class CostInventory:
             request.mapping_revision,
             request.expense_accounts,
             request.expected_costs,
+            request.units_per_whole,
         )
 
     @property
     def revision(self) -> str:
-        payload = json.dumps(
-            (
-                "operating-cost-inventory-v1",
-                self.window_id,
-                self.company_id,
-                self.currency,
-                self.from_date.isoformat(),
-                self.through_date.isoformat(),
-                self.cash_account,
-                self.mapping_revision,
-                sorted(self.expense_accounts),
-                sorted((*cost.key, cost.owner) for cost in self.expected_costs),
-            ),
-            separators=(",", ":"),
+        scope = (
+            self.window_id,
+            self.company_id,
+            self.currency,
+            self.from_date.isoformat(),
+            self.through_date.isoformat(),
+            self.cash_account,
+            self.mapping_revision,
+            sorted(self.expense_accounts),
+            sorted((*cost.key, cost.owner) for cost in self.expected_costs),
         )
+        terms = (
+            ("operating-cost-inventory-v1", *scope)
+            if self.units_per_whole is None
+            else ("operating-cost-inventory-v2", *scope, self.units_per_whole)
+        )
+        payload = json.dumps(terms, separators=(",", ":"))
         return sha256(payload.encode()).hexdigest()
 
 
@@ -77,6 +82,22 @@ class WindowCosts:
         if self.missing or self.accounting is None:
             return None
         return self.accounting.receipt.verified_cost_minor
+
+    def amount_in_units(self, currency: str, units_per_whole: int) -> int | None:
+        amount = self.amount_minor
+        if (
+            amount is None
+            or self.accounting is None
+            or units_per_whole is None
+            or not _valid_scale(units_per_whole)
+            or currency != self.accounting.request.currency
+        ):
+            return None
+        scale = self.accounting.request.units_per_whole
+        if scale is None:
+            return None
+        converted, remainder = divmod(amount * units_per_whole, scale)
+        return None if remainder else converted
 
 
 def read_window_costs(

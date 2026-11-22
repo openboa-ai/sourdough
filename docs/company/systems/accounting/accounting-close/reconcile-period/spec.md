@@ -20,6 +20,8 @@ An immutable close receipt preserves the independent statement revision, the jou
 
 Trusted consumers reopen the original request and its receipt by company and exact close ID, with the service time sampled before assessing that journal snapshot. They do not substitute the latest receipt, rerun reconciliation, or read journal tables as a second accounting interface. A pre-existing receipt without a recorded assessment time remains readable but cannot prove an as-of cutoff.
 
+An explicitly scaled close compares only like units. A relevant posting with absent or differing units is unresolved, not a number to add to the statement. A corrected close preserves its original scale. Legacy unscaled closes retain their original scope and receipt semantics, but cannot attest to conversion into another unit.
+
 ## Functional and quality requirements
 
 - **FR.** Return a clean close at the declared cutoff or discrepancies with evidence and owners. Preserve locked history.

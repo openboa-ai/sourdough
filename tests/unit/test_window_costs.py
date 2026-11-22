@@ -110,10 +110,11 @@ class WindowCostsTests(unittest.TestCase):
         return read_window_costs(self.store, self.company, window, close_id)
 
     def test_missing_actual_becomes_verified_only_in_the_linked_close(self):
-        window = self.register("first", self.request)
+        request = replace(self.request, units_per_whole=100)
+        window = self.register("first", request)
         cutoff = window.plan.closes_ns
         self.assertEqual(self.read("unknown").missing, ("accounting-close",))
-        original = self.close(self.request, cutoff + 1)
+        original = self.close(request, cutoff + 1)
         pending = self.read(original.request_id)
         self.assertIsNone(pending.amount_minor)
         self.assertEqual(pending.missing, ("missing-cost-receipt",))
@@ -136,10 +137,11 @@ class WindowCostsTests(unittest.TestCase):
                         JournalLine("expense-compute", 30),
                         JournalLine("operating-cash", -30),
                     ),
+                    units_per_whole=100,
                 ),
             )
         repaired = replace(
-            self.request,
+            request,
             request_id="corrected",
             supersedes=original.request_id,
             statement_revision="independent-statement-1",
@@ -156,6 +158,10 @@ class WindowCostsTests(unittest.TestCase):
             (corrected.window_revision, corrected.amount_minor), (window.revision, 30)
         )
         self.assertEqual(corrected.accounting.request, repaired)
+        self.assertEqual(corrected.amount_in_units("USD", 100_000_000), 30_000_000)
+        self.assertIsNone(corrected.amount_in_units("USD", 3))
+        self.assertIsNone(corrected.amount_in_units("USDT", 100_000_000))
+        self.assertIsNone(pending.amount_in_units("USD", 100_000_000))
         self.assertEqual(self.read(original.request_id), pending)
 
     def test_refuses_incompatible_scope_and_assessment_before_close(self):
@@ -208,6 +214,19 @@ class WindowCostsTests(unittest.TestCase):
         coverage = self.read(fee_only.request_id)
         self.assertEqual(coverage.missing, ("operating-cost-inventory",))
         self.assertIsNone(coverage.amount_minor)
+
+    def test_legacy_covered_amount_does_not_certify_a_scale(self):
+        request = replace(
+            self.request,
+            expected_costs=(
+                replace(self.compute, evidence_revision="no-charge", amount_minor=0),
+            ),
+        )
+        window = self.register("first", request)
+        self.close(request, window.plan.closes_ns + 1)
+        coverage = self.read(request.request_id)
+        self.assertEqual(coverage.amount_minor, 0)
+        self.assertIsNone(coverage.amount_in_units("USD", 100))
 
     def test_legacy_close_remains_readable_without_fabricating_an_assessment_time(self):
         window = self.register("first", self.request)
