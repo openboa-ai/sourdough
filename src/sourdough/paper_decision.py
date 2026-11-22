@@ -17,6 +17,7 @@ from .work import (
     _time,
     follow_up_state,
     require_result_read,
+    reopen_follow_up,
     schedule_follow_up,
 )
 
@@ -189,6 +190,36 @@ def reopen_paper_decision(
         if row is None:
             raise DutyRefused("No original paper decision to recover")
         return PaperDecisionReceipt(row[0], row[1], PaperDecision(*row[2:]))
+
+
+def reopen_unsubmitted_decisions(
+    store: Path, company_id: str, *, allow_buy: bool
+) -> tuple[tuple[FollowUpClaim, PaperDecisionReceipt], ...]:
+    with closing(_connect(store, "ro")) as connection:
+        connection.execute("BEGIN")
+        if not connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_decision'"
+        ).fetchone():
+            return ()
+        rows = connection.execute(
+            """SELECT a.id, r.grant_id, d.id, r.run_id, a.execution_profile
+               FROM paper_decision decision
+               JOIN duty_run r ON r.run_id = decision.run_id AND r.is_current = 1
+               JOIN duty d ON d.id = decision.duty_id AND d.id = r.duty_id AND d.state = 'running'
+               JOIN founder a ON a.id = d.founder_id AND a.company_id = ?
+               WHERE (? OR decision.action != 'buy')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM paper_order o JOIN duty_run original ON original.run_id = o.run_id
+                     WHERE original.duty_id = d.id
+                 )
+               ORDER BY decision.decided_at, d.id LIMIT 8""",
+            (company_id, allow_buy),
+        ).fetchall()
+    pending = []
+    for row in rows:
+        work = reopen_follow_up(store, DutyClaim(company_id, *row))
+        pending.append((work, reopen_paper_decision(store, work)))
+    return tuple(pending)
 
 
 def settle_paper_decision(

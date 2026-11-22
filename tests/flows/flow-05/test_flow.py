@@ -143,6 +143,93 @@ print(json.dumps(result))
             str(fee_bps),
         )
 
+    def test_supervisor_resumes_a_later_decision_committed_before_admission(self):
+        worker = """
+import os, signal, sys
+from pathlib import Path
+from sourdough import cli, company_run
+marker = Path(sys.argv.pop(1))
+persist = company_run.persist_paper_decision
+def cut(*args, **kwargs):
+    receipt = persist(*args, **kwargs)
+    if not marker.exists():
+        marker.write_text(receipt.decision_id)
+        os.kill(os.getpid(), signal.SIGKILL)
+    return receipt
+company_run.persist_paper_decision = cut
+raise SystemExit(cli.main())
+"""
+        driver = """
+import sys
+from sourdough import cli
+worker, marker = sys.argv[1:3]
+del sys.argv[1:3]
+supervise = cli.supervise_worker
+def launch(command, store, company_id, **options):
+    child = [sys.executable, "-IB", "-c", worker, marker, *command[4:]]
+    return supervise(child, store, company_id, **options)
+cli.supervise_worker = launch
+raise SystemExit(cli.main())
+"""
+        for action, count in (("hold", 1), ("buy", 2)):
+            with self.subTest(action=action):
+                self.prepare(later_action=action)
+                marker = self.store.with_name("committed-later-decision")
+                process = subprocess.run(
+                    [
+                        sys.executable,
+                        "-IB",
+                        "-c",
+                        driver,
+                        worker,
+                        str(marker),
+                        "supervise-paper",
+                        str(self.store),
+                        str(self.venue),
+                        *self.identity,
+                        "--employee",
+                        str(self.peer),
+                        "--repeat-paper",
+                        "--turn-budget",
+                        "2",
+                        "--max-restarts",
+                        "1",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=18,
+                )
+                self.assertEqual(process.returncode, 0, process.stderr)
+                resumed, summary = [
+                    json.loads(line) for line in process.stdout.splitlines()
+                ]
+                original, replacement = summary["attempts"]
+                self.assertEqual(original["returncode"], -signal.SIGKILL)
+                self.assertEqual(replacement["returncode"], 0)
+                (trade,) = resumed["later_trades"]
+                (saved,) = self.read(
+                    self.store,
+                    "SELECT decision_id, action, duty_id FROM paper_decision",
+                )
+                self.assertEqual(
+                    saved, (marker.read_text(), action, trade["claim"]["duty_id"])
+                )
+                self.assertEqual(trade["decision"]["decision_id"], saved[0])
+                self.assertIsNotNone(trade["next_duty"])
+                self.assertEqual(
+                    self.read(self.store, "SELECT count(*) FROM duty_run"), [(2,)]
+                )
+                self.assertEqual(
+                    self.read(self.store, "SELECT count(*) FROM work_follow_up"), [(2,)]
+                )
+                self.assertEqual(
+                    self.read(self.venue, "SELECT count(*) FROM venue_execution"),
+                    [(count,)],
+                )
+                self.assertEqual(
+                    self.read(self.store, "SELECT count(*) FROM paper_fill"), [(count,)]
+                )
+
     def cli(self, *args):
         return subprocess.run(
             [sys.executable, "-IB", "-m", "sourdough.cli", *map(str, args)],

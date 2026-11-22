@@ -36,6 +36,7 @@ from .paper_decision import (
     PaperDecisionReceipt,
     persist_paper_decision,
     reopen_paper_decision,
+    reopen_unsubmitted_decisions,
     settle_paper_decision,
 )
 from .paper_order import PaperIntent, reserved_exposure, submit_paper_order
@@ -181,13 +182,28 @@ def _operate(
             )
 
     review = None
-    trades = []
+    trades = _resume_later_decisions(
+        writer, venue, allow_buy=repeat_paper and not reconciliation.unresolved
+    )
+    if trades and trades[-1].next_duty is None:
+        return CompanyRun(
+            first, review, tuple(trades), reconciliation, blocked, fenced_runs
+        )
     while turn_budget or reconciliation.next_query_at is not None:
         if (
             reconciliation.next_query_at is not None
             and reconciliation.next_query_at <= int(time())
         ):
             reconciliation, blocked = _recover(writer, venue, next_purpose)
+            trades.extend(
+                _resume_later_decisions(
+                    writer,
+                    venue,
+                    allow_buy=repeat_paper and not reconciliation.unresolved,
+                )
+            )
+            if trades and trades[-1].next_duty is None:
+                break
         writer.verify()
         follow_up = None
         if turn_budget:
@@ -370,9 +386,36 @@ def _trade(
     decision = PaperDecision.from_proposal(runtime.trade(read_result))
     writer.verify()
     receipt = persist_paper_decision(store, follow_up, decision, now=int(time()))
+    return _apply_later_decision(writer, follow_up, venue, receipt)
+
+
+def _resume_later_decisions(
+    writer: WriterLease, venue: FixedQuoteVenue, *, allow_buy: bool
+) -> list[LaterPaperTrade]:
+    writer.verify()
+    resumed = []
+    for work, receipt in reopen_unsubmitted_decisions(
+        writer.store, writer.company_id, allow_buy=allow_buy
+    ):
+        result = _apply_later_decision(writer, work, venue, receipt)
+        resumed.append(result)
+        if result.next_duty is None:
+            break
+    return resumed
+
+
+def _apply_later_decision(
+    writer: WriterLease,
+    follow_up: FollowUpClaim,
+    venue: FixedQuoteVenue,
+    receipt: PaperDecisionReceipt,
+) -> LaterPaperTrade:
+    writer.verify()
+    store, claim, decision = writer.store, follow_up.claim, receipt.decision
     if decision.action != "buy":
         next_duty = settle_paper_decision(store, follow_up, receipt, follow_up.result)
         return LaterPaperTrade(claim, receipt, None, None, next_duty)
+    account = reopen_binding(store, claim.company_id).account
     order = submit_paper_order(
         store,
         claim,
