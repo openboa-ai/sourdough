@@ -15,10 +15,12 @@ from sourdough.first_duty import claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxBalance, SandboxPlan
 from sourdough.paper_account import PaperMandate, bind
+from sourdough.paper_books import post_confirmed_fill, read_booked_no_fill
 from sourdough.paper_execution import PaperIntent, VenueRefused
 from sourdough.paper_order import OrderRefused, OrderReplyUnknown, submit_paper_order
 from sourdough.paper_reconcile import reconcile_paper_orders
 from sourdough.spot_cash import SpotCashUnits
+from sourdough.work_projection import read_local_board_timeline
 
 
 class NautilusPaperPort(unittest.TestCase):
@@ -100,6 +102,93 @@ class NautilusPaperPort(unittest.TestCase):
                 ).fetchone(),
                 (now - 10 * 10**9, now - 2, now),
             )
+
+    def test_rejected_order_releases_once_only_after_the_original_balance(self):
+        store = self.venue.journal.with_name("company.sqlite")
+        founded = found(store, FoundingTerms("refusal", "charter", "paper", "runtime"))
+        self.venue.provision(replace(self.plan, company_id=founded.company_id))
+        balance = self.venue.start_generation()
+        self.venue.prove_account("current", "BINANCE-001", "USDT", balance)
+        account = self.venue.observe_account("paper")
+        bind(
+            store,
+            PaperMandate(
+                "mandate", founded.company_id, "charter", account, 10_000_000_000
+            ),
+            self.venue,
+        )
+        claim = claim_first_duty(store, founded.company_id, "runtime")
+        price = 59_000_000
+        stamp = time_ns()
+        self.venue.publish_quote("current", price, stamp, stamp)
+        intent = PaperIntent("action", self.terms.revision, 20, price)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            submission = pool.submit(
+                submit_paper_order, store, claim, intent, self.venue
+            )
+            deadline = monotonic() + 3
+            command = None
+            while command is None and monotonic() < deadline:
+                command = self.venue.claim_command("current")
+                sleep(0.01)
+            self.assertIsNotNone(command)
+            order_id = command.order_id
+            self.venue.mark_unresolved("current", order_id)
+            self.assertEqual(submission.result(timeout=2).order_id, order_id)
+        self.venue.invalidate_quote()
+        self.assertIsNone(self.venue.read_cancellation("paper", order_id))
+        self.venue.record_cancellation(
+            "current", order_id, "original-refusal", 0, outcome="rejected"
+        )
+        with self.assertRaisesRegex(VenueRefused, "changed its terms"):
+            self.venue.record_cancellation(
+                "current", order_id, "original-refusal", 0, outcome="denied"
+            )
+        self.assertFalse(
+            self.venue.record_account("current", order_id, 0, balance.cash_atoms - 1)
+        )
+        self.assertIsNone(self.venue.read_cancellation("paper", order_id))
+        self.assertIsNone(
+            post_confirmed_fill(store, founded.company_id, order_id, self.venue)
+        )
+        [order] = read_local_board_timeline(store, founded.company_id)["paper"][
+            "orders"
+        ]
+        self.assertEqual(
+            (order["status"], order["open_reservation_minor_units"]),
+            ("unresolved", 20 * price),
+        )
+        self.assertTrue(
+            self.venue.record_account("current", order_id, 0, balance.cash_atoms)
+        )
+        for account_sync in (False, True):
+            terminal = self.venue.read_cancellation(
+                "paper", order_id, account_sync=account_sync
+            )
+            self.assertEqual(
+                (terminal.event_id, terminal.outcome, terminal.filled_quantity),
+                ("original-refusal", "rejected", 0),
+            )
+            self.assertIsNone(
+                post_confirmed_fill(
+                    store,
+                    founded.company_id,
+                    order_id,
+                    self.venue,
+                    account_sync=account_sync,
+                )
+            )
+        result = read_booked_no_fill(store, founded.company_id, order_id)
+        self.assertEqual((result.status, result.position_quantity), ("rejected", 0))
+        [order] = read_local_board_timeline(store, founded.company_id)["paper"][
+            "orders"
+        ]
+        self.assertEqual(
+            (order["status"], order["open_reservation_minor_units"]), ("rejected", 0)
+        )
+        self.assertEqual(
+            NautilusPaperVenue(self.venue.journal).start_generation(), balance
+        )
 
     def test_invalid_managed_terms_never_reserve_or_reach_the_venue(self):
         store = self.venue.journal.with_name("company.sqlite")

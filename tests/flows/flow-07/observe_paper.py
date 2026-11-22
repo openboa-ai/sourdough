@@ -68,6 +68,27 @@ print(json.dumps(reply))
 """
 
 
+SDK_RISK_CASE = """
+import sys
+from sourdough import cli, nautilus_runtime
+nautilus_runtime._WORKER = '''
+import importlib, sys
+import msgspec
+import nautilus_trader.backtest.engine as sdk
+from nautilus_trader.risk.config import RiskEngineConfig
+engine = sdk.BacktestEngine
+def with_stricter_risk(config):
+    return engine(config=msgspec.structs.replace(
+        config, risk_engine=RiskEngineConfig(max_notional_per_order={"BTCUSDT.BINANCE": 1})
+    ))
+sdk.BacktestEngine = with_stricter_risk
+sys.path.insert(0, sys.argv.pop(1))
+importlib.import_module(sys.argv.pop(1)).main()
+'''
+raise SystemExit(cli.main())
+"""
+
+
 def cli(*args, timeout=40):
     run = subprocess.run(
         [sys.executable, "-IB", "-m", "sourdough.cli", *map(str, args)],
@@ -105,9 +126,12 @@ def observe(
     restart_engine: bool = False,
     expected_lots: int = 20,
     research_inputs: list[dict] | None = None,
+    sdk_risk_denial: bool = False,
 ) -> dict:
     if restart_engine and tape is not None:
         raise ValueError("Engine restart observation requires a current-market binding")
+    if sdk_risk_denial and (tape is None or expected_lots != 0):
+        raise ValueError("SDK risk stimulus belongs only to the offline denial case")
     output.mkdir(mode=0o700)
     employee = output / "employee"
     employee.write_text(
@@ -165,8 +189,11 @@ def observe(
             [
                 sys.executable,
                 "-IB",
-                "-m",
-                "sourdough.cli",
+                *(
+                    ("-c", SDK_RISK_CASE)
+                    if sdk_risk_denial
+                    else ("-m", "sourdough.cli")
+                ),
                 "serve-nautilus-paper",
                 str(store),
                 str(engine),
@@ -288,6 +315,15 @@ def observe(
                 """SELECT f.result_kind,f.result_id,d.state
                    FROM work_follow_up f JOIN duty d ON d.id=f.duty_id""",
             ) == [("paper_no_fill", original, "scheduled")]
+        if sdk_risk_denial:
+            assert rows(
+                venue,
+                "SELECT order_id,event_id,outcome,filled_quantity FROM sandbox_cancellation",
+            ) == [(original, event_id, "denied", 0)]
+            assert rows(
+                store,
+                "SELECT order_id,event_id,outcome,filled_quantity,released FROM paper_cancellation",
+            ) == [(original, event_id, "denied", 0, 1)]
     if restarted is not None:
         exits = [
             json.loads(line)

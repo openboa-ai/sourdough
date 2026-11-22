@@ -2,9 +2,13 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol, get_args
 
 from .paper_account import AccountObserver, PaperAccount
+
+
+TerminalOutcome = Literal["cancelled", "rejected", "denied", "expired"]
+TERMINAL_OUTCOMES = get_args(TerminalOutcome)
 
 
 class VenueRefused(Exception):
@@ -57,6 +61,7 @@ class VenueCancellation:
     instrument_rules_digest: str
     event_id: str
     filled_quantity: int
+    outcome: TerminalOutcome = "cancelled"
 
 
 @dataclass(frozen=True)

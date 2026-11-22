@@ -16,6 +16,8 @@ from .paper_execution import (
     PaperIntent,
     PaperOrderSizing,
     ReplayAvailability,
+    TERMINAL_OUTCOMES,
+    TerminalOutcome,
     VenueCancellation,
     VenueExecution,
     VenuePosition,
@@ -30,7 +32,8 @@ REPLAY_CONNECTOR = "nautilus-offline-spot-replay-v1"
 _STALE_NS = 15 * 10**9
 _CANCELLATION_SCHEMA = """CREATE TABLE IF NOT EXISTS sandbox_cancellation (
     order_id TEXT PRIMARY KEY NOT NULL REFERENCES sandbox_order(order_id),
-    generation TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL
+    generation TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL,
+    outcome TEXT NOT NULL DEFAULT 'cancelled'
 )"""
 _STORE_QUOTE = """INSERT OR REPLACE INTO sandbox_quote
     (singleton,generation,price_atoms_per_lot,received_ns,exchange_trade_ns,event_ns)
@@ -50,6 +53,21 @@ def _ensure_quote_time(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(sandbox_quote)")}
     if "event_ns" not in columns:
         connection.execute("ALTER TABLE sandbox_quote ADD COLUMN event_ns INTEGER")
+
+
+def _ensure_terminal_outcome(connection: sqlite3.Connection) -> None:
+    connection.execute(_CANCELLATION_SCHEMA)
+    if not _has_terminal_outcome(connection):
+        connection.execute(
+            "ALTER TABLE sandbox_cancellation ADD COLUMN outcome TEXT NOT NULL DEFAULT 'cancelled'"
+        )
+
+
+def _has_terminal_outcome(connection: sqlite3.Connection) -> bool:
+    return any(
+        row[1] == "outcome"
+        for row in connection.execute("PRAGMA table_info(sandbox_cancellation)")
+    )
 
 
 @dataclass(frozen=True)
@@ -183,7 +201,7 @@ class NautilusPaperVenue:
                        position_lots INTEGER NOT NULL, cash_atoms INTEGER NOT NULL
                    )"""
             )
-            connection.execute(_CANCELLATION_SCHEMA)
+            _ensure_terminal_outcome(connection)
             terms = json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"))
             row = connection.execute(
                 "SELECT destination_id,plan FROM sandbox_config WHERE singleton=1"
@@ -367,7 +385,7 @@ class NautilusPaperVenue:
     def start_generation(self) -> SandboxBalance:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(_CANCELLATION_SCHEMA)
+            _ensure_terminal_outcome(connection)
             _ensure_quote_time(connection)
             connection.execute("DELETE FROM sandbox_quote")
             connection.execute(
@@ -506,10 +524,14 @@ class NautilusPaperVenue:
                 "SELECT 1 FROM sqlite_schema WHERE name='sandbox_cancellation'"
             ).fetchone():
                 return None
+            outcome = (
+                "c.outcome" if _has_terminal_outcome(connection) else "'cancelled'"
+            )
             row = connection.execute(
-                """SELECT c.event_id,c.filled_quantity FROM sandbox_cancellation c
+                f"""SELECT c.event_id,c.filled_quantity,{outcome}
+                   FROM sandbox_cancellation c
                    JOIN sandbox_order o ON o.order_id=c.order_id AND o.generation=c.generation
-                   WHERE c.order_id=? AND (NOT ? OR EXISTS (
+                   WHERE c.order_id=? AND ((NOT ? AND {outcome}='cancelled') OR EXISTS (
                        SELECT 1 FROM sandbox_account_observation a WHERE a.order_id=c.order_id
                    ))""",
                 (order_id, account_sync),
@@ -711,7 +733,13 @@ class NautilusPaperVenue:
             )
 
     def record_cancellation(
-        self, generation: str, order_id: str, event_id: str, filled_quantity: int | None
+        self,
+        generation: str,
+        order_id: str,
+        event_id: str,
+        filled_quantity: int | None,
+        *,
+        outcome: TerminalOutcome = "cancelled",
     ) -> None:
         with self._connect("rw") as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -721,13 +749,19 @@ class NautilusPaperVenue:
                    FROM sandbox_order o WHERE order_id=? AND generation=?""",
                 (order_id, generation),
             ).fetchone()
-            if order is None or not isinstance(event_id, str) or not event_id:
+            if (
+                order is None
+                or not isinstance(event_id, str)
+                or not event_id
+                or outcome not in TERMINAL_OUTCOMES
+            ):
                 raise VenueRefused(
                     "Sandbox cancellation conflicts with the original order"
                 )
             requested, booked, state = order
             if (
-                state == "filled"
+                outcome == "cancelled"
+                and state == "filled"
                 and requested == booked
                 and (
                     filled_quantity is None
@@ -742,21 +776,25 @@ class NautilusPaperVenue:
                 state not in ("dispatching", "unresolved")
                 or type(filled_quantity) is not int
                 or not booked <= filled_quantity < requested
+                or (outcome in ("rejected", "denied") and filled_quantity != 0)
             ):
                 raise VenueRefused(
                     "Sandbox cancellation conflicts with the original order"
                 )
             prior = connection.execute(
-                "SELECT * FROM sandbox_cancellation WHERE order_id=? OR event_id=?",
+                """SELECT order_id,generation,event_id,filled_quantity,outcome
+                   FROM sandbox_cancellation WHERE order_id=? OR event_id=?""",
                 (order_id, event_id),
             ).fetchall()
-            terms = (order_id, generation, event_id, filled_quantity)
+            terms = (order_id, generation, event_id, filled_quantity, outcome)
             if prior:
                 if prior != [terms]:
                     raise VenueRefused("Sandbox cancellation replay changed its terms")
                 return
             connection.execute(
-                "INSERT INTO sandbox_cancellation VALUES (?,?,?,?)", terms
+                """INSERT INTO sandbox_cancellation
+                   (order_id,generation,event_id,filled_quantity,outcome) VALUES (?,?,?,?,?)""",
+                terms,
             )
             self._mark_unresolved(connection, generation, order_id)
 
