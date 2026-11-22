@@ -47,6 +47,18 @@ def _has_drafts(database: Connection) -> bool:
     )
 
 
+def draft_at_revision(
+    database: Connection, agent_id: str, name: str, revision: str
+) -> Draft | None:
+    if not _has_drafts(database):
+        return None
+    row = database.execute(
+        "SELECT name,revision,content FROM desk_draft WHERE agent_id=? AND name=? AND revision=?",
+        (agent_id, name, revision),
+    ).fetchone()
+    return Draft(*row) if row else None
+
+
 def resolve_desk(
     writer: WriterLease, claim: DutyClaim, purpose: str, *, include_drafts: bool = False
 ) -> tuple[str, tuple[Draft, ...]]:

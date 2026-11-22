@@ -7,7 +7,7 @@ from hashlib import sha256
 from sqlite3 import Connection
 from uuid import uuid4
 
-from .agent_desk import require_desk
+from .agent_desk import draft_at_revision, require_desk
 from .company import _connect
 from .duty_run import DutyClaim, DutyRefused
 from .writer_lease import WriterLease
@@ -275,13 +275,12 @@ def publish_selection(
                     "Publication request conflicts with its original selection"
                 )
             return SharedAsset(*prior[:-1])
-        draft = database.execute(
-            "SELECT content FROM desk_draft WHERE agent_id=? AND name=? AND revision=?",
-            (claim.founder_id, selection.draft_name, selection.draft_revision),
-        ).fetchone()
-        if draft is None or selection.end > len(draft[0]):
+        draft = draft_at_revision(
+            database, claim.founder_id, selection.draft_name, selection.draft_revision
+        )
+        if draft is None or selection.end > len(draft.content):
             raise DutyRefused("Current private draft or selected range is unavailable")
-        excerpt = draft[0][selection.start : selection.end]
+        excerpt = draft.content[selection.start : selection.end]
         if not excerpt.strip():
             raise DutyRefused("Cannot publish an empty selection")
         asset = SharedAsset(

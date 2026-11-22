@@ -174,6 +174,20 @@ class CompanyAssets(unittest.TestCase):
         )
         [assigned] = author.call("read_project_assignments", {"after": ""})["projects"]
         self.assertTrue(assigned["can_publish"])
+        with self.assertRaisesRegex(DutyRefused, "Current private draft"):
+            author.call(
+                "publish_draft_selection",
+                {
+                    "request_id": "first",
+                    "draft_name": "journal",
+                    "draft_revision": "not-saved",
+                    "project_id": assigned["project_id"],
+                    "project_revision": assigned["revision"],
+                    "audience": ["peer"],
+                    "start": 0,
+                    "end": 16,
+                },
+            )
         draft = save_draft(
             self.writer,
             self.claims["author"],
