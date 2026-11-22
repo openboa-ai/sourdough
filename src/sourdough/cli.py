@@ -19,12 +19,13 @@ from sourdough.hired_paper_run import run_hired_paper_company
 from sourdough.hiring_run import run_hiring
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
+from sourdough.paper_execution import VenueRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
-from sourdough.paper_execution import VenueRefused
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
+from sourdough.trading_engine import EngineRefused, prepare_engine
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 from sourdough.work_projection import read_local_board_timeline
 
@@ -110,6 +111,11 @@ def main() -> int:
     inspection.add_argument("--company-id", required=True)
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
+    engine = commands.add_parser("prepare-trading-engine")
+    engine.add_argument("store", type=Path)
+    engine.add_argument("directory", type=Path)
+    engine.add_argument("--company-id", required=True)
+    engine.add_argument("--wheelhouse", type=Path)
     paper = commands.add_parser("bind-paper")
     paper.add_argument("store", type=Path)
     paper.add_argument("journal", type=Path)
@@ -202,6 +208,11 @@ def main() -> int:
                 )
             )
             return 0
+        elif args.command == "prepare-trading-engine":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                result = prepare_engine(
+                    writer, args.directory, wheelhouse=args.wheelhouse
+                )
         elif args.command == "bind-paper":
             venue = FixedQuoteVenue(args.journal)
             venue.require_independent_from(args.store)
@@ -346,6 +357,7 @@ def main() -> int:
         BindingRefused,
         DutyRefused,
         TradeRefused,
+        EngineRefused,
         OrderRefused,
         PostingRefused,
         VenueRefused,

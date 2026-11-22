@@ -39,3 +39,11 @@ Credential values stay in the company secret facility. Configuration stores scop
 | Mode isolation | Request historical replay and current-market paper, then attempt paper-to-live endpoint or credential substitution. Both authorized modes remain virtual; independent destination logs show zero unauthorized real order calls. |
 
 This is a development-unit design. Runtime version, package source, installation policy, deployment host and provider credentials are not selected or installed by this document. See [engine qualification](../qualify-engine/spec.md) and the founder/new-hire acceptance contracts for stronger runtime, independent-venue and Agent evidence.
+
+## Preparing the runtime package
+
+The local deployment service can run `sourdough prepare-trading-engine STORE ENGINE_DIRECTORY --company-id ID` before activating a trading configuration. Use a private, company-owned directory. The command installs the packaged wheel lock in an isolated environment on supported Apple Silicon hosts, probes the required entry points, and reopens the same verified installation receipt on an identical request. An operator-provided `--wheelhouse` selects offline, hash-checked artifacts with no index fallback. The trading runtime is an external dependency installed separately from the Sourdough package.
+
+An existing receipt is accepted only if the installed files still match its content fingerprint. Changes to installed files fail before importing the runtime, even if the distribution metadata is unchanged.
+
+The setup receipt establishes package identity and importability only. It authorizes no market access or submission and is not a running worker, active trading configuration, or verified fill.
