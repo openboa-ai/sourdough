@@ -8,7 +8,15 @@ from pathlib import Path
 from uuid import uuid4
 
 from .company import SCHEMA_REVISION, _company_version, _connect
-from .first_duty import FIRST_DUTY_SCOPE, DutyClaim, DutyRefused, first_claim_state
+from .duty_run import (
+    PAPER_EXECUTION,
+    POSITION_REVIEW,
+    DutyClaim,
+    DutyRefused,
+    resolve_run,
+    start_run,
+)
+from .first_duty import FIRST_DUTY_SCOPE, resolve_first_run
 
 
 def _time(value: int) -> int:
@@ -144,7 +152,8 @@ def finish_first_duty(
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _check_store(connection, claim.company_id)
-        scope, state = first_claim_state(connection, claim)
+        authority = resolve_first_run(connection, claim)
+        scope, state = authority.current_scope, authority.duty_state
         existing = connection.execute(
             """SELECT duty_id, due_at, result_kind, result_id, result_revision, available_at
                FROM work_follow_up WHERE previous_duty_id = ?""",
@@ -159,6 +168,7 @@ def finish_first_duty(
             ):
                 raise DutyRefused("Work settlement conflicts with the original receipt")
             return FollowUp(duty_id, due_at, result)
+        authority.require_current(PAPER_EXECUTION)
         if (scope, state) != (FIRST_DUTY_SCOPE, "running"):
             raise DutyRefused("Current duty cannot be settled")
         return _schedule(connection, claim, scope, result, due_at)
@@ -172,29 +182,31 @@ def claim_follow_up(
         connection.execute("BEGIN IMMEDIATE")
         _check_store(connection, company_id)
         row = connection.execute(
-            """SELECT d.id, f.id, g.id,
+            """SELECT d.id, f.id, g.id, w.grant_scope,
                       w.result_kind, w.result_id, w.result_revision, w.available_at
                FROM work_follow_up w
                JOIN duty d ON d.id = w.duty_id AND d.state = 'scheduled'
                JOIN founder f ON f.id = d.founder_id AND f.company_id = ?
                JOIN standing_grant g ON g.id = w.grant_id AND g.founder_id = f.id
-               WHERE w.run_id IS NULL AND w.due_at <= ? AND w.available_at <= ?
+               WHERE w.due_at <= ? AND w.available_at <= ?
                  AND g.scope = w.grant_scope AND f.execution_profile = ?
                ORDER BY w.due_at, d.id LIMIT 1""",
             (company_id, now, now, execution_profile),
         ).fetchone()
         if row is None:
             return None
-        duty_id, founder_id, grant_id, *stored_result = row
+        duty_id, founder_id, grant_id, scope, *stored_result = row
         result = ResultReference(*stored_result)
-        claim = DutyClaim(
-            company_id, founder_id, grant_id, duty_id, uuid4().hex, execution_profile
+        claim = start_run(
+            connection,
+            company_id,
+            founder_id,
+            grant_id,
+            duty_id,
+            execution_profile,
+            purpose=POSITION_REVIEW,
+            grant_scope=scope,
         )
-        connection.execute(
-            "UPDATE work_follow_up SET run_id = ? WHERE duty_id = ?",
-            (claim.run_id, duty_id),
-        )
-        connection.execute("UPDATE duty SET state = 'running' WHERE id = ?", (duty_id,))
     return FollowUpClaim(claim, result)
 
 
@@ -203,27 +215,16 @@ def _review_state(
 ) -> tuple[str, str]:
     claim = follow_up.claim
     _check_store(connection, claim.company_id)
+    authority = resolve_run(connection, claim)
+    authority.require_current(POSITION_REVIEW)
     row = connection.execute(
-        """SELECT d.state, g.scope, w.result_kind, w.result_id,
-                  w.result_revision, w.available_at
-           FROM work_follow_up w
-           JOIN duty d ON d.id = w.duty_id
-           JOIN founder f ON f.id = d.founder_id
-           JOIN standing_grant g ON g.id = w.grant_id AND g.founder_id = f.id
-           WHERE d.id = ? AND w.run_id = ? AND g.id = ? AND g.scope = w.grant_scope
-             AND f.id = ? AND f.company_id = ? AND f.execution_profile = ?""",
-        (
-            claim.duty_id,
-            claim.run_id,
-            claim.grant_id,
-            claim.founder_id,
-            claim.company_id,
-            claim.execution_profile,
-        ),
+        """SELECT result_kind, result_id, result_revision, available_at
+           FROM work_follow_up WHERE duty_id = ? AND grant_id = ?""",
+        (claim.duty_id, claim.grant_id),
     ).fetchone()
-    if row is None or ResultReference(*row[2:]) != follow_up.result:
-        raise DutyRefused("Review claim or grant is no longer current")
-    return row[0], row[1]
+    if row is None or ResultReference(*row) != follow_up.result:
+        raise DutyRefused("Review result does not match its scheduled duty")
+    return authority.duty_state, authority.current_scope
 
 
 def read_follow_up_result(

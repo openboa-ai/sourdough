@@ -10,6 +10,7 @@ from sourdough.company import FoundingTerms, found, reopen
 from sourdough.first_duty import (
     DutyRefused,
     claim_first_duty,
+    require_historical_claim,
     require_paper_authority,
 )
 
@@ -44,7 +45,7 @@ class FirstDutyTests(unittest.TestCase):
         self.assertEqual(len(claims), 1)
         with closing(sqlite3.connect(self.store)) as db:
             self.assertEqual(
-                db.execute("SELECT duty_id, run_id FROM first_duty_claim").fetchall(),
+                db.execute("SELECT duty_id, run_id FROM duty_run").fetchall(),
                 [(self.receipt.due_work_id, claims[0].run_id)],
             )
 
@@ -73,4 +74,14 @@ class FirstDutyTests(unittest.TestCase):
                 (self.receipt.grant_id,),
             )
             with self.assertRaises(DutyRefused):
+                require_paper_authority(db, claim)
+
+    def test_fenced_run_can_resolve_history_but_cannot_admit_new_risk(self):
+        claim = self.claim()
+        with closing(sqlite3.connect(self.store)) as db, db:
+            db.execute(
+                "UPDATE duty_run SET is_current = 0 WHERE run_id = ?", (claim.run_id,)
+            )
+            require_historical_claim(db, claim)
+            with self.assertRaisesRegex(DutyRefused, "no longer current"):
                 require_paper_authority(db, claim)

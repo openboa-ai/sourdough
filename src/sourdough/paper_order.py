@@ -7,7 +7,8 @@ from typing import Protocol
 from uuid import uuid4
 
 from .company import _connect
-from .first_duty import DutyClaim, require_historical_claim, require_paper_authority
+from .duty_run import DutyClaim
+from .first_duty import require_historical_claim, require_paper_authority
 from .paper_account import PaperAccount, reopen_binding
 
 
@@ -86,7 +87,7 @@ def submit_paper_order(
         connection.execute(
             """CREATE TABLE IF NOT EXISTS paper_order (
                 order_id TEXT PRIMARY KEY NOT NULL,
-                run_id TEXT NOT NULL REFERENCES first_duty_claim(run_id),
+                run_id TEXT NOT NULL REFERENCES duty_run(run_id),
                 mandate_revision TEXT NOT NULL,
                 account_id TEXT NOT NULL,
                 action_id TEXT NOT NULL,
