@@ -510,6 +510,16 @@ def _trade(
     if venue.observe_account(account.account_id) != account:
         raise TradeRefused("Paper destination does not match the bound account")
     quote = venue.observe_quote(account.account_id)
+    sizing = venue.observe_order_sizing(account.account_id)
+    sizing_context = (
+        {
+            "order_sizing": asdict(sizing),
+            "position_units": "lots",
+            "quote_units": "quote_minor_units_per_lot",
+        }
+        if sizing is not None
+        else {}
+    )
 
     def project(connection, reference):
         observation = _read_paper_observation(connection, reference, claim.company_id)
@@ -518,10 +528,14 @@ def _trade(
         available = binding.exposure_limit_minor_units - reserved_exposure(
             connection, account.account_id
         )
-        return observation | {
-            "quote_minor_units": quote,
-            "available_exposure_minor_units": available,
-        }
+        return (
+            observation
+            | sizing_context
+            | {
+                "quote_minor_units": quote,
+                "available_exposure_minor_units": available,
+            }
+        )
 
     def read_result():
         writer.verify()
