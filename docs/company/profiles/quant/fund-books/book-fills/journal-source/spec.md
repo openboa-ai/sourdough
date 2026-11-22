@@ -14,6 +14,8 @@ Deliver the pending accounting source committed atomically with the fill, using 
 
 The paper fill writer records the original destination and quote currency, fee-source mapping revision, and source registration time in the same transaction as the fill, fee and reservation change. The source references the booked fee; it does not copy the amount, derive the position or authorize a second effect. Source registration time is not an execution timestamp or an accounting effective cut. An older fill without this record remains without source coverage until independently reconciled; replay must not backdate or silently reconstruct it from a newer binding. Journal delivery must separately verify currency scale, effective cut and chart mapping before posting.
 
+The fee bridge consumes an independently verified fee receipt for the original destination, account and fill, including the effective date, currency, unit scale and evidence revision. It matches the original booked fee and an admitted chart mapping before sealing the delivery terms and using the journal port. A mismatched scale, amount, source or chart is not converted or written. A positive fee debits expense and credits the scoped cash account with a stable source identity; no trade notional is posted. A witnessed zero fee records explicit delivery without a zero-value journal entry. A lost delivery acknowledgement repeats the original sealed terms and journal source identity, never a new order or another posting.
+
 **Concern for the responsible component:** While accounting is unavailable retain a durable unposted event and reconcile it by source ID on recovery. Do not erase the fill, issue an order or post the same fee twice.
 
 ## Functional and quality requirements
