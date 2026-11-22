@@ -9,6 +9,7 @@ import subprocess
 import sys
 from importlib.util import find_spec
 from pathlib import Path
+from time import monotonic, sleep
 
 
 OBSERVATION = runpy.run_path(str(Path(__file__).with_name("observe_paper.py")))
@@ -17,11 +18,75 @@ rows = OBSERVATION["rows"]
 wait_ready = OBSERVATION["wait_ready"]
 
 
+WITHHELD = """
+import json, os, signal, sys
+from pathlib import Path
+from sourdough import cli
+from sourdough.nautilus_paper import NautilusPaperVenue
+
+barrier = Path(sys.argv.pop(1))
+submit = NautilusPaperVenue.submit
+def withhold(self, order_id, account_id, intent):
+    submit(self, order_id, account_id, intent)
+    payload = barrier.with_suffix(".new")
+    with payload.open("x") as stream:
+        json.dump({"pid": os.getpid(), "order_id": order_id}, stream)
+    payload.rename(barrier)
+    signal.pause()
+NautilusPaperVenue.submit = withhold
+raise SystemExit(cli.main())
+"""
+
+FAULT_SUPERVISOR = """
+import sys
+from sourdough import cli
+marker, child = sys.argv[1:3]
+del sys.argv[1:3]
+supervise = cli.supervise_worker
+def inject(command, store, company_id, **options):
+    instrumented = [sys.executable, "-IB", "-c", child, marker, *command[4:]]
+    return supervise(instrumented, store, company_id, **options)
+cli.supervise_worker = inject
+raise SystemExit(cli.main())
+"""
+
+
 def run(*arguments):
     return [sys.executable, "-IB", "-m", "sourdough.cli", *map(str, arguments)]
 
 
-def observe(output: Path, employee: Path, wheelhouse: Path | None) -> dict:
+def cut_original_worker(service, marker, store, journal, events_path):
+    deadline = monotonic() + 75
+    while service.poll() is None and monotonic() < deadline:
+        if marker.exists():
+            cut = json.loads(marker.read_text())
+            break
+        sleep(0.05)
+    else:
+        raise RuntimeError("Company never reached the independent fill barrier")
+    events = [
+        json.loads(line)
+        for line in events_path.read_text().splitlines()
+        if line.startswith('{"event": "worker_ready"')
+    ]
+    assert len(events) == 1 and events[0]["pid"] == cut["pid"]
+    [(original, fill)] = rows(
+        journal, "SELECT order_id,fill_id FROM sandbox_fill_observation"
+    )
+    assert cut["order_id"] == original
+    if rows(store, "SELECT name FROM sqlite_schema WHERE name='paper_fill'"):
+        assert not rows(store, "SELECT fill_id FROM paper_fill")
+    os.kill(cut["pid"], signal.SIGKILL)
+    return {**cut, "fill_id": fill}
+
+
+def observe(
+    output: Path,
+    employee: Path,
+    wheelhouse: Path | None,
+    *,
+    company_cut: bool = False,
+) -> dict:
     checkout = Path(__file__).resolve().parents[3]
     installed = Path(find_spec("sourdough").origin).parent
     for source in (checkout / "src/sourdough").iterdir():
@@ -67,6 +132,7 @@ def observe(output: Path, employee: Path, wheelhouse: Path | None) -> dict:
         engine / ("nautilus-" + installation["distribution_version"]) / "sandbox.sqlite"
     )
     engine_log = output / "engine.stderr"
+    cut = None
     with engine_log.open("w") as events, (output / "engine.stdout").open("w") as stdout:
         worker = subprocess.Popen(
             run("serve-nautilus-paper", store, engine, *scope, "--seconds", 180),
@@ -92,39 +158,70 @@ def observe(output: Path, employee: Path, wheelhouse: Path | None) -> dict:
             assert account["destination_id"] == plan["destination_id"]
             assert account["environment"] == "paper"
             assert account["connector_revision"] == "nautilus-spot-sandbox-v1"
+            service_events = output / "company.stderr"
+            command = run(
+                "supervise-paper",
+                store,
+                engine,
+                *scope,
+                "--employee",
+                employee,
+                "--managed-engine",
+                "--turn-budget",
+                2,
+                "--idle-seconds",
+                140,
+                "--max-restarts",
+                int(company_cut),
+                "--max-seconds",
+                168,
+            )
+            marker = output / "before-company-receipt.json"
+            if company_cut:
+                command = [
+                    sys.executable,
+                    "-IB",
+                    "-c",
+                    FAULT_SUPERVISOR,
+                    str(marker),
+                    WITHHELD,
+                    *command[4:],
+                ]
             with (
                 (output / "company.stdout").open("w") as service_out,
-                (output / "company.stderr").open("w") as service_err,
+                service_events.open("w") as service_err,
             ):
-                service = subprocess.run(
-                    run(
-                        "supervise-paper",
-                        store,
-                        engine,
-                        *scope,
-                        "--employee",
-                        employee,
-                        "--managed-engine",
-                        "--turn-budget",
-                        2,
-                        "--idle-seconds",
-                        140,
-                        "--max-restarts",
-                        0,
-                        "--max-seconds",
-                        168,
-                    ),
+                service = subprocess.Popen(
+                    command,
                     stdout=service_out,
                     stderr=service_err,
-                    timeout=177,
+                    start_new_session=True,
                 )
+                try:
+                    if company_cut:
+                        cut = cut_original_worker(
+                            service, marker, store, journal, service_events
+                        )
+                    service.wait(timeout=177)
+                finally:
+                    if service.poll() is None:
+                        os.killpg(service.pid, signal.SIGTERM)
+                        service.wait(timeout=15)
             if service.returncode != 0:
                 raise RuntimeError((output / "company.stderr").read_text())
             result, supervision = [
                 json.loads(line)
                 for line in (output / "company.stdout").read_text().splitlines()
             ]
-            assert supervision["completed"] and len(supervision["attempts"]) == 1
+            assert supervision["completed"]
+            attempts = supervision["attempts"]
+            assert len(attempts) == 1 + int(company_cut)
+            if cut is not None:
+                assert attempts[0]["pid"] == cut["pid"]
+                assert attempts[0]["returncode"] == -signal.SIGKILL
+                assert (
+                    attempts[1]["pid"] != cut["pid"] and attempts[1]["returncode"] == 0
+                )
             assert worker.poll() is None, "Venue exited before the next duty"
             assert worker.wait(timeout=195) == 0, "Venue did not exit cleanly"
         finally:
@@ -133,17 +230,24 @@ def observe(output: Path, employee: Path, wheelhouse: Path | None) -> dict:
                 worker.wait(timeout=15)
 
     opening, review = result["first_trade"], result["review"]
-    assert opening and opening["order"] and opening["order"]["posting"], (
-        "No founder fill observed"
-    )
     assert review, "No next duty decision observed"
-    assert (
-        opening["claim"]["founder_id"]
-        == review["claim"]["founder_id"]
-        == company["founder_id"]
-    )
-    assert opening["claim"]["run_id"] != review["claim"]["run_id"]
-    posting = opening["order"]["posting"]
+    if cut is not None:
+        [recovered] = result["reconciliation"]["recovered"]
+        claim = recovered["original_claim"]
+        posting = recovered["posting"]
+        assert recovered["sources"] == ["history", "account_sync"]
+        assert (
+            posting["order_id"] == cut["order_id"]
+            and posting["fill_id"] == cut["fill_id"]
+        )
+        assert not result["reconciliation"]["unresolved"]
+    else:
+        assert opening and opening["order"] and opening["order"]["posting"], (
+            "No founder fill observed"
+        )
+        claim, posting = opening["claim"], opening["order"]["posting"]
+    assert claim["founder_id"] == review["claim"]["founder_id"] == company["founder_id"]
+    assert claim["run_id"] != review["claim"]["run_id"]
     (observed,) = rows(
         journal,
         "SELECT order_id,fill_id,quantity,price_atoms,fee_atoms FROM sandbox_fill_observation",
@@ -194,11 +298,12 @@ def observe(output: Path, employee: Path, wheelhouse: Path | None) -> dict:
         "market_activation": market["activation_id"],
         "posting": posting,
         "account": {"position_lots": position, "cash_atoms": cash},
-        "first_run_id": opening["claim"]["run_id"],
+        "first_run_id": claim["run_id"],
         "review_run_id": read_run,
         "decision": review["decision"],
         "next_duty": review["next_duty"]["duty_id"],
         "post_activation_control_commands": 0,
+        "company_cut": cut,
     }
 
 
@@ -207,10 +312,14 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--employee", required=True, type=Path)
     parser.add_argument("--wheelhouse", type=Path)
+    parser.add_argument("--cut-company-after-fill", action="store_true")
     options = parser.parse_args()
     os.umask(0o077)
     result = observe(
-        options.output.absolute(), options.employee.absolute(), options.wheelhouse
+        options.output.absolute(),
+        options.employee.absolute(),
+        options.wheelhouse,
+        company_cut=options.cut_company_after_fill,
     )
     (options.output / "observer.json").write_text(json.dumps(result))
     print(json.dumps(result))
