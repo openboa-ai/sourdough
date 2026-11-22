@@ -8,6 +8,7 @@ from time import time_ns
 from typing import TYPE_CHECKING, Protocol
 
 from .company import _connect, _identity
+from .duty_run import PAPER_EXECUTION
 
 if TYPE_CHECKING:
     from .writer_lease import WriterLease
@@ -161,6 +162,51 @@ def has_pending_binding_change(connection) -> bool:
     )
 
 
+def _has_unsubmitted_buy(connection, mandate: PaperMandate) -> bool:
+    sources = (
+        (
+            "paper_research_decision",
+            "JOIN paper_research_snapshot s ON s.run_id = decision.run_id",
+            """json_extract(decision.content, '$.action') = 'buy'
+               AND json_extract(s.inputs, '$.account_id') = ?
+               AND json_extract(s.inputs, '$.instrument_rules_digest') = ?""",
+        ),
+        (
+            "paper_decision",
+            "",
+            """decision.action = 'buy' AND decision.account_id = ?
+               AND decision.instrument_rules_digest = ?""",
+        ),
+    )
+    order_check = (
+        """AND NOT EXISTS (
+            SELECT 1 FROM paper_order o WHERE o.action_id = decision.decision_id
+                AND o.account_id = ? AND o.mandate_revision = ?
+        )"""
+        if _has_table(connection, "paper_order")
+        else ""
+    )
+    account = mandate.account
+    terms = (PAPER_EXECUTION, account.account_id, account.instrument_rules_digest)
+    if order_check:
+        terms += (account.account_id, mandate.revision)
+    return any(
+        _has_table(connection, table)
+        and connection.execute(
+            f"""SELECT 1 FROM {table} decision {snapshot}
+                JOIN duty d ON d.id = decision.duty_id
+                JOIN duty_run r ON r.duty_id = d.id AND r.is_current = 1
+                JOIN standing_grant g ON g.id = r.grant_id AND g.agent_id = d.agent_id
+                WHERE d.state = 'running' AND r.purpose = ?
+                  AND r.grant_scope = 'paper' AND g.scope = 'paper'
+                  AND {original_account} {order_check} LIMIT 1""",
+            terms,
+        ).fetchone()
+        is not None
+        for table, snapshot, original_account in sources
+    )
+
+
 def _open_effect(connection, mandate: PaperMandate) -> bool:
     if not _has_table(connection, "paper_order"):
         return False
@@ -274,6 +320,8 @@ def change_paper_binding(
         writer.verify()
         if connection.execute(_SELECT_BINDING).fetchone() != _terms(current):
             raise BindingRefused("Paper binding changed before transition")
+        if _has_unsubmitted_buy(connection, current):
+            raise BindingRefused("Finish the original buy decision before changeover")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS paper_binding_change (
                    revision TEXT PRIMARY KEY NOT NULL, previous_revision TEXT NOT NULL,

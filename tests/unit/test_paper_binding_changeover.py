@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time_ns
 
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import DutyRefused, claim_first_duty
+from sourdough.first_duty import claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.paper_account import (
@@ -19,6 +19,7 @@ from sourdough.paper_account import (
     PaperMandate,
     bind,
     change_paper_binding,
+    has_pending_binding_change,
     reopen_binding,
 )
 from sourdough.paper_execution import PaperIntent, VenueRefused
@@ -302,7 +303,7 @@ class ManagedPaperChangeover(unittest.TestCase):
             },
         ]
 
-    def test_old_research_receipt_cannot_authorize_risk_on_the_new_account(self):
+    def test_switch_does_not_strand_an_unsubmitted_opening_decision(self):
         original_plan = stage_research_inputs(
             self.store, self.company_id, self.observations("old")
         )
@@ -337,21 +338,52 @@ class ManagedPaperChangeover(unittest.TestCase):
             },
             now=102,
         )
+        with self.assertRaisesRegex(BindingRefused, "Finish the original buy decision"):
+            self.switch()
+        with closing(
+            sqlite3.connect(f"{self.store.as_uri()}?mode=ro", uri=True)
+        ) as book:
+            self.assertFalse(has_pending_binding_change(book))
+        self.assertEqual(reopen_binding(self.store, self.company_id), self.current)
+        waiting_claim, waiting_decision = find_unsubmitted_opening(
+            self.store, self.company_id
+        )
+        self.assertEqual(waiting_claim, claim)
+        self.assertEqual(waiting_decision.decision_id, decision["decision_id"])
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            resumed = pool.submit(self.reopen_process, self.old)
+            deadline = monotonic() + 4
+            command = self.old.claim_command("old")
+            while command is None and not resumed.done() and monotonic() < deadline:
+                sleep(0.01)
+                command = self.old.claim_command("old")
+            self.assertIsNotNone(command)
+            self.assertEqual(command.action_id, decision["decision_id"])
+            self.old.record_cancellation(
+                "old", command.order_id, "original-terminal", 0
+            )
+            self.assertTrue(self.old.record_account("old", command.order_id, 0, 1000))
+            result = resumed.result(timeout=9)
+        self.assertEqual(result["first_trade"]["claim"]["run_id"], claim.run_id)
+        self.assertEqual(result["first_trade"]["order"]["order_id"], command.order_id)
+        self.assertEqual(
+            rows(self.old.journal, "SELECT order_id FROM sandbox_order"),
+            [(command.order_id,)],
+        )
         self.assertIsNotNone(self.switch().effective_at_ns)
-        self.assertIsNone(find_unsubmitted_opening(self.store, self.company_id))
-        with self.assertRaisesRegex(DutyRefused, "another binding"):
-            tools.invoke("read_research_inputs", {}, now=103)
         current_plan = stage_research_inputs(
             self.store, self.company_id, self.observations("new")
         )
         self.assertNotEqual(current_plan["revision"], original_plan["revision"])
-        with self.assertRaises(OrderRefused):
-            submit_paper_order(
-                self.store,
-                claim,
-                PaperIntent(decision["decision_id"], self.terms.revision, 2, 110),
-                self.new,
-            )
+        replay = submit_paper_order(
+            self.store,
+            claim,
+            PaperIntent(decision["decision_id"], self.terms.revision, 2, 110),
+            self.new,
+        )
+        self.assertEqual(replay.order_id, command.order_id)
+        self.assertFalse(replay.dispatched_now)
         self.assertEqual(
             rows(self.new.journal, "SELECT count(*) FROM sandbox_order"), [(0,)]
         )
