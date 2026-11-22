@@ -10,6 +10,8 @@ Paper, historical replay and external destinations must use the **same core arti
 
 Pin one build digest, identical starting company state and grants except the environment-scoped account and destination, instrument rules and policy revision. Set up two separately durable, independently observable destinations: the paper venue and an external-protocol emulator. Their common subset and deliberately differing capabilities are sealed in advance. Clone state into isolated trial companies/accounts; neither has access to actual external credentials or a live network destination. The observer, not the runtime, compares normalized records and destination histories.
 
+The local protocol fixture runs in a separate process with its own ledger and no network or credentials. Its private wire fields differ from the paper core's types. On an accepted request with a lost reply, the fixture witness can independently see the order while the company-facing history cannot yet see it. The harness advances only the venue's evidence visibility; it does not modify company orders, reservations or holdings.
+
 ## Scenarios and oracle
 
 | Case | Required comparison |
