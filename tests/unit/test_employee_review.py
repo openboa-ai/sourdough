@@ -10,6 +10,54 @@ from sourdough.first_duty import DutyRefused
 
 
 class EmployeeReview(unittest.TestCase):
+    def test_profile_composition_requires_the_declared_sandbox_selection(self):
+        folder = Path(self.enterContext(TemporaryDirectory()))
+        peer = folder / "peer"
+        peer.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            "assert json.load(sys.stdin)['operation'] == 'identify'\n"
+            "print(json.dumps({'provider':'test','model':'scripted','revision':'1',"
+            "'sandbox_backend':'local-macos'}))\n"
+        )
+        peer.chmod(0o700)
+
+        def compose(*options):
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "sourdough.cli",
+                    "employee-profile",
+                    str(peer),
+                    *options,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        chosen = compose("--sandbox", "local-macos")
+        self.assertEqual(chosen.returncode, 0, chosen.stderr)
+        self.assertEqual(
+            json.loads(chosen.stdout),
+            {
+                "execution_profile": EmployeeProcess(peer).profile,
+                "sandbox_backend": "local-macos",
+            },
+        )
+        self.assertEqual(compose("--sandbox", "local-macos").stdout, chosen.stdout)
+        for options in ((), ("--sandbox", "hosted")):
+            refused = compose(*options)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(refused.stdout, "")
+
+        peer.write_text(peer.read_text().replace("'local-macos'", "'hosted'"))
+        refused = compose("--sandbox", "hosted")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("sandbox backend is not qualified", refused.stderr)
+
     def test_binding_executes_a_scoped_review_process(self):
         folder = Path(self.enterContext(TemporaryDirectory()))
         peer = folder / "peer"

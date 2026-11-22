@@ -458,6 +458,8 @@ def main():
     }
     credential_store = ["-c", 'cli_auth_credentials_store="file"']
     if request["operation"] == "identify":
+        if sys.platform != "darwin":
+            raise SystemExit("The local macOS sandbox is unavailable")
         catalog = subprocess.check_output(
             [codex, *credential_store, "debug", "models"], env=env, timeout=10
         )
@@ -473,6 +475,7 @@ def main():
                     "provider": "openai",
                     "model": model,
                     "revision": f"{version.decode().strip()}:{entries[0]['comp_hash']}",
+                    "sandbox_backend": "local-macos",
                 }
             )
         )
