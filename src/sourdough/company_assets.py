@@ -183,22 +183,30 @@ def discover_shared_assets(
     writer: WriterLease,
     claim: DutyClaim,
     purpose: str,
-) -> tuple[SharedAssetReference, ...]:
+    after: str,
+) -> tuple[tuple[SharedAssetReference, ...], str]:
+    if after and not _label(after):
+        raise DutyRefused("Invalid shared asset cursor")
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
         require_desk(database, claim, purpose)
-        return tuple(
+        page = tuple(
             SharedAssetReference(*row)
             for row in database.execute(
-                """SELECT a.asset_id,a.project_id,a.author_id,a.duty_id
-                   FROM shared_publication a JOIN shared_project p ON p.project_id=a.project_id
-                   WHERE EXISTS (SELECT 1 FROM json_each(p.members) WHERE value=?)
-                     AND EXISTS (SELECT 1 FROM json_each(a.audience) WHERE value=?)
-                   ORDER BY a.rowid DESC LIMIT 32""",
-                (claim.founder_id, claim.founder_id),
+                """WITH visible AS (
+                       SELECT a.rowid AS position,a.asset_id,a.project_id,a.author_id,a.duty_id
+                       FROM shared_publication a JOIN shared_project p ON p.project_id=a.project_id
+                       WHERE EXISTS (SELECT 1 FROM json_each(p.members) WHERE value=?)
+                         AND EXISTS (SELECT 1 FROM json_each(a.audience) WHERE value=?)
+                   )
+                   SELECT asset_id,project_id,author_id,duty_id FROM visible
+                   WHERE ?='' OR position<(SELECT position FROM visible WHERE asset_id=?)
+                   ORDER BY position DESC LIMIT 33""",
+                (claim.founder_id, claim.founder_id, after, after),
             )
         )
+        return page[:32], page[31].asset_id if len(page) > 32 else ""
 
 
 def project_access(

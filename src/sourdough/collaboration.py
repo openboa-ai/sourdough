@@ -16,7 +16,10 @@ from .writer_lease import WriterLease
 
 
 PROJECTS = tool(
-    "read_project_assignments", "Read your current shared project permissions.", {}
+    "read_project_assignments",
+    "Read current project permissions and one page of shared references. "
+    "Use an empty cursor for the first page or the returned cursor for the next.",
+    {"after": {"type": "string"}},
 )
 READ_ASSET = tool(
     "read_shared_asset",
@@ -52,15 +55,16 @@ def company_work_run(
 
     def dispatch(name: str, arguments: dict) -> dict:
         if name == "read_project_assignments":
+            assets, next_cursor = discover_shared_assets(
+                writer, claim, workflow.purpose, arguments["after"]
+            )
             return {
                 "projects": [
                     asdict(project)
                     for project in project_access(writer, claim, workflow.purpose)
                 ],
-                "shared_assets": [
-                    asdict(asset)
-                    for asset in discover_shared_assets(writer, claim, workflow.purpose)
-                ],
+                "shared_assets": [asdict(asset) for asset in assets],
+                "next_cursor": next_cursor,
             }
         if name == "read_shared_asset":
             return asdict(

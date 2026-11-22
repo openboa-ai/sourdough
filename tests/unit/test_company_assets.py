@@ -172,7 +172,7 @@ class CompanyAssets(unittest.TestCase):
             [entry["name"] for entry in peer.manifest()["tools"]],
             ["finish", "read_project_assignments", "read_shared_asset"],
         )
-        [assigned] = author.call("read_project_assignments", {})["projects"]
+        [assigned] = author.call("read_project_assignments", {"after": ""})["projects"]
         self.assertTrue(assigned["can_publish"])
         draft = save_draft(
             self.writer,
@@ -193,7 +193,7 @@ class CompanyAssets(unittest.TestCase):
             "end": 16,
         }
         published = author.call("publish_draft_selection", request)
-        [listed] = peer.call("read_project_assignments", {})["shared_assets"]
+        [listed] = peer.call("read_project_assignments", {"after": ""})["shared_assets"]
         self.assertEqual(listed["asset_id"], published["asset_id"])
         self.assertNotIn("content", listed)
         self.assertEqual(
@@ -209,13 +209,42 @@ class CompanyAssets(unittest.TestCase):
             lambda *_: {"finished": True},
         )
         self.assertEqual(
-            outsider.call("read_project_assignments", {})["shared_assets"], []
+            outsider.call("read_project_assignments", {"after": ""})["shared_assets"],
+            [],
+        )
+        hidden = author.call(
+            "publish_draft_selection",
+            request | {"request_id": "outsider-only", "audience": ["outsider"]},
+        )
+        for index in range(32):
+            author.call(
+                "publish_draft_selection", request | {"request_id": f"peer-{index}"}
+            )
+        first_page = peer.call("read_project_assignments", {"after": ""})
+        self.assertEqual(len(first_page["shared_assets"]), 32)
+        self.assertNotIn(listed, first_page["shared_assets"])
+        last_page = peer.call(
+            "read_project_assignments", {"after": first_page["next_cursor"]}
+        )
+        self.assertEqual(last_page["shared_assets"], [listed])
+        self.assertEqual(last_page["next_cursor"], "")
+        self.assertEqual(
+            peer.call("read_project_assignments", {"after": hidden["asset_id"]})[
+                "shared_assets"
+            ],
+            [],
         )
         assign_project(
             self.writer,
             self.manager,
+            "project",
             ("author", "outsider"),
             publishers=("author",),
             expected_revision=self.project,
         )
-        self.assertEqual(peer.call("read_project_assignments", {})["shared_assets"], [])
+        self.assertEqual(
+            peer.call("read_project_assignments", {"after": first_page["next_cursor"]})[
+                "shared_assets"
+            ],
+            [],
+        )

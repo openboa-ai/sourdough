@@ -22,6 +22,7 @@ The initial local project binds its audience to an explicit membership revision 
 
 - **FR.** Persist immutable shared content, version and intended audience. Bind the output receipt to its work; sharing alone cannot transfer ownership of a duty.
 - **NFR.** Repeated publication with identical identity returns one revision. A changed payload conflicts. Revocation before commit blocks publication; never mount one Agent’s whole desk into another runtime.
+- **Discovery.** The recipient can page through all authorized shared references without an author receipt. Each page and cursor is checked against current project membership and the publication audience; listing never includes asset content.
 
 ## Acceptance and independent evidence
 
