@@ -8,7 +8,8 @@ from uuid import uuid4
 
 
 LEGACY_SCHEMA_REVISION = 1
-SCHEMA_REVISION = 2
+CONTINUATION_SCHEMA_REVISION = 2
+SCHEMA_REVISION = 3
 DUTY_SCHEMA = """CREATE TABLE duty (
     id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL REFERENCES founder(id),
     state TEXT NOT NULL
@@ -22,9 +23,19 @@ FOLLOW_UP_SCHEMA = """CREATE TABLE work_follow_up (
     result_kind TEXT NOT NULL,
     result_id TEXT NOT NULL,
     result_revision TEXT NOT NULL,
-    available_at INTEGER NOT NULL,
-    run_id TEXT UNIQUE
+    available_at INTEGER NOT NULL
 )"""
+DUTY_RUN_SCHEMA = """CREATE TABLE duty_run (
+    run_id TEXT PRIMARY KEY NOT NULL,
+    duty_id TEXT NOT NULL REFERENCES duty(id),
+    grant_id TEXT NOT NULL REFERENCES standing_grant(id),
+    grant_scope TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    is_current INTEGER NOT NULL CHECK (is_current IN (0, 1))
+)"""
+CURRENT_RUN_INDEX = (
+    "CREATE UNIQUE INDEX current_duty_run ON duty_run(duty_id) WHERE is_current = 1"
+)
 SCHEMA = (
     """CREATE TABLE company (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -48,6 +59,8 @@ SCHEMA = (
         due_work_id TEXT NOT NULL UNIQUE REFERENCES duty(id)
     )""",
     FOLLOW_UP_SCHEMA,
+    DUTY_RUN_SCHEMA,
+    CURRENT_RUN_INDEX,
 )
 
 
@@ -101,13 +114,70 @@ def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
     row = connection.execute(
         "SELECT id, schema_revision FROM company WHERE singleton = 1"
     ).fetchone()
-    if row is None or row[1] not in (LEGACY_SCHEMA_REVISION, SCHEMA_REVISION):
+    if row is None or row[1] not in (
+        LEGACY_SCHEMA_REVISION,
+        CONTINUATION_SCHEMA_REVISION,
+        SCHEMA_REVISION,
+    ):
         raise FoundingRefused("Unsupported company store schema")
     return row
 
 
 def _identity(connection: sqlite3.Connection) -> str:
     return _company_version(connection)[0]
+
+
+def _upgrade_duties(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        DUTY_SCHEMA.replace("CREATE TABLE duty", "CREATE TABLE duty_next", 1)
+    )
+    connection.execute("INSERT INTO duty_next SELECT id, founder_id, state FROM duty")
+    connection.execute("DROP TABLE duty")
+    connection.execute("ALTER TABLE duty_next RENAME TO duty")
+    connection.execute(FOLLOW_UP_SCHEMA)
+
+
+def _consolidate_runs(connection: sqlite3.Connection, revision: int) -> None:
+    old_claims = connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'first_duty_claim'"
+    ).fetchone()
+    connection.execute(
+        DUTY_RUN_SCHEMA.replace(
+            "CREATE TABLE duty_run", "CREATE TABLE duty_run_next", 1
+        )
+    )
+    if old_claims:
+        connection.execute("ALTER TABLE first_duty_claim RENAME TO duty_run")
+        connection.execute(
+            """INSERT INTO duty_run_next
+               SELECT claim.run_id, claim.duty_id,
+                      (SELECT grant_id FROM founding_receipt WHERE due_work_id = claim.duty_id),
+                      'paper', 'paper_execution', 1
+               FROM duty_run claim"""
+        )
+    if revision == CONTINUATION_SCHEMA_REVISION:
+        connection.execute(
+            """INSERT INTO duty_run_next
+               SELECT run_id, duty_id, grant_id, grant_scope, 'position_review', 1
+               FROM work_follow_up WHERE run_id IS NOT NULL"""
+        )
+        connection.execute(
+            FOLLOW_UP_SCHEMA.replace(
+                "CREATE TABLE work_follow_up", "CREATE TABLE follow_up_next", 1
+            )
+        )
+        connection.execute(
+            """INSERT INTO follow_up_next
+               SELECT previous_duty_id, duty_id, grant_id, grant_scope, due_at,
+                      result_kind, result_id, result_revision, available_at
+               FROM work_follow_up"""
+        )
+        connection.execute("DROP TABLE work_follow_up")
+        connection.execute("ALTER TABLE follow_up_next RENAME TO work_follow_up")
+    if old_claims:
+        connection.execute("DROP TABLE duty_run")
+    connection.execute("ALTER TABLE duty_run_next RENAME TO duty_run")
+    connection.execute(CURRENT_RUN_INDEX)
 
 
 def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
@@ -120,15 +190,9 @@ def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
                 raise FoundingRefused("Company identity mismatch")
             if revision == SCHEMA_REVISION:
                 return
-            connection.execute(
-                DUTY_SCHEMA.replace("CREATE TABLE duty", "CREATE TABLE duty_next", 1)
-            )
-            connection.execute(
-                "INSERT INTO duty_next SELECT id, founder_id, state FROM duty"
-            )
-            connection.execute("DROP TABLE duty")
-            connection.execute("ALTER TABLE duty_next RENAME TO duty")
-            connection.execute(FOLLOW_UP_SCHEMA)
+            if revision == LEGACY_SCHEMA_REVISION:
+                _upgrade_duties(connection)
+            _consolidate_runs(connection, revision)
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise FoundingRefused("Company store failed foreign-key validation")
             connection.execute(

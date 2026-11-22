@@ -15,12 +15,14 @@ from sourdough.company import (
     reopen,
     upgrade_work_schema,
 )
+from sourdough.duty_run import DutyClaim
 from sourdough.first_duty import DutyRefused, claim_first_duty, require_paper_authority
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import post_confirmed_fill
 from sourdough.paper_order import PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.work import (
+    FollowUpClaim,
     ResultReference,
     ReviewDecision,
     claim_follow_up,
@@ -36,26 +38,54 @@ class WorkContinuation(unittest.TestCase):
         self.store = directory / "company.sqlite"
         self.terms = FoundingTerms("setup", "charter", "paper", "runtime")
 
-    def founder(self, *, legacy=False):
+    def founder(self, *, legacy=0):
         if legacy:
-            schema = tuple(
-                statement.replace(
+            schema = [
+                statement
+                for statement in company.SCHEMA
+                if statement
+                not in (
+                    company.FOLLOW_UP_SCHEMA,
+                    company.DUTY_RUN_SCHEMA,
+                    company.CURRENT_RUN_INDEX,
+                )
+            ]
+            if legacy == 1:
+                schema[schema.index(company.DUTY_SCHEMA)] = company.DUTY_SCHEMA.replace(
                     "founder_id TEXT NOT NULL REFERENCES",
                     "founder_id TEXT NOT NULL UNIQUE REFERENCES",
                 )
-                if statement == company.DUTY_SCHEMA
-                else statement
-                for statement in company.SCHEMA
-                if statement != company.FOLLOW_UP_SCHEMA
-            )
+            else:
+                schema.append(company.FOLLOW_UP_SCHEMA[:-1] + ", run_id TEXT UNIQUE)")
             with (
                 patch.object(company, "SCHEMA", schema),
-                patch.object(company, "SCHEMA_REVISION", 1),
+                patch.object(company, "SCHEMA_REVISION", legacy),
             ):
                 self.founding = found(self.store, self.terms)
         else:
             self.founding = found(self.store, self.terms)
         self.company_id = self.founding.company_id
+        if legacy:
+            with closing(sqlite3.connect(self.store)) as connection, connection:
+                connection.execute(
+                    """CREATE TABLE first_duty_claim (
+                        duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
+                        run_id TEXT NOT NULL UNIQUE
+                    )"""
+                )
+                connection.execute(
+                    "INSERT INTO first_duty_claim VALUES (?, 'original-run')",
+                    (self.founding.due_work_id,),
+                )
+                connection.execute("UPDATE duty SET state = 'running'")
+            return DutyClaim(
+                self.company_id,
+                self.founding.founder_id,
+                self.founding.grant_id,
+                self.founding.due_work_id,
+                "original-run",
+                "runtime",
+            )
         return claim_first_duty(self.store, self.company_id, "runtime")
 
     def rows(self, statement):
@@ -68,7 +98,7 @@ class WorkContinuation(unittest.TestCase):
         return claim_follow_up(self.store, self.company_id, profile, now=now)
 
     def test_migrate_populated_v1_without_changing_external_effects(self):
-        original = self.founder(legacy=True)
+        original = self.founder(legacy=1)
         venue = FixedQuoteVenue(self.store.with_name("venue.sqlite"))
         account = PaperAccount("account", "local", "rules", "USD", 5000, "paper")
         account = venue.provision(account, 100)
@@ -77,25 +107,42 @@ class WorkContinuation(unittest.TestCase):
             PaperMandate("mandate", self.company_id, "charter", account, 1000),
             venue,
         )
-        order = submit_paper_order(
-            self.store, original, PaperIntent("action", "rules", 2, 110), venue
-        )
+        intent = PaperIntent("action", "rules", 2, 110)
+        with closing(sqlite3.connect(self.store)) as connection, connection:
+            connection.execute(
+                """CREATE TABLE paper_order (
+                    order_id TEXT PRIMARY KEY NOT NULL,
+                    run_id TEXT NOT NULL REFERENCES first_duty_claim(run_id),
+                    mandate_revision TEXT NOT NULL, account_id TEXT NOT NULL,
+                    action_id TEXT NOT NULL, instrument_rules_digest TEXT NOT NULL,
+                    quantity INTEGER NOT NULL, limit_minor_units INTEGER NOT NULL,
+                    reserved_minor_units INTEGER NOT NULL, UNIQUE (run_id, action_id)
+                )"""
+            )
+            connection.execute(
+                "INSERT INTO paper_order VALUES ('original-order', ?, 'mandate', 'account', 'action', 'rules', 2, 110, 220)",
+                (original.run_id,),
+            )
+        venue.submit("original-order", "account", intent)
         posting = post_confirmed_fill(
-            self.store, self.company_id, order.order_id, venue
+            self.store, self.company_id, "original-order", venue
         )
         self.assertIsNotNone(posting)
         self.assertEqual(reopen(self.store, self.company_id).due_work_ids, ())
         self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(1,)])
         queries = [
             "SELECT * FROM founding_receipt",
-            "SELECT * FROM first_duty_claim",
             "SELECT * FROM paper_order",
             "SELECT * FROM paper_fill",
         ]
         before = [self.rows(query) for query in queries]
         upgrade_work_schema(self.store, self.company_id)
         upgrade_work_schema(self.store, self.company_id)
-        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(2,)])
+        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(3,)])
+        self.assertEqual(
+            self.rows("SELECT duty_id, run_id FROM duty_run"),
+            [(original.duty_id, original.run_id)],
+        )
         ref = ResultReference("book", posting.fill_id, "rev", 100)
         follow = finish_first_duty(self.store, original, ref, due_at=101)
         self.assertEqual(found(self.store, self.terms), self.founding)
@@ -108,12 +155,15 @@ class WorkContinuation(unittest.TestCase):
         self.assertEqual(served.claim.execution_profile, original.execution_profile)
         self.assertNotEqual(served.claim.run_id, original.run_id)
         self.assertEqual(served.result, ref)
+        historical = submit_paper_order(self.store, original, intent, venue)
+        self.assertEqual(historical.order_id, "original-order")
+        self.assertFalse(historical.dispatched_now)
         self.assertEqual(
-            venue.observe_execution(order.order_id).fill_id, posting.fill_id
+            venue.observe_execution("original-order").fill_id, posting.fill_id
         )
 
     def test_migration_failure_rolls_back_schema_and_preserves_store(self):
-        self.founder(legacy=True)
+        self.founder(legacy=1)
         with closing(sqlite3.connect(self.store)) as connection, connection:
             connection.execute("UPDATE duty SET founder_id = 'dangling'")
         before = self.store.read_bytes()
@@ -121,6 +171,45 @@ class WorkContinuation(unittest.TestCase):
             upgrade_work_schema(self.store, self.company_id)
         self.assertEqual(self.store.read_bytes(), before)
         self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(1,)])
+
+    def test_migrate_v2_with_a_claimed_review_and_its_read(self):
+        original = self.founder(legacy=2)
+        with closing(sqlite3.connect(self.store)) as connection, connection:
+            connection.execute("UPDATE duty SET state = 'settled'")
+            connection.execute(
+                "INSERT INTO duty VALUES ('review', ?, 'running')",
+                (original.founder_id,),
+            )
+            connection.execute(
+                """INSERT INTO work_follow_up VALUES (?, 'review', ?, 'paper', 100,
+                        'book', 'position', 'observed', 100, 'review-run')""",
+                (original.duty_id, original.grant_id),
+            )
+            connection.execute(
+                """CREATE TABLE work_result_read (
+                       duty_id TEXT PRIMARY KEY NOT NULL REFERENCES work_follow_up(duty_id),
+                       run_id TEXT NOT NULL, result_revision TEXT NOT NULL, read_at INTEGER NOT NULL
+                   )"""
+            )
+            connection.execute(
+                "INSERT INTO work_result_read VALUES ('review', 'review-run', 'observed', 100)"
+            )
+        upgrade_work_schema(self.store, self.company_id)
+        review = FollowUpClaim(
+            replace(original, duty_id="review", run_id="review-run"),
+            ResultReference("book", "position", "observed", 100),
+        )
+        with closing(sqlite3.connect(self.store)) as connection:
+            with self.assertRaises(DutyRefused):
+                require_paper_authority(connection, review.claim)
+        self.assertEqual(
+            self.rows("SELECT run_id, purpose FROM duty_run ORDER BY run_id"),
+            [("original-run", "paper_execution"), ("review-run", "position_review")],
+        )
+        decision = ReviewDecision("action", "observed", "hold", "Known position", 60)
+        successor = settle_review(self.store, review, decision, now=101)
+        self.assertEqual(successor.due_at, 161)
+        self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
 
     def test_early_wake_and_replay_share_one_successor(self):
         original = self.founder()
@@ -155,7 +244,7 @@ class WorkContinuation(unittest.TestCase):
         with closing(sqlite3.connect(self.store)) as connection, connection:
             connection.execute("UPDATE standing_grant SET scope = 'revoked'")
         self.assertIsNone(self.claim(100))
-        self.assertEqual(self.rows("SELECT run_id FROM work_follow_up"), [(None,)])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM duty_run"), [(1,)])
 
     def test_successor_rolls_back_if_original_settlement_fails(self):
         original = self.founder()

@@ -15,6 +15,7 @@ TABLES = (
     "duty",
     "founding_receipt",
     "work_follow_up",
+    "duty_run",
 )
 
 
@@ -69,7 +70,7 @@ class Founding(unittest.TestCase):
         original = self.inventory()
         [[setup, company, founder, grant, duty]] = original["founding_receipt"]
         self.assertEqual(setup, "board-setup")
-        self.assertEqual(original["company"], [(1, company, 2, "charter-v1")])
+        self.assertEqual(original["company"], [(1, company, 3, "charter-v1")])
         self.assertEqual(original["founder"], [(founder, company, "profile-v1")])
         self.assertEqual(
             original["standing_grant"], [(grant, founder, "manage-company")]
@@ -124,5 +125,5 @@ class Founding(unittest.TestCase):
         first, second = [self.success(attempt.result()) for attempt in attempts]
         self.assertEqual(first, second)
         self.assertEqual(
-            [len(rows) for rows in self.inventory().values()], [1, 1, 1, 1, 1, 0]
+            [len(rows) for rows in self.inventory().values()], [1, 1, 1, 1, 1, 0, 0]
         )
