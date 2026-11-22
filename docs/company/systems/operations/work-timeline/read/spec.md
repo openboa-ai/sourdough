@@ -12,6 +12,8 @@ Input contracts: founded company, current work state and [authorize-actor/check]
 
 Project company, work, decision, allowed evidence, owner, next condition and as-of time. Optional profile links do not introduce mandatory quant fields.
 
+The local Client uses the read-only service entry point `inspect-work`, specifying the company and the supported `work-timeline-v1` contract revision. The response reports that contract separately from the content revision and observation time. A request for an unsupported contract rejects before accessing the store. The local store-owner check remains in the service; the Client gets neither database access nor operational authority through this query.
+
 **Concern for the responsible component:** Authorize every read at current access scope. Do not expose restricted evidence through titles, aggregates or stale cached projections.
 
 ## Functional and quality requirements

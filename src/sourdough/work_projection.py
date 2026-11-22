@@ -12,13 +12,23 @@ from time import time_ns
 from .company import FoundingRefused, _connect, _identity
 
 
+WORK_TIMELINE_REVISION = "work-timeline-v1"
+
+
 def _rows(connection: Connection, sql: str) -> list[dict]:
     cursor = connection.execute(sql)
     labels = [column[0] for column in cursor.description]
     return [dict(zip(labels, row, strict=True)) for row in cursor]
 
 
-def read_local_board_timeline(store: Path, company_id: str) -> dict:
+def read_local_board_timeline(
+    store: Path,
+    company_id: str,
+    *,
+    contract_revision: str = WORK_TIMELINE_REVISION,
+) -> dict:
+    if contract_revision != WORK_TIMELINE_REVISION:
+        raise FoundingRefused("Unsupported work timeline contract")
     initial = store.stat(follow_symlinks=False)
     if not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.geteuid():
         raise FoundingRefused(
@@ -74,7 +84,11 @@ def read_local_board_timeline(store: Path, company_id: str) -> dict:
         ):
             raise FoundingRefused("Company store changed while inspecting its timeline")
     revision = sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
-    return body | {"revision": revision, "as_of_ns": as_of_ns}
+    return body | {
+        "contract_revision": WORK_TIMELINE_REVISION,
+        "revision": revision,
+        "as_of_ns": as_of_ns,
+    }
 
 
 def _decisions(connection: Connection, tables: set[str]) -> dict:
