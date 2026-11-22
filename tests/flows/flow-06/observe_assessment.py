@@ -84,7 +84,9 @@ def prepare(output, employee, *, scenario="company-only"):
     company, envelope, source = (
         output / name for name in ("company.sqlite", "envelope.json", "source.json")
     )
-    profile = cli("employee-profile", employee)["execution_profile"]
+    profile = cli("employee-profile", employee, "--sandbox", "local-macos")[
+        "execution_profile"
+    ]
     starter = cli(
         "found",
         company,

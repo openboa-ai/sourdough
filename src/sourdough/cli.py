@@ -109,6 +109,7 @@ def main() -> int:
     inspection.add_argument("--company-id", required=True)
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
+    profile.add_argument("--sandbox", help="User-selected sandbox backend")
     paper = commands.add_parser("bind-paper")
     paper.add_argument("store", type=Path)
     paper.add_argument("journal", type=Path)
@@ -195,11 +196,15 @@ def main() -> int:
             print(json.dumps(read_local_board_timeline(args.store, args.company_id)))
             return 0
         elif args.command == "employee-profile":
-            print(
-                json.dumps(
-                    {"execution_profile": EmployeeProcess(args.executable).profile}
+            employee = EmployeeProcess(args.executable)
+            if args.sandbox != employee.sandbox_backend:
+                raise TradeRefused(
+                    "Select the sandbox backend declared by this employee adapter"
                 )
-            )
+            selection = {"execution_profile": employee.profile}
+            if employee.sandbox_backend is not None:
+                selection["sandbox_backend"] = employee.sandbox_backend
+            print(json.dumps(selection))
             return 0
         elif args.command == "bind-paper":
             if args.store.resolve() == args.journal.resolve() or (

@@ -18,6 +18,7 @@ from .harness import ScopedRun
 from .writer_lease import WriterRefused
 
 MAX_TOOL_REQUEST_BYTES = 64 * 1024
+LOCAL_MACOS_SANDBOX = "local-macos"
 
 
 class _ReadWorkResult(socketserver.BaseRequestHandler):
@@ -63,14 +64,29 @@ class _ToolEndpoint(socketserver.UnixStreamServer):
 class EmployeeProcess:
     def __init__(self, executable: Path):
         self.executable = executable.resolve()
-        self.profile = self._profile()
+        selection = self._identify()
+        self.sandbox_backend = selection.get("sandbox_backend")
+        self.profile = self._profile(selection)
 
-    def _profile(self) -> str:
+    def _identify(self) -> dict:
         selection = self._exchange({"operation": "identify"})
-        if set(selection) != {"provider", "model", "revision"} or not all(
+        runtime_fields = {"provider", "model", "revision"}
+        if set(selection) not in (runtime_fields, runtime_fields | {"sandbox_backend"}):
+            raise TradeRefused("Employee runtime binding is unresolved")
+        if not all(
             isinstance(value, str) and value.strip() for value in selection.values()
         ):
-            raise TradeRefused("Employee model binding is unresolved")
+            raise TradeRefused("Employee runtime binding is unresolved")
+        if (
+            "sandbox_backend" in selection
+            and selection["sandbox_backend"] != LOCAL_MACOS_SANDBOX
+        ):
+            raise TradeRefused("Employee sandbox backend is not qualified")
+        return selection
+
+    def _profile(self, selection: dict | None = None) -> str:
+        if selection is None:
+            selection = self._identify()
         with self.executable.open("rb") as stream:
             executable = file_digest(stream, "sha256").hexdigest()
         terms = json.dumps([executable, selection], sort_keys=True).encode()
