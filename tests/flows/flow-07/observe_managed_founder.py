@@ -242,10 +242,14 @@ def observe(
         )
         assert not result["reconciliation"]["unresolved"]
     else:
-        assert opening and opening["order"] and opening["order"]["posting"], (
-            "No founder fill observed"
-        )
+        assert opening and opening["order"], "No founder order observed"
         claim, posting = opening["claim"], opening["order"]["posting"]
+        if posting is None:
+            [recovered] = result["reconciliation"]["recovered"]
+            assert recovered["original_claim"] == claim
+            posting = recovered["posting"]
+            assert posting["order_id"] == opening["order"]["order_id"]
+        assert not result["reconciliation"]["unresolved"]
     assert claim["founder_id"] == review["claim"]["founder_id"] == company["founder_id"]
     assert claim["run_id"] != review["claim"]["run_id"]
     (observed,) = rows(
