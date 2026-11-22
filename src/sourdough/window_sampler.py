@@ -27,6 +27,9 @@ from .paper_window import (
 from .writer_lease import WriterLease
 
 
+_MAX_SEGMENT_NS = 600 * 10**9
+
+
 def _verify_scope(
     writer: WriterLease, venue: NautilusPaperVenue, plan: WindowPlan
 ) -> None:
@@ -63,12 +66,23 @@ def register_managed_window(
 class WindowSampler:
     directory: Path
     window_id: str
+    observe_through_ns: int | None = None
 
     @contextmanager
     def activate(self, writer: WriterLease, venue: PaperExecution):
         window = read_window(writer.store, writer.company_id, self.window_id)
         if window is None:
             raise WindowRefused("Sampling requires an existing sealed window")
+        cutoff = self.observe_through_ns
+        if cutoff is not None and (
+            type(cutoff) is not int
+            or window.plan.agent_turn_limit is None
+            or not window.plan.opens_ns <= cutoff <= window.plan.closes_ns
+            or not 0 < cutoff - time_ns() <= _MAX_SEGMENT_NS
+        ):
+            raise WindowRefused(
+                "Observation cutoff is outside the bounded window segment"
+            )
         expected = paper_venue(writer.store, self.directory)
         if (
             not isinstance(venue, NautilusPaperVenue)
@@ -83,6 +97,8 @@ class WindowSampler:
             sampler = pool.submit(self._collect, writer, window, stop)
             try:
                 yield window
+                if cutoff is not None:
+                    sampler.result()
             finally:
                 stop.set()
                 sampler.result()
@@ -91,10 +107,15 @@ class WindowSampler:
         self, writer: WriterLease, window: RegisteredWindow, stop: Event
     ) -> None:
         plan = window.plan
+        cutoff = (
+            self.observe_through_ns
+            if self.observe_through_ns is not None
+            else plan.closes_ns
+        )
         captured = None
         while not stop.is_set():
             now = time_ns()
-            if now > plan.closes_ns:
+            if now > cutoff:
                 return
             delay_seconds = 0.2
             if now < plan.opens_ns:
@@ -103,12 +124,16 @@ class WindowSampler:
                 slot = (now - plan.opens_ns) // plan.cadence_ns
                 eligible = earliest_sample_ns(window, slot)
                 if now < eligible:
-                    stop.wait(min(1, (eligible - now) / 10**9))
+                    stop.wait(min(1, (min(eligible, cutoff + 1) - now) / 10**9))
                     continue
                 if slot != captured:
                     try:
                         capture_window_sample(
-                            writer, self.directory, self.window_id, slot
+                            writer,
+                            self.directory,
+                            self.window_id,
+                            slot,
+                            through_ns=cutoff,
                         )
                     except (VenueRefused, ValuationRefused):
                         pass
@@ -116,7 +141,7 @@ class WindowSampler:
                         captured = slot
                 if slot == captured:
                     next_boundary = min(
-                        plan.opens_ns + (slot + 1) * plan.cadence_ns, plan.closes_ns + 1
+                        plan.opens_ns + (slot + 1) * plan.cadence_ns, cutoff + 1
                     )
                     delay_seconds = min(1, (next_boundary - now) / 10**9)
-            stop.wait(delay_seconds)
+            stop.wait(min(delay_seconds, (cutoff + 1 - now) / 10**9))
