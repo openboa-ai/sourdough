@@ -26,7 +26,7 @@ from sourdough.paper_execution import (
     require_separate_journal,
 )
 from sourdough.paper_order import OrderRefused, submit_paper_order
-from sourdough.paper_reconcile import reconcile_paper_orders
+from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
 
 
@@ -34,10 +34,10 @@ FIXTURE = Path(__file__).resolve().parents[1] / "flows/flow-07/protocol_emulator
 
 
 class WireVenue:
-    def __init__(self, journal, withhold=None, *, partial=False):
+    def __init__(self, journal, withhold=None, *, partial=False, delay=False):
         self.journal = journal
         if withhold is not None:
-            self.call("initialize", withhold=withhold, partial=partial)
+            self.call("initialize", withhold=withhold, partial=partial, delay=delay)
 
     def call(self, operation, **fields):
         response = subprocess.run(
@@ -182,6 +182,79 @@ def rows(store, sql):
 
 
 class ExecutionProtocolParity(unittest.TestCase):
+    def test_empty_ledger_cannot_seal_a_delayed_original_submission(self):
+        for delivers in (False, True):
+            with self.subTest(delivers=delivers), TemporaryDirectory() as directory:
+                self.observe_unfenced_absence(Path(directory), delivers)
+
+    def observe_unfenced_absence(self, root, delivers):
+        store, journal = root / "company.sqlite", root / "venue.sqlite"
+        venue = WireVenue(journal, False, delay=True)
+        account = venue.observe_account("shadow-cash")
+        company_id = found(
+            store, FoundingTerms("delay", "charter", "paper", "employee")
+        ).company_id
+        bind(store, PaperMandate("mandate", company_id, "charter", account, 300), venue)
+        claim = claim_first_duty(store, company_id, "employee")
+        intent = PaperIntent("delayed-action", account.instrument_rules_digest, 2, 110)
+        with self.assertRaises(TimeoutError):
+            submit_paper_order(store, claim, intent, venue)
+        original = submit_paper_order(store, claim, intent, venue)
+        self.assertFalse(original.dispatched_now)
+        self.assertEqual(
+            rows(journal, "SELECT client_id FROM deferred_send"), [(original.order_id,)]
+        )
+        self.assertEqual(rows(journal, "SELECT client_id FROM remote_order"), [])
+        now = 100
+        for _attempt in range(1 if delivers else MAX_LOOKUP_ATTEMPTS):
+            receipt = self.reconcile_reopened(store, company_id, journal, "wire", now)[
+                "receipt"
+            ]
+            self.assertEqual((receipt["unresolved"], receipt["recovered"]), (1, []))
+            self.assertEqual(
+                rows(store, "SELECT reserved_minor_units FROM paper_order"), [(220,)]
+            )
+            self.assertEqual(rows(journal, "SELECT client_id FROM remote_order"), [])
+            now = receipt["next_query_at"]
+        with self.assertRaises(OrderRefused):
+            submit_paper_order(
+                store,
+                claim,
+                replace(intent, action_id="replacement", quantity=1),
+                venue,
+            )
+        self.assertEqual(
+            rows(journal, "SELECT client_id FROM deferred_send"), [(original.order_id,)]
+        )
+        if not delivers:
+            self.assertIsNone(now)
+            after = self.reconcile_reopened(store, company_id, journal, "wire", 10_000)[
+                "receipt"
+            ]
+            self.assertEqual((after["unresolved"], after["next_query_at"]), (1, None))
+            self.assertEqual(
+                rows(store, "SELECT reserved_minor_units FROM paper_order"), [(220,)]
+            )
+            return
+        self.assertIsNotNone(now)
+        venue.call(
+            "deliverFixture", ledger=account.account_id, clientId=original.order_id
+        )
+        self.assertEqual(
+            rows(journal, "SELECT client_id FROM remote_order"), [(original.order_id,)]
+        )
+        self.assertEqual(rows(journal, "SELECT client_id FROM deferred_send"), [])
+        resolved = self.reconcile_reopened(store, company_id, journal, "wire", now)[
+            "receipt"
+        ]
+        self.assertEqual(resolved["unresolved"], 0)
+        [applied] = resolved["recovered"]
+        self.assertEqual(applied["posting"]["order_id"], original.order_id)
+        self.assertEqual(rows(store, "SELECT count(*) FROM paper_fill"), [(1,)])
+        self.assertEqual(
+            rows(store, "SELECT reserved_minor_units FROM paper_order"), [(200,)]
+        )
+
     def test_common_admission_denial_and_original_effect_on_two_destinations(self):
         for withhold in (False, True):
             results = []

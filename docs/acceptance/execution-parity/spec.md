@@ -14,6 +14,8 @@ The local protocol fixture runs in a separate process with its own ledger and no
 
 The partial-fill pair uses the managed paper adapter's independent journal and the wire fixture. In both cases a terminal cancellation arrives before the last identified fill. Keep the remainder reserved until the reported cumulative quantity matches unique fills; run reconciliation in a fresh company process at each cut and compare its original order, fees, exposure and final position with the independently persisted venue facts. This fixture does not replace an actual SDK observation.
 
+The unfenced-absence case differs from a lost reply to an already accepted order. The emulator retains a delayed submission separately from its order ledger, so an independent reader sees an empty order ledger before delivery. A limited retry budget may expire, but neither emptiness nor timeout may release the reservation or authorize another send. If the original becomes visible during the budget, recover that order once.
+
 ## Scenarios and oracle
 
 | Case | Required comparison |

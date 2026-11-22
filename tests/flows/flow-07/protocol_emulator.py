@@ -24,11 +24,11 @@ def handle(database, request):
     operation = request["op"]
     if operation == "initialize":
         database.execute(
-            "CREATE TABLE fixture (withhold INTEGER NOT NULL, partial INTEGER NOT NULL)"
+            "CREATE TABLE fixture (withhold INTEGER NOT NULL, partial INTEGER NOT NULL, delay INTEGER NOT NULL)"
         )
         database.execute(
-            "INSERT INTO fixture VALUES (?,?)",
-            (request["withhold"], request["partial"]),
+            "INSERT INTO fixture VALUES (?,?,?)",
+            (request["withhold"], request["partial"], request["delay"]),
         )
         database.execute(
             """CREATE TABLE remote_order (
@@ -47,9 +47,12 @@ def handle(database, request):
         database.execute(
             "CREATE TABLE remote_cancel (client_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, executed INTEGER NOT NULL)"
         )
+        database.execute(
+            "CREATE TABLE deferred_send (client_id TEXT PRIMARY KEY, request TEXT NOT NULL)"
+        )
         return {}
-    withheld, partial = database.execute(
-        "SELECT withhold,partial FROM fixture"
+    withheld, partial, delay = database.execute(
+        "SELECT withhold,partial,delay FROM fixture"
     ).fetchone()
     profile = PROFILE | ({"takerBps": 0} if partial else {})
     if operation == "account":
@@ -60,12 +63,25 @@ def handle(database, request):
     if request.get("ledger") != profile["ledger"]:
         raise ValueError("Fixture does not observe or accept another account")
     identity = request["clientId"]
+    if operation == "deliverFixture":
+        (pending,) = database.execute(
+            "SELECT request FROM deferred_send WHERE client_id=?", (identity,)
+        ).fetchone()
+        database.execute("UPDATE fixture SET delay=0")
+        database.execute("DELETE FROM deferred_send WHERE client_id=?", (identity,))
+        return handle(database, json.loads(pending))
     if operation == "send":
         if (
             request.get("termsHash") != profile["termsHash"]
             or request["ceiling"] < profile["mark"]
         ):
             raise ValueError("Intent is outside the emulated common subset")
+        if delay:
+            database.execute(
+                "INSERT INTO deferred_send VALUES (?,?)",
+                (identity, json.dumps(request)),
+            )
+            return {"ack": None}
         amount = request["amount"]
         executed = 2 if partial else amount
         fee = (executed * profile["mark"] * profile["takerBps"] + 5000) // 10000
