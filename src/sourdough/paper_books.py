@@ -14,7 +14,7 @@ from .company import _connect, _identity
 from .paper_account import reopen_binding
 
 if TYPE_CHECKING:
-    from .paper_execution import PaperExecution, VenueExecution
+    from .paper_execution import PaperExecution, VenueCancellation, VenueExecution
     from .writer_lease import WriterLease
 
 
@@ -152,6 +152,73 @@ def _post_fill(db: sqlite3.Connection, order_id: str, observed: VenueExecution) 
     )
 
 
+def _apply_cancellation(
+    db: sqlite3.Connection,
+    order_id: str,
+    order: tuple,
+    evidence: VenueCancellation | None,
+) -> None:
+    if evidence is not None:
+        if (
+            evidence.order_id != order_id
+            or (evidence.account_id, evidence.instrument_rules_digest) != order[1:3]
+            or not isinstance(evidence.event_id, str)
+            or not evidence.event_id
+            or type(evidence.filled_quantity) is not int
+            or not 0 <= evidence.filled_quantity < order[3]
+        ):
+            raise PostingRefused("Cancellation does not match the original order")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS paper_cancellation (
+                order_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_order(order_id),
+                event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL,
+                released INTEGER NOT NULL CHECK (released IN (0,1))
+            )"""
+        )
+        previous = db.execute(
+            "SELECT order_id,event_id,filled_quantity FROM paper_cancellation WHERE order_id=? OR event_id=?",
+            (order_id, evidence.event_id),
+        ).fetchall()
+        terms = (order_id, evidence.event_id, evidence.filled_quantity)
+        if not previous:
+            db.execute("INSERT INTO paper_cancellation VALUES (?,?,?,0)", terms)
+        elif previous != [terms]:
+            raise PostingRefused(
+                "Cancellation conflicts with recorded terminal evidence"
+            )
+    if not _has_table(db, "paper_cancellation"):
+        return
+    pending = db.execute(
+        "SELECT filled_quantity,released FROM paper_cancellation WHERE order_id=?",
+        (order_id,),
+    ).fetchone()
+    if pending is None:
+        return
+    cumulative, released = pending
+    booked, spent = db.execute(
+        """SELECT COALESCE(SUM(quantity),0),COALESCE(SUM(quantity*price_minor_units),0)
+           FROM paper_fill WHERE order_id=?""",
+        (order_id,),
+    ).fetchone()
+    if booked > cumulative:
+        raise PostingRefused("Fill quantity exceeds recorded terminal evidence")
+    if booked == cumulative and not released:
+        db.execute(
+            "UPDATE paper_order SET reserved_minor_units=? WHERE order_id=?",
+            (spent, order_id),
+        )
+        db.execute(
+            "UPDATE paper_cancellation SET released=1 WHERE order_id=?", (order_id,)
+        )
+
+
+def resolved_order_sql(db: sqlite3.Connection) -> str:
+    filled = f"{FILLED_QUANTITY}=o.quantity" if _has_table(db, "paper_fill") else "0"
+    if not _has_table(db, "paper_cancellation"):
+        return filled
+    return f"({filled} OR EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id AND c.released=1))"
+
+
 def post_confirmed_fill(
     store: Path,
     company_id: str,
@@ -167,7 +234,10 @@ def post_confirmed_fill(
     observations = venue.read_fills(
         binding.account.account_id, order_id, account_sync=account_sync
     )
-    if not observations:
+    cancellation = venue.read_cancellation(
+        binding.account.account_id, order_id, account_sync=account_sync
+    )
+    if not observations and cancellation is None:
         return None
     with closing(_connect(store, "rw")) as db, db:
         legacy = _has_legacy_order_index(db)
@@ -184,6 +254,8 @@ def post_confirmed_fill(
                FROM paper_order WHERE order_id = ?""",
             (order_id,),
         ).fetchone()
+        if order is None or order[:2] != (binding.revision, binding.account.account_id):
+            raise PostingRefused("Order evidence does not match an admitted order")
         _ensure_fill_schema(db, legacy)
         for observed in observations:
             if observed.order_id != order_id or order != (
@@ -195,6 +267,7 @@ def post_confirmed_fill(
             ):
                 raise PostingRefused("Fill does not match admitted order")
             _post_fill(db, order_id, observed)
+        _apply_cancellation(db, order_id, order, cancellation)
         if legacy and db.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise PostingRefused("Legacy fill migration did not retain its references")
         return _completed_posting(db, order_id)
@@ -220,7 +293,7 @@ def _completed_posting(connection: sqlite3.Connection, order_id: str) -> Posting
     row = connection.execute(
         f"""SELECT p.fill_id,p.order_id,p.quantity,p.price_minor_units
             FROM paper_fill p JOIN paper_order o USING(order_id)
-            WHERE o.order_id=? AND {FILLED_QUANTITY}=o.quantity
+            WHERE o.order_id=? AND {resolved_order_sql(connection)}
             ORDER BY p.rowid DESC LIMIT 1""",
         (order_id,),
     ).fetchone()

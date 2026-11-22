@@ -121,6 +121,7 @@ def _paper_projection(connection: Connection, tables: set[str]) -> dict | None:
         return None
     have_fills = "paper_fill" in tables
     have_fees = have_fills and "paper_fill_fee" in tables
+    have_cancellations = "paper_cancellation" in tables
     details = (
         """(SELECT latest.fill_id FROM paper_fill latest WHERE order_id=o.order_id
             ORDER BY latest.rowid DESC LIMIT 1) AS fill_id,
@@ -135,10 +136,12 @@ def _paper_projection(connection: Connection, tables: set[str]) -> dict | None:
         SELECT o.order_id,o.run_id,o.action_id,o.account_id,o.instrument_rules_digest,
                o.quantity AS ordered_quantity,o.reserved_minor_units,o.limit_minor_units,
                {details},
-               {"SUM(f.fee_minor_units)" if have_fees else "NULL"} AS fee_minor_units
+               {"SUM(f.fee_minor_units)" if have_fees else "NULL"} AS fee_minor_units,
+               {"c.released" if have_cancellations else "NULL"} AS cancelled
         FROM paper_order o
         {"LEFT JOIN paper_fill p ON o.order_id=p.order_id" if have_fills else ""}
         {"LEFT JOIN paper_fill_fee f ON f.fill_id=p.fill_id" if have_fees else ""}
+        {"LEFT JOIN paper_cancellation c ON c.order_id=o.order_id" if have_cancellations else ""}
         GROUP BY o.order_id ORDER BY o.rowid
     """,
     )
@@ -146,14 +149,21 @@ def _paper_projection(connection: Connection, tables: set[str]) -> dict | None:
         order["remaining_quantity"] = order["ordered_quantity"] - (
             order["quantity"] or 0
         )
-        order["open_reservation_minor_units"] = order["remaining_quantity"] * order.pop(
-            "limit_minor_units"
+        limit = order.pop("limit_minor_units")
+        if order.pop("cancelled"):
+            order["status"] = "cancelled"
+        else:
+            order["status"] = (
+                "filled" if order["remaining_quantity"] == 0 else "unresolved"
+            )
+        order["open_reservation_minor_units"] = (
+            order["remaining_quantity"] * limit
+            if order["status"] == "unresolved"
+            else 0
         )
     return {
         "orders": trades,
-        "unresolved_orders": sum(
-            record["remaining_quantity"] != 0 for record in trades
-        ),
+        "unresolved_orders": sum(record["status"] == "unresolved" for record in trades),
         "booked_position": sum(
             record["quantity"] for record in trades if record["quantity"] is not None
         ),

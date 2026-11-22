@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .market_worker import journal_key
 from .nautilus_paper import NautilusPaperVenue, SandboxBalance
-from .nautilus_paper_worker import capture_fill, submit_limit
+from .nautilus_paper_worker import capture_cancellation, capture_fill, submit_limit
 from .paper_execution import VenueRefused
 from .replay_tape import ReplayTape
 from .spot_cash import QUOTE_SCALE, SpotCashUnits
@@ -119,6 +119,18 @@ def run(venue: NautilusPaperVenue, tape: ReplayTape, ready_fd: int) -> None:
             except Exception as error:
                 self.error = error
 
+        def on_order_canceled(self, event):
+            try:
+                self.order_id = capture_cancellation(
+                    venue,
+                    generation,
+                    units,
+                    self.cache.order(event.client_order_id),
+                    event,
+                )
+            except Exception as error:
+                self.error = error
+
     engine = BacktestEngine(
         config=BacktestEngineConfig(logging=LoggingConfig(log_level="ERROR"))
     )
@@ -154,10 +166,14 @@ def run(venue: NautilusPaperVenue, tape: ReplayTape, ready_fd: int) -> None:
         if strategy.order_id is None:
             raise VenueRefused("Offline venue did not confirm the original order")
         account = strategy.portfolio.account(instrument.id.venue)
+        base_balance = account.balance_total(base)
+        base_amount = (
+            base_balance.as_decimal() if base_balance is not None else Decimal(0)
+        )
         if not venue.record_account(
             generation,
             strategy.order_id,
-            units.lots(account.balance_total(base).as_decimal()),
+            0 if base_amount.is_zero() else units.lots(base_amount),
             units.quote_atoms(account.balance_total(quote).as_decimal()),
         ):
             raise VenueRefused(

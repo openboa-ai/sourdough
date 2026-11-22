@@ -68,6 +68,7 @@ def observe(
     tape: Path | None = None,
     *,
     restart_engine: bool = False,
+    expected_lots: int = 20,
 ) -> dict:
     if restart_engine and tape is not None:
         raise ValueError("Engine restart observation requires a current-market binding")
@@ -184,7 +185,7 @@ def observe(
                 worker.wait(timeout=8)
     order = result["first_trade"]["order"]
     posting = order["posting"]
-    assert result["first_trade"]["position_quantity"] == 20
+    assert result["first_trade"]["position_quantity"] == expected_lots
     (witnessed,) = rows(
         venue,
         "SELECT fill_id,order_id,quantity,price_atoms,fee_atoms FROM sandbox_fill_observation",
@@ -195,15 +196,46 @@ def observe(
     assert (
         witnessed[:4]
         == book
-        == (posting["fill_id"], order["order_id"], 20, posting["price_minor_units"])
+        == (
+            posting["fill_id"],
+            order["order_id"],
+            expected_lots,
+            posting["price_minor_units"],
+        )
     )
     assert posting["fee_minor_units"] == witnessed[4] == 0
     position, cash = rows(
         venue, "SELECT position_lots,cash_atoms FROM sandbox_account_observation"
     )[0]
-    assert (position, cash) == (20, 1000 * 10**8 - 20 * posting["price_minor_units"])
+    assert (position, cash) == (
+        expected_lots,
+        1000 * 10**8 - expected_lots * posting["price_minor_units"],
+    )
     assert rows(venue, "SELECT count(*) FROM sandbox_order") == [(1,)]
     assert rows(store, "SELECT count(*) FROM paper_order") == [(1,)]
+    cancellation = None
+    if expected_lots < 20:
+        [(original, event_id, filled)] = rows(
+            venue, "SELECT order_id,event_id,filled_quantity FROM sandbox_cancellation"
+        )
+        assert (original, filled) == (order["order_id"], expected_lots)
+        assert rows(
+            store,
+            "SELECT order_id,event_id,filled_quantity,released FROM paper_cancellation",
+        ) == [(original, event_id, filled, 1)]
+        [(admitted, remaining_reservation)] = rows(
+            store, "SELECT quantity,reserved_minor_units FROM paper_order"
+        )
+        assert (
+            admitted == 20
+            and remaining_reservation == filled * posting["price_minor_units"]
+        )
+        cancellation = {
+            "original_order_id": original,
+            "filled_lots": filled,
+            "cancelled_lots": admitted - filled,
+            "reserved_atoms": remaining_reservation,
+        }
     if restarted is not None:
         exits = [
             json.loads(line)
@@ -241,6 +273,7 @@ def observe(
         "instrument_revision": binding["account"]["instrument_rules_digest"],
         "connector": binding["account"]["connector_revision"],
         "replay_cut": replay_cut,
+        "cancellation": cancellation,
         "engine_worker_pid": ready["pid"],
         "replacement_worker_pid": restarted["pid"] if restarted else None,
         "scope": "virtual cash; zero test fee; one full fill",
@@ -256,6 +289,7 @@ if __name__ == "__main__":
     parser.add_argument("--wheelhouse", type=Path)
     parser.add_argument("--replay-tape", type=Path)
     parser.add_argument("--restart-engine", action="store_true")
+    parser.add_argument("--expected-lots", type=int, default=20)
     args = parser.parse_args()
     os.umask(0o077)
     print(
@@ -265,6 +299,7 @@ if __name__ == "__main__":
                 args.wheelhouse,
                 args.replay_tape,
                 restart_engine=args.restart_engine,
+                expected_lots=args.expected_lots,
             )
         )
     )

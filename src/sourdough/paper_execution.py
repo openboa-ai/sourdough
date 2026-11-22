@@ -43,6 +43,15 @@ class VenueExecution:
     filled_quantity: int | None = None
 
 
+@dataclass(frozen=True)
+class VenueCancellation:
+    order_id: str
+    account_id: str
+    instrument_rules_digest: str
+    event_id: str
+    filled_quantity: int
+
+
 class PaperDestination(AccountObserver, Protocol):
     def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None: ...
 
@@ -59,6 +68,10 @@ class PaperExecution(PaperDestination, Protocol):
     def read_fills(
         self, account_id: str, order_id: str, *, account_sync: bool = False
     ) -> tuple[VenueExecution, ...]: ...
+
+    def read_cancellation(
+        self, account_id: str, order_id: str, *, account_sync: bool = False
+    ) -> VenueCancellation | None: ...
 
 
 def require_separate_journal(company_store: Path, venue_journal: Path) -> None:

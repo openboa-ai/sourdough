@@ -14,6 +14,7 @@ from .paper_books import (
     PostingRefused,
     post_confirmed_fill,
     read_booked_fill,
+    resolved_order_sql,
 )
 from .paper_execution import PaperExecution
 from .writer_lease import WriterLease
@@ -72,7 +73,7 @@ def _open_recovery(
                 JOIN agent f ON f.id = d.agent_id
                 LEFT JOIN paper_reconciliation j ON j.order_id = o.order_id
                 WHERE o.account_id = ? AND f.company_id = ?
-                  AND ({_missing_fill(db)} OR d.state = 'running')
+                  AND ({_missing_fill(db)} OR (d.state = 'running' AND {_has_booked_fill(db)}))
                   AND (j.order_id IS NULL OR j.fill_id IS NOT NULL OR j.next_query_at <= ?
                        OR NOT ({_missing_fill(db)}))
                 ORDER BY COALESCE(j.next_query_at, 0), o.order_id LIMIT ?""",
@@ -81,9 +82,11 @@ def _open_recovery(
 
 
 def _missing_fill(connection: Connection) -> str:
-    if _has_table(connection, "paper_fill"):
-        return f"{FILLED_QUANTITY} != o.quantity"
-    return "1"
+    return f"NOT ({resolved_order_sql(connection)})"
+
+
+def _has_booked_fill(connection: Connection) -> str:
+    return f"{FILLED_QUANTITY}>0" if _has_table(connection, "paper_fill") else "0"
 
 
 def _record_lookup(
@@ -101,15 +104,17 @@ def _record_lookup(
             raise PostingRefused("Company identity mismatch")
         next_query = None
         if posting is None:
-            has_partial = (
-                _has_table(db, "paper_fill")
-                and db.execute(
-                    f"SELECT 1 FROM paper_order o WHERE o.order_id=? AND {FILLED_QUANTITY}>0",
-                    (order_id,),
-                ).fetchone()
-                is not None
+            pending_cancellation = (
+                "EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id)"
+                if _has_table(db, "paper_cancellation")
+                else "0"
             )
-            if attempts < MAX_LOOKUP_ATTEMPTS or has_partial:
+            unresolved, has_evidence = db.execute(
+                f"""SELECT {_missing_fill(db)}, ({_has_booked_fill(db)} OR {pending_cancellation})
+                    FROM paper_order o WHERE o.order_id=?""",
+                (order_id,),
+            ).fetchone()
+            if unresolved and (attempts < MAX_LOOKUP_ATTEMPTS or has_evidence):
                 next_query = now + min(60, 2 ** min(attempts, MAX_LOOKUP_ATTEMPTS))
         db.execute(
             """INSERT INTO paper_reconciliation VALUES (?, ?, ?, ?, ?)

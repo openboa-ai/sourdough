@@ -1,3 +1,4 @@
+import json
 import unittest
 from hashlib import sha256
 from pathlib import Path
@@ -7,6 +8,27 @@ from observe_paper import observe
 
 
 class OfflineReplay(unittest.TestCase):
+    def test_sdk_cancellation_releases_only_the_unfilled_remainder(self):
+        with TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            tape = root / "thin-quotes.json"
+            scenario = json.loads(
+                Path(__file__).with_name("causal-quotes.json").read_text()
+            )
+            scenario["quotes"][0]["ask_size"] = "0.00008"
+            tape.write_text(json.dumps(scenario))
+            result = observe(root / "replay", None, tape, expected_lots=8)
+        self.assertEqual(
+            result["cancellation"],
+            {
+                "original_order_id": result["posting"]["order_id"],
+                "filled_lots": 8,
+                "cancelled_lots": 12,
+                "reserved_atoms": 400_000_000,
+            },
+        )
+        self.assertTrue(result["verified_after_engine_exit"])
+
     def test_reproducible_first_decision_as_of_quote_availability(self):
         tape = Path(__file__).with_name("causal-quotes.json")
         with TemporaryDirectory() as scratch:
