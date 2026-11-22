@@ -113,6 +113,21 @@ def _offers_exist(database: Connection) -> bool:
     ).fetchone() == (2,)
 
 
+def accepted_handoff(
+    database: Connection, claim: DutyClaim, asset_id: str
+) -> dict[str, str] | None:
+    if not _offers_exist(database):
+        return None
+    row = database.execute(
+        """SELECT offer_id,sender_id,expected_result FROM work_handoff
+           WHERE successor_id=? AND recipient_id=? AND asset_id=?""",
+        (claim.duty_id, claim.founder_id, asset_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(zip(("offer_id", "sender_id", "expected_result"), row, strict=True))
+
+
 _READY_OFFERS = """FROM work_handoff o
     JOIN work_review_decision review ON review.duty_id=o.original_duty AND review.run_id=o.sender_run
     JOIN work_follow_up w ON w.previous_duty_id=review.duty_id AND w.grant_scope='assessment'

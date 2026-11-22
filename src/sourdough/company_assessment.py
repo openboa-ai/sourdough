@@ -21,7 +21,7 @@ from .work import (
     read_follow_up_result,
     schedule_follow_up,
 )
-from .work_handoff import shared_revision
+from .work_handoff import accepted_handoff, shared_revision
 from .writer_lease import WriterLease
 
 
@@ -409,7 +409,11 @@ def read_assessment_result(
             )
             if reference.revision != shared_revision(asset):
                 raise DutyRefused("Shared handoff evidence revision changed")
-            return {"revision": reference.revision, "shared_evidence": asdict(asset)}
+            result = {"revision": reference.revision, "shared_evidence": asdict(asset)}
+            handoff = accepted_handoff(connection, claim, asset.asset_id)
+            if handoff is not None:
+                result["handoff"] = handoff
+            return result
         if reference.kind != "company_assessment":
             raise DutyRefused("This review does not reference a company assessment")
         row = connection.execute(

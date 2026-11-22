@@ -16,6 +16,8 @@ Use an offered-to-accepted transition instead of clearing the original owner as 
 
 The first local transition supports company assessment review. The sender offers its next follow-up during a review; the offer becomes actionable only after that exact review commits its decision and follow-up. The sender's follow-up stays scheduled under its original owner until accepted. The recipient can discover an actionable offer in a separate authorized turn. Acceptance must win against the sender claiming that follow-up: atomically retire the still-scheduled duty and schedule one successor for the recipient, referencing the selected shared evidence. It does not inherit the sender's private record, standing grant or unresolved trading effect.
 
+The accepted expected result is part of the successor's authorized work-result read, with the offer ID and sender. A new provider session does not need to reconstruct the offer from chat or private notes.
+
 **Concern for the responsible component:** Verify receiver access to evidence before transfer; stale acceptance must not be able to resurrect a superseded assignment.
 
 ## Functional and quality requirements

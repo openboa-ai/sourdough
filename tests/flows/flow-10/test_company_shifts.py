@@ -95,6 +95,7 @@ else:
         assert evidence["author_id"] == "author"
         assert evidence["content"] == "Checked discrepancy."
         assert request["harness"]["drafts"] == []
+        assert prior["handoff"]["expected_result"] == "Independently check the discrepancy.", prior
         rationale = "Independently reviewed the shared discrepancy."
     result = call("record_review_decision", {
         "observation_revision": prior["revision"], "action": "hold",

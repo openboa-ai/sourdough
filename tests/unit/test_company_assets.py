@@ -398,6 +398,14 @@ class CompanyAssets(unittest.TestCase):
         received = read_assessment_result(self.writer, work, now=82)
         self.assertEqual(received["shared_evidence"]["content"], "Reviewed finding.")
         self.assertEqual(received["shared_evidence"]["author_id"], "author")
+        self.assertEqual(
+            received["handoff"],
+            {
+                "offer_id": offer_id,
+                "sender_id": "author",
+                "expected_result": "Recheck the finding.",
+            },
+        )
         self.assertEqual(work.claim.founder_id, "peer")
         decision = ReviewDecision(
             "new-owner-review",
