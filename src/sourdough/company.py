@@ -10,7 +10,8 @@ from uuid import uuid4
 LEGACY_SCHEMA_REVISION = 1
 CONTINUATION_SCHEMA_REVISION = 2
 RUN_SCHEMA_REVISION = 3
-SCHEMA_REVISION = 4
+PURPOSE_SCHEMA_REVISION = 4
+SCHEMA_REVISION = 5
 DUTY_SCHEMA = """CREATE TABLE duty (
     id TEXT PRIMARY KEY NOT NULL, founder_id TEXT NOT NULL REFERENCES founder(id),
     state TEXT NOT NULL
@@ -38,6 +39,12 @@ DUTY_RUN_SCHEMA = """CREATE TABLE duty_run (
 CURRENT_RUN_INDEX = (
     "CREATE UNIQUE INDEX current_duty_run ON duty_run(duty_id) WHERE is_current = 1"
 )
+RESULT_READ_SCHEMA = """CREATE TABLE IF NOT EXISTS work_result_read (
+    duty_id TEXT NOT NULL REFERENCES work_follow_up(duty_id),
+    run_id TEXT PRIMARY KEY NOT NULL REFERENCES duty_run(run_id),
+    result_revision TEXT NOT NULL,
+    read_at INTEGER NOT NULL
+)"""
 SCHEMA = (
     """CREATE TABLE company (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -120,6 +127,7 @@ def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
         LEGACY_SCHEMA_REVISION,
         CONTINUATION_SCHEMA_REVISION,
         RUN_SCHEMA_REVISION,
+        PURPOSE_SCHEMA_REVISION,
         SCHEMA_REVISION,
     ):
         raise FoundingRefused("Unsupported company store schema")
@@ -199,16 +207,33 @@ def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
                 connection.execute(
                     "ALTER TABLE work_follow_up ADD COLUMN purpose TEXT NOT NULL DEFAULT 'position_review'"
                 )
-            else:
+            elif revision != PURPOSE_SCHEMA_REVISION:
                 if revision == LEGACY_SCHEMA_REVISION:
                     _upgrade_duties(connection)
                 _consolidate_runs(connection, revision)
+            _upgrade_result_reads(connection)
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise FoundingRefused("Company store failed foreign-key validation")
             connection.execute(
                 "UPDATE company SET schema_revision = ? WHERE singleton = 1",
                 (SCHEMA_REVISION,),
             )
+
+
+def _upgrade_result_reads(connection: sqlite3.Connection) -> None:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'work_result_read'"
+    ).fetchone():
+        return
+    connection.execute(
+        RESULT_READ_SCHEMA.replace("work_result_read (", "work_result_read_next (", 1)
+    )
+    connection.execute(
+        """INSERT INTO work_result_read_next (duty_id, run_id, result_revision, read_at)
+           SELECT duty_id, run_id, result_revision, read_at FROM work_result_read"""
+    )
+    connection.execute("DROP TABLE work_result_read")
+    connection.execute("ALTER TABLE work_result_read_next RENAME TO work_result_read")
 
 
 def found(store: Path, terms: FoundingTerms) -> FoundingReceipt:

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from .company import SCHEMA_REVISION, _company_version, _connect
+from .company import RESULT_READ_SCHEMA, SCHEMA_REVISION, _company_version, _connect
 from .duty_run import (
     PAPER_EXECUTION,
     POSITION_REVIEW,
@@ -293,14 +293,7 @@ def read_follow_up_result(
         result = read(connection, follow_up.result)
         if result.get("revision") != follow_up.result.revision:
             raise DutyRefused("Review result revision changed")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS work_result_read (
-                duty_id TEXT PRIMARY KEY NOT NULL REFERENCES work_follow_up(duty_id),
-                run_id TEXT NOT NULL,
-                result_revision TEXT NOT NULL,
-                read_at INTEGER NOT NULL
-            )"""
-        )
+        connection.execute(RESULT_READ_SCHEMA)
         connection.execute(
             """INSERT OR IGNORE INTO work_result_read VALUES (?, ?, ?, ?)""",
             (claim.duty_id, claim.run_id, follow_up.result.revision, now),
@@ -318,8 +311,8 @@ def require_result_read(
     observed = (
         has_reads
         and connection.execute(
-            "SELECT run_id, result_revision, read_at FROM work_result_read WHERE duty_id = ?",
-            (claim.duty_id,),
+            "SELECT run_id, result_revision, read_at FROM work_result_read WHERE duty_id = ? AND run_id = ?",
+            (claim.duty_id, claim.run_id),
         ).fetchone()
     )
     if (

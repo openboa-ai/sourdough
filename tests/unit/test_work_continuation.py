@@ -143,7 +143,7 @@ class WorkContinuation(unittest.TestCase):
         before = [self.rows(query) for query in queries]
         upgrade_work_schema(self.store, self.company_id)
         upgrade_work_schema(self.store, self.company_id)
-        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(4,)])
+        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(5,)])
         self.assertEqual(
             self.rows("SELECT duty_id, run_id FROM duty_run"),
             [(original.duty_id, original.run_id)],
