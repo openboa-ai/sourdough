@@ -28,7 +28,7 @@ elif operation == "ready":
     result = {"ready": True}
 elif operation == "staffing_duty":
     need = invoke("read_staffing_need", {})
-    choice = invoke("record_staffing_choice", {
+    choice = need.get("saved_choice") or invoke("record_staffing_choice", {
         "evidence_revision": need["revision"], "action": "hire",
         "rationale": "Backlog exceeds available capacity.",
         "alternatives": ["reassign", "defer"], "next_check_seconds": 300,
@@ -48,6 +48,9 @@ elif operation in ("assessment_duty", "hired_research_duty"):
             "disposition": "recommend_change", "rationale": "Observed six rather than eight.",
             "next_check_seconds": 60,
         })
+    elif first.get("saved_buy"):
+        decision = first["saved_buy"]
+        result = invoke("request_research_order", {"decision_id": decision["decision_id"]})
     else:
         inputs = invoke("read_research_inputs", {})
         start, end = inputs["observations"]
@@ -89,6 +92,7 @@ from contextlib import closing
 from pathlib import Path
 from time import time
 from sourdough import assessment_run, cli, company_assessment, hired_paper_run, onboarding
+from sourdough import paper_research, staffing_tools
 from sourdough.paper_venue import FixedQuoteVenue
 marker = Path(sys.argv.pop(1))
 fault_site = sys.argv.pop(1)
@@ -136,6 +140,18 @@ def withheld_acceptance(*args, **kwargs):
     if fault_site == "after_acceptance":
         interrupted()
     return result
+record_choice = staffing_tools.record_choice
+def withheld_choice(*args, **kwargs):
+    result = record_choice(*args, **kwargs)
+    if fault_site == "after_staffing_choice":
+        interrupted()
+    return result
+research = paper_research.ResearchTools.invoke
+def withheld_research(tools, name, *args, **kwargs):
+    result = research(tools, name, *args, **kwargs)
+    if name == "record_research_decision" and fault_site == "after_research_decision":
+        interrupted()
+    return result
 def environment_clock():
     return time() + (121 if marker.exists() else 0)
 assessment_run.time = environment_clock
@@ -144,6 +160,8 @@ hired_paper_run._apply_paper_order = withheld_order
 cli.FixedQuoteVenue = WithheldFill
 company_assessment.publish_assessment = withheld_assessment
 onboarding.accept_first_duty = withheld_acceptance
+staffing_tools.record_choice = withheld_choice
+paper_research.ResearchTools.invoke = withheld_research
 raise SystemExit(cli.main())
 """
 
@@ -183,8 +201,10 @@ class ConnectedFlow(unittest.TestCase):
         for scope, submit_request, fault_site in (
             ("assessment", True, "after_publication"),
             ("assessment", True, "after_acceptance"),
+            ("assessment", True, "after_staffing_choice"),
             ("paper", True, "after_fill"),
             ("paper", True, "after_acceptance"),
+            ("paper", True, "after_research_decision"),
             ("paper", True, "after_fill_with_lookup_timeout"),
             ("paper", True, "before_send"),
             ("paper", False, "none"),
@@ -298,6 +318,11 @@ class ConnectedFlow(unittest.TestCase):
                     )
                     cli("stage-paper-observations", store, source, *identity)
                     entry = ("supervise-hired-paper", str(store), str(venue))
+                extra_run = fault_site in (
+                    "after_acceptance",
+                    "after_staffing_choice",
+                    "after_research_decision",
+                )
                 response = subprocess.run(
                     [
                         sys.executable,
@@ -314,7 +339,7 @@ class ConnectedFlow(unittest.TestCase):
                         "--idle-seconds",
                         "6" if fault_site == "after_fill_with_lookup_timeout" else "2",
                         "--turn-budget",
-                        "4" if fault_site == "after_acceptance" else "3",
+                        "4" if extra_run else "3",
                         "--max-restarts",
                         "1",
                     ],
@@ -347,7 +372,7 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(claim["agent_id"], agent_id)
                 self.assertNotEqual(claim["duty_id"], first_duty)
                 self.assertEqual(claim["execution_profile"], profile)
-                expected_runs = 4 if fault_site == "after_acceptance" else 3
+                expected_runs = 4 if extra_run else 3
                 self.assertEqual(
                     rows(store, "SELECT count(*) FROM duty_run"), [(expected_runs,)]
                 )
@@ -368,6 +393,18 @@ class ConnectedFlow(unittest.TestCase):
                     rows(store, "SELECT count(*) FROM work_follow_up"), [(2,)]
                 )
                 self.assertEqual(rows(store, "PRAGMA foreign_key_check"), [])
+                if fault_site == "after_staffing_choice":
+                    self.assertEqual(
+                        rows(
+                            store,
+                            """SELECT decision.run_id!=admission.run_id, origin.is_current
+                               FROM staffing_choice decision
+                               JOIN duty_run origin ON origin.run_id=decision.run_id
+                               JOIN hire_receipt hired ON hired.choice_id=decision.choice_id
+                               JOIN hire_admission_run admission ON admission.request_id=hired.request_id""",
+                        ),
+                        [(1, 0)],
+                    )
                 if scope == "assessment":
                     self.assertEqual(
                         rows(store, "SELECT count(*) FROM assessment_publication"),
@@ -387,6 +424,20 @@ class ConnectedFlow(unittest.TestCase):
                     self.assertEqual(
                         rows(venue, "SELECT count(*) FROM venue_execution"), [(1,)]
                     )
+                    if fault_site == "after_research_decision":
+                        self.assertEqual(
+                            rows(
+                                store,
+                                """SELECT decision.run_id!=authorized.run_id, origin.is_current
+                                   FROM paper_research_decision decision
+                                   JOIN duty_run origin ON origin.run_id=decision.run_id
+                                   JOIN hired_research_order_request authorized
+                                     ON authorized.decision_id=decision.decision_id
+                                   JOIN paper_order admitted ON admitted.action_id=decision.decision_id
+                                     AND admitted.run_id=authorized.run_id""",
+                            ),
+                            [(1, 0)],
+                        )
                     if fault_site == "after_fill_with_lookup_timeout":
                         self.assertEqual(
                             rows(
