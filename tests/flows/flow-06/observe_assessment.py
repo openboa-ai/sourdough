@@ -69,7 +69,10 @@ def store_json(path, body):
     path.write_text(json.dumps(body, sort_keys=True))
 
 
-def prepare(output, employee, *, hiring_only=False):
+def prepare(output, employee, *, scenario="company-only"):
+    assert scenario in ("company-only", "hiring-only", "paper")
+    hiring_only = scenario == "hiring-only"
+    paper = scenario == "paper"
     root = Path(__file__).resolve().parents[3]
     installed = Path(find_spec("sourdough").origin).parent
     for source in (root / "src/sourdough").glob("*.py"):
@@ -102,13 +105,20 @@ def prepare(output, employee, *, hiring_only=False):
             "authority": {
                 "manager_grant_id": starter["grant_id"],
                 "execution_profile": profile,
-                "allowed_scope": "assessment",
+                "allowed_scope": "paper" if paper else "assessment",
                 "slots": 1,
                 "turns": 5,
             },
             "need": {
                 "duty_id": "records-backlog",
                 "summary": (
+                    "Review delegated synthetic paper-execution research independently. "
+                    "The only current reviewer is fully assigned to a time-sensitive obligation. "
+                    "Reassignment delays that obligation; deferral leaves the backlog open. "
+                    "Only the isolated simulation is in scope; no live funds or venue access."
+                )
+                if paper
+                else (
                     "Assess fourteen overdue company records independently. The only current "
                     "reviewer is fully assigned to a time-sensitive obligation. Reassignment "
                     "delays that obligation; deferral leaves the backlog open. The assessment "
@@ -150,7 +160,7 @@ def prepare(output, employee, *, hiring_only=False):
     startup = cli("stage-staffing", company, envelope, *identity)
     sealed_source = (
         None
-        if hiring_only
+        if hiring_only or paper
         else cli("stage-assessment-source", company, source, *identity)
     )
     initial_roster = rows(company, "SELECT id,execution_profile FROM agent")
@@ -159,7 +169,7 @@ def prepare(output, employee, *, hiring_only=False):
         "revision": head,
         "tree": tree,
         "client": False,
-        "environment": "hiring-only" if hiring_only else "company-only",
+        "environment": scenario,
         "founding": starter,
         "profile": profile,
         "staffing": startup,
@@ -262,7 +272,7 @@ def observe(output, employee):
     assert author != trial["founding"]["founder_id"]
     assert publication[6] == trial["founding"]["founder_id"]
     claim = review["claim"]
-    assert (claim["founder_id"], claim["execution_profile"]) == (
+    assert (claim["agent_id"], claim["execution_profile"]) == (
         author,
         trial["profile"],
     )

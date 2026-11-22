@@ -139,11 +139,11 @@ def run_first_trade(
 
 
 def resume_opening_research(
-    writer: WriterLease, venue: FixedQuoteVenue
+    writer: WriterLease, venue: FixedQuoteVenue, *, hired: bool = False
 ) -> TradeResult | None:
     writer.verify()
     store, company_id = writer.store, writer.company_id
-    pending = find_unsubmitted_opening(store, company_id)
+    pending = find_unsubmitted_opening(store, company_id, hired=hired)
     if pending is None:
         return None
     claim, research = pending

@@ -299,6 +299,30 @@ def first_duty_accepted(writer: WriterLease, claim: DutyClaim) -> bool:
         )
 
 
+def is_hired_first_duty(connection: Connection, claim: DutyClaim) -> bool:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name = 'hire_onboarding' AND type = 'table'"
+    ).fetchone():
+        return False
+    return (
+        connection.execute(
+            "SELECT 1 FROM hire_onboarding WHERE agent_id = ? AND first_duty_id = ?",
+            (claim.founder_id, claim.duty_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def has_hired_acceptance(connection: Connection, claim: DutyClaim) -> bool:
+    return is_hired_first_duty(connection, claim) and (
+        connection.execute(
+            "SELECT 1 FROM onboarding_acceptance WHERE duty_id = ? AND run_id = ?",
+            (claim.duty_id, claim.run_id),
+        ).fetchone()
+        is not None
+    )
+
+
 def invoke_onboarding(
     writer: WriterLease, claim: DutyClaim, name: str, arguments: dict
 ) -> dict:

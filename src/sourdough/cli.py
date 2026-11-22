@@ -15,6 +15,7 @@ from sourdough.duty_run import count_company_runs
 from sourdough.employee_process import EmployeeProcess
 from sourdough.first_duty import DutyRefused
 from sourdough.first_trade import TradeRefused, run_first_trade
+from sourdough.hired_paper_run import run_hired_paper_company
 from sourdough.hiring_run import run_hiring
 from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused
@@ -37,14 +38,26 @@ def _store_key(value: str) -> tuple[int, int]:
     return device, inode
 
 
+def _agent_receipt(fields):
+    receipt = dict(fields)
+    if "founder_id" in receipt and "run_id" in receipt:
+        receipt["agent_id"] = receipt.pop("founder_id")
+    return receipt
+
+
 def _start_supervisor(args):
     assessment = args.command == "supervise-assessment"
+    worker_name = {
+        "supervise-assessment": "_assessment-worker",
+        "supervise-hired-paper": "_hired-paper-worker",
+        "supervise-paper": "_paper-worker",
+    }[args.command]
     command = [
         sys.executable,
         "-I",
         "-m",
         "sourdough.cli",
-        "_assessment-worker" if assessment else "_paper-worker",
+        worker_name,
         str(args.store),
         *([] if assessment else [str(args.journal)]),
         "--company-id",
@@ -58,7 +71,7 @@ def _start_supervisor(args):
         "--budget-from",
         str(count_company_runs(args.store, args.company_id)),
     ]
-    if not assessment and args.repeat_paper:
+    if getattr(args, "repeat_paper", False):
         command.append("--repeat-paper")
     return supervise_worker(
         command,
@@ -116,14 +129,21 @@ def main() -> int:
     source.add_argument("store", type=Path)
     source.add_argument("records", type=Path)
     source.add_argument("--company-id", required=True)
-    for command in ("supervise-assessment", "_assessment-worker"):
+    for command in (
+        "supervise-assessment",
+        "_assessment-worker",
+        "supervise-hired-paper",
+        "_hired-paper-worker",
+    ):
         managed = commands.add_parser(command)
         managed.add_argument("store", type=Path)
+        if "hired-paper" in command:
+            managed.add_argument("journal", type=Path)
         managed.add_argument("--company-id", required=True)
         managed.add_argument("--employee", type=Path, required=True)
         managed.add_argument("--turn-budget", type=int, default=3)
         managed.add_argument("--idle-seconds", type=int, default=140)
-        if command == "supervise-assessment":
+        if command.startswith("supervise-"):
             managed.add_argument("--max-restarts", type=int, default=1)
             managed.add_argument("--startup-seconds", type=int, default=35)
             managed.add_argument("--max-seconds", type=int, default=360)
@@ -230,7 +250,11 @@ def main() -> int:
                 )
             print(json.dumps(result))
             return 0
-        elif args.command in ("supervise-paper", "supervise-assessment"):
+        elif args.command in (
+            "supervise-paper",
+            "supervise-assessment",
+            "supervise-hired-paper",
+        ):
             result = _start_supervisor(args)
             print(json.dumps(asdict(result)))
             return 0 if result.completed else 1
@@ -266,6 +290,18 @@ def main() -> int:
             result = run_assessment_company(
                 args.store,
                 args.company_id,
+                lambda: EmployeeProcess(args.employee),
+                turn_budget=args.turn_budget,
+                idle_seconds=args.idle_seconds,
+                budget_from=args.budget_from,
+                store_key=args.store_key,
+                on_ready=lambda lease: announce_ready(args.ready_fd, lease),
+            )
+        elif args.command == "_hired-paper-worker":
+            result = run_hired_paper_company(
+                args.store,
+                args.company_id,
+                FixedQuoteVenue(args.journal),
                 lambda: EmployeeProcess(args.employee),
                 turn_budget=args.turn_budget,
                 idle_seconds=args.idle_seconds,
@@ -322,7 +358,13 @@ def main() -> int:
     ) as error:
         print(f"Company command refused: {error}", file=sys.stderr)
         return 1
-    print(json.dumps(asdict(result)))
+    fields = (
+        _agent_receipt
+        if args.command
+        in ("operate-hiring", "_assessment-worker", "_hired-paper-worker")
+        else dict
+    )
+    print(json.dumps(asdict(result, dict_factory=fields)))
     return 0
 
 

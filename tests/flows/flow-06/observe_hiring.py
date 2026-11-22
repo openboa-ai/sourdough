@@ -53,7 +53,7 @@ raise SystemExit(cli.main())
 def observe(output, employee):
     compile(WITHHELD_RESOURCES, "withheld hire transport", "exec")
     output.mkdir(mode=0o700)
-    company, identity, trial = prepare(output, employee, hiring_only=True)
+    company, identity, trial = prepare(output, employee, scenario="hiring-only")
     deliveries, workspace = (
         output / name for name in ("hire-deliveries.jsonl", "workspace-cut")
     )
@@ -109,7 +109,7 @@ def observe(output, employee):
         json.loads(line) for line in deliveries.read_text().splitlines()
     ]
     assert original == replay
-    assert original["agent_id"] == blocked[0] == receipt["hire_claim"]["founder_id"]
+    assert original["agent_id"] == blocked[0] == receipt["hire_claim"]["agent_id"]
     assert original["agent_id"] != trial["founding"]["founder_id"]
     assert receipt["hire_claim"]["execution_profile"] == trial["profile"]
     assert rows(company, "SELECT agent_id,allocated_turns FROM hire_receipt") == [

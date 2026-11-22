@@ -8,7 +8,7 @@ from .writer_lease import WriterLease
 
 
 def requeue_uncommitted_work(
-    writer: WriterLease, *, purpose: str | None = None
+    writer: WriterLease, *, purpose: str | None = None, hired_only: bool = False
 ) -> tuple[str, ...]:
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -21,6 +21,11 @@ def requeue_uncommitted_work(
                 "SELECT name FROM sqlite_schema WHERE type = 'table'"
             )
         }
+        if hired_only and "hire_receipt" not in tables:
+            return ()
+        ownership = (
+            "JOIN hire_receipt hire ON hire.agent_id = actor.id" if hired_only else ""
+        )
         committed = (
             "paper_research_decision",
             "paper_decision",
@@ -42,6 +47,7 @@ def requeue_uncommitted_work(
                        CASE WHEN founding.due_work_id IS NOT NULL THEN 'due' ELSE 'scheduled' END
                 FROM duty d JOIN duty_run run ON run.duty_id = d.id AND run.is_current = 1
                 JOIN agent actor ON actor.id = d.agent_id AND actor.company_id = ?
+                {ownership}
                 LEFT JOIN founding_receipt founding ON founding.due_work_id = d.id
                 LEFT JOIN work_follow_up follow_up ON follow_up.duty_id = d.id
                 WHERE d.state = 'running'

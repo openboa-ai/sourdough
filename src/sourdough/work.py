@@ -224,6 +224,40 @@ def claim_assessment_review(
     )
 
 
+def claim_bound_position_review(
+    store: Path, company_id: str, agent_id: str, execution_profile: str, *, now: int
+) -> FollowUpClaim | None:
+    return _claim_follow_up(
+        store, company_id, execution_profile, now, (POSITION_REVIEW,), agent_id=agent_id
+    )
+
+
+def owed_hired_follow_up_owner(
+    store: Path, company_id: str, execution_profile: str, purpose: str
+) -> str | None:
+    with closing(_connect(store, "ro")) as connection:
+        _check_store(connection, company_id)
+        if not connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name='hire_receipt' AND type='table'"
+        ).fetchone():
+            return None
+        row = connection.execute(
+            """SELECT a.id FROM work_follow_up w
+               JOIN duty d ON d.id=w.duty_id AND d.state='scheduled'
+               JOIN agent a ON a.id=d.agent_id AND a.company_id=?
+               JOIN hire_receipt h ON h.agent_id=a.id AND h.grant_id=w.grant_id
+               JOIN standing_grant g ON g.id=h.grant_id AND g.agent_id=a.id
+               WHERE w.purpose=? AND a.execution_profile=? AND g.scope=w.grant_scope
+                 AND h.allocated_turns > (
+                     SELECT count(*) FROM duty owned
+                     JOIN duty_run spent ON spent.duty_id=owned.id WHERE owned.agent_id=a.id
+                 )
+               ORDER BY max(w.due_at,w.available_at),d.id LIMIT 1""",
+            (company_id, purpose, execution_profile),
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
 def _claim_follow_up(
     store: Path,
     company_id: str,

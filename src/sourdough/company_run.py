@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from sqlite3 import Connection
 from time import monotonic, sleep, time
@@ -24,6 +24,7 @@ from .first_trade import (
     resume_opening_research,
     run_first_trade,
 )
+from .onboarding import is_hired_first_duty
 from .paper_account import reopen_binding
 from .paper_books import (
     Posting,
@@ -250,20 +251,30 @@ def _recover(
             "SELECT due_work_id FROM founding_receipt WHERE company_id = ?",
             (company_id,),
         ).fetchone()
+        hired_opening = {
+            order.original_claim.duty_id
+            for order in recovery.recovered
+            if is_hired_first_duty(connection, order.original_claim)
+        }
     blocked = []
     for original in recovery.recovered:
         writer.verify()
         result = _book_reference(store, company_id, original.posting)
         claim = original.original_claim
         try:
-            if claim.duty_id == first_duty_id:
+            hired = claim.duty_id in hired_opening
+            if claim.duty_id == first_duty_id or hired:
                 research = reopen_research_decision(store, claim)
+                if hired and research is None:
+                    raise DutyRefused(
+                        "Hired paper fill must retain its original research"
+                    )
                 finish_first_duty(
                     store,
                     claim,
                     result,
                     due_at=research.next_due_at if research else result.available_at,
-                    purpose=purpose,
+                    purpose=POSITION_REVIEW if hired else purpose,
                 )
             else:
                 work = reopen_follow_up(store, claim)
@@ -272,6 +283,27 @@ def _recover(
         except DutyRefused:
             blocked.append(claim.duty_id)
     return recovery, tuple(blocked)
+
+
+def _retry_reconciliation(
+    writer: WriterLease,
+    venue: FixedQuoteVenue,
+    purpose: str,
+    recovery: PaperReconciliation,
+    blocked: tuple[str, ...],
+    deadline: float,
+) -> tuple[PaperReconciliation, tuple[str, ...]]:
+    recovered = list(recovery.recovered)
+    while recovery.next_query_at is not None and not blocked:
+        remaining = deadline - monotonic()
+        delay = max(0, recovery.next_query_at - time())
+        if remaining <= 0 or delay >= remaining:
+            break
+        if delay:
+            sleep(delay)
+        recovery, blocked = _recover(writer, venue, purpose)
+        recovered.extend(recovery.recovered)
+    return replace(recovery, recovered=tuple(recovered)), blocked
 
 
 def _book_reference(store: Path, company_id: str, posting: Posting) -> ResultReference:

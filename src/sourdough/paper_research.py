@@ -12,6 +12,7 @@ from uuid import uuid4
 from .company import _connect, _identity
 from .duty_run import DutyClaim, DutyRefused
 from .first_duty import require_historical_claim, require_paper_authority
+from .onboarding import has_hired_acceptance
 from .paper_account import reopen_binding
 from .paper_decision import PaperDecision
 from .writer_lease import WriterLease
@@ -381,7 +382,7 @@ def reopen_research_decision(
 
 
 def find_unsubmitted_opening(
-    store: Path, company_id: str
+    store: Path, company_id: str, *, hired: bool = False
 ) -> tuple[DutyClaim, ResearchDecisionReceipt] | None:
     with closing(_connect(store, "ro")) as connection:
         connection.execute("BEGIN")
@@ -392,25 +393,50 @@ def find_unsubmitted_opening(
             if _table(connection, "paper_order")
             else ""
         )
-        row = connection.execute(
-            f"""SELECT f.id, s.grant_id, d.id, r.run_id, f.execution_profile
-                FROM founding_receipt s
-                JOIN agent f ON f.id = s.founder_id AND f.company_id = s.company_id
-                JOIN duty d ON d.id = s.due_work_id AND d.state = 'running'
+        if hired and not _table(connection, "hire_onboarding"):
+            return None
+        ownership = (
+            """JOIN hire_onboarding opening ON opening.first_duty_id = d.id
+               AND opening.agent_id = f.id AND opening.state = 'accepted'"""
+            if hired
+            else """JOIN founding_receipt opening ON opening.due_work_id = d.id
+               AND opening.company_id = f.company_id AND opening.founder_id = f.id
+               AND opening.grant_id = r.grant_id"""
+        )
+        candidates = connection.execute(
+            f"""SELECT f.id, r.grant_id, d.id, r.run_id, f.execution_profile
+                FROM duty d
+                JOIN agent f ON f.id = d.agent_id AND f.company_id = ?
                 JOIN duty_run r ON r.duty_id = d.id AND r.is_current = 1
                 JOIN paper_research_decision decision
                     ON decision.duty_id = d.id AND decision.run_id = r.run_id
-                WHERE s.company_id = ? {unsubmitted}""",
+                {ownership}
+                WHERE d.state = 'running' {unsubmitted}
+                ORDER BY d.rowid""",
             (company_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        claim = DutyClaim(company_id, *row)
-        require_paper_authority(connection, claim)
-        receipt = _research_decision(connection, claim)
-        if receipt is None:
-            raise DutyRefused("Interrupted research decision has no matching finding")
-        return claim, receipt
+        )
+        for row in candidates:
+            claim = DutyClaim(company_id, *row)
+            require_paper_authority(connection, claim)
+            receipt = _research_decision(connection, claim)
+            if receipt is None:
+                raise DutyRefused(
+                    "Interrupted research decision has no matching finding"
+                )
+            decision = receipt.decision
+            if (
+                not hired
+                or decision.action != "buy"
+                or allows_hired_research_order(
+                    connection,
+                    claim,
+                    receipt.decision_id,
+                    decision.quantity,
+                    decision.limit_minor_units,
+                )
+            ):
+                return claim, receipt
+    return None
 
 
 def allows_research_order(
@@ -425,6 +451,64 @@ def allows_research_order(
         receipt.decision.quantity,
         receipt.decision.limit_minor_units,
     ) == (action_id, "buy", quantity, limit)
+
+
+def authorize_hired_research_order(
+    writer: WriterLease, claim: DutyClaim, decision_id: str
+) -> dict:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "rw")) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        require_paper_authority(connection, claim)
+        receipt = _research_decision(connection, claim)
+        if (
+            not has_hired_acceptance(connection, claim)
+            or receipt is None
+            or receipt.decision_id != decision_id
+            or receipt.decision.action != "buy"
+        ):
+            raise DutyRefused(
+                "A hired order must request the original authorized research decision"
+            )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS hired_research_order_request (
+                duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
+                run_id TEXT NOT NULL REFERENCES duty_run(run_id),
+                decision_id TEXT NOT NULL UNIQUE REFERENCES paper_research_decision(decision_id)
+            )"""
+        )
+        terms = (claim.duty_id, claim.run_id, decision_id)
+        connection.execute(
+            "INSERT OR IGNORE INTO hired_research_order_request VALUES (?, ?, ?)", terms
+        )
+        saved = connection.execute(
+            "SELECT duty_id,run_id,decision_id FROM hired_research_order_request WHERE duty_id=?",
+            (claim.duty_id,),
+        ).fetchone()
+        if saved != terms:
+            raise DutyRefused("Order request conflicts with its original receipt")
+        return {"decision_id": decision_id, "disposition": "requested"}
+
+
+def allows_hired_research_order(
+    connection: Connection,
+    claim: DutyClaim,
+    decision_id: str,
+    quantity: int,
+    limit: int,
+) -> bool:
+    return (
+        has_hired_acceptance(connection, claim)
+        and _table(connection, "hired_research_order_request")
+        and connection.execute(
+            """SELECT 1 FROM hired_research_order_request
+               WHERE duty_id=? AND run_id=? AND decision_id=?""",
+            (claim.duty_id, claim.run_id, decision_id),
+        ).fetchone()
+        is not None
+        and requires_research(connection, claim.company_id)
+        and allows_research_order(connection, claim, decision_id, quantity, limit)
+    )
 
 
 def read_research_result(
