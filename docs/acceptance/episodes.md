@@ -1,6 +1,6 @@
 # Five independent company acceptance episodes
 
-Design draft · All five **UNRUN** · [Capability map](../README.md) · [First integration run](first-shift/spec.md#first-integration-run)
+Design draft · All five **UNRUN** · [Capability map](../README.md) · [Founder resilience run](first-shift/spec.md#first-integration-run)
 
 These are executable acceptance designs, not reports of successful tests. Give each its own company fixture, run ID, candidate build, owner, clock, budget, expected facts and bounded observation window before activation. Exercise the normal product entry and authorized actors. The observer may prepare initial conditions, inject the specified faults and read evidence, not issue Agent commands, promote a method, fix a grant or repair the ledger. Capture actual adapter/tool receipts when an Agent judgment is claimed; a mock covers plumbing only. Keep failed, blocked and incomplete trials. Passing all five does not prove the first integrated shift.
 

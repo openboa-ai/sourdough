@@ -2,7 +2,7 @@ name: Repository checks
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'feat/flow-*']
     types: [opened, reopened, synchronize, edited, ready_for_review]
   push:
     branches: [main]
@@ -19,14 +19,20 @@ jobs:
     name: Contribution names
     runs-on: ubuntu-24.04
     timeout-minutes: 3
+    outputs:
+      scope: ${{ steps.product.outputs.scope }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          fetch-depth: 2
           persist-credentials: false
       - name: Run required repository tests
         run: python3 -I .github/scripts/run_required_tests.py .github/scripts
       - name: Check branch and PR title or final commit subject
         run: python3 -I .github/scripts/check_conventions.py
+      - name: Select product checks
+        id: product
+        run: python3 -I .github/scripts/product_scope.py
 
   hygiene:
     name: Repository hygiene
@@ -91,9 +97,37 @@ jobs:
           gitleaks git "${options[@]}" --log-opts="--full-history HEAD" candidate
           gitleaks dir "${options[@]}" candidate
 
+  product:
+    name: Product checks
+    needs: naming
+    if: ${{ needs.naming.outputs.scope != 'none' }}
+    runs-on: ${{ needs.naming.outputs.scope == 'unit' && 'ubuntu-24.04' || 'macos-15' }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version-file: .python-version
+      - name: Install the locked tooling and candidate package
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pip install --no-build-isolation --no-deps .
+      - name: Check format, lint and fast behavior
+        run: |
+          python -m ruff format --check src tests
+          python -m ruff check src tests
+          python -I .github/scripts/run_required_tests.py tests/unit
+      - name: Verify the connected flow
+        if: ${{ needs.naming.outputs.scope != 'unit' }}
+        env:
+          FLOW: ${{ needs.naming.outputs.scope }}
+        run: python -I .github/scripts/run_required_tests.py "tests/flows/$FLOW" test_flow.ConnectedFlow.test_end_to_end
+
   required:
     name: Required CI
-    needs: [naming, hygiene]
+    needs: [naming, hygiene, product]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -102,7 +136,15 @@ jobs:
         env:
           NAMING: ${{ needs.naming.result }}
           HYGIENE: ${{ needs.hygiene.result }}
+          SCOPE: ${{ needs.naming.outputs.scope }}
+          PRODUCT: ${{ needs.product.result }}
         shell: bash
         run: |
           printf 'Contribution names=%s, Repository hygiene=%s\n' "$NAMING" "$HYGIENE"
           [[ "$NAMING" == success && "$HYGIENE" == success ]]
+          printf 'scope=%s, Product checks=%s\n' "$SCOPE" "$PRODUCT"
+          if [[ "$SCOPE" == none ]]; then
+            [[ "$PRODUCT" == skipped ]]
+          else
+            [[ -n "$SCOPE" && "$PRODUCT" == success ]]
+          fi
