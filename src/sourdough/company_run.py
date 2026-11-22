@@ -27,11 +27,14 @@ from .first_trade import (
 from .onboarding import is_hired_first_duty
 from .paper_account import reopen_binding
 from .paper_books import (
+    NoFillObservation,
     Posting,
     PostingRefused,
     capture_position,
     post_confirmed_fill,
-    read_position,
+    read_book_observation,
+    read_booked_no_fill,
+    read_captured_position,
 )
 from .paper_decision import (
     PaperDecision,
@@ -41,7 +44,7 @@ from .paper_decision import (
     reopen_unsubmitted_decisions,
     settle_paper_decision,
 )
-from .paper_execution import PaperExecution, PaperIntent
+from .paper_execution import PaperExecution, PaperIntent, observe_bound_position
 from .paper_order import reserved_exposure, submit_paper_order
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
@@ -158,8 +161,14 @@ def _operate(
     if first is not None:
         research = first.research
         writer.verify()
-        if first.order is not None and first.order.posting is not None:
-            result = _book_reference(store, company_id, first.order.posting)
+        result = (
+            _order_reference(
+                store, company_id, first.order.order_id, first.order.posting, venue
+            )
+            if first.order is not None
+            else None
+        )
+        if result is not None:
             finish_first_duty(
                 store,
                 first.claim,
@@ -180,7 +189,7 @@ def _operate(
                 first,
                 None,
                 reconciliation=reconciliation,
-                blocked_work=blocked,
+                blocked_work=(*blocked, first.claim.duty_id),
                 fenced_runs=fenced_runs,
             )
 
@@ -260,9 +269,16 @@ def _recover(
     blocked = []
     for original in recovery.recovered:
         writer.verify()
-        result = _book_reference(store, company_id, original.posting)
         claim = original.original_claim
         try:
+            if original.posting is not None:
+                result = _book_reference(store, company_id, original.posting, venue)
+                if result is None:
+                    raise DutyRefused("Position observation is not available")
+            elif original.no_fill is not None:
+                result = _no_fill_reference(original.no_fill)
+            else:
+                raise DutyRefused("Reconciled order has no book result")
             hired = claim.duty_id in hired_opening
             if claim.duty_id == first_duty_id or hired:
                 research = reopen_research_decision(store, claim)
@@ -307,8 +323,18 @@ def _retry_reconciliation(
     return replace(recovery, recovered=tuple(recovered)), blocked
 
 
-def _book_reference(store: Path, company_id: str, posting: Posting) -> ResultReference:
-    observation = capture_position(store, company_id, posting.fill_id, now=int(time()))
+def _book_reference(
+    store: Path, company_id: str, posting: Posting, venue: PaperExecution
+) -> ResultReference | None:
+    observation = read_captured_position(store, company_id, posting.fill_id)
+    if observation is None:
+        account = reopen_binding(store, company_id).account
+        source = observe_bound_position(venue, account, posting.order_id)
+        if source is None:
+            return None
+        observation = capture_position(
+            store, company_id, posting.fill_id, source, now=int(time())
+        )
     return ResultReference(
         "paper_position",
         observation.fill_id,
@@ -317,15 +343,37 @@ def _book_reference(store: Path, company_id: str, posting: Posting) -> ResultRef
     )
 
 
+def _no_fill_reference(observation: NoFillObservation) -> ResultReference:
+    return ResultReference(
+        "paper_no_fill",
+        observation.order_id,
+        observation.revision,
+        observation.available_at,
+    )
+
+
+def _order_reference(
+    store: Path,
+    company_id: str,
+    order_id: str,
+    posting: Posting | None,
+    venue: PaperExecution,
+) -> ResultReference | None:
+    if posting is not None:
+        return _book_reference(store, company_id, posting, venue)
+    no_fill = read_booked_no_fill(store, company_id, order_id)
+    return _no_fill_reference(no_fill) if no_fill else None
+
+
 def _read_paper_observation(
     connection: Connection, reference: ResultReference, company_id: str
 ) -> dict:
     if reference.kind == "research_finding":
         return read_research_result(connection, company_id, reference.resource_id)
-    if reference.kind != "paper_position":
-        raise DutyRefused("This duty does not reference a paper position")
     try:
-        observation = read_position(connection, company_id, reference.resource_id)
+        observation = read_book_observation(
+            connection, company_id, reference.kind, reference.resource_id
+        )
     except PostingRefused as error:
         raise DutyRefused("Committed paper observation is unavailable") from error
     return asdict(observation) | {"revision": observation.revision}
@@ -344,7 +392,7 @@ def _review(
         writer.verify()
         quote = (
             observe_review_quote(store, follow_up.claim.company_id, venue)
-            if follow_up.result.kind == "paper_position"
+            if follow_up.result.kind in ("paper_position", "paper_no_fill")
             else None
         )
 
@@ -372,7 +420,7 @@ def _review(
             decision,
             now=int(time()),
             successor_purpose=next_purpose
-            if follow_up.result.kind == "paper_position"
+            if follow_up.result.kind in ("paper_position", "paper_no_fill")
             else POSITION_REVIEW,
         )
     except (DutyRefused, TradeRefused):
@@ -465,9 +513,9 @@ def _apply_later_decision(
     posting = post_confirmed_fill(
         store, claim.company_id, order.order_id, venue, writer=writer
     )
-    if posting is None:
-        return LaterPaperTrade(claim, receipt, order.order_id, None, None)
+    result = _order_reference(store, claim.company_id, order.order_id, posting, venue)
+    if result is None:
+        return LaterPaperTrade(claim, receipt, order.order_id, posting, None)
     writer.verify()
-    result = _book_reference(store, claim.company_id, posting)
     next_duty = settle_paper_decision(store, follow_up, receipt, result)
     return LaterPaperTrade(claim, receipt, order.order_id, posting, next_duty)

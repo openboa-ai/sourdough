@@ -17,6 +17,7 @@ from .paper_execution import (
     PaperOrderSizing,
     VenueCancellation,
     VenueExecution,
+    VenuePosition,
     VenueRefused,
     require_separate_journal,
 )
@@ -444,6 +445,32 @@ class NautilusPaperVenue:
                 if row
                 else None
             )
+
+    def read_order_position(
+        self, account_id: str, order_id: str
+    ) -> VenuePosition | None:
+        deadline = monotonic() + 2
+        while True:
+            with self._connect("ro") as connection:
+                connection.execute("BEGIN")
+                account = self._account(connection, account_id)
+                row = connection.execute(
+                    """SELECT a.position_lots, o.state
+                       FROM sandbox_order o
+                       LEFT JOIN sandbox_account_observation a USING(order_id)
+                       WHERE o.order_id=?""",
+                    (order_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            position, state = row
+            if position is not None:
+                return VenuePosition(
+                    order_id, account_id, account.instrument_rules_digest, position
+                )
+            if state not in ("filled", "unresolved") or monotonic() >= deadline:
+                return None
+            sleep(0.05)
 
     def record_account(
         self, generation: str, order_id: str, position_lots: int, cash_atoms: int

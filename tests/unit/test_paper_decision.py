@@ -57,7 +57,13 @@ class LaterPaperDecision(unittest.TestCase):
         fill = post_confirmed_fill(
             self.store, self.company_id, order.order_id, self.venue
         )
-        position = capture_position(self.store, self.company_id, fill.fill_id, now=100)
+        position = capture_position(
+            self.store,
+            self.company_id,
+            fill.fill_id,
+            self.venue.read_order_position("account", order.order_id),
+            now=100,
+        )
         self.result = ResultReference(
             "paper_position", fill.fill_id, position.revision, 100
         )

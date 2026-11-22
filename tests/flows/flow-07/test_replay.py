@@ -8,6 +8,23 @@ from observe_paper import observe
 
 
 class OfflineReplay(unittest.TestCase):
+    def test_zero_fill_schedules_the_original_agents_follow_up(self):
+        tape = Path(__file__).with_name("causal-quotes.json")
+        with TemporaryDirectory() as scratch:
+            result = observe(Path(scratch) / "zero-fill", None, tape, expected_lots=0)
+        self.assertIsNone(result["posting"])
+        self.assertEqual(
+            (
+                result["cancellation"]["cancelled_lots"],
+                result["cancellation"]["reserved_atoms"],
+            ),
+            (20, 0),
+        )
+        self.assertEqual(
+            result["sandbox_account"],
+            {"position_lots": 0, "cash_atoms": 100_000_000_000},
+        )
+
     def test_sdk_cancellation_releases_only_the_unfilled_remainder(self):
         with TemporaryDirectory() as scratch:
             root = Path(scratch)

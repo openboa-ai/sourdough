@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .paper_account import AccountObserver
+from .paper_account import AccountObserver, PaperAccount
 
 
 class VenueRefused(Exception):
@@ -52,6 +52,14 @@ class VenueCancellation:
     filled_quantity: int
 
 
+@dataclass(frozen=True)
+class VenuePosition:
+    order_id: str
+    account_id: str
+    instrument_rules_digest: str
+    position_quantity: int
+
+
 class PaperDestination(AccountObserver, Protocol):
     def submit(self, order_id: str, account_id: str, intent: PaperIntent) -> None: ...
 
@@ -72,6 +80,29 @@ class PaperExecution(PaperDestination, Protocol):
     def read_cancellation(
         self, account_id: str, order_id: str, *, account_sync: bool = False
     ) -> VenueCancellation | None: ...
+
+    def read_order_position(
+        self, account_id: str, order_id: str
+    ) -> VenuePosition | None: ...
+
+
+def observe_bound_position(
+    venue: PaperExecution, account: PaperAccount, order_id: str
+) -> VenuePosition | None:
+    try:
+        if venue.observe_account(account.account_id) != account:
+            raise VenueRefused("Position lookup requires the bound destination")
+        result = venue.read_order_position(account.account_id, order_id)
+    except TimeoutError:
+        return None
+    if result is not None and (
+        (result.order_id, result.account_id, result.instrument_rules_digest)
+        != (order_id, account.account_id, account.instrument_rules_digest)
+        or type(result.position_quantity) is not int
+        or not 0 <= result.position_quantity <= 2**63 - 1
+    ):
+        raise VenueRefused("Position evidence does not match the original order")
+    return result
 
 
 def require_separate_journal(company_store: Path, venue_journal: Path) -> None:

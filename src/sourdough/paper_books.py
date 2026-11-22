@@ -8,13 +8,20 @@ from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
+from time import time
 from typing import TYPE_CHECKING
 
 from .company import _connect, _identity
 from .paper_account import reopen_binding
+from .paper_execution import observe_bound_position
 
 if TYPE_CHECKING:
-    from .paper_execution import PaperExecution, VenueCancellation, VenueExecution
+    from .paper_execution import (
+        PaperExecution,
+        VenueCancellation,
+        VenueExecution,
+        VenuePosition,
+    )
     from .writer_lease import WriterLease
 
 
@@ -46,6 +53,23 @@ class PositionObservation:
     def revision(self) -> str:
         encoded = json.dumps(asdict(self), sort_keys=True).encode()
         return sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class NoFillObservation:
+    order_id: str
+    event_id: str
+    account_id: str
+    instrument_rules_digest: str
+    position_quantity: int
+    available_at: int
+    fill_quantity: int = 0
+    status: str = "cancelled"
+    position_units: str = "instrument_units"
+
+    @property
+    def revision(self) -> str:
+        return sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
 
 
 _FILL_SCHEMA = """(
@@ -157,6 +181,7 @@ def _apply_cancellation(
     order_id: str,
     order: tuple,
     evidence: VenueCancellation | None,
+    position: VenuePosition | None,
 ) -> None:
     if evidence is not None:
         if (
@@ -172,7 +197,8 @@ def _apply_cancellation(
             """CREATE TABLE IF NOT EXISTS paper_cancellation (
                 order_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_order(order_id),
                 event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL,
-                released INTEGER NOT NULL CHECK (released IN (0,1))
+                released INTEGER NOT NULL CHECK (released IN (0,1)),
+                position_quantity INTEGER, available_at INTEGER
             )"""
         )
         previous = db.execute(
@@ -181,20 +207,27 @@ def _apply_cancellation(
         ).fetchall()
         terms = (order_id, evidence.event_id, evidence.filled_quantity)
         if not previous:
-            db.execute("INSERT INTO paper_cancellation VALUES (?,?,?,0)", terms)
+            db.execute(
+                "INSERT INTO paper_cancellation (order_id,event_id,filled_quantity,released) VALUES (?,?,?,0)",
+                terms,
+            )
         elif previous != [terms]:
             raise PostingRefused(
                 "Cancellation conflicts with recorded terminal evidence"
             )
     if not _has_table(db, "paper_cancellation"):
         return
+    columns = _cancellation_columns(db)
+    for name in ("position_quantity", "available_at"):
+        if name not in columns:
+            db.execute(f"ALTER TABLE paper_cancellation ADD COLUMN {name} INTEGER")
     pending = db.execute(
-        "SELECT filled_quantity,released FROM paper_cancellation WHERE order_id=?",
+        "SELECT filled_quantity,released,available_at FROM paper_cancellation WHERE order_id=?",
         (order_id,),
     ).fetchone()
     if pending is None:
         return
-    cumulative, released = pending
+    cumulative, released, available_at = pending
     booked, spent = db.execute(
         """SELECT COALESCE(SUM(quantity),0),COALESCE(SUM(quantity*price_minor_units),0)
            FROM paper_fill WHERE order_id=?""",
@@ -210,6 +243,52 @@ def _apply_cancellation(
         db.execute(
             "UPDATE paper_cancellation SET released=1 WHERE order_id=?", (order_id,)
         )
+    if booked == cumulative == 0 and available_at is None and position is not None:
+        db.execute(
+            "UPDATE paper_cancellation SET position_quantity=?,available_at=? WHERE order_id=?",
+            (position.position_quantity, int(time()), order_id),
+        )
+
+
+def _cancellation_columns(db: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in db.execute("PRAGMA table_info(paper_cancellation)")}
+
+
+def read_no_fill(
+    connection: sqlite3.Connection, company_id: str, order_id: str
+) -> NoFillObservation | None:
+    if _identity(connection) != company_id:
+        raise PostingRefused("Company identity mismatch")
+    if not {"position_quantity", "available_at"} <= _cancellation_columns(connection):
+        return None
+    row = connection.execute(
+        """SELECT o.order_id,c.event_id,o.account_id,o.instrument_rules_digest,
+                  c.position_quantity,c.available_at
+           FROM paper_cancellation c JOIN paper_order o USING(order_id)
+           WHERE c.order_id=? AND c.released=1 AND c.filled_quantity=0 AND c.available_at IS NOT NULL""",
+        (order_id,),
+    ).fetchone()
+    return NoFillObservation(*row) if row else None
+
+
+def read_booked_no_fill(
+    store: Path, company_id: str, order_id: str
+) -> NoFillObservation | None:
+    with closing(_connect(store, "ro")) as db:
+        db.execute("BEGIN")
+        return read_no_fill(db, company_id, order_id)
+
+
+def read_book_observation(
+    connection: sqlite3.Connection, company_id: str, kind: str, resource_id: str
+) -> PositionObservation | NoFillObservation:
+    if kind == "paper_position":
+        return read_position(connection, company_id, resource_id)
+    if kind == "paper_no_fill":
+        no_fill = read_no_fill(connection, company_id, resource_id)
+        if no_fill is not None:
+            return no_fill
+    raise PostingRefused("Requested book observation does not exist")
 
 
 def resolved_order_sql(db: sqlite3.Connection) -> str:
@@ -217,6 +296,17 @@ def resolved_order_sql(db: sqlite3.Connection) -> str:
     if not _has_table(db, "paper_cancellation"):
         return filled
     return f"({filled} OR EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id AND c.released=1))"
+
+
+def pending_no_fill_observation_sql(db: sqlite3.Connection) -> str:
+    if "available_at" not in _cancellation_columns(db):
+        return "0"
+    return """EXISTS (
+        SELECT 1 FROM paper_cancellation c JOIN duty_run r ON r.run_id=o.run_id
+        JOIN duty d ON d.id=r.duty_id
+        WHERE c.order_id=o.order_id AND c.released=1 AND c.filled_quantity=0
+          AND c.available_at IS NULL AND d.state='running'
+    )"""
 
 
 def post_confirmed_fill(
@@ -239,6 +329,11 @@ def post_confirmed_fill(
     )
     if not observations and cancellation is None:
         return None
+    position = (
+        observe_bound_position(venue, binding.account, order_id)
+        if cancellation is not None and cancellation.filled_quantity == 0
+        else None
+    )
     with closing(_connect(store, "rw")) as db, db:
         legacy = _has_legacy_order_index(db)
         if legacy:
@@ -267,7 +362,7 @@ def post_confirmed_fill(
             ):
                 raise PostingRefused("Fill does not match admitted order")
             _post_fill(db, order_id, observed)
-        _apply_cancellation(db, order_id, order, cancellation)
+        _apply_cancellation(db, order_id, order, cancellation, position)
         if legacy and db.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise PostingRefused("Legacy fill migration did not retain its references")
         return _completed_posting(db, order_id)
@@ -316,7 +411,7 @@ def read_booked_fill(store: Path, company_id: str, order_id: str) -> Posting | N
 
 
 def capture_position(
-    store: Path, company_id: str, fill_id: str, *, now: int
+    store: Path, company_id: str, fill_id: str, source: VenuePosition, *, now: int
 ) -> PositionObservation:
     with closing(_connect(store, "rw")) as db, db:
         db.execute("BEGIN IMMEDIATE")
@@ -331,25 +426,63 @@ def capture_position(
         )
         db.execute(
             """INSERT INTO paper_position_observation
-               SELECT target.fill_id, SUM(booked.quantity), ?
+               SELECT target.fill_id, ?, ?
                FROM paper_fill target
                JOIN paper_order source ON source.order_id = target.order_id
-               JOIN paper_order related ON related.account_id = source.account_id
-                   AND related.instrument_rules_digest = source.instrument_rules_digest
-               JOIN paper_fill booked ON booked.order_id = related.order_id
-               WHERE target.fill_id = ?
-               GROUP BY target.fill_id
+               WHERE target.fill_id = ? AND source.order_id = ? AND source.account_id = ?
+                 AND source.instrument_rules_digest = ?
                ON CONFLICT(fill_id) DO NOTHING""",
-            (now, fill_id),
+            (
+                source.position_quantity,
+                now,
+                fill_id,
+                source.order_id,
+                source.account_id,
+                source.instrument_rules_digest,
+            ),
         )
-        return read_position(db, company_id, fill_id)
+        recorded = read_position(db, company_id, fill_id)
+        if (
+            recorded.order_id,
+            recorded.account_id,
+            recorded.instrument_rules_digest,
+            recorded.position_quantity,
+        ) != (
+            source.order_id,
+            source.account_id,
+            source.instrument_rules_digest,
+            source.position_quantity,
+        ):
+            raise PostingRefused(
+                "Position evidence conflicts with the recorded observation"
+            )
+        return recorded
 
 
 def read_position(
     connection: sqlite3.Connection, company_id: str, fill_id: str
 ) -> PositionObservation:
+    observation = _lookup_position(connection, company_id, fill_id)
+    if observation is None:
+        raise PostingRefused("Requested book observation does not exist")
+    return observation
+
+
+def read_captured_position(
+    store: Path, company_id: str, fill_id: str
+) -> PositionObservation | None:
+    with closing(_connect(store, "ro")) as db:
+        db.execute("BEGIN")
+        return _lookup_position(db, company_id, fill_id)
+
+
+def _lookup_position(
+    connection: sqlite3.Connection, company_id: str, fill_id: str
+) -> PositionObservation | None:
     if _identity(connection) != company_id:
         raise PostingRefused("Company identity mismatch")
+    if not _has_table(connection, "paper_position_observation"):
+        return None
     row = connection.execute(
         """SELECT fill.fill_id, fill.order_id, source.account_id,
                   source.instrument_rules_digest, fill.quantity,
@@ -360,6 +493,4 @@ def read_position(
            WHERE snapshot.fill_id = ?""",
         (fill_id,),
     ).fetchone()
-    if row is None:
-        raise PostingRefused("Requested book observation does not exist")
-    return PositionObservation(*row)
+    return PositionObservation(*row) if row else None

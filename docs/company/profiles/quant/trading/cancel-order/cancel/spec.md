@@ -16,6 +16,8 @@ Address one original order instead of replacing or flattening the entire positio
 
 The local SDK bridge records a terminal cancellation event with the original order ID and cumulative filled quantity. The book releases the unfilled limit exposure only when its independently identified fills sum to that quantity. The terminal event and the release share one durable record; an incomplete observation leaves the reservation and lookup active. This applies to an SDK-initiated IOC cancellation and does not itself authorize a new cancel command.
 
+A reconciled zero-fill cancellation is a work result, not a fill. Record the original order and event, the position already booked for that account and instrument, and the time the result became available. The same authorized Agent may review that receipt on its next scheduled duty. Recovery settles the original duty from the existing receipt without submitting again.
+
 **Concern for the responsible component:** A cancellation response is not final fill history; obtain terminal evidence and account for late fills before releasing headroom.
 
 ## Functional and quality requirements
