@@ -57,10 +57,11 @@ class ExecutionPort(unittest.TestCase):
             )
 
         venue.submit.side_effect = submit
-        venue.observe_execution.side_effect = lambda order_id: (
-            execution
-            if execution is not None and execution.order_id == order_id
-            else None
+        venue.read_fills.side_effect = lambda account_id, order_id, **_: (
+            (execution,)
+            if execution is not None
+            and (execution.account_id, execution.order_id) == (account_id, order_id)
+            else ()
         )
         bind(
             self.store,
@@ -76,6 +77,9 @@ class ExecutionPort(unittest.TestCase):
         self.assertEqual(employee.run.call_args.args[0].order_sizing, sizing)
         venue.submit.assert_called_once()
         order = result.first_trade.order
+        venue.read_fills.assert_any_call(
+            account.account_id, order.order_id, account_sync=False
+        )
         self.assertEqual(reservations_at_send, [(order.order_id, 100)])
         self.assertEqual(order.posting.fill_id, "fill-at-destination")
         self.assertEqual(order.posting.price_minor_units, 99)

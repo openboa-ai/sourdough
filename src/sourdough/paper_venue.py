@@ -180,6 +180,18 @@ class FixedQuoteVenue:
             ).fetchone()
             return self._execution_with_fee(db, row)
 
+    def read_fills(
+        self, account_id: str, order_id: str, *, account_sync: bool = False
+    ) -> tuple[VenueExecution, ...]:
+        observed = (
+            self.sync_account_execution(account_id, order_id)
+            if account_sync
+            else self.observe_execution(order_id)
+        )
+        return (
+            (observed,) if observed is not None and observed.fill_id is not None else ()
+        )
+
     @staticmethod
     def _fee_rate(db: sqlite3.Connection) -> int:
         if not db.execute(

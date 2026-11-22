@@ -63,6 +63,8 @@ class NautilusPaperPort(unittest.TestCase):
         self.venue.prove_account("current", "BINANCE-001", "USDT", opening)
         stamp = time_ns()
         price = self.units.price_per_lot(Decimal("59000"))
+        first_price = price - 10
+        cash_after = self.plan.starting_atoms - 8 * first_price - 12 * price
         self.venue.publish_quote("current", price, stamp, stamp)
         account = self.venue.observe_account("paper")
         self.assertEqual(account.destination_id, destination)
@@ -80,37 +82,44 @@ class NautilusPaperPort(unittest.TestCase):
             self.assertIsNone(self.venue.claim_command("current"))
             with self.assertRaisesRegex(VenueRefused, "original sender"):
                 self.venue.record_fill("departed", "order", "fill", 20, price, 0)
-            self.venue.record_fill("current", "order", "fill", 20, price, 0)
-            self.venue.record_fill("current", "order", "fill", 20, price, 0)
+            self.venue.record_fill("current", "order", "first", 8, first_price, 0)
+            self.venue.record_fill("current", "order", "first", 8, first_price, 0)
+            [partial] = self.venue.read_fills(account.account_id, "order")
+            self.assertEqual((partial.quantity, partial.filled_quantity), (20, 8))
+            self.assertFalse(submission.done())
+            with self.assertRaisesRegex(VenueRefused, "exceed the original order"):
+                self.venue.record_fill("current", "order", "overfill", 13, price, 0)
+            self.venue.record_fill("current", "order", "final", 12, price, 0)
+            self.venue.record_fill("current", "order", "final", 12, price, 0)
             submission.result(timeout=2)
         sender = NautilusPaperVenue(self.venue.journal)
-        posting = sender.observe_execution("order")
+        history = sender.read_fills(account.account_id, "order")
         self.assertEqual(
-            (posting.fill_id, posting.quantity, posting.fee_minor_units),
-            ("fill", 20, 0),
+            [
+                (fill.fill_id, fill.filled_quantity, fill.fill_price_minor_units)
+                for fill in history
+            ],
+            [("first", 8, first_price), ("final", 12, price)],
         )
-        self.assertIsNone(sender.sync_account_execution(account.account_id, "order"))
+        self.assertEqual(
+            sender.read_fills(account.account_id, "order", account_sync=True), ()
+        )
         with self.assertRaisesRegex(VenueRefused, "missing a corroborated"):
             sender.start_generation()
         with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
             sender.observe_quote(account.account_id)
+        self.assertFalse(sender.record_account("departed", "order", 20, cash_after))
         self.assertFalse(
-            sender.record_account(
-                "departed", "order", 20, self.plan.starting_atoms - 20 * price
-            )
-        )
-        self.assertTrue(
             sender.record_account(
                 "current", "order", 20, self.plan.starting_atoms - 20 * price
             )
         )
+        self.assertTrue(sender.record_account("current", "order", 20, cash_after))
         self.assertEqual(
-            sender.sync_account_execution(account.account_id, "order"), posting
+            sender.read_fills(account.account_id, "order", account_sync=True), history
         )
         checkpoint = sender.start_generation()
-        self.assertEqual(
-            checkpoint, SandboxBalance(20, self.plan.starting_atoms - 20 * price)
-        )
+        self.assertEqual(checkpoint, SandboxBalance(20, cash_after))
         with self.assertRaisesRegex(VenueRefused, "original verified balances"):
             sender.prove_account("replacement", "BINANCE-001", "USDT", opening)
         sender.prove_account("replacement", "BINANCE-001", "USDT", checkpoint)
@@ -123,7 +132,7 @@ class NautilusPaperPort(unittest.TestCase):
                 database.execute(
                     "SELECT count(*) FROM sandbox_fill_observation"
                 ).fetchone(),
-                (1,),
+                (2,),
             )
             self.assertEqual(
                 database.execute(
