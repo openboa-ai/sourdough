@@ -6,6 +6,8 @@ import sqlite3
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import date
+from pathlib import Path
+from time import time_ns
 
 from .company import _connect, _identity
 from .general_ledger import _label
@@ -124,6 +126,13 @@ class CloseReceipt:
         return not self.issues
 
 
+@dataclass(frozen=True)
+class ClosedPeriod:
+    request: CloseRequest
+    receipt: CloseReceipt
+    assessed_ns: int | None
+
+
 def _encoded(value) -> str:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), default=date.isoformat
@@ -138,6 +147,50 @@ def _receipt(payload: str) -> CloseReceipt:
         for issue in values["issues"]
     )
     return CloseReceipt(**values)
+
+
+def _has_assessment_time(database: sqlite3.Connection) -> bool:
+    return any(
+        column[1] == "assessed_ns"
+        for column in database.execute("PRAGMA table_info(accounting_close)")
+    )
+
+
+def read_period_close(
+    store: Path, company_id: str, request_id: str
+) -> ClosedPeriod | None:
+    if not _label(request_id):
+        raise CloseRefused("Expected an exact close request ID")
+    with closing(_connect(store, "ro")) as database:
+        database.execute("BEGIN")
+        if _identity(database) != company_id:
+            raise CloseRefused("Period close belongs to another company")
+        if not database.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='accounting_close'"
+        ).fetchone():
+            return None
+        assessed = "assessed_ns" if _has_assessment_time(database) else "NULL"
+        row = database.execute(
+            f"SELECT request,receipt,{assessed} FROM accounting_close WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    fields = json.loads(row[0])
+    fields["from_date"] = date.fromisoformat(fields["from_date"])
+    fields["through_date"] = date.fromisoformat(fields["through_date"])
+    fields["expense_accounts"] = tuple(fields["expense_accounts"])
+    fields["expected_costs"] = tuple(
+        ExpectedCost(**cost) for cost in fields["expected_costs"]
+    )
+    request, receipt = CloseRequest(**fields), _receipt(row[1])
+    if (request.company_id, request.request_id) != (company_id, request_id) or (
+        request.request_id,
+        request.statement_revision,
+        request.supersedes,
+    ) != (receipt.request_id, receipt.statement_revision, receipt.supersedes):
+        raise CloseRefused("Close receipt no longer matches its original request")
+    return ClosedPeriod(request, receipt, row[2])
 
 
 def _assess(database: sqlite3.Connection, request: CloseRequest) -> CloseReceipt:
@@ -249,9 +302,14 @@ def close_period(writer: WriterLease, request: CloseRequest) -> CloseReceipt:
                    scope TEXT NOT NULL,
                    supersedes TEXT UNIQUE REFERENCES accounting_close(request_id),
                    request TEXT NOT NULL,
-                   receipt TEXT NOT NULL
+                   receipt TEXT NOT NULL,
+                   assessed_ns INTEGER
                )"""
         )
+        if not _has_assessment_time(database):
+            database.execute(
+                "ALTER TABLE accounting_close ADD COLUMN assessed_ns INTEGER"
+            )
         replay = database.execute(
             "SELECT request,receipt FROM accounting_close WHERE request_id=?",
             (request.request_id,),
@@ -280,15 +338,17 @@ def close_period(writer: WriterLease, request: CloseRequest) -> CloseReceipt:
                 raise CloseRefused(
                     "A correction cannot remove cost sources or change the chart"
                 )
+        assessed_ns = time_ns()
         receipt = _assess(database, request)
         database.execute(
-            "INSERT INTO accounting_close VALUES (?,?,?,?,?)",
+            "INSERT INTO accounting_close VALUES (?,?,?,?,?,?)",
             (
                 request.request_id,
                 scope,
                 request.supersedes,
                 payload,
                 _encoded(asdict(receipt)),
+                assessed_ns,
             ),
         )
         writer.verify()
