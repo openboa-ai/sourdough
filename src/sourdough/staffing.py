@@ -237,10 +237,16 @@ def read_need(writer: WriterLease, claim: DutyClaim) -> dict:
         if prior is not None:
             return json.loads(prior[0]) | {"revision": prior[1]}
         slots, turns = _remaining(connection, claim.grant_id)
+        permitted_profile, permitted_scope = connection.execute(
+            "SELECT execution_profile, allowed_scope FROM staffing_authority WHERE grant_id = ?",
+            (claim.grant_id,),
+        ).fetchone()
         snapshot = json.loads(body) | {
             "need_revision": revision,
             "available_slots": slots,
             "available_turns": turns,
+            "profile": permitted_profile,
+            "scope": permitted_scope,
         }
         saved = _canonical(snapshot)
         observed = sha256(saved.encode()).hexdigest()

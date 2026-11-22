@@ -1,4 +1,7 @@
+import json
 import sqlite3
+import subprocess
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -26,6 +29,7 @@ from sourdough.staffing import (
     record_choice,
     stage_staffing,
 )
+from sourdough.staffing_tools import StaffingTools
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -251,3 +255,54 @@ class Staffing(unittest.TestCase):
             self.rows("SELECT state FROM hire_onboarding"), [("accepted",)]
         )
         self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
+
+    def test_manager_sees_only_staffing_tools_and_requires_a_separate_hire(self):
+        manager, _ = self.ready("need")
+        tools = StaffingTools(self.writer, manager)
+        observation = tools.invoke("read_staffing_need", {})
+        request = tools.invoke(
+            "record_staffing_choice",
+            {
+                "action": "defer",
+                "alternatives": ["reassign", "hire"],
+                "evidence_revision": observation["revision"],
+                "rationale": "Defer while testing the current team's capacity.",
+                "next_check_seconds": 300,
+            },
+        )
+        with self.assertRaisesRegex(DutyRefused, "choice to hire"):
+            tools.invoke(
+                "request_hire",
+                {
+                    "request_id": "unwarranted",
+                    "choice_id": request["choice_id"],
+                    "role": "reviewer",
+                    "execution_profile": observation["profile"],
+                    "scope": observation["scope"],
+                    "turns": 2,
+                },
+            )
+        with self.assertRaisesRegex(DutyRefused, "not available"):
+            tools.invoke("paper_buy", {"quantity": 1, "limit_minor_units": 100})
+        self.assertEqual(self.rows("SELECT count(*) FROM agent"), [(1,)])
+        script = Path(__file__).resolve().parents[2] / "tools/codex_employee.py"
+        response = subprocess.run(
+            [
+                sys.executable,
+                "-IB",
+                script,
+                "--mcp-staffing",
+                "unused",
+                self.store.with_suffix(".json"),
+            ],
+            input='{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n',
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        )
+        registered = json.loads(response.stdout)["result"]["tools"]
+        self.assertEqual(
+            [definition["name"] for definition in registered],
+            ["read_staffing_need", "record_staffing_choice", "request_hire"],
+        )
