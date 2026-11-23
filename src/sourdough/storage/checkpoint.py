@@ -638,6 +638,10 @@ def restore_store(
             shadow,
             desk_dir=staged_desk if desk_target is not None else None,
         )
+        if manifest.desk_files and desk_target is None:
+            raise CheckpointRefused(
+                "Checkpoint archive bundles Desk files; desk_destination is required"
+            )
 
         # Verify logical watermark against live original store (immune to WAL layout)
         with closing(open_reader(lease.store)) as original, read_tx(original):

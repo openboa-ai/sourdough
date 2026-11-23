@@ -228,6 +228,16 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         occupied_desk = self.root / "occupied-desk"
         occupied_desk.mkdir()
         replacement = self.root / "never-published.sqlite"
+        # Omitting desk_destination for a Desk-bundled checkpoint must refuse cleanly
+        with self.assertRaisesRegex(CheckpointRefused, "desk_destination is required"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                lease_directory=self.leases,
+            )
+        self.assertFalse(replacement.exists())
         with self.assertRaisesRegex(CheckpointRefused, "Desk restore destination"):
             restore_store(
                 self.store,
