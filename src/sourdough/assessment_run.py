@@ -1,22 +1,27 @@
 """Run a hired assessment and its saved review without an execution venue."""
 
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import asdict, dataclass, replace
+from functools import partial
 from pathlib import Path
 from time import monotonic, sleep, time
 
 from .abandoned_work import has_uncommitted_work, requeue_uncommitted_work
 from .collaboration import company_work_run
-from .company import upgrade_work_schema
+from .company import _connect, upgrade_work_schema
 from .company_assessment import (
     ASSESSMENT,
     ASSESSMENT_REVIEW_WORKFLOW,
     ASSESSMENT_WORKFLOW,
+    MANAGER_ASSESSMENT,
     AssessmentReceipt,
     invoke_assessment,
+    manager_review_project,
     pending_publications,
     persist_assessment_draft,
     read_assessment_result,
+    review_result_allowed,
     settle_assessment,
 )
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, count_company_runs
@@ -27,6 +32,7 @@ from .work import (
     FollowUp,
     FollowUpClaim,
     ReviewDecision,
+    ResultEligibility,
     claim_assessment_review,
     owed_hired_follow_up_owner,
     settle_review,
@@ -79,9 +85,22 @@ def run_assessment_company(
             return AssessmentRun(None, None, tuple(restored), None)
 
         employee = runtime()
-        agent_id = owed_hired_follow_up_owner(
-            store, company_id, employee.profile, ASSESSMENT_REVIEW
-        )
+
+        eligible_result = partial(review_result_allowed, company_id=company_id)
+
+        def next_owner():
+            return owed_hired_follow_up_owner(
+                store,
+                company_id,
+                employee.profile,
+                ASSESSMENT_REVIEW,
+                eligible_additional_owner=lambda connection, agent_id, result: (
+                    result.kind == MANAGER_ASSESSMENT
+                    and eligible_result(connection, agent_id, result)
+                ),
+            )
+
+        agent_id = next_owner()
         hiring = None
         publication = None
         if agent_id is None:
@@ -119,9 +138,7 @@ def run_assessment_company(
             if publication is None:
                 return AssessmentRun(hiring, None, tuple(restored), None)
             hiring = replace(hiring, accepted=True)
-            agent_id = owed_hired_follow_up_owner(
-                store, company_id, employee.profile, ASSESSMENT_REVIEW
-            )
+            agent_id = next_owner()
             remaining = turn_budget - (
                 count_company_runs(store, company_id) - budget_from
             )
@@ -129,14 +146,12 @@ def run_assessment_company(
         reviews = []
         deadline = monotonic() + idle_seconds
         while agent_id and remaining > 0:
-            review = _review(writer, employee, agent_id, deadline)
+            review = _review(writer, employee, agent_id, deadline, eligible_result)
             if review is None:
                 break
             reviews.append(review)
             remaining -= 1
-            agent_id = owed_hired_follow_up_owner(
-                store, company_id, employee.profile, ASSESSMENT_REVIEW
-            )
+            agent_id = next_owner()
         return AssessmentRun(
             hiring,
             publication,
@@ -147,15 +162,24 @@ def run_assessment_company(
 
 
 def _review(
-    writer: WriterLease, employee: EmployeeProcess, agent_id: str, deadline: float
+    writer: WriterLease,
+    employee: EmployeeProcess,
+    agent_id: str,
+    deadline: float,
+    eligible_result: ResultEligibility,
 ) -> AssessmentReview | None:
     while True:
         writer.verify()
         work = claim_assessment_review(
-            writer.store, writer.company_id, agent_id, employee.profile, now=int(time())
+            writer.store,
+            writer.company_id,
+            agent_id,
+            employee.profile,
+            now=int(time()),
+            eligible_result=eligible_result,
         )
         if work is not None:
-            return _run_review(writer, employee, work)
+            return _run_review(writer, employee, work, eligible_result)
         remaining = deadline - monotonic()
         if remaining <= 0:
             return None
@@ -163,9 +187,25 @@ def _review(
 
 
 def _run_review(
-    writer: WriterLease, employee: EmployeeProcess, work: FollowUpClaim
+    writer: WriterLease,
+    employee: EmployeeProcess,
+    work: FollowUpClaim,
+    eligible_result: ResultEligibility,
 ) -> AssessmentReview:
     committed = None
+    project_id = None
+    workflow = ASSESSMENT_REVIEW_WORKFLOW
+    if work.result.kind == MANAGER_ASSESSMENT:
+        with closing(_connect(writer.store, "ro")) as connection:
+            project_id = manager_review_project(
+                connection, work.claim.company_id, work.claim.founder_id, work.result
+            )
+        workflow = replace(
+            workflow,
+            instruction="Review the published assessment addressed to you. "
+            "Read the project discussion and reply if the result needs a response. "
+            + workflow.instruction,
+        )
 
     def invoke(name: str, arguments: dict) -> dict:
         nonlocal committed
@@ -185,6 +225,7 @@ def _run_review(
             decision,
             now=int(time()),
             successor_purpose=ASSESSMENT_REVIEW,
+            eligible_result=eligible_result,
         )
         committed = AssessmentReview(work.claim, decision, next_duty)
         return asdict(committed)
@@ -192,9 +233,10 @@ def _run_review(
     run = company_work_run(
         writer,
         work.claim,
-        ASSESSMENT_REVIEW_WORKFLOW,
+        workflow,
         invoke,
         clock=lambda: int(time()),
+        project_id=project_id,
     )
     try:
         employee.run_scoped("assessment_review", run)

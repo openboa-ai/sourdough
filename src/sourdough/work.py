@@ -43,6 +43,9 @@ class ResultReference:
         _time(self.available_at)
 
 
+ResultEligibility = Callable[[sqlite3.Connection, str, ResultReference], bool]
+
+
 @dataclass(frozen=True)
 class FollowUp:
     duty_id: str
@@ -214,6 +217,7 @@ def claim_assessment_review(
     execution_profile: str,
     *,
     now: int,
+    eligible_result: ResultEligibility | None = None,
 ) -> FollowUpClaim | None:
     return _claim_follow_up(
         store,
@@ -222,6 +226,7 @@ def claim_assessment_review(
         now,
         (ASSESSMENT_REVIEW,),
         agent_id=agent_id,
+        eligible_result=eligible_result,
     )
 
 
@@ -234,7 +239,12 @@ def claim_bound_position_review(
 
 
 def owed_hired_follow_up_owner(
-    store: Path, company_id: str, execution_profile: str, purpose: str
+    store: Path,
+    company_id: str,
+    execution_profile: str,
+    purpose: str,
+    *,
+    eligible_additional_owner: ResultEligibility | None = None,
 ) -> str | None:
     with closing(_connect(store, "ro")) as connection:
         _check_store(connection, company_id)
@@ -243,20 +253,34 @@ def owed_hired_follow_up_owner(
         ).fetchone():
             return None
         candidates = connection.execute(
-            """SELECT a.id FROM work_follow_up w
+            """SELECT a.id,h.agent_id,w.result_kind,w.result_id,w.result_revision,w.available_at
+               FROM work_follow_up w
                JOIN duty d ON d.id=w.duty_id AND d.state='scheduled'
                JOIN agent a ON a.id=d.agent_id AND a.company_id=?
-               JOIN hire_receipt h ON h.agent_id=a.id AND h.grant_id=w.grant_id
-               JOIN standing_grant g ON g.id=h.grant_id AND g.agent_id=a.id
+               LEFT JOIN hire_receipt h ON h.agent_id=a.id AND h.grant_id=w.grant_id
+               JOIN standing_grant g ON g.id=w.grant_id AND g.agent_id=a.id
                WHERE w.purpose=? AND a.execution_profile=? AND g.scope=w.grant_scope
+                 AND (h.agent_id IS NOT NULL OR (? AND g.scope='manage-company'))
                ORDER BY max(w.due_at,w.available_at),d.id""",
-            (company_id, purpose, execution_profile),
+            (
+                company_id,
+                purpose,
+                execution_profile,
+                eligible_additional_owner is not None,
+            ),
         )
         return next(
             (
                 agent_id
-                for (agent_id,) in candidates
+                for agent_id, hired, *reference in candidates
                 if has_turn_capacity(connection, agent_id)
+                and (
+                    hired is not None
+                    or eligible_additional_owner is not None
+                    and eligible_additional_owner(
+                        connection, agent_id, ResultReference(*reference)
+                    )
+                )
             ),
             None,
         )
@@ -270,6 +294,7 @@ def _claim_follow_up(
     purposes: tuple[str, ...],
     *,
     agent_id: str | None = None,
+    eligible_result: ResultEligibility | None = None,
 ) -> FollowUpClaim | None:
     _time(now)
     placeholders = ", ".join("?" for _ in purposes)
@@ -303,6 +328,12 @@ def _claim_follow_up(
                 candidate
                 for candidate in candidates
                 if has_turn_capacity(connection, candidate[1])
+                and (
+                    eligible_result is None
+                    or eligible_result(
+                        connection, candidate[1], ResultReference(*candidate[5:])
+                    )
+                )
             ),
             None,
         )
@@ -415,6 +446,7 @@ def settle_review(
     *,
     now: int,
     successor_purpose: str = POSITION_REVIEW,
+    eligible_result: ResultEligibility | None = None,
 ) -> FollowUp:
     _time(now)
     next_due = _time(now + decision.next_check_seconds)
@@ -465,6 +497,10 @@ def settle_review(
             raise DutyRefused("Review conflicts with the original decision")
         if state != "running":
             raise DutyRefused("Duty cannot settle a review")
+        if eligible_result is not None and not eligible_result(
+            connection, claim.founder_id, follow_up.result
+        ):
+            raise DutyRefused("The review result is no longer in scope")
         require_result_read(connection, follow_up, decision.observation_revision, now)
         connection.execute(
             "INSERT INTO work_review_decision VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

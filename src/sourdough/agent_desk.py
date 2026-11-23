@@ -24,6 +24,18 @@ class Draft:
     content: str
 
 
+def ensure_private_desk(
+    database: Connection, company_id: str, agent_id: str, execution_profile: str
+) -> None:
+    revision = sha256(
+        f"{company_id}:{agent_id}:{execution_profile}".encode()
+    ).hexdigest()
+    database.execute(
+        "INSERT INTO private_desk VALUES (?,?) ON CONFLICT(agent_id) DO NOTHING",
+        (agent_id, revision),
+    )
+
+
 def require_desk(database: Connection, claim: DutyClaim, purpose: str) -> str:
     authority = resolve_run(database, claim)
     authority.require_current(purpose)

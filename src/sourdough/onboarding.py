@@ -9,6 +9,7 @@ from sqlite3 import Connection
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
+from .agent_desk import ensure_private_desk
 from .company import _connect
 from .company_assets import enroll_project_participant
 from .duty_run import (
@@ -262,12 +263,7 @@ def provision_hire(
                     ),
                 )
             else:
-                revision = sha256(
-                    f"{writer.company_id}:{agent_id}:{profile}".encode()
-                ).hexdigest()
-                connection.execute(
-                    "INSERT INTO private_desk VALUES (?, ?)", (agent_id, revision)
-                )
+                ensure_private_desk(connection, writer.company_id, agent_id, profile)
                 duty_id = uuid4().hex
                 connection.execute(
                     "INSERT INTO duty VALUES (?, ?, 'due')", (duty_id, agent_id)
