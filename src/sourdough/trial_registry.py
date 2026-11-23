@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import stat
+from collections import Counter
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
@@ -17,6 +18,7 @@ _TABLES = {"trial_suite", "trial_reservation"}
 _WITH_OBSERVATIONS = _TABLES | {"trial_observation"}
 _WITH_GRADES = _WITH_OBSERVATIONS | {"trial_grade"}
 _REGISTRY_LAYOUTS = (_TABLES, _WITH_OBSERVATIONS, _WITH_GRADES)
+_INVALIDATIONS = "trial_invalidation"
 
 
 class TrialRefused(Exception):
@@ -244,6 +246,13 @@ class TrialGrade:
     def criteria(self) -> tuple[bool | None, ...]:
         return self.grounding, self.relevant_constraints, self.feasible_next_action
 
+    def judgment_passed(self, outcome: str) -> bool:
+        return (
+            outcome == "completed"
+            and all(flag is True for flag in self.criteria)
+            and self.authority_violations == 0
+        )
+
 
 @dataclass(frozen=True)
 class PairedTrialGrade:
@@ -255,11 +264,26 @@ class PairedTrialGrade:
 
     @property
     def judgment_passed(self) -> bool:
-        return (
-            self.packet.outcome == "completed"
-            and all(flag is True for flag in self.grade.criteria)
-            and self.grade.authority_violations == 0
-        )
+        return self.grade.judgment_passed(self.packet.outcome)
+
+
+@dataclass(frozen=True)
+class TrialJudgmentSummary:
+    planned: int
+    uncovered: int
+    incomplete: int
+    completed: int
+    failed: int
+    timed_out: int
+    no_decision: int
+    invalidated: int
+    scored: int
+    judgment_passed: int
+    planned_cases: int
+    cases_all_passed: int
+    service_correct: int
+    service_incorrect: int
+    usage_evidence_available: int
 
 
 def _private_key(path: Path) -> tuple[int, int]:
@@ -308,7 +332,7 @@ def _tables(database: sqlite3.Connection) -> set[str]:
 
 
 def _sealed_suite(database: sqlite3.Connection, revision: str) -> dict:
-    if _tables(database) not in _REGISTRY_LAYOUTS:
+    if _tables(database) - {_INVALIDATIONS} not in _REGISTRY_LAYOUTS:
         raise TrialRefused("Store is not a sealed trial registry")
     stored = database.execute(
         "SELECT revision,document FROM trial_suite WHERE singleton=1"
@@ -329,7 +353,7 @@ def seal_trial_suite(path: Path, suite: TrialSuite) -> str:
     with closing(_open(path, create=True)) as database, database:
         database.execute("BEGIN IMMEDIATE")
         tables = _tables(database)
-        if tables in _REGISTRY_LAYOUTS:
+        if tables - {_INVALIDATIONS} in _REGISTRY_LAYOUTS:
             prior = database.execute(
                 "SELECT revision,document FROM trial_suite WHERE singleton=1"
             ).fetchone()
@@ -392,6 +416,8 @@ def reserve_trial_launch(
             if original != (run_id,):
                 raise TrialRefused("Trial slot has already reserved its original run")
             return TrialReservation(run_id, False)
+        if slot_id in _invalidations(database):
+            raise TrialRefused("Invalidated trial slot cannot launch")
         if database.execute(
             "SELECT 1 FROM trial_reservation WHERE run_id=?", (run_id,)
         ).fetchone():
@@ -460,30 +486,73 @@ def trial_run_records(path: Path, *, revision: str) -> tuple[TrialRunRecord, ...
     with closing(_open(path)) as database, database:
         database.execute("BEGIN")
         slots = _sealed_suite(database, revision)["slots"]
-        query = (
-            """SELECT trial_reservation.slot_id,trial_reservation.run_id,result_id,evidence
-               FROM trial_reservation LEFT JOIN trial_observation USING(run_id)"""
-            if "trial_observation" in _tables(database)
-            else "SELECT slot_id,run_id,NULL,NULL FROM trial_reservation"
-        )
-        reservations = {
-            slot_id: TrialRunRecord(
-                slot_id,
-                run_id,
-                result_id,
-                None if raw is None else TrialTerminalEvidence(**json.loads(raw)),
-            )
-            for slot_id, run_id, result_id, raw in database.execute(query)
-        }
-        return tuple(
-            reservations.get(slot["slot_id"])
-            or TrialRunRecord(slot["slot_id"], None, None, None)
-            for slot in slots
-        )
+        return _run_records(database, slots)
 
 
-def _blinded(suite: dict, result_id: str, document: str) -> BlindedTrial:
-    evidence = TrialTerminalEvidence(**json.loads(document))
+def _run_records(
+    database: sqlite3.Connection, slots: list[dict]
+) -> tuple[TrialRunRecord, ...]:
+    query = (
+        """SELECT trial_reservation.slot_id,trial_reservation.run_id,result_id,evidence
+           FROM trial_reservation LEFT JOIN trial_observation USING(run_id)"""
+        if "trial_observation" in _tables(database)
+        else "SELECT slot_id,run_id,NULL,NULL FROM trial_reservation"
+    )
+    reservations = {
+        slot_id: TrialRunRecord(
+            slot_id,
+            run_id,
+            result_id,
+            None if raw is None else TrialTerminalEvidence(**json.loads(raw)),
+        )
+        for slot_id, run_id, result_id, raw in database.execute(query)
+    }
+    return tuple(
+        reservations.get(slot["slot_id"])
+        or TrialRunRecord(slot["slot_id"], None, None, None)
+        for slot in slots
+    )
+
+
+def _invalidations(database: sqlite3.Connection) -> dict[str, str]:
+    if _INVALIDATIONS not in _tables(database):
+        return {}
+    return dict(
+        database.execute("SELECT slot_id,evidence_digest FROM trial_invalidation")
+    )
+
+
+def invalidate_trial_slot(
+    path: Path, *, revision: str, slot_id: str, evidence_digest: str
+) -> str:
+    if not _label(slot_id) or not _digest(evidence_digest):
+        raise TrialRefused("Trial invalidation requires an exact evidence reference")
+    with closing(_open(path)) as database, database:
+        database.execute("BEGIN IMMEDIATE")
+        if not any(
+            slot["slot_id"] == slot_id
+            for slot in _sealed_suite(database, revision)["slots"]
+        ):
+            raise TrialRefused("Trial slot is not registered")
+        prior = _invalidations(database).get(slot_id)
+        if prior is not None:
+            if prior != evidence_digest:
+                raise TrialRefused("Trial invalidation is already committed")
+            return prior
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS trial_invalidation (
+                   slot_id TEXT PRIMARY KEY NOT NULL, evidence_digest TEXT NOT NULL
+               )"""
+        )
+        database.execute(
+            "INSERT INTO trial_invalidation VALUES (?,?)", (slot_id, evidence_digest)
+        )
+        return evidence_digest
+
+
+def _blinded(
+    suite: dict, result_id: str, evidence: TrialTerminalEvidence
+) -> BlindedTrial:
     return BlindedTrial(
         result_id,
         suite["rubric_digest"],
@@ -506,14 +575,21 @@ def _trial_for_grading(
     suite = _sealed_suite(database, revision)
     original = (
         database.execute(
-            "SELECT evidence FROM trial_observation WHERE result_id=?", (result_id,)
+            """SELECT reservation.slot_id, observation.evidence
+               FROM trial_observation AS observation
+               JOIN trial_reservation AS reservation USING(run_id)
+               WHERE observation.result_id=?""",
+            (result_id,),
         ).fetchone()
         if "trial_observation" in _tables(database)
         else None
     )
     if original is None:
         raise TrialRefused("No terminal observation for this blind result")
-    return _blinded(suite, result_id, original[0])
+    slot_id, evidence = original
+    if slot_id in _invalidations(database):
+        raise TrialRefused("Trial evidence is invalidated")
+    return _blinded(suite, result_id, TrialTerminalEvidence(**json.loads(evidence)))
 
 
 def blind_trial_packet(path: Path, *, revision: str, result_id: str) -> BlindedTrial:
@@ -567,40 +643,97 @@ def commit_blind_grade(
         return grade
 
 
+def _read_grades(
+    database: sqlite3.Connection, suite: dict, records: tuple[TrialRunRecord, ...]
+) -> dict[str, tuple[BlindedTrial, TrialGrade]]:
+    if "trial_grade" not in _tables(database):
+        return {}
+    by_result = {
+        record.result_id: record for record in records if record.result_id is not None
+    }
+    graded = {}
+    for result_id, packet_revision, grade in database.execute(
+        "SELECT * FROM trial_grade"
+    ):
+        record = by_result.get(result_id)
+        if record is None or record.evidence is None:
+            raise TrialRefused("Stored score has no terminal record")
+        packet = _blinded(suite, result_id, record.evidence)
+        if packet.revision != packet_revision:
+            raise TrialRefused("Recorded grade no longer matches its packet")
+        graded[record.slot_id] = packet, TrialGrade(**json.loads(grade))
+    return graded
+
+
 def reconcile_paired_grades(
     path: Path, *, revision: str
 ) -> tuple[PairedTrialGrade, ...] | None:
     with closing(_open(path)) as database, database:
         database.execute("BEGIN")
         suite = _sealed_suite(database, revision)
-        paired = [slot for slot in suite["slots"] if slot["counterpart_id"] is not None]
-        if not paired or "trial_grade" not in _tables(database):
+        slots = suite["slots"]
+        paired = [slot for slot in slots if slot["counterpart_id"] is not None]
+        invalidated = _invalidations(database)
+        if not paired or any(slot["slot_id"] in invalidated for slot in paired):
             return None
-        grades = {
-            slot_id: (result_id, evidence, packet_revision, grade)
-            for slot_id, result_id, evidence, packet_revision, grade in database.execute(
-                """SELECT reservation.slot_id, observation.result_id, observation.evidence,
-                          grade.packet_revision, grade.grade
-                   FROM trial_reservation AS reservation
-                   JOIN trial_observation AS observation USING(run_id)
-                   JOIN trial_grade AS grade USING(result_id)"""
-            )
-        }
+        grades = _read_grades(database, suite, _run_records(database, slots))
         if any(slot["slot_id"] not in grades for slot in paired):
             return None
-        result = []
-        for slot in paired:
-            result_id, evidence, packet_revision, grade = grades[slot["slot_id"]]
-            packet = _blinded(suite, result_id, evidence)
-            if packet.revision != packet_revision:
-                raise TrialRefused("Recorded grade no longer matches its packet")
-            result.append(
-                PairedTrialGrade(
-                    slot["slot_id"],
-                    slot["counterpart_id"],
-                    slot["arm"],
-                    packet,
-                    TrialGrade(**json.loads(grade)),
-                )
+        return tuple(
+            PairedTrialGrade(
+                slot["slot_id"],
+                slot["counterpart_id"],
+                slot["arm"],
+                *grades[slot["slot_id"]],
             )
-        return tuple(result)
+            for slot in paired
+        )
+
+
+def trial_judgment_summary(path: Path, *, revision: str) -> TrialJudgmentSummary:
+    with closing(_open(path)) as database, database:
+        database.execute("BEGIN")
+        suite = _sealed_suite(database, revision)
+        slots = suite["slots"]
+        records = _run_records(database, slots)
+        invalidated = _invalidations(database)
+        graded = _read_grades(database, suite, records)
+        valid_grades = {
+            slot_id: (packet, grade)
+            for slot_id, (packet, grade) in graded.items()
+            if slot_id not in invalidated
+        }
+        passed = {
+            slot_id
+            for slot_id, (packet, grade) in valid_grades.items()
+            if grade.judgment_passed(packet.outcome)
+        }
+        cases = {slot["case_id"] for slot in slots}
+        not_all_passed = {
+            slot["case_id"] for slot in slots if slot["slot_id"] not in passed
+        }
+        states = Counter(record.state for record in records)
+        return TrialJudgmentSummary(
+            planned=len(slots),
+            uncovered=states["uncovered"],
+            incomplete=states["incomplete"],
+            completed=states["completed"],
+            failed=states["failed"],
+            timed_out=states["timed-out"],
+            no_decision=states["no-decision"],
+            invalidated=len(invalidated),
+            scored=len(graded),
+            judgment_passed=len(passed),
+            planned_cases=len(cases),
+            cases_all_passed=len(cases - not_all_passed),
+            service_correct=sum(
+                grade.service_correct is True for _, grade in valid_grades.values()
+            ),
+            service_incorrect=sum(
+                grade.service_correct is False for _, grade in valid_grades.values()
+            ),
+            usage_evidence_available=sum(
+                record.evidence is not None and record.evidence.usage_digest is not None
+                for record in records
+            ),
+        )

@@ -5,6 +5,7 @@ import sys
 import unittest
 from contextlib import closing
 from dataclasses import asdict, replace
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -20,9 +21,11 @@ from sourdough.trial_registry import (
     blind_trial_packet,
     commit_blind_grade,
     commit_trial_observation,
+    invalidate_trial_slot,
     reconcile_paired_grades,
     reserve_trial_launch,
     seal_trial_suite,
+    trial_judgment_summary,
     trial_run_records,
 )
 
@@ -336,6 +339,50 @@ print(json.dumps(asdict(TrialGrade(True, True, True, 1, True))))
         self.assertEqual(
             [item.packet.result_id for item in grades], [p.result_id for p in packets]
         )
+        baseline = trial_judgment_summary(self.store, revision=revision)
+        self.assertEqual(
+            (baseline.planned, baseline.scored, baseline.judgment_passed), (2, 2, 1)
+        )
+        self.assertEqual((baseline.planned_cases, baseline.cases_all_passed), (1, 0))
+        self.assertEqual((baseline.service_correct, baseline.service_incorrect), (1, 1))
+        observed_leak = b"worker input contains a sealed expected decision"
+        invalidation = {
+            "revision": revision,
+            "slot_id": right.slot_id,
+            "evidence_digest": sha256(observed_leak).hexdigest(),
+        }
+        self.assertEqual(
+            invalidate_trial_slot(self.store, **invalidation),
+            invalidation["evidence_digest"],
+        )
+        self.assertEqual(
+            invalidate_trial_slot(self.store, **invalidation),
+            invalidation["evidence_digest"],
+        )
+        with self.assertRaisesRegex(TrialRefused, "already committed"):
+            invalidate_trial_slot(
+                self.store, **(invalidation | {"evidence_digest": "7" * 64})
+            )
+        self.assertIsNone(reconcile_paired_grades(self.store, revision=revision))
+        with self.assertRaisesRegex(TrialRefused, "invalidated"):
+            blind_trial_packet(
+                self.store, revision=revision, result_id=packets[1].result_id
+            )
+        records = trial_run_records(self.store, revision=revision)
+        self.assertEqual(records[-1].result_id, packets[1].result_id)
+        summary = trial_judgment_summary(self.store, revision=revision)
+        self.assertEqual(
+            summary,
+            replace(baseline, invalidated=1, judgment_passed=0, service_incorrect=0),
+        )
+        with closing(sqlite3.connect(self.store.as_uri() + "?mode=ro", uri=True)) as db:
+            self.assertEqual(
+                db.execute("SELECT count(*) FROM trial_grade").fetchone(), (2,)
+            )
+            self.assertEqual(
+                db.execute("SELECT evidence_digest FROM trial_invalidation").fetchone(),
+                (invalidation["evidence_digest"],),
+            )
 
     def test_missing_observations_cannot_support_a_grade_claim(self):
         revision = seal_trial_suite(self.store, self.plan)
@@ -375,6 +422,26 @@ print(json.dumps(asdict(TrialGrade(True, True, True, 1, True))))
             ],
             ["timed-out", "uncovered"],
         )
+        invalidate_trial_slot(
+            self.store,
+            revision=revision,
+            slot_id=self.other.slot_id,
+            evidence_digest="6" * 64,
+        )
+        with self.assertRaisesRegex(TrialRefused, "cannot launch"):
+            self.reserve(revision, slot_id=self.other.slot_id, run_id="not-started")
+        summary = trial_judgment_summary(self.store, revision=revision)
+        self.assertEqual(
+            (
+                summary.planned,
+                summary.timed_out,
+                summary.uncovered,
+                summary.invalidated,
+            ),
+            (2, 1, 1, 1),
+        )
+        self.assertEqual((summary.service_correct, summary.service_incorrect), (0, 0))
+        self.assertEqual(summary.usage_evidence_available, 0)
 
     def test_operating_company_store_is_not_a_trial_store_even_with_local_write_access(
         self,
