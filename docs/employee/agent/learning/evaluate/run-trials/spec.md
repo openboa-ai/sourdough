@@ -16,6 +16,16 @@ Grade the recorded decision and tool effects separately rather than using profit
 
 **Concern for the responsible component:** Seal labels and budgets outside Agent tools. Retain failed attempts and calibrate the subjective rubric against independently labeled boundary cases.
 
+### Offline trial ledger
+
+Keep one evaluator-owned local store per sealed suite, separate from every trial company and Agent workspace. Register the suite before launching any worker. The canonical registration pins the protocol, ordered trial slots, case and family identities, isolated company starting-state and authorized input revisions, rubric and evaluator revisions, granted tool manifest, runtime profile and resource ceilings. A paired slot identifies its treatment and counterpart in the private registry. A transfer suite also pins the [recursive trial's comparison](../../../../../acceptance/recursive-learning/spec.md) and stopping rule before launch. Changing any sealed term requires a new suite; it does not revise a completed attempt.
+
+Send the runner only the material that the configured Agent is allowed to see at that decision cut. The Agent must not see evaluator labels, expected effects, concealed fault timing, its treatment identifier, or unpublished later cases. Keep blinded case evidence under opaque result IDs; reconcile treatment identity only after the evaluator's per-case scores commit. The scheduler checks the registered input digest and scoped runtime binding before launching. An input or binding mismatch is not a model failure.
+
+Reserve a slot before its one launch and bind that attempt to the original run ID. The evaluator joins that identity to separately retained decisions, tool attempts, authorized service effects and usage observations. A denied unsafe tool attempt is an Agent violation even when service enforcement passes. Commit the terminal observation once: exact delivery returns the original record and changed terms conflict. Keep terminal failures, timeouts and known no-decisions. An unstarted slot is uncovered; an unknown or interrupted launch remains incomplete until its original evidence is resolved. Do not silently relaunch a consumed slot or count an unobserved effect as a denial.
+
+Report judgment, service correctness, coverage, actual usage and timeout as separate outcomes on the registered denominator. Unknown cost is unavailable, not zero. Evidence of leakage invalidates the affected trial evidence without erasing the recorded attempt. An incomplete pair or a contaminated comparison cannot confer adoption or establish recursive improvement. This store has no production writer, role administration, deployment action or grader tool available to an Agent.
+
 ## Functional and quality requirements
 
 - **FR.** Compare configurations on sealed cases and equal budgets with a justified-deferral control. Return judgment, service correctness, coverage, cost and timeout separately. Trade coverage applies only to the quant suite.
@@ -29,6 +39,8 @@ Grade the recorded decision and tool effects separately rather than using profit
 | --- | --- |
 | Normal | Grade a grounded deferral on an outdated document with no quant tools. The quant suite additionally evaluates stale market inputs and decisions after the book changes. |
 | Failure or contention | Run a case with no headroom. If an Agent requests a risk increase and the service denies it, record Agent failure and service success separately. Leak a future label in a trial fixture: invalidate that trial and retain its record. |
+| Registration and replay | Register a finite suite and independently retain its digest and ordered slots. Refuse changed input or profile revisions before launch. Interrupt after slot reservation; retain its original identity and refuse a second launch. Record one completion and repeat delivery; reopen one terminal observation, while an omitted slot is still uncovered. |
+| Isolation and blinding | Independently verify that the ordinary worker tool and workspace inputs contain no label, treatment identifier or future-case material. Compare the grader input with the sealed rubric and confirm that matching arms to scores happens only after scores are recorded. Keep a discovered leak visible as invalid evidence. |
 
 ## Operations and change review
 
