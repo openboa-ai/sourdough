@@ -1,4 +1,4 @@
-# Commit the employment cutoff
+# Archive the Agent and revoke access
 
 Design draft · Verification **UNRUN** · Responsible component: Organization and authority
 
@@ -6,13 +6,15 @@ Design draft · Verification **UNRUN** · Responsible component: Organization an
 
 ## Boundary and dependencies
 
-Check company, decision maker, termination grant, reason, target, expected employment revision, successor/continuity coverage and request ID. Commit active → retiring, effective sequence and Agent-wide admission fence together.
+Check company, decision maker, termination grant, reason, target, expected employment revision and request ID. Commit active → archived in one transition.
 
 Input contracts: [revoke-access/retire](../../../authority/revoke-access/retire/spec.md) · [authorize-actor/check](../../../authority/authorize-actor/check/spec.md) · [resume-work/recover-shift](../../../work/resume-work/recover-shift/spec.md).
 
 ## Design decision and review
 
 Enforce the employment fence at each new claim, turn, grant and tool admission; do not wait for every distributed revocation acknowledgment to block new effects.
+
+The local cutoff consumes a distinct existing termination grant. In one transaction, record the permanent archive, revoke the grant, fence runs, and close the Agent's outstanding duties as archived. There is no intermediate retirement state, successor requirement, or return to active status. The founding owner is outside this local transition. Existing action receipts keep their original Agent and run IDs.
 
 **Concern for the responsible component:** Do not erase historical receipts or hide effects already admitted. Human employment, personal data deletion and production account administration are outside scope.
 
@@ -32,4 +34,4 @@ Enforce the employment fence at each new claim, turn, grant and tool admission; 
 
 ## Operations and change review
 
-Track revocation lag and unresolved external bindings. Recovery resumes retirement, not the Agent’s session.
+Track revocation lag and unresolved external bindings separately. No restart can reactivate the archived Agent.

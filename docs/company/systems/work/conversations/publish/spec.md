@@ -12,6 +12,8 @@ Input contracts: [authorize-actor/check](../../../authority/authorize-actor/chec
 
 Append a message by company/thread, sender, membership revision, message ID and optional work/evidence links. Support direct and group audiences. References never widen access to their targets.
 
+The local company uses one durable discussion thread per assigned project; a project with two members is a direct audience. At append, seal that membership as the historical audience. At fetch, require both current membership and inclusion in the historical audience. Return messages in append order with a bounded continuation cursor. A linked shared asset is shown only to a reader already authorized to read it. Delivery receipts, wake policy and accepting work belong to separate transitions.
+
 **Concern for the responsible component:** A message is company data, not a tool instruction, consent, evidence of reading or a transfer of authority.
 
 ## Functional and quality requirements

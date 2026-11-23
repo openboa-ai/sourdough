@@ -431,27 +431,31 @@ class Staffing(unittest.TestCase):
         )
 
     @staticmethod
-    def offer_review(read):
-        evidence = read()
-        return {
-            "tool": "record_review_decision",
-            "call_id": "review-call",
-            "observation_revision": evidence["revision"],
-            "action": "investigate",
-            "rationale": "The verified count still differs.",
-            "next_check_seconds": 60,
-        }
+    def offer_review(operation, run):
+        if operation != "assessment_review":
+            raise AssertionError("Expected the scoped assessment review")
+        evidence = run.call("read_work_result", {})
+        return run.call(
+            "record_review_decision",
+            {
+                "observation_revision": evidence["revision"],
+                "action": "investigate",
+                "rationale": "The verified count still differs.",
+                "next_check_seconds": 60,
+            },
+        )
 
     def test_interrupted_assessment_review_reclaims_its_duty_and_rereads(self):
         hire, follow_up = self.arrange_due_assessment(turns=3)
         self.lease.close()
         employee = Mock(profile="profile")
 
-        def interrupted(read):
-            read()
+        def interrupted(operation, run):
+            self.assertEqual(operation, "assessment_review")
+            run.call("read_work_result", {})
             raise TradeRefused("Lost employee session before review settlement")
 
-        employee.review_assessment.side_effect = interrupted
+        employee.run_scoped.side_effect = interrupted
         with self.assertRaisesRegex(TradeRefused, "Lost employee session"):
             self.activate_assessment(employee)
         (departed,) = self.rows(
@@ -459,7 +463,7 @@ class Staffing(unittest.TestCase):
         )
         self.assertEqual(departed[1], 1)
 
-        employee.review_assessment.side_effect = self.offer_review
+        employee.run_scoped.side_effect = self.offer_review
         result = self.activate_assessment(employee)
         replacement = result.review.claim
         self.assertEqual(replacement.founder_id, hire.agent_id)
@@ -489,7 +493,7 @@ class Staffing(unittest.TestCase):
         self.stage("next-staffing")
         self.lease.close()
         employee = Mock(profile="profile")
-        employee.review_assessment.side_effect = self.offer_review
+        employee.run_scoped.side_effect = self.offer_review
         first_run = self.activate_assessment(employee)
         self.assertEqual(first_run.review.claim.founder_id, first.agent_id)
 
@@ -514,7 +518,7 @@ class Staffing(unittest.TestCase):
         )
         self.assertEqual(later.hiring.manager_claim.duty_id, "next-staffing")
         self.assertIsNone(later.review)
-        employee.review_assessment.assert_called_once()
+        employee.run_scoped.assert_called_once()
 
     def test_general_paper_scheduler_cannot_claim_beyond_a_hire_allocation(self):
         self.authority = replace(self.authority, allowed_scope="paper")
@@ -628,6 +632,24 @@ class Staffing(unittest.TestCase):
             [(first.duty_id, resumed.duty_id)],
         )
         self.assertEqual(self.rows("SELECT count(*) FROM agent"), [(1,)])
+
+    def test_no_unassigned_staff_preserves_the_delegated_hiring_allowance(self):
+        stage_staffing(
+            self.writer,
+            self.authority,
+            StaffingNeed("overloaded", "Review the backlog", 5, 0, 1, self.now),
+        )
+        manager = claim_staffing(self.writer, "profile", now=self.now)
+        observation = StaffingTools(self.writer, manager).invoke(
+            "read_staffing_need", {}
+        )
+        self.assertEqual(
+            observation["existing_staff_capacity"], {"unassigned": 0, "assigned": 1}
+        )
+        self.assertNotIn("available_capacity", observation)
+        self.assertEqual(
+            (observation["available_slots"], observation["available_turns"]), (1, 4)
+        )
 
     def test_manager_sees_only_staffing_tools_and_requires_a_separate_hire(self):
         manager, _ = self.ready("need")

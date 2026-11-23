@@ -12,6 +12,8 @@ Input contracts: [company-assets/assign](../../../../company/systems/resources/c
 
 Resolve company/Agent to a durable desk manifest, private notes, work references and separate ephemeral scratch. Mount only resources allowed at open time; shared documents retain their own ACLs.
 
+The local workspace service retains versioned private drafts in company custody. The scoped run receives only its own permitted notes, materialized as plain files in a fresh native working directory. Do not mount the source database or local account home. These notes are data, not instructions or grants. The initial read-only view does not yet accept native edits or authorize publication.
+
 **Concern for the responsible component:** Private means limited visibility inside company custody, not Agent ownership or automatic visibility to every colleague.
 
 ## Functional and quality requirements

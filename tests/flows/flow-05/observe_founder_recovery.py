@@ -85,7 +85,9 @@ def observe(output: Path, employee: Path):
         output / name
         for name in ("company.sqlite", "venue.sqlite", "cut.json", "observations.json")
     )
-    profile = cli("employee-profile", employee)["execution_profile"]
+    profile = cli("employee-profile", employee, "--sandbox", "local-macos")[
+        "execution_profile"
+    ]
     employee_selection = json.loads(
         subprocess.run(
             [str(employee)],

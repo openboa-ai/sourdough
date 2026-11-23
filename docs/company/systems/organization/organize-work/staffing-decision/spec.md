@@ -14,6 +14,8 @@ Input contracts: [Record a decision and its next condition](../../../work/discov
 
 Record alternatives and their costs when a need arises instead of provisioning a fixed organization chart.
 
+Present assigned and unassigned capacity of existing staff separately from remaining hiring slots and delegated turn budget. Zero unassigned staff capacity is not zero hiring allowance. Preserve the identity of the decision-time snapshot; the hire command still enforces the current remaining allowance.
+
 **Concern for the responsible component:** Grade a reasoned decision not to hire as potentially correct; verify hire capability separately if the free trial never uses it.
 
 ## Functional and quality requirements

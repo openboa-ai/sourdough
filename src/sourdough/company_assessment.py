@@ -8,8 +8,11 @@ from sqlite3 import Connection
 from time import time
 from uuid import uuid4
 
+from .agent_desk import save_draft
+from .company_assets import shared_asset_for
 from .company import _connect
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, resolve_run
+from .harness import ScopedWorkflow, tool
 from .onboarding import has_hired_acceptance, invoke_onboarding
 from .work import (
     FollowUp,
@@ -18,10 +21,83 @@ from .work import (
     read_follow_up_result,
     schedule_follow_up,
 )
+from .work_handoff import accepted_handoff, shared_revision
 from .writer_lease import WriterLease
 
 
 ASSESSMENT = "assessment"
+SAVE_PRIVATE_DRAFT = tool(
+    "save_private_draft",
+    "Save a private Markdown draft for your next duty. No sharing. Use an empty revision for a new draft.",
+    {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,47}$"},
+        "content": {"type": "string"},
+        "expected_revision": {"type": "string"},
+    },
+)
+ASSESSMENT_WORKFLOW = ScopedWorkflow(
+    ASSESSMENT,
+    "Read your assignment and accept it if authorized. Compare the reported and observed "
+    "values in one accessible company record. Publish an assessment with your rationale "
+    "and a proposed next check. You cannot change the source records.",
+    (
+        SAVE_PRIVATE_DRAFT,
+        tool("read_first_duty", "Read your assignment and private Desk reference.", {}),
+        tool(
+            "accept_first_duty",
+            "Explicitly accept the assignment you read.",
+            {
+                "revision": {"type": "string"},
+                "rationale": {"type": "string", "maxLength": 2000},
+            },
+        ),
+        tool("read_assessment_inputs", "Read the authorized company records.", {}),
+        tool(
+            "publish_assessment",
+            "Publish one assessment for the permitted audience.",
+            {
+                "source_revision": {"type": "string"},
+                "record_id": {"type": "string"},
+                "disposition": {
+                    "enum": ["recommend_change", "no_change", "investigate"]
+                },
+                "rationale": {"type": "string", "maxLength": 2000},
+                "next_check_seconds": {
+                    "type": "integer",
+                    "minimum": 60,
+                    "maximum": 86400,
+                },
+            },
+        ),
+    ),
+    "publish_assessment",
+)
+
+ASSESSMENT_REVIEW_WORKFLOW = ScopedWorkflow(
+    ASSESSMENT_REVIEW,
+    "Inspect the preceding company result. Decide whether to hold, investigate, or recommend "
+    "a change. Cite the observation, record the reason, and choose the next check. "
+    "A review does not change the source records.",
+    (
+        SAVE_PRIVATE_DRAFT,
+        tool("read_work_result", "Read the authorized result and current records.", {}),
+        tool(
+            "record_review_decision",
+            "Record the reviewed decision and next responsibility.",
+            {
+                "observation_revision": {"type": "string"},
+                "action": {"enum": ["hold", "investigate", "recommend_change"]},
+                "rationale": {"type": "string", "maxLength": 2000},
+                "next_check_seconds": {
+                    "type": "integer",
+                    "minimum": 60,
+                    "maximum": 86400,
+                },
+            },
+        ),
+    ),
+    "record_review_decision",
+)
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS assessment_source (
         company_id TEXT PRIMARY KEY NOT NULL REFERENCES company(id),
@@ -327,6 +403,17 @@ def read_assessment_result(
     writer.verify_for(writer.store, claim.company_id)
 
     def project(connection, reference):
+        if reference.kind == "shared_asset":
+            asset = shared_asset_for(
+                connection, claim.founder_id, reference.resource_id
+            )
+            if reference.revision != shared_revision(asset):
+                raise DutyRefused("Shared handoff evidence revision changed")
+            result = {"revision": reference.revision, "shared_evidence": asdict(asset)}
+            handoff = accepted_handoff(connection, claim, asset.asset_id)
+            if handoff is not None:
+                result["handoff"] = handoff
+            return result
         if reference.kind != "company_assessment":
             raise DutyRefused("This review does not reference a company assessment")
         row = connection.execute(
@@ -363,6 +450,8 @@ def read_assessment_result(
 def invoke_assessment(
     writer: WriterLease, claim: DutyClaim, name: str, arguments: dict
 ) -> dict:
+    if name == "save_private_draft":
+        return persist_assessment_draft(writer, claim, ASSESSMENT, arguments)
     if name == "read_assessment_inputs" and arguments == {}:
         return read_assessment_inputs(writer, claim, now=int(time()))
     if name == "publish_assessment" and isinstance(arguments, dict):
@@ -372,3 +461,24 @@ def invoke_assessment(
             raise DutyRefused("Unexpected assessment publication fields") from error
         return asdict(publish_assessment(writer, claim, proposal, now=int(time())))
     return invoke_onboarding(writer, claim, name, arguments)
+
+
+def persist_assessment_draft(
+    writer: WriterLease, claim: DutyClaim, purpose: str, arguments: dict
+) -> dict:
+    if (
+        not isinstance(arguments, dict)
+        or arguments.keys() != {"name", "content", "expected_revision"}
+        or not isinstance(arguments["expected_revision"], str)
+    ):
+        raise DutyRefused("Private draft requires an explicit base revision")
+    return asdict(
+        save_draft(
+            writer,
+            claim,
+            purpose,
+            name=arguments["name"],
+            content=arguments["content"],
+            expected_revision=arguments["expected_revision"] or None,
+        )
+    )
