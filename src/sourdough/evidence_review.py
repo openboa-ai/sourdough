@@ -105,20 +105,23 @@ class ReviewQualification:
         )
 
 
+def review_criteria_digest(cases: tuple[ReviewCase, ...]) -> str:
+    if type(cases) is not tuple or not 1 <= len(cases) <= 32:
+        raise ReviewRuleRefused("Expected a bounded set of independent cases")
+    return _digest(
+        [EVALUATOR_REVISION, [(case.present, case.expected_missing) for case in cases]]
+    )
+
+
 def qualify_review_rule(
     candidate: ReviewRule,
     baseline: ReviewRule | None,
     cases: tuple[ReviewCase, ...],
 ) -> ReviewQualification:
-    if type(cases) is not tuple or not cases:
-        raise ReviewRuleRefused("Independent qualification requires cases")
-    criteria_digest = _digest(
-        [EVALUATOR_REVISION, [(case.present, case.expected_missing) for case in cases]]
-    )
     return ReviewQualification(
         candidate.digest,
         baseline.digest if baseline is not None else None,
-        criteria_digest,
+        review_criteria_digest(cases),
         tuple(
             CheckOutcome(
                 case.present,
