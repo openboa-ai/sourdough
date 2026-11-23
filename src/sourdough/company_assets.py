@@ -322,34 +322,54 @@ class SharedAssetReference:
     duty_id: str
 
 
-def discover_shared_assets(
+@dataclass(frozen=True)
+class PublicationReceipt:
+    asset_id: str
+    project_id: str
+    duty_id: str
+    request_id: str
+
+
+def discover_project_references(
     writer: WriterLease,
     claim: DutyClaim,
     purpose: str,
     after: str,
-) -> tuple[tuple[SharedAssetReference, ...], str]:
+) -> tuple[tuple[SharedAssetReference, ...], tuple[PublicationReceipt, ...], str]:
     if after and not _label(after):
         raise DutyRefused("Invalid shared asset cursor")
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
         require_desk(database, claim, purpose)
-        page = tuple(
-            SharedAssetReference(*row)
-            for row in database.execute(
-                """WITH visible AS (
-                       SELECT a.rowid AS position,a.asset_id,a.project_id,a.author_id,a.duty_id
+        page = database.execute(
+            """WITH scoped AS (
+                       SELECT a.rowid AS position,a.asset_id,a.project_id,a.author_id,a.duty_id,
+                              EXISTS (SELECT 1 FROM json_each(a.audience) WHERE value=:actor) AS can_read,
+                              CASE WHEN a.author_id=:actor AND a.duty_id=:duty
+                                AND EXISTS (SELECT 1 FROM json_each(p.publishers) WHERE value=:actor)
+                                THEN a.request_id END AS receipt
                        FROM shared_publication a JOIN shared_project p ON p.project_id=a.project_id
-                       WHERE EXISTS (SELECT 1 FROM json_each(p.members) WHERE value=?)
-                         AND EXISTS (SELECT 1 FROM json_each(a.audience) WHERE value=?)
+                       WHERE EXISTS (SELECT 1 FROM json_each(p.members) WHERE value=:actor)
+                   ), visible AS (
+                       SELECT * FROM scoped WHERE can_read OR receipt IS NOT NULL
                    )
-                   SELECT asset_id,project_id,author_id,duty_id FROM visible
-                   WHERE ?='' OR position<(SELECT position FROM visible WHERE asset_id=?)
+                   SELECT asset_id,project_id,author_id,duty_id,can_read,receipt FROM visible
+                   WHERE :after='' OR position<(SELECT position FROM visible WHERE asset_id=:after)
                    ORDER BY position DESC LIMIT 33""",
-                (claim.founder_id, claim.founder_id, after, after),
-            )
+            {"actor": claim.founder_id, "duty": claim.duty_id, "after": after},
+        ).fetchall()
+        assets = tuple(
+            SharedAssetReference(asset, project, author, duty)
+            for asset, project, author, duty, can_read, _ in page[:32]
+            if can_read
         )
-        return page[:32], page[31].asset_id if len(page) > 32 else ""
+        receipts = tuple(
+            PublicationReceipt(asset, project, duty, receipt)
+            for asset, project, _, duty, _, receipt in page[:32]
+            if receipt is not None
+        )
+        return assets, receipts, page[31][0] if len(page) > 32 else ""
 
 
 def project_access(

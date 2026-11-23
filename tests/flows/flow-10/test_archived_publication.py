@@ -43,24 +43,33 @@ else:
     scope = call("read_project_assignments", {"after": ""})
     [project] = scope["projects"]
     if prior["shared_evidence"]["asset_id"] == "author-input":
-        draft = call("save_private_draft", {
-            "name": "report", "content": "Published finding. Private appendix.",
-            "expected_revision": "",
-        })
-        call("publish_draft_selection", {
-            "request_id": "publish", "draft_name": draft["name"],
-            "draft_revision": draft["revision"], "project_id": project["project_id"],
-            "project_revision": project["revision"], "audience": ["recipient"],
-            "start": 0, "end": 18,
-        })
-        raise RuntimeError("The independently committed publication reply should be withheld")
-    assert prior["shared_evidence"]["asset_id"] == "recipient-input"
-    [published] = [asset for asset in scope["shared_assets"] if asset["author_id"] == "author"]
-    evidence = call("read_shared_asset", {"asset_id": published["asset_id"]})
-    assert evidence["content"] == "Published finding." and request["harness"]["drafts"] == []
+        if not request["harness"]["drafts"]:
+            draft = call("save_private_draft", {
+                "name": "report", "content": "Published finding. Private appendix.",
+                "expected_revision": "",
+            })
+            call("publish_draft_selection", {
+                "request_id": "publish", "draft_name": draft["name"],
+                "draft_revision": draft["revision"], "project_id": project["project_id"],
+                "project_revision": project["revision"], "audience": ["recipient"],
+                "start": 0, "end": 18,
+            })
+            raise RuntimeError("The independently committed publication reply should be withheld")
+        [receipt] = scope["publication_receipts"]
+        assert receipt["request_id"] == "publish", receipt
+        assert all(asset["asset_id"] != receipt["asset_id"] for asset in scope["shared_assets"])
+        [draft] = request["harness"]["drafts"]
+        assert draft["content"] == "Published finding. Private appendix."
+        asset_id = receipt["asset_id"]
+    else:
+        assert prior["shared_evidence"]["asset_id"] == "recipient-input"
+        [published] = [asset for asset in scope["shared_assets"] if asset["author_id"] == "author"]
+        evidence = call("read_shared_asset", {"asset_id": published["asset_id"]})
+        assert evidence["content"] == "Published finding." and request["harness"]["drafts"] == []
+        asset_id = evidence["asset_id"]
     result = call("record_review_decision", {
         "observation_revision": prior["revision"], "action": "hold",
-        "rationale": "Verified the original publication " + evidence["asset_id"],
+        "rationale": "Verified the original publication " + asset_id,
         "next_check_seconds": 86400,
     })
 print(json.dumps(result))
@@ -84,7 +93,7 @@ collaboration.publish_selection = publish_then_exit
 
 
 class ArchivedPublication(unittest.TestCase):
-    def test_restart_preserves_publication_but_fences_the_archived_author(self):
+    def interrupt_publication(self):
         root = Path(self.enterContext(TemporaryDirectory()))
         employee, store, marker = (
             root / name for name in ("employee", "company.sqlite", "publication.json")
@@ -145,9 +154,47 @@ class ArchivedPublication(unittest.TestCase):
         ]
         self.assertEqual(exit_event["returncode"], 76)
         witnessed = json.loads(marker.read_text())
-        asset_id = witnessed["asset"]["asset_id"]
         claim = DutyClaim(**witnessed["claim"])
         self.assertEqual(claim.founder_id, "author")
+        return store, company_id, command, claim, witnessed
+
+    def test_reopened_author_recovers_original_receipt_without_republishing(self):
+        store, _, command, original, witnessed = self.interrupt_publication()
+        resumed = subprocess.run(
+            [sys.executable, "-IB", "-c", SUPERVISOR, WORKER, *command],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        result, supervision = map(json.loads, resumed.stdout.splitlines())
+        self.assertTrue(supervision["completed"])
+        original_asset = witnessed["asset"]["asset_id"]
+        review = result["review"]
+        self.assertEqual(review["claim"]["agent_id"], original.founder_id)
+        self.assertEqual(review["claim"]["duty_id"], original.duty_id)
+        self.assertNotEqual(review["claim"]["run_id"], original.run_id)
+        self.assertIn(original_asset, review["decision"]["rationale"])
+        self.assertEqual(
+            rows(
+                store,
+                "SELECT asset_id,author_id,content FROM shared_publication WHERE request_id<>'seed'",
+            ),
+            [(original_asset, original.founder_id, "Published finding.")],
+        )
+        self.assertEqual(
+            rows(
+                store,
+                "SELECT run_id,is_current FROM duty_run WHERE duty_id=? ORDER BY rowid",
+                (original.duty_id,),
+            ),
+            [(original.run_id, 0), (review["claim"]["run_id"], 1)],
+        )
+        self.assertEqual(rows(store, "PRAGMA foreign_key_check"), [])
+
+    def test_restart_preserves_publication_but_fences_the_archived_author(self):
+        store, company_id, command, claim, witnessed = self.interrupt_publication()
+        asset_id = witnessed["asset"]["asset_id"]
 
         def publication():
             return rows(
