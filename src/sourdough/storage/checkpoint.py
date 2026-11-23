@@ -300,30 +300,98 @@ def _validate_desk_relative_path(relative: str) -> PurePosixPath:
     return pure
 
 
-def _collect_desk_files(desk_root: Path) -> list[tuple[str, Path]]:
-    resolved_root = desk_root.resolve(strict=True)
-    if not resolved_root.is_dir():
-        raise CheckpointRefused("Desk snapshot root is not a directory")
-    collected: list[tuple[str, Path]] = []
-    for dirpath, dirnames, filenames in os.walk(resolved_root, followlinks=False):
-        dirnames.sort()
-        filenames.sort()
-        current_dir = Path(dirpath)
-        for name in list(dirnames):
-            candidate = current_dir / name
-            if candidate.is_symlink():
-                raise CheckpointRefused(f"Symlink prohibited inside Desk: {name}")
-        for name in filenames:
-            candidate = current_dir / name
-            info = candidate.lstat()
+def _stage_pinned_desk(
+    source_root: Path,
+    dest_root: Path,
+    *,
+    fsync_files: bool = False,
+) -> tuple[str, ...]:
+    """Copy Desk files using O_NOFOLLOW dir_fd traversal and fstat-pinned reads.
+
+    Every subdirectory and regular file is opened relative to its parent directory
+    descriptor with O_NOFOLLOW, verified via fstat on the open descriptor, and
+    copied directly from that pinned descriptor into dest_root so pathnames inside
+    an Agent-writable Desk are never reopened after validation.
+    """
+    if os.path.lexists(dest_root):
+        raise CheckpointRefused("Desk staging destination already exists")
+    if source_root.is_symlink():
+        raise CheckpointRefused("Symlink prohibited for Desk snapshot root")
+    try:
+        parent = source_root.parent.resolve(strict=True)
+        root_target = parent / source_root.name
+        root_fd = os.open(root_target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise CheckpointRefused("Desk snapshot root is not a safe directory") from error
+
+    dest_root.mkdir(mode=0o700, parents=True)
+    collected: list[str] = []
+
+    def _walk(dir_fd: int, prefix: PurePosixPath) -> None:
+        try:
+            names = sorted(os.listdir(dir_fd))
+        except OSError as error:
+            raise CheckpointRefused("Failed to list Desk directory") from error
+        for name in names:
+            rel_path = prefix / name if prefix.parts else PurePosixPath(name)
+            rel_str = rel_path.as_posix()
+            _validate_desk_relative_path(rel_str)
+            try:
+                info = os.lstat(name, dir_fd=dir_fd)
+            except OSError as error:
+                raise CheckpointRefused(f"Desk entry disappeared: {rel_str}") from error
             if stat.S_ISLNK(info.st_mode):
                 raise CheckpointRefused(f"Symlink prohibited inside Desk: {name}")
+            if stat.S_ISDIR(info.st_mode):
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=dir_fd,
+                    )
+                except OSError as error:
+                    raise CheckpointRefused(
+                        f"Symlink or changed directory prohibited inside Desk: {name}"
+                    ) from error
+                try:
+                    _walk(child_fd, rel_path)
+                finally:
+                    os.close(child_fd)
+                continue
             if not stat.S_ISREG(info.st_mode):
                 raise CheckpointRefused(f"Non-regular file prohibited in Desk: {name}")
-            rel = candidate.relative_to(resolved_root).as_posix()
-            _validate_desk_relative_path(rel)
-            collected.append((rel, candidate))
-    return collected
+            try:
+                file_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=dir_fd,
+                )
+            except OSError as error:
+                raise CheckpointRefused(
+                    f"Symlink or unreadable file prohibited inside Desk: {name}"
+                ) from error
+            with os.fdopen(file_fd, "rb") as pinned:
+                pinned_info = os.fstat(pinned.fileno())
+                if not stat.S_ISREG(pinned_info.st_mode):
+                    raise CheckpointRefused(
+                        f"Non-regular file prohibited in Desk: {name}"
+                    )
+                target = dest_root.joinpath(*rel_path.parts)
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with target.open("xb") as out:
+                    os.fchmod(out.fileno(), 0o600)
+                    shutil.copyfileobj(pinned, out)
+                if fsync_files:
+                    _fsync_file(target)
+            collected.append(rel_str)
+
+    try:
+        _walk(root_fd, PurePosixPath())
+    finally:
+        os.close(root_fd)
+    if fsync_files:
+        _fsync_dir(dest_root)
+    return tuple(collected)
 
 
 def _publish_file(candidate: Path, target: Path) -> None:
@@ -358,7 +426,10 @@ def checkpoint_store(
         snapshot_normalized_store(store, staged_db)
         with closing(open_reader(staged_db)) as reader, read_tx(reader):
             watermark = compute_logical_watermark(reader, company_id)
-        desk_entries = _collect_desk_files(desk_root) if desk_root is not None else []
+        staged_desk = Path(directory) / "desk"
+        desk_files = (
+            _stage_pinned_desk(desk_root, staged_desk) if desk_root is not None else ()
+        )
         manifest = CheckpointManifest(
             format=CHECKPOINT_FORMAT,
             company_id=company_id,
@@ -367,7 +438,7 @@ def checkpoint_store(
             size=staged_db.stat().st_size,
             sha256=_hash_file(staged_db),
             watermark=watermark,
-            desk_files=tuple(rel for rel, _ in desk_entries),
+            desk_files=desk_files,
         )
         candidate = Path(directory) / "checkpoint.zip"
         with candidate.open("xb") as handle:
@@ -377,8 +448,11 @@ def checkpoint_store(
                     _MANIFEST_ENTRY, json.dumps(asdict(manifest), sort_keys=True)
                 )
                 output.write(staged_db, _STORE_ENTRY)
-                for rel, path in desk_entries:
-                    output.write(path, f"{_DESK_PREFIX}{rel}")
+                for rel in desk_files:
+                    safe = _validate_desk_relative_path(rel)
+                    output.write(
+                        staged_desk.joinpath(*safe.parts), f"{_DESK_PREFIX}{rel}"
+                    )
         writer.verify()
         _publish_file(candidate, archive)
     return manifest
@@ -518,16 +592,7 @@ def inspect_checkpoint(archive: Path, company_id: str) -> CheckpointManifest:
 def _copy_desk_tree(source_root: Path, dest_root: Path) -> None:
     if os.path.lexists(dest_root):
         raise CheckpointRefused("Desk restore destination already exists")
-    dest_root.mkdir(mode=0o700, parents=True)
-    for rel, path in _collect_desk_files(source_root):
-        safe = _validate_desk_relative_path(rel)
-        target = dest_root.joinpath(*safe.parts)
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with target.open("xb") as out:
-            os.fchmod(out.fileno(), 0o600)
-            out.write(path.read_bytes())
-        _fsync_file(target)
-    _fsync_dir(dest_root)
+    _stage_pinned_desk(source_root, dest_root, fsync_files=True)
 
 
 def restore_store(

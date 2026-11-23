@@ -32,6 +32,8 @@ class StoreRetirement:
 class ManagedConnection(sqlite3.Connection):
     """Autocommit connection that closes open explicit transactions on context exit."""
 
+    _allow_retired: bool = False
+
     def __exit__(self, exc_type, exc_val, exc_tb) -> Literal[False]:
         if self.in_transaction:
             if exc_type is None:
@@ -148,7 +150,9 @@ def open_writer(
             raise StorageRefused(f"Unsupported journal mode: {journal_mode}")
         connection.execute("PRAGMA synchronous = FULL")
         connection.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys else 'OFF'}")
+        connection.execute("PRAGMA recursive_triggers = ON")
         connection.execute("PRAGMA temp_store = MEMORY")
+        connection._allow_retired = allow_retired
     except BaseException:
         connection.close()
         raise
@@ -183,6 +187,11 @@ def write_tx(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """Run an atomic BEGIN IMMEDIATE write transaction."""
     connection.execute("BEGIN IMMEDIATE")
     try:
+        _check_user_version(connection)
+        _check_writable_state(
+            connection,
+            allow_retired=bool(getattr(connection, "_allow_retired", False)),
+        )
         yield connection
     except BaseException:
         if connection.in_transaction:

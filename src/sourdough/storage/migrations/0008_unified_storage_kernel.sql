@@ -30,6 +30,15 @@ BEGIN
     SELECT RAISE(ABORT, 'audit_event is append-only');
 END;
 
+CREATE TRIGGER IF NOT EXISTS tr_audit_event_no_replace
+BEFORE INSERT ON audit_event
+WHEN NEW.event_seq IS NOT NULL AND EXISTS (
+    SELECT 1 FROM audit_event WHERE event_seq = NEW.event_seq
+)
+BEGIN
+    SELECT RAISE(ABORT, 'audit_event is append-only');
+END;
+
 CREATE TABLE IF NOT EXISTS command_receipt (
     company_id TEXT NOT NULL,
     command_id TEXT NOT NULL,

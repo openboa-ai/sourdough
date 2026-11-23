@@ -87,6 +87,36 @@ class StorageDatabaseAndKernel(unittest.TestCase):
         with self.assertRaisesRegex(StorageRefused, "retired"):
             open_writer(self.store)
 
+    def test_preopened_writer_cannot_commit_after_store_retirement(self):
+        from sourdough.storage.checkpoint import checkpoint_store, restore_store
+
+        root = self.store.parent
+        leases = root / "leases"
+        archive = root / "cut.zip"
+        checkpoint_store(self.store, self.company_id, archive, lease_directory=leases)
+        with closing(open_writer(self.store)) as stale_writer:
+            before_seq = max_event_seq(stale_writer, self.company_id)
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                root / "replacement.sqlite",
+                lease_directory=leases,
+            )
+            with self.assertRaisesRegex(StorageRefused, "retired"):
+                with write_tx(stale_writer):
+                    append_audit_event(
+                        stale_writer,
+                        company_id=self.company_id,
+                        domain="work",
+                        entity_type="duty",
+                        entity_id="after-retire",
+                        event_type="duty.tampered",
+                        actor_id=self.receipt.founder_id,
+                        payload={},
+                    )
+            self.assertEqual(max_event_seq(stale_writer, self.company_id), before_seq)
+
     def test_audit_event_is_strict_and_append_only(self):
         with closing(open_writer(self.store)) as writer:
             with write_tx(writer):
@@ -112,6 +142,27 @@ class StorageDatabaseAndKernel(unittest.TestCase):
                     "DELETE FROM audit_event WHERE event_seq = ?",
                     (seq,),
                 )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                writer.execute(
+                    """INSERT OR REPLACE INTO audit_event (
+                           event_seq, company_id, domain, entity_type, entity_id,
+                           event_type, actor_id, run_id, command_id, payload_json,
+                           recorded_at_ns
+                       ) VALUES (?, ?, 'work', 'duty', 'id', 'tampered', 'a', NULL, NULL, '{}', 1)""",
+                    (seq, self.company_id),
+                )
+            # Even a raw connection with recursive_triggers=OFF cannot REPLACE existing event_seq
+            with closing(sqlite3.connect(self.store, autocommit=True)) as raw:
+                raw.execute("PRAGMA recursive_triggers = OFF")
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                    raw.execute(
+                        """INSERT OR REPLACE INTO audit_event (
+                               event_seq, company_id, domain, entity_type, entity_id,
+                               event_type, actor_id, run_id, command_id, payload_json,
+                               recorded_at_ns
+                           ) VALUES (?, ?, 'work', 'duty', 'id', 'tampered', 'a', NULL, NULL, '{}', 1)""",
+                        (seq, self.company_id),
+                    )
             # STRICT table rejects text in INTEGER recorded_at_ns column
             with self.assertRaises(sqlite3.IntegrityError):
                 writer.execute(

@@ -175,7 +175,7 @@ class StorageCheckpointAndRestore(unittest.TestCase):
             )
         self.assertFalse((self.root / "should-not-exist.sqlite").exists())
 
-        # Symlink inside Desk must be rejected at checkpoint time
+        # Symlink inside Desk (file, subdir, or root) must be rejected at checkpoint time
         bad_desk = self.root / "bad-desk"
         bad_desk.mkdir()
         os.symlink(self.store, bad_desk / "escape.sqlite")
@@ -185,6 +185,31 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                 self.company_id,
                 self.root / "bad.zip",
                 desk_root=bad_desk,
+                lease_directory=self.leases,
+            )
+
+        bad_subdir_desk = self.root / "bad-subdir-desk"
+        bad_subdir_desk.mkdir()
+        os.symlink(self.root, bad_subdir_desk / "escape-dir")
+        with self.assertRaisesRegex(CheckpointRefused, "Symlink"):
+            checkpoint_store(
+                self.store,
+                self.company_id,
+                self.root / "bad-subdir.zip",
+                desk_root=bad_subdir_desk,
+                lease_directory=self.leases,
+            )
+
+        real_desk = self.root / "real-desk"
+        real_desk.mkdir()
+        symlink_root = self.root / "symlink-desk-root"
+        os.symlink(real_desk, symlink_root)
+        with self.assertRaisesRegex(CheckpointRefused, "Symlink"):
+            checkpoint_store(
+                self.store,
+                self.company_id,
+                self.root / "bad-root.zip",
+                desk_root=symlink_root,
                 lease_directory=self.leases,
             )
 
