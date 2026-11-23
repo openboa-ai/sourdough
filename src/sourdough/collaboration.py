@@ -5,7 +5,7 @@ from dataclasses import asdict, replace
 
 from .company_assets import (
     Selection,
-    discover_shared_assets,
+    discover_project_references,
     project_access,
     project_review_instruction,
     publish_selection,
@@ -21,7 +21,8 @@ from .work_handoff import HandoffOffer, accept_handoff, discover_handoffs, offer
 
 PROJECTS = tool(
     "read_project_assignments",
-    "Read current project permissions and one page of shared references. "
+    "Read current project permissions, shared references and your own publication receipts "
+    "for this duty. Resolve an uncertain publication from its receipt before publishing again. "
     "Use an empty cursor for the first page or the returned cursor for the next.",
     {"after": {"type": "string"}},
 )
@@ -154,7 +155,12 @@ def company_work_run(
                     for project in project_access(writer, claim, workflow.purpose)
                     if project.project_id == project_id
                 ]
-                return {"projects": assigned, "shared_assets": [], "next_cursor": None}
+                return {
+                    "projects": assigned,
+                    "shared_assets": [],
+                    "publication_receipts": [],
+                    "next_cursor": None,
+                }
         if name == "read_project_inbox":
             deliveries, next_cursor = read_inbox(
                 writer, claim, workflow.purpose, **arguments
@@ -203,7 +209,7 @@ def company_work_run(
                     )
                 }
         if name == "read_project_assignments":
-            assets, next_cursor = discover_shared_assets(
+            assets, receipts, next_cursor = discover_project_references(
                 writer, claim, workflow.purpose, arguments["after"]
             )
             return {
@@ -212,6 +218,7 @@ def company_work_run(
                     for project in project_access(writer, claim, workflow.purpose)
                 ],
                 "shared_assets": [asdict(asset) for asset in assets],
+                "publication_receipts": [asdict(receipt) for receipt in receipts],
                 "next_cursor": next_cursor,
             }
         if name == "read_shared_asset":

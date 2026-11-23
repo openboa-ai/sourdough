@@ -701,7 +701,9 @@ class CompanyAssets(unittest.TestCase):
             "end": 16,
         }
         published = author.call("publish_draft_selection", request)
-        [listed] = peer.call("read_project_assignments", {"after": ""})["shared_assets"]
+        peer_projects = peer.call("read_project_assignments", {"after": ""})
+        self.assertEqual(peer_projects["publication_receipts"], [])
+        [listed] = peer_projects["shared_assets"]
         self.assertEqual(listed["asset_id"], published["asset_id"])
         self.assertNotIn("content", listed)
         self.assertEqual(
@@ -742,7 +744,25 @@ class CompanyAssets(unittest.TestCase):
             ],
             [],
         )
-        assign_project(
+        own_page = author.call("read_project_assignments", {"after": ""})
+        self.assertEqual(own_page["shared_assets"], [])
+        self.assertEqual(len(own_page["publication_receipts"]), 32)
+        own_tail = author.call(
+            "read_project_assignments", {"after": own_page["next_cursor"]}
+        )
+        self.assertEqual(own_tail["next_cursor"], "")
+        self.assertEqual(
+            own_tail["publication_receipts"][-1],
+            {
+                "asset_id": published["asset_id"],
+                "project_id": "project",
+                "duty_id": self.claims["author"].duty_id,
+                "request_id": request["request_id"],
+            },
+        )
+        with self.assertRaisesRegex(DutyRefused, "Shared asset is unavailable"):
+            author.call("read_shared_asset", {"asset_id": published["asset_id"]})
+        new_revision = assign_project(
             self.writer,
             self.manager,
             "project",
@@ -753,6 +773,20 @@ class CompanyAssets(unittest.TestCase):
         self.assertEqual(
             peer.call("read_project_assignments", {"after": first_page["next_cursor"]})[
                 "shared_assets"
+            ],
+            [],
+        )
+        assign_project(
+            self.writer,
+            self.manager,
+            "project",
+            ("author", "outsider"),
+            publishers=(),
+            expected_revision=new_revision,
+        )
+        self.assertEqual(
+            author.call("read_project_assignments", {"after": ""})[
+                "publication_receipts"
             ],
             [],
         )

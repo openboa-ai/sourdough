@@ -23,6 +23,7 @@ The initial local project binds its audience to an explicit membership revision 
 - **FR.** Persist immutable shared content, version and intended audience. Bind the output receipt to its work; sharing alone cannot transfer ownership of a duty.
 - **NFR.** Repeated publication with identical identity returns one revision. A changed payload conflicts. Revocation before commit blocks publication; never mount one Agent’s whole desk into another runtime.
 - **Discovery.** The recipient can page through all authorized shared references without an author receipt. Each page and cursor is checked against current project membership and the publication audience; listing never includes asset content.
+- **Receipt recovery.** On reopening the same duty, the current authorized publisher can page through its original publication receipts alongside project references, even when it was not a recipient. A receipt includes only the asset, project, duty and original request IDs. It does not grant read access to the shared asset, disclose the private source or extend the original authority.
 
 ## Acceptance and independent evidence
 
@@ -30,6 +31,7 @@ The initial local project binds its audience to an explicit membership revision 
 | --- | --- |
 | Normal | Publish a sanitized paragraph to a two-person project; the recipient sees the output but cannot read private notes or an unshared attachment. Reopen the author desk on a new session. |
 | Failure or contention | Remove source disclosure rights before commit, retry a stale revision, and inspect from a third principal. Observe no unauthorized content or duplicate artifact. |
+| Lost reply | Stop the worker after publication commits but before it returns. Reopen the same duty and Desk on a fresh run. The authorized author finds the original receipt without republishing; the new run does not gain access to material outside its audience. |
 
 **Oracle:** Compare the actual bytes and access outcomes for author, recipient and outsider; verify stable receipt and original source ACL. Run [W1](../../../../acceptance/episodes.md#w1-personal-work).
 
