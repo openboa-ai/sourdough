@@ -8,6 +8,8 @@ Business situation: [Choose and perform work](../../../../capabilities.md#judgme
 
 Given the charter, obligations, available observations and cost, the Agent identifies work without a board message. A work decision retains typed evidence references and their revisions; a profile, not the work service, interprets their contents.
 
+The company must also make room for discovery when no task has been assigned. A standing responsibility can make a bounded review eligible; the Agent decides whether the available evidence warrants new work, a request to a colleague, a later check or no action.
+
 ## Observable outcome
 
 A decision cites available evidence, selects an action or a justified wait and leaves a condition that prompts further work.
@@ -24,5 +26,6 @@ The Agent can investigate, act, wait or delegate within its grant. The quant pro
 
 - [Record a decision and its next condition](decide/spec.md)
 - [Continue a duty after a committed result](continue-after-result/spec.md)
+- [Activate an Agent for a company responsibility](activate/spec.md)
 
 Review this intent against the company outcome above. Evidence for implementation, regression and operating behavior belongs to the individual changes; cross-feature acceptance belongs to the company map.
