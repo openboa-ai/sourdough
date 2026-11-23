@@ -22,7 +22,12 @@ class StaffingTools:
         if not isinstance(arguments, dict):
             raise DutyRefused("Staffing tools require a structured request")
         if name == "read_staffing_need" and not arguments:
-            return read_need(self.writer, self.claim)
+            snapshot = read_need(self.writer, self.claim)
+            existing_staff_capacity = {
+                "unassigned": snapshot.pop("available_capacity"),
+                "assigned": snapshot.pop("assigned_capacity"),
+            }
+            return snapshot | {"existing_staff_capacity": existing_staff_capacity}
         if name == "record_staffing_choice":
             alternatives = arguments.get("alternatives")
             if not isinstance(alternatives, list):
