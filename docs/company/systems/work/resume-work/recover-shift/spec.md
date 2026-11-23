@@ -14,14 +14,15 @@ Input contracts: [Persist the founding charter](../../../organization/found-comp
 
 ## Design decision and review
 
-Keep a renewable claim generation instead of trusting the session ID after restart.
+Keep a renewable monotonic claim generation (`fencing_token` in `work_runs`) inside the unified `CompanyRuntime` instead of trusting a provider session ID after restart. Partial unique indexes on `work_runs` enforce at most one active `running` execution per `agent_id` (protecting Desk integrity) and per `work_item_id` (preventing duplicate concurrent work). Long waits transition a run to a zero-compute durable `waiting` state (`wait_until_ns` and/or `wait_event_key`) so execution slots are released without holding worker threads or processes.
 
-**Concern for the responsible component:** Confirm every mutating tool checks the current generation, not only the scheduler's completion endpoint.
+**Concern for the responsible component:** Confirm every mutating tool and domain commit verifies `WHERE run_id = ? AND fencing_token = ? AND status = 'running'`, not only the scheduler's completion endpoint.
 
 ## Functional and quality requirements
 
-- **FR.** Reclaim an expired or demonstrably dead claim under a new generation. Replay existing receipts before allowing further actions.
-- **NFR.** Only the current generation can complete or mutate a work item. Sequence timestamps separately for process exit, restart and work resumption.
+- **FR.** Reclaim an expired or demonstrably dead claim by atomically incrementing `fencing_token` under `CompanyRuntime` startup recovery (after acquiring `WriterLease`, sweeping expired `work_runs` leases, fencing prior tokens and reconciling `in_flight` rows in `external_actions` by original `idempotency_key` before admitting new risk). Replay existing receipts before allowing further actions.
+- **FR.** Release execution slots cleanly on durable waits (`status = 'waiting'`) and transition back to `queued` atomically when `now >= wait_until_ns` or a matching domain event commits, while enforcing anti-self-wake (an Agent's own message never wakes that Agent).
+- **NFR.** Only the current `fencing_token` can complete or mutate a work item. Sequence timestamps separately for process exit, restart and work resumption.
 
 ## Acceptance and independent evidence
 

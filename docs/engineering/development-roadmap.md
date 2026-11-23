@@ -1,4 +1,4 @@
-# Sourdough development roadmap · baseline v1.7
+# Sourdough development roadmap · baseline v1.8
 
 Design for review; product evidence **NOT_RUN**. [System boundaries](../company-agent-quant.md) · [Feature outcomes](feature-boundaries.md) · [Owning specs](work-packages.md)
 
@@ -30,11 +30,20 @@ Start with one Python company service and SQLite transactions. Keep the Agent pr
 
 Later work is not a checklist for the first trade. Start recording authority, account isolation, order identity and price/cost basis when first used. Do not claim full qualification of any untested branch.
 
+## Architecture convergence and Wave A delivery route
+
+Converge the active flow branches onto the unified runtime and storage kernel in ordered waves so parallel implementation streams do not conflict on schema or scheduler plumbing:
+
+1. **Close ready Flow 10 work first:** Merge ready `#160` into `feat/flow-10` before starting kernel convergence.
+2. **Wave A (`feat/flow-runtime-kernel`):** Deliver the unified SQLite storage kernel (`open_writer`/`open_reader`, WAL + `BEGIN IMMEDIATE`, ordered SQL migrations with legacy v1–v7 upgrade and fail-closed future `user_version`, WAL-normalized checkpoints and logical watermark cut checks), the three-entity Work kernel (`work_items`, `work_runs`, `work_responsibilities` + `work_conditions`), and unified `CompanyRuntime` + `DutyRegistry` on a dedicated `feat/flow-runtime-kernel` branch gated by `tests/flows/flow-runtime-kernel/test_flow.py`, preserving the separate two-process managed paper venue boundary (`paper_sender_lease` + bounded rotating segments).
+3. **Wave B (parallel convergence onto `main`):** Converge Flow 10 (Two-Plane Agent Harness with pinned macOS `sandbox_backend` + OS-sandboxed Desk), Flow 11 (local UDS `/v1/` Control Plane + Zig Board Client, gated by a pre-Stream-B2 Native SDK 0.11.1 capability probe for transport adapter and pending-receipt persistence), and Flow 08 (cost-inclusive accounting close) onto the unified kernel.
+4. **Wave C and Wave D:** Converge Flow 09 (`StrategyRelease`, PIT catalogs, paired isolated company-arm comparison), Flow 12 (deterministic `manage-change/activate` and external `request-maintenance/track`), and Flow 13 (physically separate evaluator SQLite store, itemized method deltas, 3-stage pre-commit gate, DAG quarantine rollback, blind position-swapped judging and two-generation RSI transfer), followed by full end-to-end paper company verification on `main`.
+
 ## Development handoff
 
 Sol is the development model for Goal 01–04. This does not select or authorize the employee Agent's runtime.
 
-1. Verify this design with `shasum -a 256 -c docs/engineering/baseline-v1.7.sha256` from the repository root. This revision consolidates agent review rules; the approved founding contract and first-trade finish line are unchanged. Retained manifests describe their historical trees: v1.6 at `d6ba0fab`, v1.5 at `1fbf55d`, v1.4 at `8865b9c`, v1.3 at `9e602d0`, v1.2 at `c19ed62`, v1.1 at `b6d7b53`.
+1. Verify this design with `shasum -a 256 -c docs/engineering/baseline-v1.8.sha256` from the repository root. This revision unifies the company runtime, SQLite storage kernel, two-plane harness, local UDS control plane and learning/comparison contracts; the approved founding contract and first-trade finish line are unchanged. Retained manifests describe their historical trees: v1.7 at `a7b274a`, v1.6 at `d6ba0fab`, v1.5 at `1fbf55d`, v1.4 at `8865b9c`, v1.3 at `9e602d0`, v1.2 at `c19ed62`, v1.1 at `b6d7b53`.
 2. Start with `01 / found-company/bootstrap`. Use the [first Goal](flow-delivery/goal-01-04.md), [work packages](work-packages.md) and [implementation conventions](flow-delivery/guide.md). Verify scope and accepted spec before product changes.
 3. Implement a change that one consumer can observe. Run the affected case and the connected path available so far. Use one unit PR per reviewable behavior, not per file. Record the candidate revision, environment, expected/observed result, next action and owner in the flow Issue.
 4. If something does not block the first trade or invalidate its evidence, leave it for its owning milestone. Report unavailable conditions honestly. No plugin, per-trade board approval, benchmark or live account is a prerequisite. Requirements revisions receive new manifests; never overwrite a historical manifest to make it pass.

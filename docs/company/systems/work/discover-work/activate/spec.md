@@ -23,7 +23,12 @@ Scheduled continuation and discovery use the same Work scheduler but different i
                            ↑                                      |
                            └──── decision, work or next check ────┘
 
-Use the existing Work service, durable store and claim path. Start with one-shot time conditions and one typed internal event: a committed revision of a designated shared asset. Do not create another Work queue, a provider-native schedule, a process per Agent, or an external broker. The typed event is a reference to company data; the asset service remains its authority. External connectors and recurring schedules can use the same interface later, not a parallel execution path.
+Use the unified `CompanyRuntime`, `DutyRegistry` and three-entity Work kernel in the authoritative SQLite store:
+- `work_items` owns durable duties, ownership and disposition.
+- `work_runs` owns execution claims with partial unique indexes permitting at most one active `running` execution per `agent_id` and per `work_item_id`, monotonic `fencing_token`, an **anti-self-wake** invariant (an Agent's own message or status comment never triggers a wake for the same `agent_id`), and **zero-compute durable waits** (`status = 'waiting'` with `wait_until_ns` and/or `wait_event_key`, releasing execution slots until due time or a matching domain event).
+- `work_responsibilities` and `work_conditions` own standing responsibilities and time/event triggers with `condition_revision` and `(source_identity, condition_revision)` deduplication before creating eligible work.
+
+Start with one-shot time conditions and one typed internal event: a committed revision of a designated shared asset. Do not create separate per-scenario worker loops, another Work queue, a provider-native schedule, a process per Agent, or an external broker. The typed event is a reference to company data; the asset service remains its authority. External connectors and recurring schedules use the same `DutyRegistry` and Work kernel interface, not a parallel execution path.
 
 ## Requirements
 

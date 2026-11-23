@@ -10,7 +10,7 @@ Input contracts: founded company, current work state and [authorize-actor/check]
 
 ## Design decision and review
 
-Project company, work, decision, allowed evidence, owner, next condition and as-of time. Optional profile links do not introduce mandatory quant fields.
+Project company, work, decision, allowed evidence, owner, next condition and as-of time via ACL-filtered on-demand indexed queries on `open_reader()` (`mode=ro`, `PRAGMA query_only=ON`) exposed through `/v1/projections/{name}` on the local UDS Control Plane. Preserve the `work-timeline-v1` content-hash `revision` contract for existing consumers while exposing `ETag` and monotonic `event_seq` on `work-timeline-v2` (supporting `If-None-Match` conditional reads). Optional profile links do not introduce mandatory quant fields.
 
 **Concern for the responsible component:** Authorize every read at current access scope. Do not expose restricted evidence through titles, aggregates or stale cached projections.
 
