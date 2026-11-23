@@ -1,6 +1,7 @@
 import unittest
 from contextlib import closing
 from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import time
@@ -8,7 +9,18 @@ from time import time
 from sourdough.agent_desk import save_draft
 from sourdough.collaboration import company_work_run
 from sourdough.company import FoundingTerms, _connect, found
-from sourdough.company_assessment import read_assessment_result
+from sourdough.company_assessment import (
+    ASSESSMENT_REVIEW_WORKFLOW,
+    MANAGER_ASSESSMENT,
+    AssessmentProposal,
+    SourceRecord,
+    publish_assessment,
+    read_assessment_inputs,
+    read_assessment_result,
+    review_result_allowed,
+    seal_assessment_source,
+    settle_assessment,
+)
 from sourdough.company_assets import (
     Selection,
     assign_project,
@@ -17,9 +29,15 @@ from sourdough.company_assets import (
     read_shared_asset,
     seal_project_review,
 )
+from sourdough.conversations import Post, append_message
 from sourdough.duty_run import ASSESSMENT_REVIEW, DutyRefused, start_run
 from sourdough.harness import ScopedWorkflow, tool
-from sourdough.onboarding import claim_hired_first, provision_hire
+from sourdough.onboarding import (
+    accept_first_duty,
+    claim_hired_first,
+    provision_hire,
+    read_first_duty,
+)
 from sourdough.staffing import (
     HireRequest,
     StaffingAuthority,
@@ -204,6 +222,155 @@ class CompanyAssets(unittest.TestCase):
                 (hire.agent_id,),
             ).fetchone()
             self.assertEqual(retained, (hire.agent_id, 2))
+
+    def settle_project_assessment(self):
+        now, _, _, hire = self.prepare_project_hire()
+        provision_hire(
+            self.writer, hire.agent_id, "assessment", lambda _: True, now=now
+        )
+        claim = claim_hired_first(self.writer, hire.agent_id, "profile")
+        mandate = read_first_duty(self.writer, claim)
+        accept_first_duty(self.writer, claim, mandate["revision"], "Review the count.")
+        (project,) = project_access(self.writer, claim, "assessment")
+        message = append_message(
+            self.writer,
+            claim,
+            "assessment",
+            Post("onboarding", project.revision, "progress", "Source reviewed.", ""),
+        )
+        with closing(_connect(self.writer.store, "ro")) as database:
+            self.assertEqual(
+                database.execute("SELECT count(*) FROM work_follow_up").fetchone(), (0,)
+            )
+        seal_assessment_source(
+            self.writer, (SourceRecord("count", "Documents", 8, 6, now),)
+        )
+        inputs = read_assessment_inputs(self.writer, claim, now=now)
+        publication = publish_assessment(
+            self.writer,
+            claim,
+            AssessmentProposal(
+                inputs["revision"], "count", "investigate", "Two missing.", 60
+            ),
+            now=now,
+        )
+        next_hire = settle_assessment(self.writer, claim, publication)
+        self.assertEqual(settle_assessment(self.writer, claim, publication), next_hire)
+        return claim, publication, next_hire, project, message
+
+    def test_project_result_schedules_one_separate_manager_response(self):
+        claim, publication, next_hire, project, message = (
+            self.settle_project_assessment()
+        )
+        allowed = partial(review_result_allowed, company_id=claim.company_id)
+        with closing(_connect(self.writer.store, "ro")) as database:
+            (manager_duty, due_at, prior_duty) = database.execute(
+                """SELECT w.duty_id,w.due_at,w.previous_duty_id
+                   FROM work_follow_up w JOIN duty d ON d.id=w.duty_id
+                   WHERE d.agent_id=? AND w.result_kind=? AND w.result_id=?""",
+                (self.founder, MANAGER_ASSESSMENT, publication.action_id),
+            ).fetchone()
+            self.assertGreaterEqual(due_at, publication.published_at)
+            self.assertEqual(prior_duty, "hire-for-project")
+        query = (self.writer.store, claim.company_id, self.founder, "profile")
+        self.assertIsNone(
+            claim_assessment_review(*query, now=due_at - 1, eligible_result=allowed)
+        )
+        review = claim_assessment_review(*query, now=due_at, eligible_result=allowed)
+        self.assertEqual(review.claim.duty_id, manager_duty)
+        self.assertNotEqual(review.claim.run_id, claim.run_id)
+        self.assertEqual(review.claim.grant_id, self.manager)
+        result = read_assessment_result(self.writer, review, now=due_at)
+        self.assertEqual(set(result), {"revision", "assessment", "project_id"})
+        self.assertEqual(result["revision"], publication.revision)
+        self.assertEqual(result["project_id"], project.project_id)
+        employee = company_work_run(
+            self.writer,
+            review.claim,
+            ASSESSMENT_REVIEW_WORKFLOW,
+            lambda *_: {},
+            project_id=project.project_id,
+        )
+        self.assertEqual(employee.manifest()["drafts"], [])
+        with self.assertRaisesRegex(DutyRefused, "different project"):
+            employee.call(
+                "read_project_discussion", {"project_id": "project", "after": ""}
+            )
+        thread = employee.call(
+            "read_project_discussion", {"project_id": project.project_id, "after": ""}
+        )
+        self.assertEqual(thread["messages"], [asdict(message)])
+        reply = employee.call(
+            "post_project_message",
+            {
+                "request_id": "reply",
+                "project_id": project.project_id,
+                "project_revision": project.revision,
+                "body": "Please reconcile the two missing documents.",
+                "asset_id": "",
+            },
+        )
+        self.assertEqual(reply["sender_id"], self.founder)
+        next_manager = settle_review(
+            self.writer.store,
+            review,
+            ReviewDecision(
+                "reply-review",
+                result["revision"],
+                "investigate",
+                "Reconcile missing documents.",
+                60,
+            ),
+            now=due_at,
+            successor_purpose=ASSESSMENT_REVIEW,
+            eligible_result=allowed,
+        )
+        with closing(_connect(self.writer.store, "ro")) as database:
+            pending = database.execute(
+                "SELECT id,agent_id FROM duty WHERE state='scheduled'"
+            ).fetchall()
+            self.assertCountEqual(
+                pending,
+                [
+                    (next_hire.duty_id, claim.founder_id),
+                    (next_manager.duty_id, self.founder),
+                ],
+            )
+            self.assertEqual(
+                database.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+
+    def test_revoked_project_cannot_start_the_manager_review(self):
+        claim, publication, next_hire, project, _ = self.settle_project_assessment()
+        assign_project(
+            self.writer,
+            self.manager,
+            project.project_id,
+            ("author", claim.founder_id),
+            publishers=("author",),
+            expected_revision=project.revision,
+        )
+        allowed = partial(review_result_allowed, company_id=claim.company_id)
+        now = publication.published_at + 86400
+        self.assertIsNone(
+            claim_assessment_review(
+                self.writer.store,
+                claim.company_id,
+                self.founder,
+                "profile",
+                now=now,
+                eligible_result=allowed,
+            )
+        )
+        next_review = claim_assessment_review(
+            self.writer.store,
+            claim.company_id,
+            claim.founder_id,
+            "profile",
+            now=now,
+            eligible_result=allowed,
+        )
+        self.assertEqual(next_review.claim.duty_id, next_hire.duty_id)
 
     def publish(self, selection, author="author"):
         return publish_selection(
