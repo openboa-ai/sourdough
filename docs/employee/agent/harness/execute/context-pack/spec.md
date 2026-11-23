@@ -12,21 +12,22 @@ Input contracts: [authorize-actor/check](../../../../../company/systems/authorit
 
 ## Design decision and review
 
-A native transcript may accelerate a turn but never overrides authoritative company records. Build a fresh pack on replacement; reconstruct durable decisions before considering further work.
+A native transcript may accelerate a turn but never overrides authoritative company records. Build a fresh compact Wake-Up Brief with lazy hydration on replacement, keeping the stable prefix (mandate, role rules, fixed admitted tool schemas) separate from trailing dynamic observations, and reconstruct durable decisions before considering further work. When multi-step turns approach context limits, apply two-stage compaction: first offload oversized tool outputs to per-run scratch/Desk log files with a bounded summary reference, then summarize completed turns into a structured state checkpoint.
 
-**Concern for the responsible component:** Mark retrieved messages, notes and documents as data. Omit future outcomes, evaluation labels, secrets, inaccessible references and revoked instructions; do not persist hidden model reasoning.
+**Concern for the responsible component:** Mark retrieved messages, notes and documents as data. Omit future outcomes, evaluation labels, secrets, inaccessible references and revoked instructions. Never persist hidden model reasoning, secrets or raw private Desk contents in diagnostic logs.
 
 ## Functional and quality requirements
 
 - **FR.** Bound the pack by the declared token/time limit. Reserve space first for mandate, current grants, unresolved effects, obligations and evidence IDs. Drop optional context with an explicit omission reason. If required facts cannot fit or be verified, block the dependent action.
-- **NFR.** Return manifest digest and effective method revision for audit without exposing private content. Never broaden visibility to make handover or compaction succeed.
+- **FR.** Tool-output offloading and structured context compaction must **never** evict open-effect receipts, active grant or authority checks, mandate limits or unresolved obligations.
+- **NFR.** Return manifest digest and effective method revision for audit without exposing private content, secrets or hidden model reasoning in diagnostic logs. Never broaden visibility to make handover or compaction succeed.
 
 ## Acceptance and independent evidence
 
 | Case | Setup, action and expected observation |
 | --- | --- |
 | Normal | Rehydrate a new session of the original pinned runtime on the same Agent duty with no provider session. Compare required fields, granted references, omissions and active method with company records. |
-| Failure or contention | Remove access after pack creation; the later tool read must still deny it. Oversize optional history cannot evict an open-effect receipt or grant check. |
+| Failure or contention | Remove access after pack creation; the later tool read must still deny it. Oversize optional history, tool-output offloading and structured compaction cannot evict an open-effect receipt or grant check; diagnostic logs contain zero hidden model reasoning, secrets or raw private Desk contents. |
 | First claim | Assemble the founder's first context from its founding receipt, current claim and grants with no previous decision. Start a real bounded turn and observe its new decision; missing prior decision alone must not block it. |
 
 **Oracle:** Compare independently sealed ACL, duty and artifact inventories with what the runtime actually received. Exercise [W1](../../../../../acceptance/episodes.md#w1-personal-work) and [L1](../../../../../acceptance/episodes.md#l1-learning).

@@ -12,14 +12,15 @@ Input contracts: [Record a decision and its next condition](../../../../../compa
 
 ## Design decision and review
 
-Publish an evidence-linked candidate instead of directly editing the Agent's active memory.
+Publish an evidence-linked, content-addressed **itemized method delta** (`ADD`, `PATCH` or `DEPRECATE`) instead of directly editing the Agent's active memory or performing monolithic prompt rewrites that drop prior edge-case fixes. Each method item records `method_id`, `revision_sha256`, `delta_kind` (`ADD | PATCH | DEPRECATE`), `trigger_spec`, `audience_scope` (`one Agent | project | company`), `parent_method_ids`, `active_snapshot_id`, source references, uncertainty, superseded revision and `status` (`candidate | active | quarantined | retired`). Retaining `parent_method_ids` and `active_snapshot_id` builds the provenance DAG required for contamination-safe quarantine rollback.
 
-**Concern for the responsible component:** Recheck source access when retrieving a note; company ownership does not authorize every Agent to read the original work.
+**Concern for the responsible component:** Recheck source access when retrieving a note; company ownership does not authorize every Agent to read the original work. Enforce an explicit **private-to-shared redaction gate** before a candidate distilled from private Desk material can enter `project` or `company` evaluation.
 
 ## Functional and quality requirements
 
-- **FR.** Store personal and company knowledge under scoped access. A candidate stays separate from the active method until evaluated.
-- **FR.** For an improvement-procedure candidate, retain the predecessor procedure, earlier attempted changes (including rejections), predicted versus observed effects, evaluation conditions and the proposed change in how the next candidate will be produced. Reference the company-owned record, not hidden model state.
+- **FR.** Store personal, project and company methods as atomic itemized deltas (`ADD`, `PATCH`, `DEPRECATE`) under explicit `audience_scope` (`one Agent | project | company`). A candidate stays separate from the active method until it clears pre-commit evaluation and adoption.
+- **FR.** For an improvement-procedure candidate, retain the predecessor procedure, `parent_method_ids`, `active_snapshot_id`, earlier attempted changes (including rejections), predicted versus observed effects, evaluation conditions and the proposed change in how the next candidate will be produced. Reference the company-owned record, not hidden model state.
+- **FR.** Pass any candidate crossing from `one Agent` private Desk evidence to `project` or `company` `audience_scope` through an audited private-to-shared redaction gate that strips or withholds restricted source content before wider evaluation.
 - **NFR.** A summary cannot overwrite venue or ledger facts or transfer private workspace access.
 
 ## Acceptance and independent evidence
