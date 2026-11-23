@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from pathlib import Path
 
-from .market_worker import SpotInstrumentTerms, journal_key, read_spot_terms, reopen
+from .market_worker import SpotInstrumentTerms, read_spot_terms, reopen
 from .nautilus_paper import NautilusPaperVenue, SandboxPlan
 from .paper_account import (
     BindingChange,
@@ -13,6 +13,7 @@ from .paper_account import (
     change_paper_binding,
 )
 from .paper_execution import VenueRefused
+from .paper_sender_lease import hold_sender_lease, verify_sender_lease
 from .replay_tape import ReplayTape
 from .supervisor import SupervisionResult, supervise_worker
 from .trading_engine import VERSION, _environment, prepare_engine
@@ -155,47 +156,54 @@ def supervise_paper(
 ) -> SupervisionResult:
     if type(seconds) is not int or not 1 <= seconds <= 600:
         raise VenueRefused("Sandbox activation must be bounded to one to 600 seconds")
-    with hold_company_writer(store, company_id) as writer:
-        if tape_path is None:
-            engine, venue, terms = _prepared(writer, directory)
-            tape_revision = None
-            worker = "sourdough.nautilus_paper_worker"
-            arguments = [str(seconds)]
-        else:
-            tape = ReplayTape.load(tape_path)
-            installation = prepare_engine(writer, directory, allow_install=False)
-            engine = (
-                directory.resolve() / f"nautilus-{installation.distribution_version}"
-            )
-            venue = paper_venue(writer.store, directory, replay=True)
-            terms, tape_revision = tape.terms, tape.revision
-            worker = "sourdough.nautilus_replay_worker"
-            arguments = [str(tape_path.resolve()), str(seconds)]
-        _, plan = venue.configuration()
-        if (
-            plan.company_id != writer.company_id
-            or plan.terms != terms
-            or plan.tape_revision != tape_revision
-        ):
-            raise VenueRefused("Prepared sandbox does not match the company")
-        key = journal_key(venue.journal)
-    return supervise_worker(
-        [
-            str(engine / "runtime" / "bin" / "python"),
-            "-IB",
-            "-c",
-            _WORKER,
-            str(Path(__file__).resolve().parents[1]),
-            worker,
-            str(venue.journal),
-            *arguments,
-        ],
-        venue.journal,
-        company_id,
-        max_restarts=1,
-        startup_seconds=32,
-        max_seconds=seconds + 80,
-        emit=emit,
-        environment=_environment(engine / "home"),
-        expected_store_key=key,
-    )
+    journal = paper_venue(store, directory, replay=tape_path is not None).journal
+    with hold_sender_lease(journal) as (descriptor, key):
+        with hold_company_writer(store, company_id) as writer:
+            if tape_path is None:
+                engine, venue, terms = _prepared(writer, directory)
+                tape_revision = None
+                worker = "sourdough.nautilus_paper_worker"
+                arguments = [str(seconds)]
+            else:
+                tape = ReplayTape.load(tape_path)
+                installation = prepare_engine(writer, directory, allow_install=False)
+                engine = (
+                    directory.resolve()
+                    / f"nautilus-{installation.distribution_version}"
+                )
+                venue = paper_venue(writer.store, directory, replay=True)
+                terms, tape_revision = tape.terms, tape.revision
+                worker = "sourdough.nautilus_replay_worker"
+                arguments = [str(tape_path.resolve()), str(seconds)]
+            _, plan = venue.configuration()
+            if (
+                venue.journal != journal
+                or plan.company_id != writer.company_id
+                or plan.terms != terms
+                or plan.tape_revision != tape_revision
+            ):
+                raise VenueRefused("Prepared sandbox does not match the company")
+            verify_sender_lease(journal, descriptor, key)
+        return supervise_worker(
+            [
+                str(engine / "runtime" / "bin" / "python"),
+                "-IB",
+                "-c",
+                _WORKER,
+                str(Path(__file__).resolve().parents[1]),
+                worker,
+                str(journal),
+                *arguments,
+                "--sender-lease-fd",
+                str(descriptor),
+            ],
+            journal,
+            company_id,
+            max_restarts=1,
+            startup_seconds=32,
+            max_seconds=seconds + 80,
+            emit=emit,
+            environment=_environment(engine / "home"),
+            expected_store_key=key,
+            inherited_fds=(descriptor,),
+        )
