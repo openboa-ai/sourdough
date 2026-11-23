@@ -6,16 +6,16 @@ Design draft · Verification **UNRUN** · Responsible component: Agent Configura
 
 ## Boundary and dependencies
 
-Input contracts: A versioned configuration schema and a declared adapter manifest describing supported provider/model choices. Validating the declaration is local and has no side effects. An active registry, company, account or model call is not needed to prepare a profile.
+Input contracts: A versioned configuration schema and a declared adapter manifest describing supported provider, model and sandbox backend choices. Validating the declaration is local and has no side effects. An active registry, company, account or model call is not needed to prepare a profile.
 
 ## Design decision and review
 
-Return an immutable profile reference for the explicit runtime implementation, adapter revision, provider, model revision and pinned `sandbox_backend` (local macOS sandbox enforcement required, with no automatic fallback to unsandboxed or alternate OS backends). Do not settle mutable aliases or sandbox defaults silently: if the selection or sandbox backend cannot be pinned, report it as unresolved. Configuration owns the description; organization binds one profile to each new Agent ID. The harness checks actual eligibility, sandbox availability, current consent, grants and budget before launch. A profile can be reused, not rewritten.
+Return an immutable profile reference for the explicit runtime implementation, adapter revision, provider, model revision and pinned `sandbox_backend`. The user selects the sandbox during Agent configuration, independently of the model. Local macOS sandbox enforcement is the required supported option, with no automatic fallback to unsandboxed or alternate OS backends; other backends are selectable only after qualification for the chosen runtime. Do not settle mutable aliases or sandbox defaults silently: if the selection or sandbox backend cannot be pinned, report it as unresolved. Configuration owns the description; organization binds one profile to each new Agent ID. The harness checks actual eligibility, sandbox availability, current consent, grants and budget before launch. A profile can be reused, not rewritten.
 
 ## Functional and quality requirements
 
-- **FR.** Compose supported alternatives without hardwiring a vendor. Pin `sandbox_backend` as part of the immutable profile; a new model, runtime or `sandbox_backend` selection yields another profile rather than rebinding an existing Agent. A fresh session or machine on the same binding does not constitute a profile change.
-- **NFR.** Record the effective selection without secrets. Replaying an identical declaration yields the same reference; changing any pinned field (including `sandbox_backend`) cannot yield that reference. Unknown compatibility or an unavailable local macOS sandbox backend fails closed before launch.
+- **FR.** Compose supported alternatives without hardwiring a vendor. Pin `sandbox_backend` as part of the immutable profile; a change of model, runtime or `sandbox_backend` is a new profile selection rather than rebinding an existing Agent. The Agent does not select or switch its sandbox at run time. A fresh session or machine on the same binding does not constitute a profile change.
+- **NFR.** Record the effective selection without secrets. Replaying an identical declaration yields the same reference; changing any pinned field (including `sandbox_backend`) cannot yield that reference. Unknown compatibility or an unavailable selected sandbox backend fails closed before launch.
 
 ## Acceptance and independent evidence
 
@@ -23,6 +23,7 @@ Return an immutable profile reference for the explicit runtime implementation, a
 | --- | --- |
 | Normal | Declare two supported models for one adapter and pinned macOS `sandbox_backend`; compose profiles P and Q, then repeat P. Expect two distinct references and one stable P, zero hires and zero provider starts. Organization can independently hire A and B on P without collapsing their identities. |
 | Failure or contention | Declare an unsupported pair, an unresolved model alias or an unavailable `sandbox_backend`; expect no eligible profile and no fallback launch. Attempt to bind Q under an existing A/P session; admission denies the mismatch and no tool runs. A predecessor's receipts still identify the predecessor. |
+| Sandbox selection | Select the qualified local macOS backend and verify the effective `sandbox_backend` matches on two runs. An unavailable or unqualified selection yields no launch and no fallback. With two qualified backends, composing the same runtime and model with the second backend yields a different profile; the existing Agent cannot launch on it. |
 
 **Oracle:** Compare canonical fields, profile references and roster binding with independent registry/start and action logs. Test the separate [real adapter qualification](../../harness/adapters/qualify/spec.md) before claiming provider support.
 

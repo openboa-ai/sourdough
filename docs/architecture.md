@@ -36,7 +36,7 @@ flowchart TD
         Gateway["Resource connector gateway"]
         Acct["Accounting · actuals and close"]
         Fin["Finance · budgets, commitments and cash planning"]
-        Config["Agent Configuration · pinned runtime and model"]
+        Config["Agent Configuration · pinned runtime, model and sandbox"]
         Config -->|Profile bound at creation| Work
         Work -->|Agent ID, bound profile and claim| Harness
         Desk -->|Granted evidence references| Harness

@@ -12,7 +12,7 @@ Input contracts: [Supervisor](../../../work/resume-work/supervise/spec.md), comp
 
 ## Design decision and review
 
-Restore into an isolated shadow-staged candidate instead of overwriting the last good copy in place. Because the live company store operates in SQLite `WAL` mode (`autocommit=True` + `BEGIN IMMEDIATE`), both checkpoint snapshot creation and shadow-staged restore MUST normalize the staged SQLite database to `PRAGMA journal_mode=DELETE` with **zero `-wal` or `-shm` sidecar files** before publish, after passing `PRAGMA quick_check`, `PRAGMA foreign_key_check` and `fsync`.
+Restore into an isolated shadow-staged candidate instead of overwriting the last good copy in place. Because the live company store operates in SQLite `WAL` mode (`autocommit=True` + `BEGIN IMMEDIATE`), both checkpoint snapshot creation and shadow-staged restore MUST stage via SQLite online backup, normalize the staged database to `PRAGMA journal_mode=DELETE`, verify `PRAGMA quick_check` and `PRAGMA foreign_key_check`, close the writer and confirm **zero `-wal` or `-shm` sidecar files**, and `fsync` before atomic publish.
 
 Verify checkpoint and restore cuts using a **logical watermark** (`company_id`, `schema_version`, `max_event_seq` and canonical domain digest) rather than raw SQLite file byte SHA-256, because WAL checkpointing and journal normalization can alter physical database bytes without changing logical company state. Bundle matching per-Agent Desk snapshots alongside SQLite `private_desk` revisions inside each checkpoint so restored Agents reopen consistent private files without restoring revoked mounts.
 
