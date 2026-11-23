@@ -9,6 +9,7 @@ from time import time
 from uuid import uuid4
 
 from .company import _connect, upgrade_work_schema
+from .company_assets import require_project_onboarding_authority
 from .duty_run import (
     DutyClaim,
     DutyRefused,
@@ -110,11 +111,13 @@ class StaffingNeed:
     available_capacity: int
     assigned_capacity: int
     available_at: int
+    project_id: str | None = None
 
     def __post_init__(self) -> None:
         if (
             not _label(self.duty_id, 128)
             or not _label(self.summary)
+            or (self.project_id is not None and not _label(self.project_id, 128))
             or any(
                 type(value) is not int or not 0 <= value < 2**63
                 for value in (
@@ -156,7 +159,19 @@ def stage_staffing(
         ).fetchone()
         if existing != terms:
             raise DutyRefused("Staffing authority conflicts with the sealed envelope")
-        body = _canonical(asdict(need))
+        facts = asdict(need)
+        if need.project_id is None:
+            facts.pop("project_id")
+        else:
+            if authority.allowed_scope != "assessment":
+                raise DutyRefused("Project onboarding is scoped to company assessment")
+            require_project_onboarding_authority(
+                connection,
+                writer.company_id,
+                authority.manager_grant_id,
+                need.project_id,
+            )
+        body = _canonical(facts)
         revision = sha256(body.encode()).hexdigest()
         assignment = (
             need.duty_id,
