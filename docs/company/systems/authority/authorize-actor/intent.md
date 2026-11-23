@@ -21,4 +21,5 @@ Grants are scoped to company, resource, operation, environment, time and applica
 ## Development changes
 
 - [Bind a principal to a company identity](bind/spec.md)
+- [Manage role definitions and scoped assignments](manage-roles/spec.md)
 - [Decide a scoped capability at use time](check/spec.md)
