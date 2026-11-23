@@ -1,14 +1,18 @@
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import unittest
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sourdough.company import FoundingRefused, FoundingTerms, found
+from sourdough.paper_risk import PaperSuspension, suspend_paper_risk
 from sourdough.work_projection import read_local_board_timeline
+from sourdough.writer_lease import hold_company_writer
 
 
 class BoardTimeline(unittest.TestCase):
@@ -36,9 +40,56 @@ class BoardTimeline(unittest.TestCase):
             ],
         )
         self.assertIsNone(first["paper"])
+        self.assertIsNone(first["risk_control"])
         self.assertEqual(second["revision"], first["revision"])
         self.assertGreaterEqual(second["as_of_ns"], first["as_of_ns"])
         self.assertEqual(self.store.read_bytes(), before)
+
+    def test_risk_projection_reports_only_the_effective_receipt_without_writes(self):
+        company_id = self.receipt.company_id
+        original = read_local_board_timeline(self.store, company_id)
+
+        def authorize(*args):
+            return "verification-principal"
+
+        with hold_company_writer(
+            self.store, company_id, lease_directory=self.store.parent / "leases"
+        ) as writer:
+            applied = suspend_paper_risk(
+                writer,
+                PaperSuspension("hold", "charter", 0, "Private review"),
+                authorize,
+            )
+            conflict = suspend_paper_risk(
+                writer, PaperSuspension("stale", "charter", 0, "Not applied"), authorize
+            )
+        self.assertEqual(conflict.disposition, "conflicting_revision")
+        before = self.store.read_bytes()
+        observed = read_local_board_timeline(self.store, company_id)
+        self.assertEqual(
+            observed["risk_control"],
+            {
+                "state": "suspended",
+                "effective_revision": applied.effective_revision,
+                "last_applied": {
+                    "request_id": "hold",
+                    "operation": applied.operation,
+                    "recorded_at_ns": applied.recorded_at_ns,
+                },
+            },
+        )
+        self.assertNotEqual(observed["revision"], original["revision"])
+        self.assertNotIn("verification-principal", json.dumps(observed))
+        self.assertNotIn("Private review", json.dumps(observed))
+        self.assertEqual(self.store.read_bytes(), before)
+        with closing(sqlite3.connect(self.store)) as database, database:
+            database.execute(
+                "DELETE FROM paper_risk_command WHERE disposition='applied'"
+            )
+        self.assertEqual(
+            read_local_board_timeline(self.store, company_id)["risk_control"],
+            {"state": "unavailable", "effective_revision": None, "last_applied": None},
+        )
 
     def test_unrelated_company_and_nonowner_are_refused_without_mutation(self):
         before = self.store.read_bytes()

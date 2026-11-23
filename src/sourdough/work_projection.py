@@ -10,6 +10,7 @@ from sqlite3 import Connection
 from time import time_ns
 
 from .company import FoundingRefused, _connect, _identity
+from .paper_risk import PaperRiskRefused, effective_paper_risk
 
 
 WORK_TIMELINE_REVISION = "work-timeline-v1"
@@ -75,6 +76,7 @@ def read_local_board_timeline(
             "access": "local_store_owner",
             "duties": duties,
             "paper": _paper_projection(connection, tables),
+            "risk_control": _risk_control(connection, tables),
         }
         current = store.stat(follow_symlinks=False)
         if (initial.st_dev, initial.st_ino, initial.st_uid) != (
@@ -88,6 +90,33 @@ def read_local_board_timeline(
         "contract_revision": WORK_TIMELINE_REVISION,
         "revision": revision,
         "as_of_ns": as_of_ns,
+    }
+
+
+def _risk_control(connection: Connection, tables: set[str]) -> dict | None:
+    if not {"paper_binding", "paper_risk_command"} & tables:
+        return None
+    try:
+        current = effective_paper_risk(connection)
+    except PaperRiskRefused:
+        return {
+            "state": "unavailable",
+            "effective_revision": None,
+            "last_applied": None,
+        }
+    applied = current.applied
+    return {
+        "state": "suspended" if current.suspended else "not_suspended",
+        "effective_revision": current.revision,
+        "last_applied": (
+            {
+                "request_id": applied.request_id,
+                "operation": applied.operation,
+                "recorded_at_ns": applied.recorded_at_ns,
+            }
+            if applied is not None
+            else None
+        ),
     }
 
 

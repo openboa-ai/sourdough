@@ -68,8 +68,12 @@ class PaperRiskReceipt:
 
 @dataclass(frozen=True)
 class PaperRiskState:
-    revision: int
     suspended: bool
+    applied: PaperRiskReceipt | None
+
+    @property
+    def revision(self) -> int:
+        return self.applied.effective_revision if self.applied else 0
 
 
 def _has_commands(connection: Connection) -> bool:
@@ -85,17 +89,24 @@ def effective_paper_risk(connection: Connection) -> PaperRiskState:
     _, schema = _company_version(connection)
     if _has_commands(connection):
         row = connection.execute(
-            """SELECT operation,effective_revision FROM paper_risk_command
+            """SELECT request_id,principal,operation,disposition,effective_revision,recorded_at_ns
+               FROM paper_risk_command
                WHERE disposition='applied' ORDER BY effective_revision DESC LIMIT 1"""
         ).fetchone()
         if row is not None:
-            operation, revision = row
-            if operation not in (SUSPEND_NEW_RISK, RESUME_NEW_RISK) or revision < 1:
+            applied = PaperRiskReceipt(*row)
+            if (
+                applied.operation not in (SUSPEND_NEW_RISK, RESUME_NEW_RISK)
+                or type(applied.effective_revision) is not int
+                or applied.effective_revision < 1
+                or type(applied.recorded_at_ns) is not int
+                or applied.recorded_at_ns <= 0
+            ):
                 raise PaperRiskRefused("Unsupported effective paper risk control")
-            return PaperRiskState(revision, operation == SUSPEND_NEW_RISK)
+            return PaperRiskState(applied.operation == SUSPEND_NEW_RISK, applied)
     if schema == PAPER_CONTROL_SCHEMA_REVISION:
         raise PaperRiskRefused("Controlled store has no effective paper risk receipt")
-    return PaperRiskState(0, False)
+    return PaperRiskState(False, None)
 
 
 def _principal(

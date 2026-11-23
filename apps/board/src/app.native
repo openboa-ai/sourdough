@@ -25,4 +25,5 @@
     </column>
   </scroll>
   <if test="{available}"><text size="sm" foreground="text_muted">{investment}</text></if>
+  <if test="{show_risk_control}"><text size="sm">{risk_control}</text></if>
 </column>

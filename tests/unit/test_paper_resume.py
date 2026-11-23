@@ -24,6 +24,7 @@ from sourdough.paper_risk import (
     read_paper_risk_receipt,
     suspend_paper_risk,
 )
+from sourdough.work_projection import read_local_board_timeline
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -119,6 +120,14 @@ class ResumeManagedPaper(unittest.TestCase):
                 (resume.disposition, resume.effective_revision), ("applied", 2)
             )
             self.assertFalse(self.state().suspended)
+            projected = read_local_board_timeline(self.store, self.company_id)[
+                "risk_control"
+            ]
+            self.assertEqual(
+                (projected["state"], projected["effective_revision"]),
+                ("not_suspended", 2),
+            )
+            self.assertEqual(projected["last_applied"]["operation"], RESUME_NEW_RISK)
             self.assertEqual(
                 read_paper_risk_receipt(
                     writer,
