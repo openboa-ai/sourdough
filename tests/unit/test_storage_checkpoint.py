@@ -405,6 +405,73 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                 (MAX_SCHEMA_VERSION,),
             )
 
+    def test_tampered_desk_bytes_are_refused_with_or_without_manifest_rewrite(self):
+        desk = self.root / "desk-auth"
+        desk.mkdir()
+        (desk / "state.md").write_text("trusted-context\n", encoding="utf-8")
+        archive = self.root / "checkpoint-auth.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            desk_root=desk,
+            lease_directory=self.leases,
+        )
+        with ZipFile(archive, "r") as zf:
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            db_bytes = zf.read("company.sqlite")
+
+        # Attack 1: tamper desk/state.md while leaving manifest.json and company.sqlite untouched
+        tampered_1 = self.root / "tampered-desk-1.zip"
+        with ZipFile(tampered_1, "w", compression=ZIP_STORED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, sort_keys=True))
+            zf.writestr("company.sqlite", db_bytes)
+            zf.writestr("desk/state.md", b"poisoned-context\n")
+
+        with self.assertRaisesRegex(CheckpointRefused, "Desk contents failed"):
+            inspect_checkpoint(tampered_1, self.company_id)
+        with self.assertRaisesRegex(CheckpointRefused, "Desk contents failed"):
+            restore_store(
+                self.store,
+                self.company_id,
+                tampered_1,
+                self.root / "never-desk-1.sqlite",
+                desk_destination=self.root / "never-desk-1",
+                lease_directory=self.leases,
+            )
+
+        # Attack 2: tamper desk/state.md AND recompute manifest.desk_digest to match tampered bytes
+        poisoned = b"poisoned-context-2\n"
+        forged_digest = sha256(
+            json.dumps(
+                [["state.md", sha256(poisoned).hexdigest()]], separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        manifest["desk_digest"] = forged_digest
+        tampered_2 = self.root / "tampered-desk-2.zip"
+        with ZipFile(tampered_2, "w", compression=ZIP_STORED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, sort_keys=True))
+            zf.writestr("company.sqlite", db_bytes)
+            zf.writestr("desk/state.md", poisoned)
+
+        with self.assertRaisesRegex(CheckpointRefused, "authoritative audit digest"):
+            inspect_checkpoint(tampered_2, self.company_id)
+        with self.assertRaisesRegex(CheckpointRefused, "authoritative audit digest"):
+            restore_store(
+                self.store,
+                self.company_id,
+                tampered_2,
+                self.root / "never-desk-2.sqlite",
+                desk_destination=self.root / "never-desk-2",
+                lease_directory=self.leases,
+            )
+        # Original store remains live and writable
+        with closing(open_writer(self.store)) as writer:
+            self.assertEqual(
+                writer.execute("SELECT schema_revision FROM company").fetchone(),
+                (MAX_SCHEMA_VERSION,),
+            )
+
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)

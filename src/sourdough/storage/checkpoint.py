@@ -5,7 +5,7 @@ import os
 import shutil
 import sqlite3
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from functools import lru_cache
@@ -13,6 +13,7 @@ from hashlib import file_digest, sha256
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from time import monotonic, time_ns
+from uuid import uuid4
 from zipfile import ZIP_STORED, BadZipFile, ZipFile
 
 from .db import (
@@ -26,7 +27,7 @@ from .db import (
     verify_no_wal_sidecars,
     write_tx,
 )
-from .kernel import max_event_seq
+from .kernel import append_audit_event, max_event_seq
 
 
 CHECKPOINT_FORMAT = "sourdough-checkpoint-v2"
@@ -68,6 +69,17 @@ class LogicalWatermark:
             raise CheckpointRefused("Invalid logical watermark")
 
 
+def _compute_desk_digest(entries: Iterable[tuple[str, str]]) -> str:
+    """Compute a canonical SHA-256 digest over sorted (relative_path, file_sha256) pairs."""
+    canonical = sorted((str(rel), str(digest)) for rel, digest in entries)
+    return sha256(
+        json.dumps(canonical, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+EMPTY_DESK_DIGEST = _compute_desk_digest(())
+
+
 @dataclass(frozen=True)
 class CheckpointManifest:
     format: str
@@ -78,6 +90,8 @@ class CheckpointManifest:
     sha256: str
     watermark: LogicalWatermark
     desk_files: tuple[str, ...] = ()
+    desk_digest: str = EMPTY_DESK_DIGEST
+    cut_id: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -91,6 +105,11 @@ class CheckpointManifest:
             or not isinstance(self.sha256, str)
             or len(self.sha256) != 64
             or any(ch not in "0123456789abcdef" for ch in self.sha256)
+            or not isinstance(self.desk_digest, str)
+            or len(self.desk_digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in self.desk_digest)
+            or not isinstance(self.cut_id, str)
+            or not self.cut_id.strip()
         ):
             raise CheckpointRefused("Invalid checkpoint manifest")
 
@@ -422,14 +441,45 @@ def checkpoint_store(
     ):
         if os.path.lexists(archive):
             raise CheckpointRefused("Checkpoint destination already exists")
-        staged_db = Path(directory) / _STORE_ENTRY
-        snapshot_normalized_store(store, staged_db)
-        with closing(open_reader(staged_db)) as reader, read_tx(reader):
-            watermark = compute_logical_watermark(reader, company_id)
+        # Stage and hash Desk files first so symlink/file refusals fail before mutating the live store.
         staged_desk = Path(directory) / "desk"
         desk_files = (
             _stage_pinned_desk(desk_root, staged_desk) if desk_root is not None else ()
         )
+        desk_digest = _compute_desk_digest(
+            (
+                rel,
+                _hash_file(
+                    staged_desk.joinpath(*_validate_desk_relative_path(rel).parts)
+                ),
+            )
+            for rel in desk_files
+        )
+        # Bind the Desk digest into the authoritative append-only audit log before snapshotting SQLite.
+        cut_id = uuid4().hex
+        with (
+            closing(
+                open_writer(writer.store, create=False, lease=writer)
+            ) as live_writer,
+            write_tx(live_writer),
+        ):
+            append_audit_event(
+                live_writer,
+                company_id=company_id,
+                domain="ops",
+                entity_type="checkpoint",
+                entity_id=cut_id,
+                event_type="company.checkpoint_cut",
+                actor_id="checkpoint",
+                payload={
+                    "desk_digest": desk_digest,
+                    "desk_files": list(desk_files),
+                },
+            )
+        staged_db = Path(directory) / _STORE_ENTRY
+        snapshot_normalized_store(store, staged_db)
+        with closing(open_reader(staged_db)) as reader, read_tx(reader):
+            watermark = compute_logical_watermark(reader, company_id)
         manifest = CheckpointManifest(
             format=CHECKPOINT_FORMAT,
             company_id=company_id,
@@ -439,6 +489,8 @@ def checkpoint_store(
             sha256=_hash_file(staged_db),
             watermark=watermark,
             desk_files=desk_files,
+            desk_digest=desk_digest,
+            cut_id=cut_id,
         )
         candidate = Path(directory) / "checkpoint.zip"
         with candidate.open("xb") as handle:
@@ -489,6 +541,8 @@ def _parse_manifest(raw: bytes) -> CheckpointManifest:
             sha256=payload["sha256"],
             watermark=watermark,
             desk_files=tuple(desk_files),
+            desk_digest=payload["desk_digest"],
+            cut_id=payload["cut_id"],
         )
     except KeyError as error:
         raise CheckpointRefused("Missing checkpoint manifest field") from error
@@ -536,15 +590,26 @@ def _extract_checkpoint(
                     with database.open("xb") as out:
                         os.fchmod(out.fileno(), 0o600)
                         out.write(zf.read(_STORE_ENTRY))
-                    if desk_dir is not None and manifest.desk_files:
-                        desk_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    desk_hashes: list[tuple[str, str]] = []
+                    if manifest.desk_files:
+                        if desk_dir is not None:
+                            desk_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
                         for rel in manifest.desk_files:
                             safe = _validate_desk_relative_path(rel)
-                            target = desk_dir.joinpath(*safe.parts)
-                            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                            with target.open("xb") as out:
-                                os.fchmod(out.fileno(), 0o600)
-                                out.write(zf.read(f"{_DESK_PREFIX}{rel}"))
+                            content = zf.read(f"{_DESK_PREFIX}{rel}")
+                            desk_hashes.append((rel, sha256(content).hexdigest()))
+                            if desk_dir is not None:
+                                target = desk_dir.joinpath(*safe.parts)
+                                target.parent.mkdir(
+                                    mode=0o700, parents=True, exist_ok=True
+                                )
+                                with target.open("xb") as out:
+                                    os.fchmod(out.fileno(), 0o600)
+                                    out.write(content)
+                    if _compute_desk_digest(desk_hashes) != manifest.desk_digest:
+                        raise CheckpointRefused(
+                            "Extracted Desk contents failed SHA-256 verification"
+                        )
             except BadZipFile as error:
                 raise CheckpointRefused("Checkpoint archive is corrupt") from error
     except CheckpointRefused:
@@ -575,6 +640,31 @@ def _extract_checkpoint(
                 raise CheckpointRefused("Extracted checkpoint failed foreign_key_check")
             actual_watermark = compute_logical_watermark(reader, company_id)
             _verify_trusted_schema_objects(reader, actual_watermark.schema_version)
+            cut_rows = reader.execute(
+                """SELECT payload_json FROM audit_event
+                   WHERE company_id = ? AND domain = 'ops'
+                     AND entity_type = 'checkpoint' AND entity_id = ?
+                     AND event_type = 'company.checkpoint_cut'""",
+                (company_id, manifest.cut_id),
+            ).fetchall()
+            if len(cut_rows) != 1:
+                raise CheckpointRefused(
+                    "Checkpoint cut is not authenticated by authoritative audit log"
+                )
+            try:
+                cut_payload = json.loads(str(cut_rows[0][0]))
+            except json.JSONDecodeError as error:
+                raise CheckpointRefused(
+                    "Malformed checkpoint cut audit event"
+                ) from error
+            if (
+                not isinstance(cut_payload, dict)
+                or cut_payload.get("desk_digest") != manifest.desk_digest
+                or cut_payload.get("desk_files") != list(manifest.desk_files)
+            ):
+                raise CheckpointRefused(
+                    "Checkpoint Desk contents do not match authoritative audit digest"
+                )
     except StorageRefused as error:
         raise CheckpointRefused(str(error)) from error
     verify_no_wal_sidecars(database)
