@@ -17,6 +17,7 @@ from .writer_lease import WriterLease
 
 PAPER_RISK_COMMAND = "paper-risk-command-v1"
 SUSPEND_NEW_RISK = "suspend_new_risk"
+RESUME_NEW_RISK = "resume_new_risk"
 AuthorizeBoard = Callable[[Connection, str, str], str | None]
 
 _SELECT = """
@@ -89,20 +90,21 @@ def effective_paper_risk(connection: Connection) -> PaperRiskState:
         ).fetchone()
         if row is not None:
             operation, revision = row
-            if operation != SUSPEND_NEW_RISK or revision < 1:
+            if operation not in (SUSPEND_NEW_RISK, RESUME_NEW_RISK) or revision < 1:
                 raise PaperRiskRefused("Unsupported effective paper risk control")
-            return PaperRiskState(revision, True)
+            return PaperRiskState(revision, operation == SUSPEND_NEW_RISK)
     if schema == PAPER_CONTROL_SCHEMA_REVISION:
         raise PaperRiskRefused("Controlled store has no effective paper risk receipt")
     return PaperRiskState(0, False)
 
 
 def _principal(
-    connection: Connection, company_id: str, authorize: AuthorizeBoard | None
+    connection: Connection,
+    company_id: str,
+    operation: str,
+    authorize: AuthorizeBoard | None,
 ) -> str:
-    principal = (
-        authorize(connection, company_id, SUSPEND_NEW_RISK) if authorize else None
-    )
+    principal = authorize(connection, company_id, operation) if authorize else None
     if not isinstance(principal, str) or not principal.strip() or len(principal) > 128:
         raise PaperRiskRefused("Current board risk control grant is required")
     return principal
@@ -116,6 +118,87 @@ def _prior(connection: Connection, request_id: str) -> tuple | None:
     )
 
 
+@dataclass(frozen=True)
+class _AuthorizedControl:
+    terms: tuple
+    prior: PaperRiskReceipt | None
+    current_revision: int
+    eligible: bool
+
+
+def _authorize_control(
+    connection: Connection,
+    writer: WriterLease,
+    command: PaperSuspension,
+    operation: str,
+    authorize: AuthorizeBoard | None,
+) -> _AuthorizedControl:
+    writer.verify()
+    principal = _principal(connection, writer.company_id, operation, authorize)
+    company_id, schema = _company_version(connection)
+    if company_id != writer.company_id:
+        raise PaperRiskRefused("Company identity mismatch")
+    if schema not in CURRENT_WORK_SCHEMA_REVISIONS:
+        raise PaperRiskRefused("Company work schema must be upgraded before control")
+    terms = (principal, operation, *astuple(command)[1:])
+    if prior := _prior(connection, command.request_id):
+        if prior[:6] != terms:
+            raise PaperRiskRefused("Request identity is already in use")
+        receipt = PaperRiskReceipt(command.request_id, *prior[:2], *prior[6:])
+        return _AuthorizedControl(terms, receipt, receipt.effective_revision, False)
+    state = effective_paper_risk(connection)
+    (current_charter,) = connection.execute(
+        "SELECT charter_revision FROM company WHERE singleton=1"
+    ).fetchone()
+    eligible = (command.charter_revision, command.expected_revision) == (
+        current_charter,
+        state.revision,
+    ) and (operation == SUSPEND_NEW_RISK or state.suspended)
+    return _AuthorizedControl(terms, None, state.revision, eligible)
+
+
+def _append_control(
+    connection: Connection,
+    request_id: str,
+    control: _AuthorizedControl,
+    *,
+    applied: bool,
+) -> PaperRiskReceipt:
+    principal, operation, *_ = control.terms
+    receipt = PaperRiskReceipt(
+        request_id,
+        principal,
+        operation,
+        "applied" if applied else "conflicting_revision",
+        control.current_revision + int(applied),
+        time_ns(),
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS paper_risk_command (
+               request_id TEXT PRIMARY KEY NOT NULL, principal TEXT NOT NULL,
+               operation TEXT NOT NULL,
+               charter_revision TEXT NOT NULL, expected_revision INTEGER NOT NULL,
+               reason TEXT NOT NULL, contract_revision TEXT NOT NULL,
+               disposition TEXT NOT NULL CHECK(disposition IN ('applied','conflicting_revision')),
+               effective_revision INTEGER NOT NULL, recorded_at_ns INTEGER NOT NULL
+           )"""
+    )
+    connection.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS paper_risk_effective_revision
+           ON paper_risk_command(effective_revision) WHERE disposition='applied'"""
+    )
+    connection.execute(
+        "INSERT INTO paper_risk_command VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (request_id, *control.terms, *astuple(receipt)[3:]),
+    )
+    if applied:
+        connection.execute(
+            "UPDATE company SET schema_revision=? WHERE singleton=1",
+            (PAPER_CONTROL_SCHEMA_REVISION,),
+        )
+    return receipt
+
+
 def suspend_paper_risk(
     writer: WriterLease,
     command: PaperSuspension,
@@ -124,75 +207,57 @@ def suspend_paper_risk(
     writer.verify()
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        writer.verify()
-        principal = _principal(connection, writer.company_id, authorize)
-        company_id, schema = _company_version(connection)
-        if company_id != writer.company_id:
-            raise PaperRiskRefused("Company identity mismatch")
-        if schema not in CURRENT_WORK_SCHEMA_REVISIONS:
-            raise PaperRiskRefused(
-                "Company work schema must be upgraded before control"
-            )
-        terms = (principal, SUSPEND_NEW_RISK, *astuple(command)[1:])
-        prior = _prior(connection, command.request_id)
-        if prior is not None:
-            if prior[:6] != terms:
-                raise PaperRiskRefused("Request identity is already in use")
-            return PaperRiskReceipt(command.request_id, *prior[:2], *prior[6:])
+        control = _authorize_control(
+            connection, writer, command, SUSPEND_NEW_RISK, authorize
+        )
+        return control.prior or _append_control(
+            connection, command.request_id, control, applied=control.eligible
+        )
 
-        current_revision = effective_paper_risk(connection).revision
-        (current_charter,) = connection.execute(
-            "SELECT charter_revision FROM company WHERE singleton=1"
-        ).fetchone()
-        applied = (command.charter_revision, command.expected_revision) == (
-            current_charter,
-            current_revision,
+
+def _resume_with_evidence(
+    writer: WriterLease,
+    command: PaperSuspension,
+    authorize: AuthorizeBoard | None,
+    observe: Callable[[], Callable[[Connection], None]],
+) -> PaperRiskReceipt:
+    writer.verify()
+    with closing(_connect(writer.store, "ro")) as connection:
+        connection.execute("BEGIN")
+        initial = _authorize_control(
+            connection, writer, command, RESUME_NEW_RISK, authorize
         )
-        receipt = PaperRiskReceipt(
-            command.request_id,
-            principal,
-            SUSPEND_NEW_RISK,
-            "applied" if applied else "conflicting_revision",
-            current_revision + int(applied),
-            time_ns(),
+        if initial.prior is not None:
+            return initial.prior
+    verify_local = observe() if initial.eligible else None
+    with closing(_connect(writer.store, "rw")) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = _authorize_control(
+            connection, writer, command, RESUME_NEW_RISK, authorize
         )
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS paper_risk_command (
-                   request_id TEXT PRIMARY KEY NOT NULL, principal TEXT NOT NULL,
-                   operation TEXT NOT NULL,
-                   charter_revision TEXT NOT NULL, expected_revision INTEGER NOT NULL,
-                   reason TEXT NOT NULL, contract_revision TEXT NOT NULL,
-                   disposition TEXT NOT NULL CHECK(disposition IN ('applied','conflicting_revision')),
-                   effective_revision INTEGER NOT NULL, recorded_at_ns INTEGER NOT NULL
-               )"""
-        )
-        connection.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS paper_risk_effective_revision
-               ON paper_risk_command(effective_revision) WHERE disposition='applied'"""
-        )
-        connection.execute(
-            "INSERT INTO paper_risk_command VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (command.request_id, *terms, *astuple(receipt)[3:]),
-        )
+        if current.terms != initial.terms:
+            raise PaperRiskRefused("Board authorization changed during observation")
+        if current.prior is not None:
+            return current.prior
+        applied = current.eligible and verify_local is not None
         if applied:
-            connection.execute(
-                "UPDATE company SET schema_revision=? WHERE singleton=1",
-                (PAPER_CONTROL_SCHEMA_REVISION,),
-            )
-        return receipt
+            verify_local(connection)
+        return _append_control(connection, command.request_id, current, applied=applied)
 
 
 def read_paper_risk_receipt(
     writer: WriterLease,
     request_id: str,
     authorize: AuthorizeBoard | None,
+    *,
+    operation: str = SUSPEND_NEW_RISK,
 ) -> PaperRiskReceipt | None:
     writer.verify()
     with closing(_connect(writer.store, "ro")) as connection:
         connection.execute("BEGIN")
         writer.verify()
-        principal = _principal(connection, writer.company_id, authorize)
+        principal = _principal(connection, writer.company_id, operation, authorize)
         prior = _prior(connection, request_id)
-        if prior is None or prior[0] != principal:
+        if prior is None or prior[:2] != (principal, operation):
             return None
         return PaperRiskReceipt(request_id, *prior[:2], *prior[6:])
