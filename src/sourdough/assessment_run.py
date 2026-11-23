@@ -6,7 +6,6 @@ from pathlib import Path
 from time import monotonic, sleep, time
 
 from .abandoned_work import has_uncommitted_work, requeue_uncommitted_work
-from .company import upgrade_work_schema
 from .company_assessment import (
     ASSESSMENT,
     AssessmentReceipt,
@@ -91,7 +90,6 @@ def _run_assessment(
     budget_from: int,
     on_ready: Callable[[WriterLease], None],
 ) -> AssessmentRun:
-    upgrade_work_schema(store, company_id)
     restored = []
     for claim, receipt in pending_publications(writer):
         settle_assessment(writer, claim, receipt)

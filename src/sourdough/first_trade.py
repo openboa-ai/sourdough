@@ -76,6 +76,31 @@ def run_first_trade(
     *,
     writer: WriterLease | None = None,
 ) -> TradeResult:
+    if writer is None:
+        from .runtime.engine import CompanyRuntime, build_default_registry
+        from .runtime.registry import DutyOutcome
+
+        registry = build_default_registry(
+            {"paper.first_trade": lambda _ctx: DutyOutcome("completed")}
+        )
+        return CompanyRuntime(store, company_id, registry).run_bound_handler(
+            "paper.first_trade",
+            lambda lease: _run_first_trade_bound(
+                store, company_id, venue, runtime, writer=lease
+            ),
+            venue=venue,
+        )
+    return _run_first_trade_bound(store, company_id, venue, runtime, writer=writer)
+
+
+def _run_first_trade_bound(
+    store: Path,
+    company_id: str,
+    venue: PaperExecution,
+    runtime: EmployeeRuntime,
+    *,
+    writer: WriterLease | None = None,
+) -> TradeResult:
     venue.require_independent_from(store)
     binding = reopen_binding(store, company_id)
     account = binding.account

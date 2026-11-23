@@ -21,10 +21,12 @@ from .registry import (
 )
 from .venue_coordinator import BoundedVenueCoordinator, VenueSegmentPolicy
 from .work_kernel import (
+    RunFenced,
     WorkItem,
     claim_work_run,
     complete_work_run,
     evaluate_conditions,
+    fail_work_run,
     reclaim_expired_runs,
     wake_waiting_runs,
     yield_run_to_wait,
@@ -118,24 +120,51 @@ class CompanyRuntime:
                     break
                 item, run, descriptor = claimed
                 # Execute outside any open SQLite write transaction!
-                outcome = descriptor.execute(
-                    DutyContext(writer, self._company_id, item, run, timestamp)
-                )
+                try:
+                    outcome = descriptor.execute(
+                        DutyContext(writer, self._company_id, item, run, timestamp)
+                    )
+                except Exception as error:
+                    try:
+                        writer.verify()
+                        with (
+                            closing(open_writer(self._store, lease=writer)) as conn,
+                            write_tx(conn),
+                        ):
+                            fail_work_run(
+                                conn,
+                                run.run_id,
+                                run.fencing_token,
+                                error_summary=type(error).__name__,
+                                return_to_due=True,
+                                now_ns=timestamp,
+                            )
+                    except RunFenced:
+                        pass
+                    raise
                 writer.verify()
                 with (
                     closing(open_writer(self._store, lease=writer)) as conn,
                     write_tx(conn),
                 ):
                     if outcome.disposition == "waiting":
-                        yield_run_to_wait(
-                            conn,
-                            run.run_id,
-                            run.fencing_token,
-                            wait_until_ns=outcome.wait_until_ns,
-                            wait_event_key=outcome.wait_event_key,
-                            reason=outcome.wait_reason,
-                            now_ns=timestamp,
-                        )
+                        # Handlers such as open_peer_request() may already have
+                        # transitioned this fenced run into durable waiting state.
+                        status_row = conn.execute(
+                            """SELECT status FROM work_runs
+                               WHERE run_id = ? AND fencing_token = ?""",
+                            (run.run_id, run.fencing_token),
+                        ).fetchone()
+                        if status_row is None or status_row[0] != "waiting":
+                            yield_run_to_wait(
+                                conn,
+                                run.run_id,
+                                run.fencing_token,
+                                wait_until_ns=outcome.wait_until_ns,
+                                wait_event_key=outcome.wait_event_key,
+                                reason=outcome.wait_reason,
+                                now_ns=timestamp,
+                            )
                     elif outcome.disposition == "blocked":
                         complete_work_run(
                             conn,

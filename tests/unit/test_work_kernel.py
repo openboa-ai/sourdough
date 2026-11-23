@@ -378,3 +378,99 @@ class WorkKernel(unittest.TestCase):
                 (item.work_item_id,),
             ).fetchone()
             self.assertEqual(item_state, ("due", self.founder_id))
+
+    def test_peer_request_deadline_wake_expires_open_request_and_enforces_ownership(
+        self,
+    ):
+        with closing(open_writer(self.store)) as conn:
+            with write_tx(conn):
+                item, _ = create_work_item(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.assessment",
+                    source_kind="project",
+                    source_id="proj-timeout",
+                    dedupe_key="timeout-item",
+                    payload={"step": 1},
+                    now_ns=1_000,
+                )
+                # Conflicting payload on same dedupe_key must fail closed
+                with self.assertRaisesRegex(WorkKernelRefused, "conflicting terms"):
+                    create_work_item(
+                        conn,
+                        company_id=self.company_id,
+                        owner_agent_id=self.founder_id,
+                        duty_kind="work.assessment",
+                        source_kind="project",
+                        source_id="proj-timeout",
+                        dedupe_key="timeout-item",
+                        payload={"step": 2},
+                        now_ns=1_001,
+                    )
+                # Another agent cannot attach a condition to founder's work item
+                with self.assertRaisesRegex(WorkKernelRefused, "belongs to another"):
+                    set_condition(
+                        conn,
+                        company_id=self.company_id,
+                        owner_agent_id=self.peer_id,
+                        work_item_id=item.work_item_id,
+                        trigger_kind="timer",
+                        due_at_ns=5_000,
+                        now_ns=1_002,
+                    )
+                run = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    lease_owner="worker-a",
+                    lease_ttl_ns=60_000,
+                    now_ns=1_500,
+                )
+                open_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    requester_run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    recipient_agent_id=self.peer_id,
+                    question="Need review?",
+                    expected_decision="approve",
+                    evidence_refs=["asset:r1"],
+                    deadline_ns=10_000,
+                    request_id="req-timeout-1",
+                    now_ns=2_000,
+                )
+
+            # Timer wake past deadline must wake item AND expire the open peer request
+            with write_tx(conn):
+                woken = wake_waiting_runs(conn, self.company_id, now_ns=12_000)
+                self.assertEqual(woken, (item.work_item_id,))
+                req_state = conn.execute(
+                    "SELECT state FROM work_peer_requests WHERE request_id = 'req-timeout-1'"
+                ).fetchone()
+                self.assertEqual(req_state, ("expired",))
+                # Requester can now re-claim and open a fresh peer request without conflict
+                run2 = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    lease_owner="worker-a",
+                    lease_ttl_ns=60_000,
+                    now_ns=12_100,
+                )
+                req2, _ = open_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    requester_run_id=run2.run_id,
+                    fencing_token=run2.fencing_token,
+                    recipient_agent_id=self.peer_id,
+                    question="Retry review?",
+                    expected_decision="approve",
+                    evidence_refs=["asset:r1"],
+                    deadline_ns=30_000,
+                    request_id="req-timeout-2",
+                    now_ns=12_200,
+                )
+                self.assertEqual(req2.state, "open")

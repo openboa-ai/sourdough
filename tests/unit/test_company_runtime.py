@@ -20,7 +20,9 @@ from sourdough.runtime.venue_coordinator import (
 from sourdough.runtime.work_kernel import (
     claim_work_run,
     create_work_item,
+    open_peer_request,
     register_responsibility,
+    resolve_peer_request,
     set_condition,
 )
 from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
@@ -160,3 +162,103 @@ class UnifiedCompanyRuntime(unittest.TestCase):
         self.assertEqual([seg.active_seconds for seg in segments], [60, 56, 8])
         self.assertEqual(sum(seg.active_seconds for seg in segments), 124)
         self.assertTrue(all(seg.work_seconds >= 3 for seg in segments))
+
+    def test_runtime_step_releases_agent_slot_on_handler_exception_and_peer_wait(self):
+        peer_id = "peer-colleague"
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "INSERT INTO agent VALUES (?, ?, ?)",
+                (peer_id, self.company_id, "profile-peer"),
+            )
+            item, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.flaky",
+                source_kind="manual",
+                source_id="flaky-1",
+                now_ns=1_000,
+            )
+
+        attempts = 0
+
+        def flaky_handler(ctx: DutyContext) -> DutyOutcome:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient tool crash")
+            if attempts == 2:
+                with closing(open_writer(self.store, lease=ctx.writer)) as conn:
+                    with write_tx(conn):
+                        open_peer_request(
+                            conn,
+                            company_id=ctx.company_id,
+                            requester_work_item_id=ctx.work_item.work_item_id,
+                            requester_run_id=ctx.run.run_id,
+                            fencing_token=ctx.run.fencing_token,
+                            recipient_agent_id=peer_id,
+                            question="Confirm?",
+                            expected_decision="yes_no",
+                            evidence_refs=["asset:a"],
+                            deadline_ns=50_000,
+                            request_id="req-in-step",
+                            now_ns=ctx.now_ns,
+                        )
+                return DutyOutcome(disposition="waiting", wait_reason="peer")
+            return DutyOutcome(disposition="completed", result={"ok": True})
+
+        def peer_handler(ctx: DutyContext) -> DutyOutcome:
+            with closing(open_writer(self.store, lease=ctx.writer)) as conn:
+                with write_tx(conn):
+                    resolve_peer_request(
+                        conn,
+                        company_id=ctx.company_id,
+                        request_id="req-in-step",
+                        actor_id=peer_id,
+                        resolution_state="answered",
+                        response_payload={"answer": "yes"},
+                        now_ns=ctx.now_ns,
+                    )
+            return DutyOutcome(disposition="completed", result={"answered": True})
+
+        runtime = CompanyRuntime(
+            self.store,
+            self.company_id,
+            build_default_registry(
+                {
+                    "work.flaky": flaky_handler,
+                    "work.peer_response": peer_handler,
+                }
+            ),
+            lease_directory=self.leases,
+        )
+
+        # Attempt 1 raises -> run marked failed, work item returned to due immediately
+        with self.assertRaisesRegex(RuntimeError, "transient tool crash"):
+            runtime.step(max_dispatches=2, now_ns=2_000)
+        with closing(open_reader(self.store)) as reader, read_tx(reader):
+            self.assertEqual(
+                reader.execute(
+                    "SELECT state FROM work_items WHERE work_item_id = ?",
+                    (item.work_item_id,),
+                ).fetchone(),
+                ("due",),
+            )
+            self.assertEqual(
+                reader.execute(
+                    "SELECT COUNT(*) FROM work_runs WHERE status = 'running'"
+                ).fetchone()[0],
+                0,
+            )
+
+        # Attempt 2 opens peer request (already yields to waiting) -> peer answers -> attempt 3 settles!
+        s2 = runtime.step(max_dispatches=4, now_ns=3_000)
+        self.assertEqual(len(s2.executed_runs), 3)
+        with closing(open_reader(self.store)) as reader, read_tx(reader):
+            self.assertEqual(
+                reader.execute(
+                    "SELECT state FROM work_items WHERE work_item_id = ?",
+                    (item.work_item_id,),
+                ).fetchone(),
+                ("settled",),
+            )

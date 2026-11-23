@@ -153,6 +153,13 @@ def create_work_item(
     if state not in ("due", "scheduled"):
         raise WorkKernelRefused(f"Initial work item state cannot be {state}")
     _require_agent(connection, company_id, owner_agent_id)
+    if parent_work_item_id is not None:
+        parent_row = connection.execute(
+            "SELECT 1 FROM work_items WHERE work_item_id = ? AND company_id = ?",
+            (parent_work_item_id, company_id),
+        ).fetchone()
+        if parent_row is None:
+            raise WorkKernelRefused("Parent work item not found for company")
     payload_json = _canonical_json(payload or {})
 
     if dedupe_key is not None:
@@ -171,6 +178,8 @@ def create_work_item(
                 or prior.duty_kind != duty_kind
                 or prior.source_kind != source_kind
                 or prior.source_id != source_id
+                or prior.parent_work_item_id != parent_work_item_id
+                or prior.payload_json != payload_json
             ):
                 raise WorkKernelRefused(
                     "Work item dedupe_key reused with conflicting terms"
@@ -263,8 +272,14 @@ def claim_work_run(
     if item_row is None:
         raise WorkKernelRefused("Work item not found for company")
     _, _, agent_id, duty_kind, state = item_row
-    if state not in ("due", "scheduled"):
+    if state != "due":
         raise WorkKernelRefused(f"Work item is not claimable in state {state}")
+    if dedupe_key is not None:
+        dup_run = connection.execute(
+            "SELECT 1 FROM work_runs WHERE dedupe_key = ?", (dedupe_key,)
+        ).fetchone()
+        if dup_run is not None:
+            raise WorkKernelRefused("Work run dedupe_key already exists")
 
     max_token = int(
         connection.execute(
@@ -481,6 +496,25 @@ def wake_waiting_runs(
                WHERE work_item_id = ? AND state = 'waiting'""",
             (now_ns, work_item_id),
         )
+        if (
+            reason == "timer"
+            and isinstance(wait_event_key, str)
+            and wait_event_key.startswith("peer_response:")
+        ):
+            expired_req_id = wait_event_key.removeprefix("peer_response:")
+            connection.execute(
+                """UPDATE work_peer_requests
+                   SET state = 'expired',
+                       response_json = COALESCE(response_json, '{"reason":"deadline_elapsed"}'),
+                       resolved_at_ns = ?
+                   WHERE company_id = ? AND request_id = ? AND state = 'open'""",
+                (now_ns, company_id, expired_req_id),
+            )
+        audit_actor = (
+            triggering_actor_id
+            if reason == "event" and triggering_actor_id
+            else "work_scheduler"
+        )
         append_audit_event(
             connection,
             company_id=company_id,
@@ -488,7 +522,7 @@ def wake_waiting_runs(
             entity_type="work_item",
             entity_id=work_item_id,
             event_type="work.wait_woken",
-            actor_id=triggering_actor_id or "work_scheduler",
+            actor_id=audit_actor,
             run_id=run_id,
             payload={"reason": reason, "event_key": event_key},
             recorded_at_ns=now_ns,
@@ -539,6 +573,69 @@ def reclaim_expired_runs(
         )
         fenced_runs.append(str(run_id))
     return tuple(fenced_runs)
+
+
+def fail_work_run(
+    connection: sqlite3.Connection,
+    run_id: str,
+    fencing_token: int,
+    *,
+    error_summary: str,
+    return_to_due: bool = True,
+    now_ns: int | None = None,
+) -> WorkRun:
+    """Record a failed active run and release the Agent's active execution slot."""
+    run = assert_run_fencing(connection, run_id, fencing_token)
+    timestamp = time_ns() if now_ns is None else now_ns
+    outcome_json = _canonical_json({"disposition": "failed", "error": error_summary})
+    changed = connection.execute(
+        """UPDATE work_runs
+           SET status = 'failed', lease_owner = NULL, lease_expires_at_ns = NULL,
+               outcome_json = ?, updated_at_ns = ?
+           WHERE run_id = ? AND fencing_token = ? AND status = 'running'""",
+        (outcome_json, timestamp, run_id, fencing_token),
+    )
+    if changed.rowcount != 1:
+        raise RunFenced("Run was fenced before failure transition")
+    next_state = "due" if return_to_due else "blocked"
+    connection.execute(
+        "UPDATE work_items SET state = ?, updated_at_ns = ? WHERE work_item_id = ?",
+        (next_state, timestamp, run.work_item_id),
+    )
+    append_audit_event(
+        connection,
+        company_id=run.company_id,
+        domain="work",
+        entity_type="work_run",
+        entity_id=run_id,
+        event_type="work.run_failed",
+        actor_id=run.agent_id,
+        run_id=run_id,
+        payload={
+            "work_item_id": run.work_item_id,
+            "error": error_summary,
+            "item_state": next_state,
+        },
+        recorded_at_ns=timestamp,
+    )
+    return WorkRun(
+        run.run_id,
+        run.company_id,
+        run.work_item_id,
+        run.agent_id,
+        run.duty_kind,
+        "failed",
+        run.fencing_token,
+        None,
+        None,
+        None,
+        None,
+        run.budget_ceiling_minor,
+        run.dedupe_key,
+        outcome_json,
+        run.created_at_ns,
+        timestamp,
+    )
 
 
 def complete_work_run(
@@ -732,6 +829,8 @@ def set_condition(
 ) -> WorkCondition:
     """Arm an Agent-owned next condition (timer or shared_asset_revision)."""
     _require_agent(connection, company_id, owner_agent_id)
+    if type(condition_revision) is not int or condition_revision < 1:
+        raise WorkKernelRefused("condition_revision must be a positive integer")
     if trigger_kind not in ("timer", "shared_asset_revision", "peer_response"):
         raise WorkKernelRefused(f"Unsupported condition trigger_kind: {trigger_kind}")
     if trigger_kind == "timer" and due_at_ns is None:
@@ -740,6 +839,10 @@ def set_condition(
         not source_identity or not source_identity.strip()
     ):
         raise WorkKernelRefused("Asset revision condition requires source_identity")
+    if trigger_kind == "peer_response" and (
+        not source_identity or not source_identity.strip()
+    ):
+        raise WorkKernelRefused("Peer response condition requires source_identity")
     if responsibility_id is None and work_item_id is None:
         raise WorkKernelRefused(
             "Condition must link a responsibility_id or work_item_id"
@@ -753,6 +856,16 @@ def set_condition(
         if row is None or row[0] != owner_agent_id or row[1] != "active":
             raise WorkKernelRefused(
                 "Responsibility is inactive or owned by another Agent"
+            )
+    if work_item_id is not None:
+        item_owner = connection.execute(
+            """SELECT owner_agent_id FROM work_items
+               WHERE company_id = ? AND work_item_id = ?""",
+            (company_id, work_item_id),
+        ).fetchone()
+        if item_owner is None or item_owner[0] != owner_agent_id:
+            raise WorkKernelRefused(
+                "Work item does not exist or belongs to another Agent"
             )
 
     cid = condition_id or uuid4().hex
@@ -949,7 +1062,15 @@ def evaluate_conditions(
             )
             continue
 
-        duty_kind = resp_duty_kind or "work.discovery_review"
+        duty_kind = resp_duty_kind
+        if not duty_kind and parent_item_id is not None:
+            parent_kind = connection.execute(
+                "SELECT duty_kind FROM work_items WHERE work_item_id = ?",
+                (parent_item_id,),
+            ).fetchone()
+            if parent_kind is not None:
+                duty_kind = str(parent_kind[0])
+        duty_kind = duty_kind or "work.discovery_review"
         item, _ = create_work_item(
             connection,
             company_id=company_id,
@@ -1176,7 +1297,9 @@ def resolve_peer_request(
         company_id,
         now_ns=timestamp,
         event_key=f"peer_response:{request_id}",
-        triggering_actor_id=actor_id,
+        triggering_actor_id=(
+            "work_scheduler" if resolution_state == "expired" else actor_id
+        ),
     )
     append_audit_event(
         connection,
