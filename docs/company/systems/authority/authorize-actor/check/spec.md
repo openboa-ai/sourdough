@@ -6,11 +6,13 @@ Design draft · Verification **UNRUN** · Responsible component: Authorization s
 
 ## Boundary and dependencies
 
-Input contracts: [authorize-actor/bind](../bind/spec.md).
+Input contracts: [authorize-actor/bind](../bind/spec.md) · [Role definitions and assignments](../manage-roles/spec.md).
 
 ## Design decision and review
 
 Evaluate principal, action, resource, environment, current grant and policy revisions before the protected effect. Return a scoped decision and reason, not a reusable blanket permission.
+
+A matching scoped role assignment grants an action only when its current resource and work constraints also hold. Read the current revisions from the owning stores; do not use the Client, a tool list, a token claim or an earlier allow as authority. The service that admits the action enforces the decision; an authorization check does not replace the responsible domain's validation.
 
 **Concern for the responsible component:** Grants are scoped to company, resource, operation, environment, time and applicable budget.
 

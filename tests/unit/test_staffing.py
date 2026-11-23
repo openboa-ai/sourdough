@@ -633,6 +633,24 @@ class Staffing(unittest.TestCase):
         )
         self.assertEqual(self.rows("SELECT count(*) FROM agent"), [(1,)])
 
+    def test_no_unassigned_staff_preserves_the_delegated_hiring_allowance(self):
+        stage_staffing(
+            self.writer,
+            self.authority,
+            StaffingNeed("overloaded", "Review the backlog", 5, 0, 1, self.now),
+        )
+        manager = claim_staffing(self.writer, "profile", now=self.now)
+        observation = StaffingTools(self.writer, manager).invoke(
+            "read_staffing_need", {}
+        )
+        self.assertEqual(
+            observation["existing_staff_capacity"], {"unassigned": 0, "assigned": 1}
+        )
+        self.assertNotIn("available_capacity", observation)
+        self.assertEqual(
+            (observation["available_slots"], observation["available_turns"]), (1, 4)
+        )
+
     def test_manager_sees_only_staffing_tools_and_requires_a_separate_hire(self):
         manager, _ = self.ready("need")
         tools = StaffingTools(self.writer, manager)
