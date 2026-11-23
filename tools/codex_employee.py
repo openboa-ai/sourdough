@@ -155,8 +155,8 @@ STAFFING_TOOLS = [
         {},
     ),
     scoped_tool(
-        "record_staffing_choice",
-        "Record your reasoned choice; this does not hire or spend.",
+        "submit_staffing_decision",
+        "Submit your reasoned decision with an explicit hire request only if you choose to hire.",
         {
             "evidence_revision": {"type": "string"},
             "action": {"enum": ["hire", "reassign", "defer"]},
@@ -166,23 +166,21 @@ STAFFING_TOOLS = [
                 "items": {"enum": ["hire", "reassign", "defer"]},
             },
             "next_check_seconds": {"type": "integer", "minimum": 60, "maximum": 86400},
-        },
-    ),
-    scoped_tool(
-        "request_hire",
-        "Apply for one hire against your committed choice and current grant.",
-        {
-            **{
-                field: {"type": "string"}
-                for field in (
-                    "request_id",
-                    "choice_id",
-                    "role",
-                    "execution_profile",
-                    "scope",
-                )
+            "hire": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "object",
+                        "properties": {
+                            "request_id": {"type": "string"},
+                            "role": {"type": "string"},
+                            "turns": {"type": "integer", "minimum": 1, "maximum": 64},
+                        },
+                        "required": ["request_id", "role", "turns"],
+                        "additionalProperties": False,
+                    },
+                ],
             },
-            "turns": {"type": "integer", "minimum": 1, "maximum": 64},
         },
     ),
 ]
@@ -212,7 +210,7 @@ HIRED_RESEARCH_TOOLS = [
 ]
 SCOPED_MODES = {
     "--mcp-research": (RESEARCH_TOOLS, "record_research_decision"),
-    "--mcp-staffing": (STAFFING_TOOLS, "record_staffing_choice"),
+    "--mcp-staffing": (STAFFING_TOOLS, "submit_staffing_decision"),
     "--mcp-onboarding": (ONBOARDING_TOOLS, "accept_first_duty"),
     "--mcp-hired-research": (HIRED_RESEARCH_TOOLS, "record_research_decision"),
 }
@@ -238,7 +236,9 @@ def scoped_call(address, name, args, outbox, tools, terminal_tool, *, legacy):
         data = json.dumps(args, sort_keys=True, separators=(",", ":")).encode()
         args = args | {"call_id": sha256(data).hexdigest()}
     message = json.dumps({"name": name, "arguments": args}).encode() + b"\n"
-    for _ in range(2 if legacy and name == "request_hire" else 1):
+    for _ in range(
+        2 if legacy and name in ("request_hire", "submit_staffing_decision") else 1
+    ):
         try:
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(5)
@@ -572,13 +572,12 @@ def main():
             prompt = (
                 "You are the delegated hiring manager for a local Sourdough company trial. "
                 "Use read_staffing_need to compare workload, existing coverage and delegated allowance. "
-                "If the result includes saved_choice, keep that original judgment and choice ID. "
-                "Recheck current allowance before explicitly deciding whether to request the hire; a saved choice grants nothing. "
-                "Choose whether to hire, reassign or defer. Consider both unselected alternatives and "
-                "cite the revision, factual rationale and next check in record_staffing_choice. "
-                "Do not assume hiring is needed. If justified and affordable, use request_hire with "
-                "the committed choice ID, a stable request ID, role, displayed profile and scope, "
-                "and a bounded turn allocation sufficient for the hire's independent work and review. "
+                "Choose whether to hire, reassign or defer. Submit one decision with "
+                "submit_staffing_decision: include the observed revision, factual rationale, "
+                "both unselected alternatives and the next check interval. "
+                "For a hire, include an explicit hire object with a stable request ID, role "
+                "and sufficient turns within the observed allowance; the company binds its delegated profile and scope. "
+                "For reassignment or deferral set hire to null. Do not assume hiring is needed. "
                 "No shell, external account or spending permission is available."
             )
         elif operation == "research_duty":

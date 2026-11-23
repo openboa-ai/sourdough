@@ -128,6 +128,69 @@ class Staffing(unittest.TestCase):
         self.assertEqual(self.rows("SELECT count(*) FROM duty"), [(2,)])
         self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
 
+    def test_staffing_submission_admits_one_hire_or_preserves_the_precommit_state(self):
+        claim, _ = self.ready("capacity")
+        tools = StaffingTools(self.writer, claim)
+        observed = tools.invoke("read_staffing_need", {})
+        submit = "submit_staffing_decision"
+        request = {"request_id": "one-hire", "role": "reviewer", "turns": 3}
+        choice = {
+            "evidence_revision": observed["revision"],
+            "action": "hire",
+            "rationale": "Assigned staff cannot cover the exceptions.",
+            "alternatives": ["reassign", "defer"],
+            "next_check_seconds": 120,
+        }
+        with self.assertRaisesRegex(DutyRefused, "explicit hire request"):
+            tools.invoke(submit, choice | {"hire": None})
+        with self.assertRaisesRegex(DutyRefused, "delegated scope or allocation"):
+            tools.invoke(submit, choice | {"hire": request | {"turns": 5}})
+        with self.assertRaisesRegex(DutyRefused, "Unexpected explicit hire"):
+            tools.invoke(submit, choice | {"hire": request | {"scope": "paper"}})
+        self.assertEqual(self.rows("SELECT count(*) FROM staffing_choice"), [(0,)])
+        self.assertEqual(self.rows("SELECT count(*) FROM hire_receipt"), [(0,)])
+
+        terms = choice | {"hire": request}
+        result = tools.invoke(submit, terms)
+        self.assertEqual(tools.invoke(submit, terms), result)
+        with self.assertRaisesRegex(DutyRefused, "replay conflicts"):
+            tools.invoke(submit, terms | {"hire": request | {"turns": 2}})
+        self.assertEqual(
+            self.rows(
+                """SELECT h.choice_id,g.scope,a.execution_profile,h.allocated_turns
+                   FROM hire_receipt h JOIN standing_grant g ON g.id=h.grant_id
+                   JOIN agent a ON a.id=h.agent_id"""
+            ),
+            [(result["choice_id"], "assessment", "profile", 3)],
+        )
+        self.assertEqual(self.rows("SELECT count(*) FROM agent"), [(2,)])
+        self.assertEqual(self.rows("PRAGMA foreign_key_check"), [])
+
+    def test_staffing_submission_without_hire_keeps_the_manager_next_review(self):
+        claim, _ = self.ready("capacity")
+        tools = StaffingTools(self.writer, claim)
+        observed = tools.invoke("read_staffing_need", {})
+        terms = {
+            "evidence_revision": observed["revision"],
+            "action": "defer",
+            "rationale": "Wait for the next coverage review.",
+            "alternatives": ["hire", "reassign"],
+            "next_check_seconds": 120,
+            "hire": None,
+        }
+        response = tools.invoke("submit_staffing_decision", terms)
+        self.assertIsNone(response["hire"])
+        self.assertEqual(tools.invoke("submit_staffing_decision", terms), response)
+        self.assertEqual(self.rows("SELECT count(*) FROM hire_receipt"), [(0,)])
+        self.assertEqual(
+            self.rows(
+                """SELECT d.agent_id,d.state FROM duty d JOIN staffing_follow_up f
+                   ON f.duty_id=d.id WHERE f.previous_duty_id=?""",
+                (claim.duty_id,),
+            ),
+            [(claim.founder_id, "due")],
+        )
+
     def test_second_committed_choice_cannot_reuse_the_first_allocation(self):
         first, first_choice = self.ready("first")
         second, second_choice = self.ready("second")
@@ -699,5 +762,8 @@ class Staffing(unittest.TestCase):
         registered = json.loads(response.stdout)["result"]["tools"]
         self.assertEqual(
             [definition["name"] for definition in registered],
-            ["read_staffing_need", "record_staffing_choice", "request_hire"],
+            ["read_staffing_need", "submit_staffing_decision"],
         )
+        hire_schema = registered[1]["inputSchema"]["properties"]["hire"]["anyOf"][1]
+        self.assertEqual(set(hire_schema["required"]), {"request_id", "role", "turns"})
+        self.assertFalse(hire_schema["additionalProperties"])

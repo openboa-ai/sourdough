@@ -37,11 +37,13 @@ elif operation == "ready":
     result = {"ready": True}
 elif operation == "staffing_duty":
     need = call("read_staffing_need")
-    choice = call("record_staffing_choice", evidence_revision=need["revision"], action="hire",
-                  rationale="No available reviewer.", alternatives=["reassign", "defer"],
-                  next_check_seconds=300)
-    result = call("request_hire", request_id="hire-reviewer", choice_id=choice["choice_id"],
-                  role="reviewer", execution_profile=need["profile"], scope=need["scope"], turns=2)
+    terms = dict(evidence_revision=need["revision"], action="hire",
+                 rationale="No available reviewer.", alternatives=["reassign", "defer"],
+                 next_check_seconds=300,
+                 hire=dict(request_id="hire-reviewer", role="reviewer", turns=2))
+    result = call("submit_staffing_decision", **terms)
+    assert call("submit_staffing_decision", **terms) == result
+    assert result["hire"]["allocated_turns"] == 2
 elif operation == "assessment_duty":
     tools = {item["name"] for item in request["harness"]["tools"]}
     duty = call("read_first_duty")
