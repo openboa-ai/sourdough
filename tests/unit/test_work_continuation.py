@@ -18,6 +18,7 @@ from sourdough.first_duty import DutyRefused, claim_first_duty, require_paper_au
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import post_confirmed_fill
 from sourdough.paper_order import PaperIntent, submit_paper_order
+from sourdough.paper_risk import PaperRiskRefused, PaperSuspension, suspend_paper_risk
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.work import (
     FollowUpClaim,
@@ -28,6 +29,7 @@ from sourdough.work import (
     read_follow_up_result,
     settle_review,
 )
+from sourdough.writer_lease import hold_company_writer
 
 
 class WorkContinuation(unittest.TestCase):
@@ -93,6 +95,27 @@ class WorkContinuation(unittest.TestCase):
 
     def claim(self, now, profile="runtime"):
         return claim_follow_up(self.store, self.company_id, profile, now=now)
+
+    def test_suspension_requires_migrated_company_work_tables(self):
+        original = self.founder(legacy=1)
+        command = PaperSuspension("suspend", "charter", 0, "Risk review")
+
+        def authorize(*args):
+            return "verification-principal"
+
+        with hold_company_writer(self.store, self.company_id) as writer:
+            before = self.store.read_bytes()
+            with self.assertRaisesRegex(PaperRiskRefused, "must be upgraded"):
+                suspend_paper_risk(writer, command, authorize)
+            self.assertEqual(self.store.read_bytes(), before)
+            upgrade_work_schema(self.store, self.company_id)
+            receipt = suspend_paper_risk(writer, command, authorize)
+        self.assertEqual(receipt.disposition, "applied")
+        self.assertEqual(
+            self.rows("SELECT id,execution_profile FROM agent"),
+            [(original.founder_id, "runtime")],
+        )
+        self.assertEqual(self.rows("SELECT run_id FROM duty_run"), [(original.run_id,)])
 
     def test_shared_profile_does_not_make_a_second_agent_the_founder(self):
         self.founding = found(self.store, self.terms)
