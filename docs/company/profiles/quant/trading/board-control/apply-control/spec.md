@@ -37,7 +37,7 @@ Apply a versioned service command instead of treating the UI toggle as evidence 
 | Case | Setup, action and expected observation |
 | --- | --- |
 | Normal | Suspend with a working order. Read the applied revision, observe another attempted increase denied, then inspect a late fill on the original order. |
-| Failure or contention | Replay an old resume request after a newer suspension. Reject stale revision without changing policy or hiding exposure. |
+| Failure or contention | After a newer suspension, submit a new resume request with a stale revision and separately retry an already applied resume. Reject the new request and return the original receipt for the exact retry. Neither changes the latest effective state or hides exposure. |
 | Admission race | Pause a new request after destination preflight but before its reservation transaction; commit suspension first and verify zero new order or reservation. In the opposite ordering, preserve the existing reservation and reconcile the original fill without accepting another. |
 | Authority and reply loss | Withhold the authorized reply after commit and reopen Client. Recover exactly one effective transition from the original ID. An unbound or revoked principal, unsupported contract revision or changed request cannot apply an effect. A supported service query still reports the effective revision without applying a command. |
 | Compatibility and freshness | Reopen the suspended company with a previously supported writer, and reject its write attempt. Refuse resume using stale, mismatched or unresolved original-account evidence. Under verified current conditions, apply exactly one new revision and admit an independent eligible request under it. |
