@@ -95,6 +95,7 @@ Each spec has one primary verification owner. Earlier steps implement only the p
 - [resources/company-assets/transfer](../company/systems/resources/company-assets/transfer/spec.md)
 - [resources/provision-resource/provision](../company/systems/resources/provision-resource/provision/spec.md)
 - [work/collaborate/handoff](../company/systems/work/collaborate/handoff/spec.md)
+- [work/collaborate/respond](../company/systems/work/collaborate/respond/spec.md)
 - [work/conversations/notify](../company/systems/work/conversations/notify/spec.md)
 - [work/conversations/publish](../company/systems/work/conversations/publish/spec.md)
 - [desk/publish](../employee/agent/desk/publish/spec.md)

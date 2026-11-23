@@ -36,6 +36,8 @@ Use the existing Work service, durable store and claim path. Start with one-shot
 
 Record the triggering actor or service, source fact or due slot, matching condition and Work ID, decision time, run disposition, and next condition. Record why a relevant trigger was held or denied. No audit of every irrelevant message or private reasoning is needed. Preserve the rules for an existing duty whose deadline arrives without any change in the source.
 
+The first [request and response work unit](../../collaborate/respond/spec.md) applies the peer-request contract when the requester cannot finish before a colleague answers. The response does not wait for the requester's publication or transfer ownership.
+
 ## First verification and delivery
 
 1. Exercise the Work entry point for time, typed event, peer request, no-wake communication, replacement, replay and revocation. Assert durable state separately from the returned receipt. Neither a fixture nor a local spec check proves a real Agent turn.
