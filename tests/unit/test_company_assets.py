@@ -14,6 +14,7 @@ from sourdough.company_assessment import (
     MANAGER_ASSESSMENT,
     AssessmentProposal,
     SourceRecord,
+    pending_publications,
     publish_assessment,
     read_assessment_inputs,
     read_assessment_result,
@@ -60,6 +61,15 @@ from sourdough.work_handoff import (
     accept_handoff,
     discover_handoffs,
     offer_handoff,
+)
+from sourdough.work_peer_response import (
+    PeerQuestion,
+    answer_peer_question,
+    claim_peer_response,
+    claim_resumed_peer_work,
+    read_peer_outcome,
+    read_peer_question,
+    request_peer_response,
 )
 from sourdough.writer_lease import hold_company_writer
 
@@ -222,6 +232,171 @@ class CompanyAssets(unittest.TestCase):
                 (hire.agent_id,),
             ).fetchone()
             self.assertEqual(retained, (hire.agent_id, 2))
+
+    def prepare_peer_question(self):
+        now, _, manager_only_asset, hire = self.prepare_project_hire()
+        provision_hire(
+            self.writer, hire.agent_id, "assessment", lambda _: True, now=now
+        )
+        claim = claim_hired_first(self.writer, hire.agent_id, "profile")
+        mandate = read_first_duty(self.writer, claim)
+        accept_first_duty(self.writer, claim, mandate["revision"], "Review the count.")
+        question = PeerQuestion(
+            "reconcile-timing",
+            self.founder,
+            "Reconcile now or wait for the next batch?",
+            "Choose when to reconcile.",
+            now + 60,
+        )
+        return now, claim, question, manager_only_asset
+
+    def test_peer_question_resumes_the_same_owner_before_publication(self):
+        now, claim, question, manager_only_asset = self.prepare_peer_question()
+        (project,) = project_access(self.writer, claim, "assessment")
+        append_message(
+            self.writer,
+            claim,
+            "assessment",
+            Post(
+                project.project_id,
+                project.revision,
+                "discussion",
+                question.question,
+                "",
+            ),
+        )
+        self.assertIsNone(claim_peer_response(self.writer, "profile", now=now))
+        with self.assertRaisesRegex(DutyRefused, "assigned project route"):
+            request_peer_response(
+                self.writer, claim, replace(question, recipient_id="outsider"), now=now
+            )
+        with self.assertRaisesRegex(DutyRefused, "asset is unavailable"):
+            request_peer_response(
+                self.writer,
+                claim,
+                replace(
+                    question, asset_id=manager_only_asset, asset_revision="unshared"
+                ),
+                now=now,
+            )
+        waiting = request_peer_response(self.writer, claim, question, now=now)
+        self.assertEqual(
+            request_peer_response(self.writer, claim, question, now=now), waiting
+        )
+        with self.assertRaisesRegex(DutyRefused, "original receipt"):
+            request_peer_response(
+                self.writer,
+                claim,
+                replace(question, question="Different question."),
+                now=now,
+            )
+        with closing(_connect(self.writer.store, "ro")) as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT agent_id,state FROM duty WHERE id=?", (claim.duty_id,)
+                ).fetchone(),
+                (claim.founder_id, "waiting"),
+            )
+            self.assertIsNone(
+                database.execute(
+                    "SELECT name FROM sqlite_schema WHERE name='assessment_publication'"
+                ).fetchone()
+            )
+        self.assertIsNone(claim_resumed_peer_work(self.writer, "profile", now=now))
+        response = claim_peer_response(self.writer, "profile", now=now)
+        self.assertEqual(
+            (response.duty_id, response.founder_id),
+            (waiting.response_duty, self.founder),
+        )
+        self.assertIsNone(claim_peer_response(self.writer, "profile", now=now))
+        with self.assertRaisesRegex(DutyRefused, "requires a current read"):
+            answer_peer_question(self.writer, response, "answered", "Wait.", now=now)
+        self.assertEqual(
+            read_peer_question(self.writer, response, now=now),
+            {
+                "question": question.question,
+                "expected_response": question.expected_response,
+                "expires_at": question.expires_at,
+                "evidence": None,
+            },
+        )
+        answer = answer_peer_question(
+            self.writer, response, "answered", "Wait.", now=now + 1
+        )
+        self.assertEqual(
+            answer_peer_question(
+                self.writer, response, "answered", "Wait.", now=now + 1
+            ),
+            answer,
+        )
+        resumed = claim_resumed_peer_work(self.writer, "profile", now=now + 1)
+        self.assertEqual(
+            (resumed.duty_id, resumed.founder_id), (claim.duty_id, claim.founder_id)
+        )
+        self.assertNotEqual(resumed.run_id, claim.run_id)
+        self.assertIsNone(claim_resumed_peer_work(self.writer, "profile", now=now + 1))
+        self.assertEqual(
+            read_peer_outcome(self.writer, resumed),
+            {
+                "request_key": question.request_key,
+                "outcome": "answered",
+                "answer": "Wait.",
+            },
+        )
+        with self.assertRaises(DutyRefused):
+            read_peer_outcome(self.writer, claim)
+
+    def test_published_assessment_cannot_yield_to_a_peer_response(self):
+        now, claim, question, _ = self.prepare_peer_question()
+        seal_assessment_source(
+            self.writer, (SourceRecord("count", "Documents", 8, 6, now),)
+        )
+        inputs = read_assessment_inputs(self.writer, claim, now=now)
+        publication = publish_assessment(
+            self.writer,
+            claim,
+            AssessmentProposal(
+                inputs["revision"], "count", "investigate", "Two missing.", 60
+            ),
+            now=now,
+        )
+        with self.assertRaisesRegex(DutyRefused, "committed result"):
+            request_peer_response(self.writer, claim, question, now=now)
+        self.assertIsNone(claim_peer_response(self.writer, "profile", now=now))
+        self.assertEqual(pending_publications(self.writer), ((claim, publication),))
+        follow_up = settle_assessment(self.writer, claim, publication)
+        self.assertEqual(follow_up.result.resource_id, publication.action_id)
+
+    def test_peer_expiry_resumes_without_waking_a_withdrawn_recipient(self):
+        now, claim, question, _ = self.prepare_peer_question()
+        (project,) = project_access(self.writer, claim, "assessment")
+        waiting = request_peer_response(self.writer, claim, question, now=now)
+        assign_project(
+            self.writer,
+            self.manager,
+            project.project_id,
+            ("author", claim.founder_id),
+            publishers=("author",),
+            expected_revision=project.revision,
+        )
+        self.assertIsNone(claim_peer_response(self.writer, "profile", now=now))
+        self.assertIsNone(claim_resumed_peer_work(self.writer, "profile", now=now))
+        resumed = claim_resumed_peer_work(
+            self.writer, "profile", now=question.expires_at
+        )
+        self.assertEqual(resumed.duty_id, claim.duty_id)
+        self.assertEqual(read_peer_outcome(self.writer, resumed)["outcome"], "expired")
+        with closing(_connect(self.writer.store, "ro")) as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT count(*) FROM duty_run WHERE duty_id=?",
+                    (waiting.response_duty,),
+                ).fetchone(),
+                (0,),
+            )
+            self.assertEqual(
+                database.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
 
     def settle_project_assessment(self):
         now, _, _, hire = self.prepare_project_hire()
