@@ -440,17 +440,19 @@ def settle_review(
     now: int,
     successor_purpose: str = POSITION_REVIEW,
     successor_result: ResultReference | None = None,
-    historical_paper: bool = False,
+    paper_review_only: bool = False,
 ) -> FollowUp:
     _time(now)
     next_due = _time(now + decision.next_check_seconds)
     result = successor_result or follow_up.result
     claim = follow_up.claim
     transition = (
-        historical_paper
+        paper_review_only
         and follow_up.purpose == PAPER_EXECUTION
-        and successor_purpose == PAPER_EXECUTION
-        and successor_result is not None
+        and (
+            (successor_purpose == PAPER_EXECUTION and successor_result is not None)
+            or (successor_purpose == POSITION_REVIEW and successor_result is None)
+        )
     )
     if not transition and (
         follow_up.purpose not in (POSITION_REVIEW, ASSESSMENT_REVIEW)

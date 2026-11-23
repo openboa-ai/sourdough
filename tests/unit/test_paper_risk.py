@@ -12,8 +12,10 @@ from sourdough.company import (
     upgrade_work_schema,
 )
 from sourdough.company_run import run_paper_company
+from sourdough.duty_run import PAPER_EXECUTION, POSITION_REVIEW
 from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
+from sourdough.paper_books import capture_position, post_confirmed_fill
 from sourdough.paper_execution import PaperIntent
 from sourdough.paper_order import OrderRefused, OrderReplyUnknown, submit_paper_order
 from sourdough.paper_risk import (
@@ -24,6 +26,7 @@ from sourdough.paper_risk import (
     suspend_paper_risk,
 )
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.work import ResultReference, finish_first_duty
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -199,4 +202,45 @@ class PaperRiskControl(unittest.TestCase):
                 read_paper_risk_receipt(writer, self.command.request_id, self.authorize)
         self.assertEqual(
             self.rows(self.store, "SELECT count(*) FROM paper_risk_command"), [(2,)]
+        )
+
+    def test_previously_scheduled_execution_duty_continues_as_review_only(self):
+        with self.writer() as writer:
+            order = submit_paper_order(
+                self.store, self.claim, self.intent, self.venue, writer=writer
+            )
+            fill = post_confirmed_fill(
+                self.store,
+                self.company.company_id,
+                order.order_id,
+                self.venue,
+                writer=writer,
+            )
+            position = capture_position(
+                self.store,
+                self.company.company_id,
+                fill.fill_id,
+                self.venue.read_order_position("account", order.order_id),
+                now=100,
+            )
+            scheduled = finish_first_duty(
+                self.store,
+                self.claim,
+                ResultReference("paper_position", fill.fill_id, position.revision, 100),
+                due_at=100,
+                purpose=PAPER_EXECUTION,
+            )
+            suspend_paper_risk(writer, self.command, self.authorize)
+        employee = ReviewingEmployee()
+        result = run_paper_company(
+            self.store, self.company.company_id, self.venue, employee, repeat_paper=True
+        )
+        self.assertEqual(result.review.claim.duty_id, scheduled.duty_id)
+        self.assertEqual(result.review.next_duty.purpose, POSITION_REVIEW)
+        self.assertEqual(employee.observed["fill_id"], fill.fill_id)
+        self.assertEqual(result.later_trades, ())
+        self.assertEqual(result.blocked_work, ())
+        self.assertEqual(
+            self.rows(self.journal, "SELECT order_id FROM venue_execution"),
+            [(order.order_id,)],
         )

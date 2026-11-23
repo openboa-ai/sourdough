@@ -267,7 +267,7 @@ def _operate(
                 company_id,
                 runtime.profile,
                 now=int(time()),
-                allow_paper_execution=repeat_paper
+                allow_paper_execution=(repeat_paper or suspended)
                 and not (reconciliation.unresolved or blocked),
                 eligible_paper_result=eligible,
             )
@@ -286,7 +286,7 @@ def _operate(
                 historical_execution = (
                     scope_of(connection, follow_up.result) != active_scope
                 )
-        if follow_up.purpose == POSITION_REVIEW or historical_execution:
+        if follow_up.purpose == POSITION_REVIEW or historical_execution or suspended:
             review = _review(writer, follow_up, venue, runtime, next_purpose)
         else:
             trade = _trade(writer, follow_up, venue, runtime)
@@ -509,7 +509,7 @@ def _review(
             now=int(time()),
             successor_purpose=purpose,
             successor_result=successor,
-            historical_paper=follow_up.purpose == PAPER_EXECUTION,
+            paper_review_only=follow_up.purpose == PAPER_EXECUTION,
         )
     except (DutyRefused, TradeRefused):
         try:
