@@ -69,6 +69,12 @@ class StorageMigrations(unittest.TestCase):
                         "external_actions",
                         "company_restore_receipt",
                         "company_store_retired",
+                        "work_peer_requests",
+                        "work_condition_occurrences",
+                        "work_conditions",
+                        "work_responsibilities",
+                        "work_runs",
+                        "work_items",
                     ):
                         raw.execute(f"DROP TABLE IF EXISTS {table}")
                     raw.execute(

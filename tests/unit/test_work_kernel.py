@@ -1,0 +1,380 @@
+import unittest
+from contextlib import closing
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from sourdough.company import FoundingTerms, found
+from sourdough.runtime.work_kernel import (
+    RunFenced,
+    WorkKernelRefused,
+    assert_run_fencing,
+    cancel_condition,
+    claim_work_run,
+    complete_work_run,
+    create_work_item,
+    evaluate_conditions,
+    list_conditions,
+    open_peer_request,
+    reclaim_expired_runs,
+    register_responsibility,
+    replace_condition,
+    resolve_peer_request,
+    revoke_responsibility,
+    set_condition,
+    wake_waiting_runs,
+    yield_run_to_wait,
+)
+from sourdough.storage.db import open_writer, write_tx
+
+
+class WorkKernel(unittest.TestCase):
+    def setUp(self):
+        directory = Path(self.enterContext(TemporaryDirectory()))
+        self.store = directory / "company.sqlite"
+        self.receipt = found(
+            self.store, FoundingTerms("setup", "charter-v1", "manage", "profile-v1")
+        )
+        self.company_id = self.receipt.company_id
+        self.founder_id = self.receipt.founder_id
+        self.peer_id = "colleague-1"
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "INSERT INTO agent VALUES (?, ?, ?)",
+                (self.peer_id, self.company_id, "profile-v2"),
+            )
+
+    def test_active_uniqueness_fencing_lease_reclamation_and_zero_compute_wait(self):
+        with closing(open_writer(self.store)) as conn:
+            with write_tx(conn):
+                item1, dup1 = create_work_item(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.analyze",
+                    source_kind="manual",
+                    source_id="src-1",
+                    dedupe_key="item-1",
+                    now_ns=1_000,
+                )
+                item1_again, dup2 = create_work_item(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.analyze",
+                    source_kind="manual",
+                    source_id="src-1",
+                    dedupe_key="item-1",
+                    now_ns=1_000,
+                )
+                item2, _ = create_work_item(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.analyze",
+                    source_kind="manual",
+                    source_id="src-2",
+                    now_ns=1_001,
+                )
+            self.assertFalse(dup1)
+            self.assertTrue(dup2)
+            self.assertEqual(item1, item1_again)
+
+            # Claim item1 -> active running slot owned by founder_id
+            with write_tx(conn):
+                run1 = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=item1.work_item_id,
+                    lease_owner="worker-a",
+                    lease_ttl_ns=10_000,
+                    now_ns=2_000,
+                )
+            self.assertEqual(run1.fencing_token, 1)
+
+            # Same agent cannot hold two active running runs simultaneously
+            with self.assertRaisesRegex(WorkKernelRefused, "active running"):
+                with write_tx(conn):
+                    claim_work_run(
+                        conn,
+                        company_id=self.company_id,
+                        work_item_id=item2.work_item_id,
+                        lease_owner="worker-b",
+                        lease_ttl_ns=10_000,
+                        now_ns=2_500,
+                    )
+
+            # Yielding run1 to zero-compute durable wait releases founder's active slot!
+            with write_tx(conn):
+                yield_run_to_wait(
+                    conn,
+                    run1.run_id,
+                    run1.fencing_token,
+                    wait_until_ns=50_000,
+                    wait_event_key="asset:doc-1",
+                    now_ns=3_000,
+                )
+                run2 = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=item2.work_item_id,
+                    lease_owner="worker-a",
+                    lease_ttl_ns=5_000,
+                    now_ns=3_100,
+                )
+            self.assertEqual(run2.fencing_token, 1)
+
+            # Anti-self-wake: founder's own event must NOT wake run1
+            with write_tx(conn):
+                self.assertEqual(
+                    wake_waiting_runs(
+                        conn,
+                        self.company_id,
+                        now_ns=4_000,
+                        event_key="asset:doc-1",
+                        triggering_actor_id=self.founder_id,
+                    ),
+                    (),
+                )
+                # Peer event wakes run1 cleanly
+                woken = wake_waiting_runs(
+                    conn,
+                    self.company_id,
+                    now_ns=4_100,
+                    event_key="asset:doc-1",
+                    triggering_actor_id=self.peer_id,
+                )
+            self.assertEqual(woken, (item1.work_item_id,))
+
+            # Expire run2 lease -> reclaim fences run2 and allows fresh fencing_token=2
+            with write_tx(conn):
+                fenced = reclaim_expired_runs(conn, self.company_id, now_ns=9_000)
+            self.assertEqual(fenced, (run2.run_id,))
+            with self.assertRaises(RunFenced):
+                assert_run_fencing(conn, run2.run_id, run2.fencing_token)
+
+            with write_tx(conn):
+                run2_retry = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=item2.work_item_id,
+                    lease_owner="worker-b",
+                    lease_ttl_ns=10_000,
+                    now_ns=9_100,
+                )
+            self.assertEqual(run2_retry.fencing_token, 2)
+
+            # Stale run2 cannot complete; fresh run2_retry settles cleanly
+            with self.assertRaises(RunFenced):
+                with write_tx(conn):
+                    complete_work_run(
+                        conn, run2.run_id, run2.fencing_token, outcome={"ok": False}
+                    )
+            with write_tx(conn):
+                completed, _ = complete_work_run(
+                    conn,
+                    run2_retry.run_id,
+                    run2_retry.fencing_token,
+                    outcome={"ok": True},
+                    now_ns=9_500,
+                )
+            self.assertEqual(completed.status, "completed")
+
+    def test_standing_responsibilities_mutable_conditions_dedup_and_revocation(self):
+        with closing(open_writer(self.store)) as conn:
+            with write_tx(conn):
+                resp = register_responsibility(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Audit shared policy memos",
+                    readable_scope=["project:alpha"],
+                    now_ns=1_000,
+                )
+                timer_cond = set_condition(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=resp.responsibility_id,
+                    trigger_kind="timer",
+                    due_at_ns=5_000,
+                    now_ns=1_000,
+                )
+                # Replace timer with a designated shared asset revision trigger
+                asset_cond = replace_condition(
+                    conn,
+                    timer_cond.condition_id,
+                    owner_agent_id=self.founder_id,
+                    trigger_kind="shared_asset_revision",
+                    source_identity="asset:memo-1",
+                    expected_revision="rev-2",
+                    now_ns=2_000,
+                )
+                extra_cond = set_condition(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=resp.responsibility_id,
+                    trigger_kind="timer",
+                    due_at_ns=6_000,
+                    now_ns=2_000,
+                )
+                cancel_condition(
+                    conn,
+                    extra_cond.condition_id,
+                    owner_agent_id=self.founder_id,
+                    now_ns=2_100,
+                )
+            self.assertEqual(asset_cond.condition_revision, 2)
+            self.assertEqual(
+                len(list_conditions(conn, self.company_id, self.founder_id)), 3
+            )
+
+            # Superseded timer (5_000) and cancelled timer (6_000) must NOT fire!
+            with write_tx(conn):
+                admitted_none = evaluate_conditions(
+                    conn, self.company_id, now_ns=10_000
+                )
+                # Self-authored asset revision must NOT wake owner (anti-self-wake)
+                admitted_self = evaluate_conditions(
+                    conn,
+                    self.company_id,
+                    now_ns=10_000,
+                    observed_assets={"asset:memo-1": "rev-2"},
+                    triggering_actor_id=self.founder_id,
+                )
+            self.assertEqual(admitted_none, ())
+            self.assertEqual(admitted_self, ())
+
+            # Peer-authored matching revision fires once and deduplicates on replay
+            with write_tx(conn):
+                admitted = evaluate_conditions(
+                    conn,
+                    self.company_id,
+                    now_ns=10_500,
+                    observed_assets={"asset:memo-1": "rev-2"},
+                    triggering_actor_id=self.peer_id,
+                )
+                replayed = evaluate_conditions(
+                    conn,
+                    self.company_id,
+                    now_ns=10_600,
+                    observed_assets={"asset:memo-1": "rev-2"},
+                    triggering_actor_id=self.peer_id,
+                )
+            self.assertEqual(len(admitted), 1)
+            self.assertEqual(admitted[0].duty_kind, "work.discovery_review")
+            self.assertEqual(replayed, ())
+
+            # Revoking responsibility cancels future armed conditions
+            with write_tx(conn):
+                set_condition(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=resp.responsibility_id,
+                    trigger_kind="timer",
+                    due_at_ns=20_000,
+                    now_ns=11_000,
+                )
+                revoke_responsibility(
+                    conn, self.company_id, resp.responsibility_id, now_ns=12_000
+                )
+                after_revoke = evaluate_conditions(conn, self.company_id, now_ns=25_000)
+            self.assertEqual(after_revoke, ())
+
+    def test_blocking_peer_request_response_expiry_and_late_answer_ignored(self):
+        with closing(open_writer(self.store)) as conn:
+            with write_tx(conn):
+                item, _ = create_work_item(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.assessment",
+                    source_kind="project",
+                    source_id="proj-1",
+                    now_ns=1_000,
+                )
+                run = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    lease_owner="worker-a",
+                    lease_ttl_ns=60_000,
+                    now_ns=1_500,
+                )
+                req, replayed = open_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    requester_run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    recipient_agent_id=self.peer_id,
+                    question="Approve option A or B?",
+                    expected_decision="option_choice",
+                    evidence_refs=["asset:draft-1"],
+                    deadline_ns=50_000,
+                    request_id="req-1",
+                    now_ns=2_000,
+                )
+                # Exact replay returns identical request without creating another duty
+                req_replay, replayed2 = open_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    requester_run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    recipient_agent_id=self.peer_id,
+                    question="Approve option A or B?",
+                    expected_decision="option_choice",
+                    evidence_refs=["asset:draft-1"],
+                    deadline_ns=50_000,
+                    request_id="req-1",
+                    now_ns=2_100,
+                )
+            self.assertFalse(replayed)
+            self.assertTrue(replayed2)
+            self.assertEqual(req, req_replay)
+
+            # Requester cannot answer its own request
+            with self.assertRaisesRegex(WorkKernelRefused, "named recipient"):
+                with write_tx(conn):
+                    resolve_peer_request(
+                        conn,
+                        company_id=self.company_id,
+                        request_id="req-1",
+                        actor_id=self.founder_id,
+                        resolution_state="answered",
+                        response_payload={"choice": "A"},
+                        now_ns=3_000,
+                    )
+
+            # Recipient answers -> wakes requester work item once; late answer ignored
+            with write_tx(conn):
+                resolved, changed = resolve_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    request_id="req-1",
+                    actor_id=self.peer_id,
+                    resolution_state="answered",
+                    response_payload={"choice": "A"},
+                    now_ns=3_500,
+                )
+                late, changed_late = resolve_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    request_id="req-1",
+                    actor_id=self.peer_id,
+                    resolution_state="declined",
+                    response_payload={"choice": "B"},
+                    now_ns=4_000,
+                )
+            self.assertTrue(changed)
+            self.assertFalse(changed_late)
+            self.assertEqual(resolved.state, "answered")
+            self.assertEqual(late.state, "answered")
+            item_state = conn.execute(
+                "SELECT state, owner_agent_id FROM work_items WHERE work_item_id = ?",
+                (item.work_item_id,),
+            ).fetchone()
+            self.assertEqual(item_state, ("due", self.founder_id))

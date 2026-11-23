@@ -30,6 +30,19 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "company_store_retired": frozenset(
         {"storage/checkpoint.py", "storage/migrations.py"}
     ),
+    # Three-entity Work kernel tables
+    "work_items": frozenset({"runtime/work_kernel.py", "storage/migrations.py"}),
+    "work_runs": frozenset({"runtime/work_kernel.py", "storage/migrations.py"}),
+    "work_responsibilities": frozenset(
+        {"runtime/work_kernel.py", "storage/migrations.py"}
+    ),
+    "work_conditions": frozenset({"runtime/work_kernel.py", "storage/migrations.py"}),
+    "work_condition_occurrences": frozenset(
+        {"runtime/work_kernel.py", "storage/migrations.py"}
+    ),
+    "work_peer_requests": frozenset(
+        {"runtime/work_kernel.py", "storage/migrations.py"}
+    ),
     # Core company & staffing tables
     "company": frozenset(
         {"company.py", "storage/migrations.py", "storage/checkpoint.py"}
