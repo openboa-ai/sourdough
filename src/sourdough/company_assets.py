@@ -25,6 +25,7 @@ SCHEMA = (
            content TEXT NOT NULL, UNIQUE(author_id,request_id)
        )""",
 )
+_MAX_PROJECT_MEMBERS = 32
 
 
 def _label(value: str) -> bool:
@@ -77,6 +78,53 @@ def _current_project_manager(
     )
 
 
+def require_project_onboarding_authority(
+    database: Connection, company_id: str, manager_grant: str, project_id: str
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    if not _current_project_manager(database, company_id, manager_grant):
+        raise DutyRefused("Project onboarding requires current company management")
+    if not database.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='shared_project'"
+    ).fetchone():
+        raise DutyRefused("Designated project is unavailable")
+    revision, members, publishers = project_membership(database, project_id)
+    (manager,) = database.execute(
+        "SELECT agent_id FROM standing_grant WHERE id=?", (manager_grant,)
+    ).fetchone()
+    if manager not in members:
+        raise DutyRefused("Hiring authority does not cover the designated project")
+    return revision, members, publishers
+
+
+def enroll_project_participant(
+    database: Connection,
+    company_id: str,
+    manager_grant: str,
+    project_id: str,
+    agent_id: str,
+) -> None:
+    if not database.in_transaction or not _active_member(
+        database, company_id, agent_id
+    ):
+        raise DutyRefused("Project onboarding requires an active company Agent")
+    revision, members, publishers = require_project_onboarding_authority(
+        database, company_id, manager_grant, project_id
+    )
+    if agent_id in members:
+        return
+    if len(members) >= _MAX_PROJECT_MEMBERS:
+        raise DutyRefused("Designated project has no room for another member")
+    enrolled = tuple(sorted((*members, agent_id)))
+    database.execute(
+        "UPDATE shared_project SET revision=?, members=? WHERE project_id=?",
+        (
+            _revision((company_id, project_id, revision, enrolled, publishers)),
+            _json(enrolled),
+            project_id,
+        ),
+    )
+
+
 def assign_project(
     writer: WriterLease,
     manager_grant: str,
@@ -89,7 +137,7 @@ def assign_project(
     """Internal company setup operation, never an Agent tool or an implicit membership grant."""
     if (
         not _label(project_id)
-        or not 1 <= len(members) <= 32
+        or not 1 <= len(members) <= _MAX_PROJECT_MEMBERS
         or not all(_label(member) for member in (*members, *publishers))
         or len(set(members)) != len(members)
         or len(set(publishers)) != len(publishers)

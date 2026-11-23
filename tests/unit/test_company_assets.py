@@ -3,6 +3,7 @@ from contextlib import closing
 from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time
 
 from sourdough.agent_desk import save_draft
 from sourdough.collaboration import company_work_run
@@ -11,12 +12,25 @@ from sourdough.company_assessment import read_assessment_result
 from sourdough.company_assets import (
     Selection,
     assign_project,
+    project_access,
     publish_selection,
     read_shared_asset,
     seal_project_review,
 )
 from sourdough.duty_run import ASSESSMENT_REVIEW, DutyRefused, start_run
 from sourdough.harness import ScopedWorkflow, tool
+from sourdough.onboarding import claim_hired_first, provision_hire
+from sourdough.staffing import (
+    HireRequest,
+    StaffingAuthority,
+    StaffingChoice,
+    StaffingNeed,
+    admit_hire,
+    claim_staffing,
+    read_need,
+    record_choice,
+    stage_staffing,
+)
 from sourdough.work import (
     ReviewDecision,
     claim_assessment_review,
@@ -40,6 +54,7 @@ class CompanyAssets(unittest.TestCase):
             store, FoundingTerms("assets", "charter", "manage-company", "profile")
         )
         self.manager = company.grant_id
+        self.founder = company.founder_id
         self.writer = self.enterContext(
             hold_company_writer(
                 store, company.company_id, lease_directory=scratch / "leases"
@@ -78,6 +93,117 @@ class CompanyAssets(unittest.TestCase):
         self.project = assign_project(
             self.writer, self.manager, "project", self.members, publishers=("author",)
         )
+
+    def prepare_project_hire(self):
+        revision = assign_project(
+            self.writer,
+            self.manager,
+            "onboarding",
+            (self.founder, "author"),
+            publishers=("author",),
+        )
+        draft = save_draft(
+            self.writer,
+            self.claims["author"],
+            "assessment",
+            name="source",
+            content="Restricted",
+            expected_revision=None,
+        )
+        asset = publish_selection(
+            self.writer,
+            self.claims["author"],
+            "assessment",
+            Selection(
+                "old-source",
+                draft.name,
+                draft.revision,
+                "onboarding",
+                revision,
+                (self.founder,),
+                0,
+                len(draft.content),
+            ),
+        )
+        now = int(time())
+        stage_staffing(
+            self.writer,
+            StaffingAuthority(self.manager, "profile", "assessment", 1, 4),
+            StaffingNeed(
+                "hire-for-project",
+                "Check records",
+                5,
+                0,
+                1,
+                now,
+                project_id="onboarding",
+            ),
+        )
+        manager = claim_staffing(self.writer, "profile", now=now)
+        observed = read_need(self.writer, manager)
+        self.assertEqual(observed["project_id"], "onboarding")
+        choice = record_choice(
+            self.writer,
+            manager,
+            StaffingChoice(
+                observed["revision"],
+                "hire",
+                "There is no free reviewer.",
+                ("reassign", "defer"),
+                60,
+            ),
+        )
+        hire = admit_hire(
+            self.writer,
+            manager,
+            HireRequest("one-hire", choice, "reviewer", "profile", "assessment", 2),
+        )
+        return now, revision, asset.asset_id, hire
+
+    def test_first_duty_gets_only_participation_in_the_designated_project(self):
+        now, old_revision, asset_id, hire = self.prepare_project_hire()
+        ready = provision_hire(
+            self.writer, hire.agent_id, "assessment", lambda _: True, now=now
+        )
+        self.assertIsNotNone(ready.first_duty_id)
+        self.assertEqual(
+            provision_hire(
+                self.writer, hire.agent_id, "assessment", lambda _: True, now=now
+            ),
+            ready,
+        )
+        claim = claim_hired_first(self.writer, hire.agent_id, "profile")
+        (project,) = project_access(self.writer, claim, "assessment")
+        self.assertEqual(project.project_id, "onboarding")
+        self.assertNotEqual(project.revision, old_revision)
+        self.assertFalse(project.can_publish)
+        with self.assertRaises(DutyRefused):
+            read_shared_asset(self.writer, claim, "assessment", asset_id)
+
+    def test_withdrawn_project_authority_blocks_start_without_discarding_the_hire(self):
+        now, revision, _, hire = self.prepare_project_hire()
+        assign_project(
+            self.writer,
+            self.manager,
+            "onboarding",
+            ("author",),
+            publishers=("author",),
+            expected_revision=revision,
+        )
+        status = provision_hire(
+            self.writer, hire.agent_id, "assessment", lambda _: True, now=now
+        )
+        self.assertEqual(
+            (status.state, status.reason, status.first_duty_id),
+            ("blocked", "project_access_unavailable", None),
+        )
+        self.assertIsNone(claim_hired_first(self.writer, hire.agent_id, "profile"))
+        with closing(_connect(self.writer.store, "ro")) as database:
+            retained = database.execute(
+                "SELECT agent_id,allocated_turns FROM hire_receipt WHERE agent_id=?",
+                (hire.agent_id,),
+            ).fetchone()
+            self.assertEqual(retained, (hire.agent_id, 2))
 
     def publish(self, selection, author="author"):
         return publish_selection(
