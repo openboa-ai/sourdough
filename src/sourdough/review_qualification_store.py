@@ -41,7 +41,7 @@ class ReviewQualificationReceipt:
     qualification: ReviewQualification
 
 
-def _published(
+def reopen_published_review_rule(
     database: Connection, company_id: str, asset_id: str, resolve: PublishedRuleResolver
 ) -> ReviewRule:
     if not isinstance(asset_id, str) or not 1 <= len(asset_id) <= 128:
@@ -69,8 +69,6 @@ def record_review_qualification(
     cases: tuple[ReviewCase, ...],
 ) -> ReviewQualificationReceipt:
     """Resolve published assets and sealed cases through trusted company services."""
-    if type(cases) is not tuple or not 1 <= len(cases) <= 32:
-        raise ReviewRuleRefused("Expected a bounded set of independent cases")
     writer.verify()
     with closing(_connect(writer.store, "rw")) as database, database:
         database.execute("BEGIN IMMEDIATE")
@@ -78,9 +76,13 @@ def record_review_qualification(
         company_id = _identity(database)
         if company_id != writer.company_id:
             raise ReviewRuleRefused("Company identity mismatch")
-        candidate = _published(database, company_id, candidate_asset_id, resolve)
+        candidate = reopen_published_review_rule(
+            database, company_id, candidate_asset_id, resolve
+        )
         baseline = (
-            _published(database, company_id, baseline_asset_id, resolve)
+            reopen_published_review_rule(
+                database, company_id, baseline_asset_id, resolve
+            )
             if baseline_asset_id is not None
             else None
         )
