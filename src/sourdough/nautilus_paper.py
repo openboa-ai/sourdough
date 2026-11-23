@@ -119,6 +119,13 @@ class SandboxBalance:
     cash_atoms: int
 
 
+@dataclass(frozen=True)
+class SandboxRestoreCut:
+    balance: SandboxBalance
+    order_ids: tuple[str, ...]
+    fills: tuple[tuple[str, str, int, int, int], ...]
+
+
 class NautilusPaperVenue:
     def __init__(self, journal: Path):
         self.journal = journal.resolve()
@@ -397,6 +404,34 @@ class NautilusPaperVenue:
             connection.commit()
             _, plan = self._configuration(connection)
             return self._checkpoint(connection, plan)
+
+    def read_restore_cut(self, account_id: str) -> SandboxRestoreCut:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            self._account(connection, account_id)
+            _, plan = self._configuration(connection)
+            if (
+                plan.tape_revision is not None
+                or connection.execute(
+                    "SELECT 1 FROM sandbox_order WHERE state='queued' LIMIT 1"
+                ).fetchone()
+            ):
+                raise VenueRefused("Restore requires settled original paper orders")
+            return SandboxRestoreCut(
+                self._checkpoint(connection, plan),
+                tuple(
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT order_id FROM sandbox_order ORDER BY order_id"
+                    )
+                ),
+                tuple(
+                    connection.execute(
+                        """SELECT fill_id,order_id,quantity,price_atoms,fee_atoms
+                       FROM sandbox_fill_observation ORDER BY fill_id"""
+                    )
+                ),
+            )
 
     def prove_account(
         self,

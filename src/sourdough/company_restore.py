@@ -3,10 +3,12 @@
 import json
 import os
 import stat
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from sqlite3 import Connection
 from tempfile import TemporaryDirectory
 
 from .company import (
@@ -91,6 +93,21 @@ def _finish_publication(target: Path, staging: Path, receipt: CoreRestore) -> No
 def restore_core_checkpoint(
     store: Path, company_id: str, archive: Path, destination: Path
 ) -> CoreRestore:
+    return _restore_checkpoint(
+        store, company_id, archive, destination, check_original=_require_core
+    )
+
+
+def _restore_checkpoint(
+    store: Path,
+    company_id: str,
+    archive: Path,
+    destination: Path,
+    *,
+    check_original: Callable[[Connection], None],
+    reconcile: Callable[[Path], None] | None = None,
+    external_scope: tuple[str | int, ...] = (),
+) -> CoreRestore:
     target = destination.parent.resolve(strict=True) / destination.name
     with (
         _hold_company_store(store, company_id) as lease,
@@ -98,24 +115,22 @@ def restore_core_checkpoint(
     ):
         shadow = Path(work) / "replacement.sqlite"
         manifest = _extract_checkpoint(archive, company_id, shadow)
-        revision = sha256(
-            json.dumps(
-                [
-                    company_id,
-                    lease.store_key,
-                    manifest.captured_ns,
-                    manifest.sha256,
-                    str(target),
-                ],
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        terms = [
+            company_id,
+            lease.store_key,
+            manifest.captured_ns,
+            manifest.sha256,
+            str(target),
+        ]
+        if external_scope:
+            terms.append(external_scope)
+        revision = sha256(json.dumps(terms, separators=(",", ":")).encode()).hexdigest()
         receipt = CoreRestore(company_id, revision, manifest.sha256)
         staging = target.with_name(f".sourdough-restore-{revision}.sqlite")
         with closing(_connect(lease.store, "ro")) as original:
             original.execute("BEGIN")
             retired = _retired_store(original)
-            _require_core(original)
+            check_original(original)
         if retired is not None and retired.request_revision != revision:
             raise CheckpointRefused(
                 "Original store is retired for another restore request"
@@ -141,8 +156,9 @@ def restore_core_checkpoint(
                     "Original store does not match the checkpoint cut"
                 )
 
+        if reconcile is not None:
+            reconcile(shadow)
         with closing(_connect(shadow, "rw")) as replacement, replacement:
-            _require_core(replacement)
             replacement.execute(
                 """CREATE TABLE IF NOT EXISTS company_restore_receipt (
                     request_revision TEXT PRIMARY KEY, checkpoint_sha256 TEXT NOT NULL
