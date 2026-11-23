@@ -1,8 +1,12 @@
+import json
 import os
+import sqlite3
 import unittest
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from zipfile import ZIP_STORED, ZipFile
 
 from sourdough.company import FoundingTerms, found
 from sourdough.storage.checkpoint import (
@@ -210,6 +214,156 @@ class StorageCheckpointAndRestore(unittest.TestCase):
             )
         self.assertFalse(replacement.exists())
         # Original store MUST remain unretired and writable!
+        with closing(open_writer(self.store)) as writer:
+            self.assertEqual(
+                writer.execute("SELECT schema_revision FROM company").fetchone(),
+                (MAX_SCHEMA_VERSION,),
+            )
+
+    def test_intervening_write_during_reconcile_refuses_before_retirement(self):
+        archive = self.root / "checkpoint-race.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "should-not-publish.sqlite"
+
+        def concurrent_mutation(_shadow: Path) -> None:
+            # Simulate a caller mutating the original store without WriterLease
+            # after the initial watermark check succeeded.
+            with closing(open_writer(self.store)) as writer, write_tx(writer):
+                append_audit_event(
+                    writer,
+                    company_id=self.company_id,
+                    domain="work",
+                    actor_id=self.receipt.founder_id,
+                    entity_type="duty",
+                    entity_id="duty-race",
+                    event_type="duty.claimed",
+                    payload={"source": "intervening-writer"},
+                )
+
+        with self.assertRaisesRegex(CheckpointRefused, "logical watermark"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                reconcile=concurrent_mutation,
+                lease_directory=self.leases,
+            )
+        self.assertFalse(replacement.exists())
+        # Original store must stay live and retain the intervening write.
+        with closing(open_writer(self.store)) as writer:
+            self.assertEqual(
+                writer.execute("SELECT schema_revision FROM company").fetchone(),
+                (MAX_SCHEMA_VERSION,),
+            )
+            count = writer.execute(
+                "SELECT COUNT(*) FROM audit_event WHERE entity_id = 'duty-race'"
+            ).fetchone()[0]
+            self.assertEqual(count, 1)
+
+    def test_forged_archive_with_injected_trigger_is_refused(self):
+        archive = self.root / "checkpoint-clean.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        tampered_dir = self.root / "tampered"
+        tampered_dir.mkdir()
+        with ZipFile(archive, "r") as zf:
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            db_path = tampered_dir / "company.sqlite"
+            db_path.write_bytes(zf.read("company.sqlite"))
+
+        # Inject a rogue SQL trigger and forge size, sha256, and even watermark
+        with closing(sqlite3.connect(db_path, autocommit=True)) as conn:
+            conn.execute(
+                """CREATE TRIGGER tr_rogue_escalate AFTER INSERT ON duty
+                   BEGIN
+                       UPDATE standing_grant SET scope = 'escalated';
+                   END"""
+            )
+            forged_wm = compute_logical_watermark(conn, self.company_id)
+
+        raw = db_path.read_bytes()
+        manifest["size"] = len(raw)
+        manifest["sha256"] = sha256(raw).hexdigest()
+        manifest["watermark"] = {
+            "company_id": forged_wm.company_id,
+            "schema_version": forged_wm.schema_version,
+            "max_event_seq": forged_wm.max_event_seq,
+            "domain_digest": forged_wm.domain_digest,
+        }
+        forged_zip = self.root / "forged-trigger.zip"
+        with ZipFile(forged_zip, "w", compression=ZIP_STORED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, sort_keys=True))
+            zf.write(db_path, "company.sqlite")
+
+        # Both standalone inspect_checkpoint and restore_store must refuse the trigger
+        with self.assertRaisesRegex(CheckpointRefused, "triggers or views"):
+            inspect_checkpoint(forged_zip, self.company_id)
+        replacement = self.root / "never-restored-trigger.sqlite"
+        with self.assertRaisesRegex(CheckpointRefused, "triggers or views"):
+            restore_store(
+                self.store,
+                self.company_id,
+                forged_zip,
+                replacement,
+                lease_directory=self.leases,
+            )
+        self.assertFalse(replacement.exists())
+
+    def test_forged_archive_with_altered_index_is_refused_by_restore(self):
+        archive = self.root / "checkpoint-index.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        tampered_dir = self.root / "tampered-index"
+        tampered_dir.mkdir()
+        with ZipFile(archive, "r") as zf:
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            db_path = tampered_dir / "company.sqlite"
+            db_path.write_bytes(zf.read("company.sqlite"))
+
+        # Alter schema without adding triggers (drop an index) and re-sign manifest
+        with closing(sqlite3.connect(db_path, autocommit=True)) as conn:
+            conn.execute("DROP INDEX idx_audit_event_company_seq")
+            forged_wm = compute_logical_watermark(conn, self.company_id)
+
+        raw = db_path.read_bytes()
+        manifest["size"] = len(raw)
+        manifest["sha256"] = sha256(raw).hexdigest()
+        manifest["watermark"] = {
+            "company_id": forged_wm.company_id,
+            "schema_version": forged_wm.schema_version,
+            "max_event_seq": forged_wm.max_event_seq,
+            "domain_digest": forged_wm.domain_digest,
+        }
+        forged_zip = self.root / "forged-index.zip"
+        with ZipFile(forged_zip, "w", compression=ZIP_STORED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, sort_keys=True))
+            zf.write(db_path, "company.sqlite")
+
+        # Live store logical watermark includes full sqlite_schema, so restore refuses
+        replacement = self.root / "never-restored-index.sqlite"
+        with self.assertRaisesRegex(CheckpointRefused, "logical watermark"):
+            restore_store(
+                self.store,
+                self.company_id,
+                forged_zip,
+                replacement,
+                lease_directory=self.leases,
+            )
+        self.assertFalse(replacement.exists())
         with closing(open_writer(self.store)) as writer:
             self.assertEqual(
                 writer.execute("SELECT schema_revision FROM company").fetchone(),

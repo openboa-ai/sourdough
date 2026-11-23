@@ -8,6 +8,7 @@ import stat
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from hashlib import file_digest, sha256
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -144,16 +145,33 @@ def compute_logical_watermark(
     if not 1 <= schema_version <= MAX_SCHEMA_VERSION:
         raise CheckpointRefused(f"Unsupported company schema version: {schema_version}")
 
-    tables = [
-        str(item[0])
+    schema_objects = [
+        (
+            str(item[0]),
+            str(item[1]),
+            str(item[2]),
+            "" if item[3] is None else str(item[3]),
+        )
         for item in connection.execute(
-            """SELECT name FROM sqlite_schema
-               WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-               ORDER BY name"""
+            """SELECT type, name, tbl_name, sql FROM sqlite_schema
+               WHERE name NOT LIKE 'sqlite_%'
+               ORDER BY type, name, tbl_name, COALESCE(sql, '')"""
         ).fetchall()
-        if str(item[0]) not in _WATERMARK_EXCLUDED_TABLES
+        if str(item[2]) not in _WATERMARK_EXCLUDED_TABLES
+        and str(item[1]) not in _WATERMARK_EXCLUDED_TABLES
+    ]
+    tables = [
+        name for obj_type, name, _tbl, _sql in schema_objects if obj_type == "table"
     ]
     hasher = sha256()
+    hasher.update(
+        json.dumps(
+            {"schema": schema_objects},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    hasher.update(b"\n")
     for table in tables:
         columns = [
             str(col[1])
@@ -182,6 +200,48 @@ def compute_logical_watermark(
         max_event_seq=max_event_seq(connection, company_id),
         domain_digest=hasher.hexdigest(),
     )
+
+
+@lru_cache(maxsize=16)
+def _trusted_triggers_and_views(
+    schema_version: int,
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Return the canonical trigger and view definitions bundled up to schema_version."""
+    from .migrations import _execute_sql_script_in_tx, load_migrations
+
+    with closing(sqlite3.connect(":memory:", autocommit=True)) as reference:
+        reference.execute("PRAGMA foreign_keys = ON")
+        reference.execute("PRAGMA trusted_schema = OFF")
+        for migration in load_migrations():
+            if migration.version <= schema_version:
+                _execute_sql_script_in_tx(reference, migration.sql)
+        rows = reference.execute(
+            """SELECT type, name, tbl_name, COALESCE(sql, '')
+               FROM sqlite_schema
+               WHERE type IN ('trigger', 'view') AND name NOT LIKE 'sqlite_%'
+               ORDER BY type, name, tbl_name, COALESCE(sql, '')"""
+        ).fetchall()
+    return tuple((str(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows)
+
+
+def _verify_trusted_schema_objects(
+    connection: sqlite3.Connection, schema_version: int
+) -> None:
+    """Refuse archives containing untrusted, altered, or missing triggers or views."""
+    actual = tuple(
+        (str(r[0]), str(r[1]), str(r[2]), str(r[3]))
+        for r in connection.execute(
+            """SELECT type, name, tbl_name, COALESCE(sql, '')
+               FROM sqlite_schema
+               WHERE type IN ('trigger', 'view') AND name NOT LIKE 'sqlite_%'
+               ORDER BY type, name, tbl_name, COALESCE(sql, '')"""
+        ).fetchall()
+    )
+    expected = _trusted_triggers_and_views(schema_version)
+    if actual != expected:
+        raise CheckpointRefused(
+            "Checkpoint database contains unexpected, altered, or missing triggers or views"
+        )
 
 
 def _normalize_database_to_delete_mode(database: Path) -> None:
@@ -440,6 +500,7 @@ def _extract_checkpoint(
             if reader.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise CheckpointRefused("Extracted checkpoint failed foreign_key_check")
             actual_watermark = compute_logical_watermark(reader, company_id)
+            _verify_trusted_schema_objects(reader, actual_watermark.schema_version)
     except StorageRefused as error:
         raise CheckpointRefused(str(error)) from error
     verify_no_wal_sidecars(database)
@@ -573,18 +634,38 @@ def restore_store(
             if os.path.lexists(desk_target):
                 raise CheckpointRefused("Desk restore destination already exists")
             staged_desk_sibling = desk_target.with_name(
-                f".sourdough-desk-stage-{request_revision[:16]}"
+                f".sourdough-desk-stage-{request_revision[:16]}-{time_ns()}"
             )
             _copy_desk_tree(staged_desk, staged_desk_sibling)
 
         try:
-            # Fence and retire the original store only after all candidates are staged
+            # Fence and retire the original store only after all candidates are staged.
+            # Re-verify retirement state, logical watermark, and unoccupied targets
+            # inside the BEGIN IMMEDIATE transaction so any intervening write (even
+            # from a caller that did not acquire WriterLease) refuses restore cleanly.
             with (
                 closing(
                     open_writer(lease.store, create=False, lease=lease)
                 ) as original_writer,
                 write_tx(original_writer),
             ):
+                if read_retirement(original_writer) is not None:
+                    raise CheckpointRefused("Original store is already retired")
+                current_watermark = compute_logical_watermark(
+                    original_writer, company_id
+                )
+                if current_watermark != manifest.watermark:
+                    raise CheckpointRefused(
+                        "Original store logical watermark changed before restore retirement"
+                    )
+                if os.path.lexists(target):
+                    raise CheckpointRefused("Replacement destination already exists")
+                if (
+                    staged_desk_sibling is not None
+                    and desk_target is not None
+                    and os.path.lexists(desk_target)
+                ):
+                    raise CheckpointRefused("Desk restore destination already exists")
                 original_writer.execute(
                     """CREATE TABLE IF NOT EXISTS company_store_retired (
                         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
