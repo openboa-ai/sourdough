@@ -184,6 +184,38 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                 lease_directory=self.leases,
             )
 
+    def test_existing_desk_destination_refuses_before_retiring_original_store(self):
+        desk = self.root / "desk-src"
+        desk.mkdir()
+        (desk / "notes.md").write_text("draft\n", encoding="utf-8")
+        archive = self.root / "checkpoint-desk.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            desk_root=desk,
+            lease_directory=self.leases,
+        )
+        occupied_desk = self.root / "occupied-desk"
+        occupied_desk.mkdir()
+        replacement = self.root / "never-published.sqlite"
+        with self.assertRaisesRegex(CheckpointRefused, "Desk restore destination"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                desk_destination=occupied_desk,
+                lease_directory=self.leases,
+            )
+        self.assertFalse(replacement.exists())
+        # Original store MUST remain unretired and writable!
+        with closing(open_writer(self.store)) as writer:
+            self.assertEqual(
+                writer.execute("SELECT schema_revision FROM company").fetchone(),
+                (MAX_SCHEMA_VERSION,),
+            )
+
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)

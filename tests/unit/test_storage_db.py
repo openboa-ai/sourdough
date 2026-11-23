@@ -1,5 +1,6 @@
 import sqlite3
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
@@ -287,3 +288,12 @@ class StorageDatabaseAndKernel(unittest.TestCase):
                 )
             self.assertEqual(settled.status, "confirmed")
             self.assertIn("f-1", settled.receipt_json)
+
+    def test_concurrent_fresh_found_handles_wal_activation_contention(self):
+        for trial in range(15):
+            fresh = self.store.with_name(f"concurrent-{trial}.sqlite")
+            terms = FoundingTerms("setup", "charter-v1", "manage", "profile-v1")
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(found, fresh, terms) for _ in range(4)]
+                receipts = [future.result() for future in futures]
+            self.assertEqual(len(set(receipts)), 1)

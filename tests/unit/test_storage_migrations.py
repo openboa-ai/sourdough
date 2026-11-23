@@ -11,7 +11,11 @@ from sourdough.company import (
     upgrade_work_schema,
 )
 from sourdough.storage.db import MAX_SCHEMA_VERSION, StorageRefused, open_reader
-from sourdough.storage.migrations import load_migrations, verify_applied_migrations
+from sourdough.storage.migrations import (
+    load_migrations,
+    migrate_store,
+    verify_applied_migrations,
+)
 
 
 class StorageMigrations(unittest.TestCase):
@@ -112,3 +116,11 @@ class StorageMigrations(unittest.TestCase):
             raw.execute(f"PRAGMA user_version = {MAX_SCHEMA_VERSION + 2}")
         with self.assertRaisesRegex(FoundingRefused, "Unsupported future"):
             upgrade_work_schema(self.store, receipt.company_id)
+
+    def test_migrate_store_refuses_legacy_v5_without_legacy_upgrade_hook(self):
+        receipt = found(self.store, self.terms)
+        with closing(sqlite3.connect(self.store)) as raw, raw:
+            raw.execute("UPDATE company SET schema_revision = 5 WHERE singleton = 1")
+            raw.execute("PRAGMA user_version = 0")
+        with self.assertRaisesRegex(StorageRefused, "legacy upgrade hook"):
+            migrate_store(self.store, receipt.company_id)

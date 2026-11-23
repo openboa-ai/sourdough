@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sqlite3
 import stat
 from collections.abc import Callable
@@ -489,6 +490,13 @@ def restore_store(
     target = destination.parent.resolve(strict=True) / destination.name
     if os.path.lexists(target):
         raise CheckpointRefused("Replacement destination already exists")
+    desk_target: Path | None = None
+    if desk_destination is not None:
+        desk_target = (
+            desk_destination.parent.resolve(strict=True) / desk_destination.name
+        )
+        if os.path.lexists(desk_target):
+            raise CheckpointRefused("Desk restore destination already exists")
 
     with (
         hold_company_writer(
@@ -502,7 +510,7 @@ def restore_store(
             archive,
             company_id,
             shadow,
-            desk_dir=staged_desk if desk_destination is not None else None,
+            desk_dir=staged_desk if desk_target is not None else None,
         )
 
         # Verify logical watermark against live original store (immune to WAL layout)
@@ -559,37 +567,53 @@ def restore_store(
             )
         _normalize_database_to_delete_mode(shadow)
 
-        # Fence and retire the original store before publishing the replacement
-        with (
-            closing(
-                open_writer(lease.store, create=False, lease=lease)
-            ) as original_writer,
-            write_tx(original_writer),
-        ):
-            original_writer.execute(
-                """CREATE TABLE IF NOT EXISTS company_store_retired (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    request_revision TEXT NOT NULL,
-                    original_schema INTEGER NOT NULL,
-                    retired_at_ns INTEGER NOT NULL
-                ) STRICT"""
+        # Stage Desk snapshot on the destination filesystem BEFORE retiring original store
+        staged_desk_sibling: Path | None = None
+        if desk_target is not None and manifest.desk_files:
+            if os.path.lexists(desk_target):
+                raise CheckpointRefused("Desk restore destination already exists")
+            staged_desk_sibling = desk_target.with_name(
+                f".sourdough-desk-stage-{request_revision[:16]}"
             )
-            original_writer.execute(
-                """INSERT INTO company_store_retired (
-                       singleton, request_revision, original_schema, retired_at_ns
-                   ) VALUES (1, ?, ?, ?)""",
-                (request_revision, manifest.schema_version, time_ns()),
-            )
-            original_writer.execute(
-                "UPDATE company SET schema_revision = ? WHERE singleton = 1",
-                (RETIRED_SCHEMA_REVISION,),
-            )
+            _copy_desk_tree(staged_desk, staged_desk_sibling)
 
-        _publish_file(shadow, target)
-        verify_no_wal_sidecars(target)
+        try:
+            # Fence and retire the original store only after all candidates are staged
+            with (
+                closing(
+                    open_writer(lease.store, create=False, lease=lease)
+                ) as original_writer,
+                write_tx(original_writer),
+            ):
+                original_writer.execute(
+                    """CREATE TABLE IF NOT EXISTS company_store_retired (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        request_revision TEXT NOT NULL,
+                        original_schema INTEGER NOT NULL,
+                        retired_at_ns INTEGER NOT NULL
+                    ) STRICT"""
+                )
+                original_writer.execute(
+                    """INSERT INTO company_store_retired (
+                           singleton, request_revision, original_schema, retired_at_ns
+                       ) VALUES (1, ?, ?, ?)""",
+                    (request_revision, manifest.schema_version, time_ns()),
+                )
+                original_writer.execute(
+                    "UPDATE company SET schema_revision = ? WHERE singleton = 1",
+                    (RETIRED_SCHEMA_REVISION,),
+                )
 
-        if desk_destination is not None and manifest.desk_files:
-            _copy_desk_tree(staged_desk, desk_destination)
+            _publish_file(shadow, target)
+            verify_no_wal_sidecars(target)
+
+            if staged_desk_sibling is not None and desk_target is not None:
+                os.rename(staged_desk_sibling, desk_target)
+                _fsync_dir(desk_target.parent)
+                staged_desk_sibling = None
+        finally:
+            if staged_desk_sibling is not None and os.path.lexists(staged_desk_sibling):
+                shutil.rmtree(staged_desk_sibling, ignore_errors=True)
 
         return CoreRestoreReceipt(
             company_id=company_id,

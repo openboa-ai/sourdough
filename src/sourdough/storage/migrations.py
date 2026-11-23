@@ -184,6 +184,10 @@ def migrate_store(
             ):
                 return MAX_SCHEMA_VERSION
 
+            if revision < 6 and legacy_upgrade_hook is None:
+                raise StorageRefused(
+                    f"Legacy v{revision} company store requires an explicit legacy upgrade hook"
+                )
             if revision < MAX_SCHEMA_VERSION and legacy_upgrade_hook is not None:
                 legacy_upgrade_hook(connection, revision)
 

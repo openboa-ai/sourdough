@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic, sleep
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -91,6 +92,24 @@ def _check_writable_state(
                 )
 
 
+def _set_journal_mode_with_retry(connection: sqlite3.Connection, mode: str) -> None:
+    """Retry journal_mode transition across concurrent cold-start initialization."""
+    deadline = monotonic() + (BUSY_TIMEOUT_MS / 1000.0)
+    delay = 0.01
+    while True:
+        try:
+            connection.execute(f"PRAGMA journal_mode = {mode}")
+            return
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            if (
+                "locked" not in message and "busy" not in message
+            ) or monotonic() >= deadline:
+                raise
+            sleep(min(delay, max(0.0, deadline - monotonic())))
+            delay = min(delay * 1.5, 0.1)
+
+
 def open_writer(
     store: Path,
     *,
@@ -119,12 +138,12 @@ def open_writer(
         _check_user_version(connection)
         _check_writable_state(connection, allow_retired=allow_retired)
         if journal_mode == "WAL":
-            connection.execute("PRAGMA journal_mode = WAL")
+            _set_journal_mode_with_retry(connection, "WAL")
             connection.execute(
                 f"PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES}"
             )
         elif journal_mode == "DELETE":
-            connection.execute("PRAGMA journal_mode = DELETE")
+            _set_journal_mode_with_retry(connection, "DELETE")
         elif journal_mode != "PRESERVE":
             raise StorageRefused(f"Unsupported journal mode: {journal_mode}")
         connection.execute("PRAGMA synchronous = FULL")
