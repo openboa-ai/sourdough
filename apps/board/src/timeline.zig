@@ -21,6 +21,11 @@ const Timeline = struct {
         decision: ?struct { action: []const u8 },
     },
     paper: ?struct { booked_position: i64 },
+    risk_control: ?RiskControl = null,
+};
+const RiskControl = struct {
+    state: []const u8,
+    effective_revision: ?u64,
 };
 const Duty = struct {
     duty_id: []const u8,
@@ -46,6 +51,8 @@ pub const Model = struct {
     observed: []const u8 = "",
     revision: []const u8 = "",
     investment: []const u8 = "",
+    risk_control: []const u8 = "",
+    show_risk_control: bool = false,
     duties: []const Duty = &.{},
     pub const view_unbound = .{ "scope", "storage", "request", "pending" };
 
@@ -55,6 +62,8 @@ pub const Model = struct {
         self.observed = "";
         self.revision = "";
         self.investment = "";
+        self.risk_control = "";
+        self.show_risk_control = false;
         self.duties = &.{};
         _ = self.storage.reset(.free_all);
     }
@@ -86,11 +95,27 @@ pub const Model = struct {
             try std.fmt.allocPrint(alloc, "Booked paper position: {d} instrument units", .{paper.booked_position})
         else
             "No investment observations in this view.";
+        self.show_risk_control = incoming.risk_control != null;
+        self.risk_control = if (incoming.risk_control) |control|
+            try riskText(alloc, control)
+        else
+            "";
         self.duties = rows;
         self.available = true;
         self.status = if (rows.len == 0) "No work in this view." else "Work timeline · Read only";
     }
 };
+
+fn riskText(alloc: std.mem.Allocator, control: RiskControl) ![]const u8 {
+    const revision = control.effective_revision orelse return "Paper risk status unavailable.";
+    const label = if (std.mem.eql(u8, control.state, "suspended"))
+        "New paper risk is suspended"
+    else if (std.mem.eql(u8, control.state, "not_suspended"))
+        "No active paper risk suspension"
+    else
+        return "Paper risk status unavailable.";
+    return std.fmt.allocPrint(alloc, "{s} · Control revision {d}", .{ label, revision });
+}
 
 fn clockText(alloc: std.mem.Allocator, unix: i64) ![]const u8 {
     if (unix < 0 or unix > std.math.maxInt(i64) / std.time.ns_per_s)
@@ -158,10 +183,25 @@ test "a compatible response reports missing observations without substituting ze
     try std.testing.expectEqualStrings("Not recorded", model.duties[0].decision);
     try std.testing.expectEqualStrings("2023-11-14 22:13:20 UTC", model.observed);
     try std.testing.expectEqualStrings("No investment observations in this view.", model.investment);
+    try std.testing.expect(!model.show_risk_control);
     model.clear("Unavailable");
     model.scope.company = "other";
     try std.testing.expectError(error.IncompatibleTimeline, model.present(body));
     try std.testing.expect(!model.available and model.duties.len == 0);
+}
+
+test "risk status is shown only from a compatible service response" {
+    var model = Model{ .scope = .{ .company = "company" } };
+    defer model.storage.deinit();
+    const body =
+        \\{"contract_revision":"work-timeline-v1","company_id":"company","revision":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","as_of_ns":1700000000000000000,"duties":[],"paper":null,"risk_control":{"state":"suspended","effective_revision":3}}
+    ;
+    try model.present(body);
+    try std.testing.expect(model.show_risk_control);
+    try std.testing.expectEqualStrings("New paper risk is suspended · Control revision 3", model.risk_control);
+    model.clear("Unavailable");
+    try std.testing.expect(!model.show_risk_control);
+    try std.testing.expectEqualStrings("", model.risk_control);
 }
 
 test "an old or incomplete reply cannot restore company work" {

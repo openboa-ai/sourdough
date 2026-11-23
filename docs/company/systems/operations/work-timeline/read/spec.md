@@ -14,6 +14,8 @@ Project company, work, decision, allowed evidence, owner, next condition and as-
 
 The local Client uses the read-only service entry point `inspect-work`, specifying the company and the supported `work-timeline-v1` contract revision. The response reports that contract separately from the content revision and observation time. A request for an unsupported contract rejects before accessing the store. The local store-owner check remains in the service; the Client gets neither database access nor operational authority through this query.
 
+An optional `risk_control` observation reports the effective paper risk revision, suspension state and last applied request reference, operation and time from the [risk control owner](../../../../profiles/quant/trading/board-control/apply-control/spec.md). No paper profile yields no observation; a controlled store with incomplete evidence returns unavailable, not unsuspended. A conflicting request never becomes the last applied receipt. Unsuspended does not imply a current grant or permission to submit an order. Earlier compatible Clients may ignore the observation.
+
 **Concern for the responsible component:** Authorize every read at current access scope. Do not expose restricted evidence through titles, aggregates or stale cached projections.
 
 ## Functional and quality requirements
