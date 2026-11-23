@@ -7,6 +7,7 @@ from hashlib import sha256
 from sqlite3 import Connection
 from uuid import uuid4
 
+from .abandoned_work import has_uncommitted_work
 from .agent_desk import ensure_private_desk, require_desk
 from .company import _connect
 from .company_assets import (
@@ -163,6 +164,8 @@ def request_peer_response(
         require_desk(database, claim, _ASSESSMENT)
         if not has_hired_acceptance(database, claim):
             raise DutyRefused("Peer request requires an accepted assignment")
+        if not has_uncommitted_work(database, claim.duty_id):
+            raise DutyRefused("Peer request cannot suspend a committed result")
         if not now < question.expires_at <= now + 86400:
             raise DutyRefused("Peer request deadline is outside its bounded window")
         if not has_turn_capacity(database, claim.founder_id):

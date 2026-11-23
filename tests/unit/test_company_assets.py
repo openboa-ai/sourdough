@@ -14,6 +14,7 @@ from sourdough.company_assessment import (
     MANAGER_ASSESSMENT,
     AssessmentProposal,
     SourceRecord,
+    pending_publications,
     publish_assessment,
     read_assessment_inputs,
     read_assessment_result,
@@ -344,6 +345,27 @@ class CompanyAssets(unittest.TestCase):
         )
         with self.assertRaises(DutyRefused):
             read_peer_outcome(self.writer, claim)
+
+    def test_published_assessment_cannot_yield_to_a_peer_response(self):
+        now, claim, question, _ = self.prepare_peer_question()
+        seal_assessment_source(
+            self.writer, (SourceRecord("count", "Documents", 8, 6, now),)
+        )
+        inputs = read_assessment_inputs(self.writer, claim, now=now)
+        publication = publish_assessment(
+            self.writer,
+            claim,
+            AssessmentProposal(
+                inputs["revision"], "count", "investigate", "Two missing.", 60
+            ),
+            now=now,
+        )
+        with self.assertRaisesRegex(DutyRefused, "committed result"):
+            request_peer_response(self.writer, claim, question, now=now)
+        self.assertIsNone(claim_peer_response(self.writer, "profile", now=now))
+        self.assertEqual(pending_publications(self.writer), ((claim, publication),))
+        follow_up = settle_assessment(self.writer, claim, publication)
+        self.assertEqual(follow_up.result.resource_id, publication.action_id)
 
     def test_peer_expiry_resumes_without_waking_a_withdrawn_recipient(self):
         now, claim, question, _ = self.prepare_peer_question()
