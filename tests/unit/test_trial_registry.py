@@ -11,12 +11,16 @@ from tempfile import TemporaryDirectory
 from sourdough.company import FoundingTerms, found
 from sourdough.trial_registry import (
     TrialCeiling,
+    TrialGrade,
     TrialInputs,
     TrialRefused,
     TrialSlot,
     TrialSuite,
     TrialTerminalEvidence,
+    blind_trial_packet,
+    commit_blind_grade,
     commit_trial_observation,
+    reconcile_paired_grades,
     reserve_trial_launch,
     seal_trial_suite,
     trial_run_records,
@@ -245,6 +249,132 @@ os._exit(75)
                 replace(trial, slots=(left, candidate))
         with self.assertRaisesRegex(TrialRefused, "complete declared pairs"):
             replace(self.plan, purpose="recursive")
+
+    def test_reconcile_arms_only_after_the_separate_blind_scores_commit(self):
+        left = replace(self.slot, arm="incumbent", counterpart_id="right")
+        right = replace(
+            left,
+            slot_id="right",
+            arm="candidate",
+            counterpart_id=left.slot_id,
+            inputs=replace(self.inputs, worker_context="9" * 64),
+        )
+        revision = seal_trial_suite(
+            self.store, replace(self.plan, purpose="recursive", slots=(left, right))
+        )
+        packets = []
+        for slot in (left, right):
+            run_id = f"private-{slot.arm}"
+            self.reserve(
+                revision, slot_id=slot.slot_id, run_id=run_id, inputs=slot.inputs
+            )
+            record = commit_trial_observation(
+                self.store,
+                revision=revision,
+                slot_id=slot.slot_id,
+                run_id=run_id,
+                evidence=TrialTerminalEvidence(
+                    "completed", "1" * 64, "2" * 64, "3" * 64, "4" * 64, "5" * 64
+                ),
+            )
+            packets.append(
+                blind_trial_packet(
+                    self.store, revision=revision, result_id=record.result_id
+                )
+            )
+        self.assertIsNone(reconcile_paired_grades(self.store, revision=revision))
+        script = """
+import json, sys
+from dataclasses import asdict
+from sourdough.trial_registry import TrialGrade
+packet = json.load(sys.stdin)
+assert set(packet) == {
+    "result_id", "rubric_digest", "evaluator_digest", "outcome",
+    "decision_digest", "tool_trace_digest", "service_effects_digest",
+}
+assert packet["rubric_digest"] == "e" * 64 and packet["evaluator_digest"] == "f" * 64
+assert packet["decision_digest"] == "2" * 64 and packet["tool_trace_digest"] == "3" * 64
+print(json.dumps(asdict(TrialGrade(True, True, True, 1, True))))
+"""
+        scorer = subprocess.run(
+            [sys.executable, "-IB", "-c", script],
+            input=json.dumps(asdict(packets[0])),
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=True,
+        )
+        denied = TrialGrade(**json.loads(scorer.stdout))
+        request = {"revision": revision, "packet": packets[0], "grade": denied}
+        with self.assertRaisesRegex(TrialRefused, "original blinded packet"):
+            commit_blind_grade(
+                self.store,
+                **(request | {"packet": replace(packets[0], rubric_digest="8" * 64)}),
+            )
+        self.assertEqual(commit_blind_grade(self.store, **request), denied)
+        self.assertIsNone(reconcile_paired_grades(self.store, revision=revision))
+        self.assertEqual(commit_blind_grade(self.store, **request), denied)
+        with self.assertRaisesRegex(TrialRefused, "already committed"):
+            commit_blind_grade(
+                self.store,
+                **(request | {"grade": replace(denied, authority_violations=0)}),
+            )
+        commit_blind_grade(
+            self.store,
+            revision=revision,
+            packet=packets[1],
+            grade=TrialGrade(True, True, True, 0, False),
+        )
+        grades = reconcile_paired_grades(self.store, revision=revision)
+        self.assertEqual(
+            [
+                (item.arm, item.judgment_passed, item.grade.service_correct)
+                for item in grades
+            ],
+            [("incumbent", False, True), ("candidate", True, False)],
+        )
+        self.assertEqual(
+            [item.packet.result_id for item in grades], [p.result_id for p in packets]
+        )
+
+    def test_missing_observations_cannot_support_a_grade_claim(self):
+        revision = seal_trial_suite(self.store, self.plan)
+        self.reserve(revision)
+        with self.assertRaisesRegex(TrialRefused, "opaque trial result"):
+            blind_trial_packet(self.store, revision=revision, result_id="first")
+        record = commit_trial_observation(
+            self.store,
+            revision=revision,
+            slot_id=self.slot.slot_id,
+            run_id="first",
+            evidence=TrialTerminalEvidence("timed-out", "1" * 64),
+        )
+        packet = blind_trial_packet(
+            self.store, revision=revision, result_id=record.result_id
+        )
+        unavailable = TrialGrade(None, None, None, None, None)
+        for claim in (
+            replace(unavailable, grounding=False),
+            replace(unavailable, authority_violations=0),
+            replace(unavailable, service_correct=False),
+        ):
+            with self.assertRaisesRegex(TrialRefused, "without its evidence"):
+                commit_blind_grade(
+                    self.store, revision=revision, packet=packet, grade=claim
+                )
+        self.assertEqual(
+            commit_blind_grade(
+                self.store, revision=revision, packet=packet, grade=unavailable
+            ),
+            unavailable,
+        )
+        self.assertEqual(
+            [
+                record.state
+                for record in trial_run_records(self.store, revision=revision)
+            ],
+            ["timed-out", "uncovered"],
+        )
 
     def test_operating_company_store_is_not_a_trial_store_even_with_local_write_access(
         self,

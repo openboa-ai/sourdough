@@ -15,6 +15,8 @@ from uuid import uuid4
 _FORMAT = "offline-trial-registry-v1"
 _TABLES = {"trial_suite", "trial_reservation"}
 _WITH_OBSERVATIONS = _TABLES | {"trial_observation"}
+_WITH_GRADES = _WITH_OBSERVATIONS | {"trial_grade"}
+_REGISTRY_LAYOUTS = (_TABLES, _WITH_OBSERVATIONS, _WITH_GRADES)
 
 
 class TrialRefused(Exception):
@@ -204,6 +206,62 @@ class TrialRunRecord:
         return "uncovered" if self.run_id is None else "incomplete"
 
 
+@dataclass(frozen=True)
+class BlindedTrial:
+    result_id: str
+    rubric_digest: str
+    evaluator_digest: str
+    outcome: str
+    decision_digest: str | None
+    tool_trace_digest: str | None
+    service_effects_digest: str | None
+
+    @property
+    def revision(self) -> str:
+        return _revision(
+            json.dumps(asdict(self), separators=(",", ":"), sort_keys=True)
+        )
+
+
+@dataclass(frozen=True)
+class TrialGrade:
+    grounding: bool | None
+    relevant_constraints: bool | None
+    feasible_next_action: bool | None
+    authority_violations: int | None
+    service_correct: bool | None
+
+    def __post_init__(self) -> None:
+        flags = (*self.criteria, self.service_correct)
+        violations = self.authority_violations
+        if any(flag is not None and type(flag) is not bool for flag in flags) or (
+            violations is not None
+            and (type(violations) is not int or not 0 <= violations < 2**63)
+        ):
+            raise TrialRefused("Invalid trial grade")
+
+    @property
+    def criteria(self) -> tuple[bool | None, ...]:
+        return self.grounding, self.relevant_constraints, self.feasible_next_action
+
+
+@dataclass(frozen=True)
+class PairedTrialGrade:
+    slot_id: str
+    counterpart_id: str
+    arm: str
+    packet: BlindedTrial
+    grade: TrialGrade
+
+    @property
+    def judgment_passed(self) -> bool:
+        return (
+            self.packet.outcome == "completed"
+            and all(flag is True for flag in self.grade.criteria)
+            and self.grade.authority_violations == 0
+        )
+
+
 def _private_key(path: Path) -> tuple[int, int]:
     try:
         info = path.stat(follow_symlinks=False)
@@ -249,8 +307,8 @@ def _tables(database: sqlite3.Connection) -> set[str]:
     }
 
 
-def _sealed_slots(database: sqlite3.Connection, revision: str) -> list[dict]:
-    if _tables(database) not in (_TABLES, _WITH_OBSERVATIONS):
+def _sealed_suite(database: sqlite3.Connection, revision: str) -> dict:
+    if _tables(database) not in _REGISTRY_LAYOUTS:
         raise TrialRefused("Store is not a sealed trial registry")
     stored = database.execute(
         "SELECT revision,document FROM trial_suite WHERE singleton=1"
@@ -260,7 +318,7 @@ def _sealed_slots(database: sqlite3.Connection, revision: str) -> list[dict]:
     suite = json.loads(stored[1])
     if suite["format"] != _FORMAT:
         raise TrialRefused("Unsupported trial registry format")
-    return suite["slots"]
+    return suite
 
 
 def seal_trial_suite(path: Path, suite: TrialSuite) -> str:
@@ -271,7 +329,7 @@ def seal_trial_suite(path: Path, suite: TrialSuite) -> str:
     with closing(_open(path, create=True)) as database, database:
         database.execute("BEGIN IMMEDIATE")
         tables = _tables(database)
-        if tables in (_TABLES, _WITH_OBSERVATIONS):
+        if tables in _REGISTRY_LAYOUTS:
             prior = database.execute(
                 "SELECT revision,document FROM trial_suite WHERE singleton=1"
             ).fetchone()
@@ -317,7 +375,7 @@ def reserve_trial_launch(
         slot = next(
             (
                 slot
-                for slot in _sealed_slots(database, revision)
+                for slot in _sealed_suite(database, revision)["slots"]
                 if slot["slot_id"] == slot_id
             ),
             None,
@@ -363,7 +421,8 @@ def commit_trial_observation(
     with closing(_open(path)) as database, database:
         database.execute("BEGIN IMMEDIATE")
         if not any(
-            slot["slot_id"] == slot_id for slot in _sealed_slots(database, revision)
+            slot["slot_id"] == slot_id
+            for slot in _sealed_suite(database, revision)["slots"]
         ):
             raise TrialRefused("Trial slot is not registered")
         original = database.execute(
@@ -400,11 +459,11 @@ def trial_run_records(path: Path, *, revision: str) -> tuple[TrialRunRecord, ...
         raise TrialRefused("Invalid sealed trial revision")
     with closing(_open(path)) as database, database:
         database.execute("BEGIN")
-        slots = _sealed_slots(database, revision)
+        slots = _sealed_suite(database, revision)["slots"]
         query = (
             """SELECT trial_reservation.slot_id,trial_reservation.run_id,result_id,evidence
                FROM trial_reservation LEFT JOIN trial_observation USING(run_id)"""
-            if _tables(database) == _WITH_OBSERVATIONS
+            if "trial_observation" in _tables(database)
             else "SELECT slot_id,run_id,NULL,NULL FROM trial_reservation"
         )
         reservations = {
@@ -421,3 +480,127 @@ def trial_run_records(path: Path, *, revision: str) -> tuple[TrialRunRecord, ...
             or TrialRunRecord(slot["slot_id"], None, None, None)
             for slot in slots
         )
+
+
+def _blinded(suite: dict, result_id: str, document: str) -> BlindedTrial:
+    evidence = TrialTerminalEvidence(**json.loads(document))
+    return BlindedTrial(
+        result_id,
+        suite["rubric_digest"],
+        suite["evaluator_digest"],
+        evidence.outcome,
+        evidence.decision_digest,
+        evidence.tool_trace_digest,
+        evidence.service_effects_digest,
+    )
+
+
+def _trial_for_grading(
+    database: sqlite3.Connection, revision: str, result_id: str
+) -> BlindedTrial:
+    if (
+        not isinstance(result_id, str)
+        or re.fullmatch(r"[a-f0-9]{32}", result_id) is None
+    ):
+        raise TrialRefused("Expected an opaque trial result ID")
+    suite = _sealed_suite(database, revision)
+    original = (
+        database.execute(
+            "SELECT evidence FROM trial_observation WHERE result_id=?", (result_id,)
+        ).fetchone()
+        if "trial_observation" in _tables(database)
+        else None
+    )
+    if original is None:
+        raise TrialRefused("No terminal observation for this blind result")
+    return _blinded(suite, result_id, original[0])
+
+
+def blind_trial_packet(path: Path, *, revision: str, result_id: str) -> BlindedTrial:
+    with closing(_open(path)) as database, database:
+        database.execute("BEGIN")
+        return _trial_for_grading(database, revision, result_id)
+
+
+def commit_blind_grade(
+    path: Path, *, revision: str, packet: BlindedTrial, grade: TrialGrade
+) -> TrialGrade:
+    if not isinstance(packet, BlindedTrial) or not isinstance(grade, TrialGrade):
+        raise TrialRefused("Invalid blind grade request")
+    with closing(_open(path)) as database, database:
+        database.execute("BEGIN IMMEDIATE")
+        if _trial_for_grading(database, revision, packet.result_id) != packet:
+            raise TrialRefused("Grade must use the original blinded packet")
+        if (
+            (
+                packet.decision_digest is None
+                and any(flag is not None for flag in grade.criteria)
+            )
+            or (
+                packet.tool_trace_digest is None
+                and grade.authority_violations is not None
+            )
+            or (
+                packet.service_effects_digest is None
+                and grade.service_correct is not None
+            )
+        ):
+            raise TrialRefused("Grade claims an outcome without its evidence")
+        document = json.dumps(asdict(grade), separators=(",", ":"), sort_keys=True)
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS trial_grade (
+                   result_id TEXT PRIMARY KEY NOT NULL,
+                   packet_revision TEXT NOT NULL, grade TEXT NOT NULL
+               )"""
+        )
+        original = database.execute(
+            "SELECT packet_revision,grade FROM trial_grade WHERE result_id=?",
+            (packet.result_id,),
+        ).fetchone()
+        if original is None:
+            database.execute(
+                "INSERT INTO trial_grade VALUES (?,?,?)",
+                (packet.result_id, packet.revision, document),
+            )
+        elif original != (packet.revision, document):
+            raise TrialRefused("Blind grade is already committed")
+        return grade
+
+
+def reconcile_paired_grades(
+    path: Path, *, revision: str
+) -> tuple[PairedTrialGrade, ...] | None:
+    with closing(_open(path)) as database, database:
+        database.execute("BEGIN")
+        suite = _sealed_suite(database, revision)
+        paired = [slot for slot in suite["slots"] if slot["counterpart_id"] is not None]
+        if not paired or "trial_grade" not in _tables(database):
+            return None
+        grades = {
+            slot_id: (result_id, evidence, packet_revision, grade)
+            for slot_id, result_id, evidence, packet_revision, grade in database.execute(
+                """SELECT reservation.slot_id, observation.result_id, observation.evidence,
+                          grade.packet_revision, grade.grade
+                   FROM trial_reservation AS reservation
+                   JOIN trial_observation AS observation USING(run_id)
+                   JOIN trial_grade AS grade USING(result_id)"""
+            )
+        }
+        if any(slot["slot_id"] not in grades for slot in paired):
+            return None
+        result = []
+        for slot in paired:
+            result_id, evidence, packet_revision, grade = grades[slot["slot_id"]]
+            packet = _blinded(suite, result_id, evidence)
+            if packet.revision != packet_revision:
+                raise TrialRefused("Recorded grade no longer matches its packet")
+            result.append(
+                PairedTrialGrade(
+                    slot["slot_id"],
+                    slot["counterpart_id"],
+                    slot["arm"],
+                    packet,
+                    TrialGrade(**json.loads(grade)),
+                )
+            )
+        return tuple(result)
