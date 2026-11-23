@@ -14,6 +14,7 @@ PURPOSE_SCHEMA_REVISION = 4
 RUN_READ_SCHEMA_REVISION = 5
 SCHEMA_REVISION = 6
 PAPER_CONTROL_SCHEMA_REVISION = 7
+CURRENT_WORK_SCHEMA_REVISIONS = (SCHEMA_REVISION, PAPER_CONTROL_SCHEMA_REVISION)
 AGENT_SCHEMA = """CREATE TABLE agent (
     id TEXT PRIMARY KEY NOT NULL, company_id TEXT NOT NULL REFERENCES company(id),
     execution_profile TEXT NOT NULL
@@ -173,8 +174,7 @@ def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
         RUN_SCHEMA_REVISION,
         PURPOSE_SCHEMA_REVISION,
         RUN_READ_SCHEMA_REVISION,
-        SCHEMA_REVISION,
-        PAPER_CONTROL_SCHEMA_REVISION,
+        *CURRENT_WORK_SCHEMA_REVISIONS,
     ):
         raise FoundingRefused("Unsupported company store schema")
     return company_id, schema
@@ -251,7 +251,7 @@ def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
             company_id, revision = _company_version(connection)
             if company_id != expected_company_id:
                 raise FoundingRefused("Company identity mismatch")
-            if revision in (SCHEMA_REVISION, PAPER_CONTROL_SCHEMA_REVISION):
+            if revision in CURRENT_WORK_SCHEMA_REVISIONS:
                 return
             if revision == RUN_SCHEMA_REVISION:
                 connection.execute(

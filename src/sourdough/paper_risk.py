@@ -6,7 +6,12 @@ from dataclasses import astuple, dataclass
 from sqlite3 import Connection
 from time import time_ns
 
-from .company import PAPER_CONTROL_SCHEMA_REVISION, _company_version, _connect
+from .company import (
+    CURRENT_WORK_SCHEMA_REVISIONS,
+    PAPER_CONTROL_SCHEMA_REVISION,
+    _company_version,
+    _connect,
+)
 from .writer_lease import WriterLease
 
 
@@ -121,6 +126,13 @@ def suspend_paper_risk(
         connection.execute("BEGIN IMMEDIATE")
         writer.verify()
         principal = _principal(connection, writer.company_id, authorize)
+        company_id, schema = _company_version(connection)
+        if company_id != writer.company_id:
+            raise PaperRiskRefused("Company identity mismatch")
+        if schema not in CURRENT_WORK_SCHEMA_REVISIONS:
+            raise PaperRiskRefused(
+                "Company work schema must be upgraded before control"
+            )
         terms = (principal, SUSPEND_NEW_RISK, *astuple(command)[1:])
         prior = _prior(connection, command.request_id)
         if prior is not None:
@@ -129,13 +141,11 @@ def suspend_paper_risk(
             return PaperRiskReceipt(command.request_id, *prior[:2], *prior[6:])
 
         current_revision = effective_paper_risk(connection).revision
-        company = connection.execute(
-            "SELECT id, charter_revision FROM company WHERE singleton=1"
+        (current_charter,) = connection.execute(
+            "SELECT charter_revision FROM company WHERE singleton=1"
         ).fetchone()
-        if company is None or company[0] != writer.company_id:
-            raise PaperRiskRefused("Company identity mismatch")
         applied = (command.charter_revision, command.expected_revision) == (
-            company[1],
+            current_charter,
             current_revision,
         )
         receipt = PaperRiskReceipt(

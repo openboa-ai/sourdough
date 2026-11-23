@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from .company import RESULT_READ_SCHEMA, SCHEMA_REVISION, _company_version, _connect
+from .company import (
+    CURRENT_WORK_SCHEMA_REVISIONS,
+    RESULT_READ_SCHEMA,
+    _company_version,
+    _connect,
+)
 from .duty_run import (
     ASSESSMENT_REVIEW,
     PAPER_EXECUTION,
@@ -109,7 +114,8 @@ class ReviewDecision:
 
 
 def _check_store(connection: sqlite3.Connection, company_id: str) -> None:
-    if _company_version(connection) != (company_id, SCHEMA_REVISION):
+    identity, revision = _company_version(connection)
+    if identity != company_id or revision not in CURRENT_WORK_SCHEMA_REVISIONS:
         raise DutyRefused("Expected current company work store")
 
 

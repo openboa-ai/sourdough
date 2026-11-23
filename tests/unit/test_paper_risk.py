@@ -11,11 +11,11 @@ from sourdough.company import (
     found,
     upgrade_work_schema,
 )
+from sourdough.company_run import run_paper_company
 from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_execution import PaperIntent
 from sourdough.paper_order import OrderRefused, OrderReplyUnknown, submit_paper_order
-from sourdough.paper_reconcile import reconcile_paper_orders
 from sourdough.paper_risk import (
     SUSPEND_NEW_RISK,
     PaperRiskRefused,
@@ -25,6 +25,21 @@ from sourdough.paper_risk import (
 )
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.writer_lease import hold_company_writer
+
+
+class ReviewingEmployee:
+    profile = "runtime"
+
+    def review(self, read_result):
+        self.observed = read_result()
+        return {
+            "tool": "record_review_decision",
+            "call_id": "suspended-position-review",
+            "action": "hold",
+            "observation_revision": self.observed["revision"],
+            "rationale": "Review the original position without new risk.",
+            "next_check_seconds": 60,
+        }
 
 
 class PaperRiskControl(unittest.TestCase):
@@ -122,10 +137,16 @@ class PaperRiskControl(unittest.TestCase):
                     self.venue,
                     writer=writer,
                 )
-            results = reconcile_paper_orders(
-                self.store, self.company.company_id, self.venue, now=100, writer=writer
-            )
-        self.assertEqual(results.unresolved, 0)
+        employee = ReviewingEmployee()
+        result = run_paper_company(
+            self.store, self.company.company_id, self.venue, employee, repeat_paper=True
+        )
+        self.assertEqual(result.reconciliation.unresolved, 0)
+        self.assertEqual(result.blocked_work, ())
+        self.assertEqual(result.review.claim.founder_id, self.claim.founder_id)
+        self.assertNotEqual(result.review.claim.duty_id, self.claim.duty_id)
+        self.assertEqual(result.review.decision.action, "hold")
+        self.assertEqual(employee.observed["position_quantity"], self.intent.quantity)
         self.assertEqual(
             self.rows(self.store, "SELECT order_id,fill_id,quantity FROM paper_fill"),
             self.rows(
