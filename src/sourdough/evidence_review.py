@@ -83,6 +83,7 @@ class ReviewCase:
 
 @dataclass(frozen=True)
 class CheckOutcome:
+    present: tuple[EvidenceClass, ...]
     expected_missing: tuple[EvidenceClass, ...]
     candidate_missing: tuple[EvidenceClass, ...]
     baseline_missing: tuple[EvidenceClass, ...] | None
@@ -120,6 +121,7 @@ def qualify_review_rule(
         criteria_digest,
         tuple(
             CheckOutcome(
+                case.present,
                 case.expected_missing,
                 candidate.missing(case.present),
                 baseline.missing(case.present) if baseline is not None else None,
