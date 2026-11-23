@@ -20,6 +20,12 @@ A staffing assignment may designate one existing project and the narrow particip
 
 When no project is designated, onboarding follows its existing path. If designated access cannot be established under current policy, keep the hire and its budget receipt, expose the provisioning block and do not start the Agent with fallback access. An exact retry must not duplicate membership or the first duty. Keep the Desk private and use the same company asset and conversation boundaries as any existing member.
 
+### Close the first project assignment with its manager
+
+When that first project assessment is published for its authorized manager, settlement arms one separate manager review linked to the original staffing duty and exact publication. Use the manager's recorded staffing review interval, never before the result becomes available. The hire retains its own next duty. Replay must not create another manager review; posting, editing or receiving a project message does not create work or wake a run.
+
+The manager's scheduled turn uses its own verified profile, Desk and current company grant. Provide the exact result issued to that manager and the authorized project conversation, not the hire's private Desk or additional source records. The manager can respond under the existing project policy and settle its own review; it does not inherit the hire's assignment or acquire a spending or trading capability. If the manager or project access is no longer valid, the original publication and hire's follow-up remain intact, without launching the manager under fallback authority.
+
 **Concern for the responsible component:** No worker should run with default privileges while its workspace or budget is incomplete. A role title is not proof of readiness.
 
 ## Functional and quality requirements
@@ -34,6 +40,7 @@ When no project is designated, onboarding follows its existing path. If designat
 | Normal | Interrupt between grant and desk creation; resume automatically and observe the same hire in a live first turn accepting the original duty. |
 | Failure or contention | Deny the workspace temporarily; show hired/blocked rather than working. Deliver duplicate readiness events and an out-of-scope write: no new hire and zero unauthorized effects. |
 | Project work | Under standing scoped authority, observe a manager Agent hire for one small task without the Client. The hire gets one Desk and one budget allocation, reads the designated shared asset, replies to the manager in the project, and records a result. Recheck that a different project and the manager's private Desk remain inaccessible. No trade is necessary. |
+| Manager response | In that company-only scenario, leave the hire's next responsibility intact. At the manager's scheduled time, observe the original manager read the exact published assessment and reply in the same project using a separate run. Verify both authors, the reply delivery and the two independent owners of later work. Duplicate publication settlement and unrelated messages do not create a second manager review. |
 
 **Oracle:** Independently compare roster, budget reservation, desk inventory, runtime start and accepted work receipt. Run [H1](../../../../../acceptance/episodes.md#h1-hiring).
 
