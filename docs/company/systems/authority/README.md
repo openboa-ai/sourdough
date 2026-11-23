@@ -11,6 +11,7 @@ Design draft · [Company and quant architecture](../../../README.md#system-hiera
 A runtime session, role title or API credential is not an Agent identity or a grant.
 
 - [bind](authorize-actor/bind/spec.md) — Bind a principal to a company identity. Change only the asserted company or replay a retired proof: zero issued credentials and zero resource reads.
+- [manage roles](authorize-actor/manage-roles/spec.md) — Manage reusable permission sets and scoped assignments without granting power through a job title or runtime.
 - [check](authorize-actor/check/spec.md) — Decide a scoped capability at use time. Use a stale revision or a valid Agent from another company; the independent resource audit shows zero protected effects.
 
 ## Withdrawal of authority
