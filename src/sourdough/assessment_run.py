@@ -35,6 +35,7 @@ from .work import (
     ReviewDecision,
     ResultEligibility,
     claim_assessment_review,
+    mark_review_incomplete,
     owed_hired_follow_up_owner,
     settle_review,
 )
@@ -113,6 +114,11 @@ class AssessmentRun:
     later_reviews: tuple[AssessmentReview, ...] = ()
 
 
+class _ReviewInterrupted(TradeRefused):
+    def __init__(self, claim: DutyClaim, reason: str = "No committed decision"):
+        super().__init__(f"Review {claim.duty_id} is incomplete: {reason}")
+
+
 def run_assessment_company(
     store: Path,
     company_id: str,
@@ -183,6 +189,7 @@ def run_assessment_company(
             hiring = replace(hiring, accepted=True)
 
         reviews = []
+        interruption = None
         deadline = monotonic() + idle_seconds
         while remaining > 0:
             now = int(time())
@@ -211,7 +218,14 @@ def run_assessment_company(
                     eligible_result=eligible_result,
                 )
                 if work is not None:
-                    reviews.append(_run_review(writer, employee, work, eligible_result))
+                    try:
+                        reviews.append(
+                            _run_review(writer, employee, work, eligible_result)
+                        )
+                    except _ReviewInterrupted as error:
+                        writer.verify()
+                        mark_review_incomplete(store, work)
+                        interruption = error
                     remaining -= 1
                     continue
             remaining_idle = deadline - monotonic()
@@ -222,6 +236,8 @@ def run_assessment_company(
             ):
                 break
             sleep(min(remaining_idle, 0.5))
+        if interruption is not None:
+            raise interruption
         return AssessmentRun(
             hiring,
             publication,
@@ -378,9 +394,9 @@ def _run_review(
     )
     try:
         employee.run_scoped("assessment_review", run)
-    except TradeRefused:
+    except TradeRefused as error:
         if committed is None:
-            raise
+            raise _ReviewInterrupted(work.claim, str(error)) from error
     if committed is None:
-        raise DutyRefused("Company review returned without a committed decision")
+        raise _ReviewInterrupted(work.claim)
     return committed

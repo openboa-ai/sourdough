@@ -4,7 +4,7 @@ from contextlib import closing
 from sqlite3 import Connection
 
 from .company import _connect, _identity
-from .duty_run import DutyRefused
+from .duty_run import ASSESSMENT_REVIEW, DutyRefused
 from .writer_lease import WriterLease
 
 
@@ -71,12 +71,12 @@ def requeue_uncommitted_work(
                 {ownership}
                 LEFT JOIN founding_receipt founding ON founding.due_work_id = d.id
                 LEFT JOIN work_follow_up follow_up ON follow_up.duty_id = d.id
-                WHERE d.state = 'running'
+                WHERE (d.state = 'running' OR (? AND d.state = 'incomplete'))
                   AND (? IS NULL OR run.purpose = ?)
                   AND (founding.due_work_id IS NOT NULL OR follow_up.duty_id IS NOT NULL)
                 {_no_committed_result(tables)}
                 ORDER BY d.rowid""",
-            (writer.company_id, purpose, purpose),
+            (writer.company_id, purpose == ASSESSMENT_REVIEW, purpose, purpose),
         ).fetchall()
         for duty_id, old_run, next_state in recovered:
             connection.execute(
