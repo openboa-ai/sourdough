@@ -254,7 +254,10 @@ def scoped_call(address, name, args, outbox, tools, terminal_tool, *, legacy):
         return tool_output("Scoped service is unavailable.", denied=True)
     if "error" in result:
         return tool_output(result["error"], denied=True)
-    if name == terminal_tool:
+    terminal_names = (
+        (terminal_tool,) if isinstance(terminal_tool, str) else terminal_tool
+    )
+    if name in terminal_names:
         try:
             with outbox.open("x") as stream:
                 json.dump(result, stream)

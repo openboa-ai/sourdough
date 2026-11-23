@@ -84,6 +84,14 @@ class PeerWait:
     expires_at: int
 
 
+@dataclass(frozen=True)
+class _ProjectPeer:
+    project_id: str
+    recipient_id: str
+    grant_id: str
+    profile: str
+
+
 def _exists(database: Connection) -> bool:
     return (
         database.execute(
@@ -94,8 +102,11 @@ def _exists(database: Connection) -> bool:
 
 
 def _project_route(
-    database: Connection, company_id: str, source_duty: str, question: PeerQuestion
-) -> tuple[str, str, str]:
+    database: Connection,
+    company_id: str,
+    source_duty: str,
+    question: PeerQuestion | None = None,
+) -> _ProjectPeer:
     route = database.execute(
         """SELECT json_extract(s.evidence,'$.project_id'),manager.id,manager.execution_profile,g.id,
                   source.agent_id
@@ -108,10 +119,14 @@ def _project_route(
            JOIN staffing_assignment s ON s.duty_id=c.duty_id
            JOIN standing_grant g ON g.id=h.manager_grant_id
            JOIN agent manager ON manager.id=g.agent_id AND manager.company_id=requester.company_id
-           WHERE source.id=? AND o.purpose='assessment' AND o.state='accepted'""",
+           WHERE source.id=? AND o.purpose='assessment' AND o.state IN ('ready','accepted')""",
         (company_id, source_duty),
     ).fetchone()
-    if route is None or route[0] is None or route[1] != question.recipient_id:
+    if (
+        route is None
+        or route[0] is None
+        or (question is not None and route[1] != question.recipient_id)
+    ):
         raise DutyRefused("Peer response is outside the assigned project route")
     project_id, recipient, profile, grant, requester = route
     if recipient == requester or any(
@@ -124,7 +139,7 @@ def _project_route(
     )
     if requester not in members:
         raise DutyRefused("Requester no longer belongs to the assigned project")
-    if question.asset_id:
+    if question is not None and question.asset_id:
         for actor in (requester, recipient):
             asset = shared_asset_for(database, actor, question.asset_id)
             if (
@@ -132,7 +147,34 @@ def _project_route(
                 or sha256(asset.content.encode()).hexdigest() != question.asset_revision
             ):
                 raise DutyRefused("Peer evidence is outside the admitted revision")
-    return project_id, grant, profile
+    return _ProjectPeer(project_id, recipient, grant, profile)
+
+
+def assigned_peer(writer: WriterLease, claim: DutyClaim) -> dict | None:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "ro")) as database:
+        database.execute("BEGIN")
+        require_desk(database, claim, _ASSESSMENT)
+        try:
+            route = _project_route(database, claim.company_id, claim.duty_id)
+        except DutyRefused:
+            return None
+        return {"project_id": route.project_id, "recipient_id": route.recipient_id}
+
+
+def peer_wait_for_run(writer: WriterLease, claim: DutyClaim) -> PeerWait | None:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "ro")) as database:
+        database.execute("BEGIN")
+        authority = resolve_run(database, claim)
+        if authority.purpose != _ASSESSMENT or not _exists(database):
+            return None
+        row = database.execute(
+            """SELECT source_duty,response_duty,expires_at FROM work_peer_request
+               WHERE source_duty=? AND source_run=?""",
+            (claim.duty_id, claim.run_id),
+        ).fetchone()
+        return PeerWait(*row) if row else None
 
 
 def request_peer_response(
@@ -172,12 +214,12 @@ def request_peer_response(
             raise DutyRefused(
                 "No turn allocation remains to resume the requesting work"
             )
-        project_id, _, profile = _project_route(
-            database, claim.company_id, claim.duty_id, question
-        )
+        route = _project_route(database, claim.company_id, claim.duty_id, question)
         if not has_turn_capacity(database, question.recipient_id):
             raise DutyRefused("Recipient has no available turn allocation")
-        ensure_private_desk(database, claim.company_id, question.recipient_id, profile)
+        ensure_private_desk(
+            database, claim.company_id, question.recipient_id, route.profile
+        )
         response_duty = uuid4().hex
         database.execute(
             "INSERT INTO duty VALUES (?,?,'scheduled')",
@@ -192,7 +234,7 @@ def request_peer_response(
                 claim.duty_id,
                 claim.run_id,
                 question.request_key,
-                project_id,
+                route.project_id,
                 question.expires_at,
                 terms,
             ),
@@ -227,13 +269,13 @@ def claim_peer_response(
         for response_duty, source_duty, project, terms in candidates:
             question = PeerQuestion(**json.loads(terms))
             try:
-                project_id, grant, bound_profile = _project_route(
+                route = _project_route(
                     database, writer.company_id, source_duty, question
                 )
             except DutyRefused:
                 continue
             if (
-                (project_id, bound_profile) == (project, profile)
+                (route.project_id, route.profile) == (project, profile)
                 and has_turn_capacity(database, question.recipient_id)
                 and not database.execute(
                     "SELECT 1 FROM duty WHERE agent_id=? AND state='running'",
@@ -244,7 +286,7 @@ def claim_peer_response(
                     database,
                     writer.company_id,
                     question.recipient_id,
-                    grant,
+                    route.grant_id,
                     response_duty,
                     profile,
                     purpose=PEER_RESPONSE,
@@ -266,10 +308,8 @@ def _response(database: Connection, claim: DutyClaim) -> tuple:
     source_duty, project, terms, *_ = row
     question = PeerQuestion(**json.loads(terms))
     route = _project_route(database, claim.company_id, source_duty, question)
-    if question.recipient_id != claim.founder_id or route != (
-        project,
-        claim.grant_id,
-        claim.execution_profile,
+    if route != _ProjectPeer(
+        project, claim.founder_id, claim.grant_id, claim.execution_profile
     ):
         raise DutyRefused("Current peer response route does not match its claim")
     return (authority.duty_state, question, *row[3:])
@@ -404,7 +444,65 @@ def claim_resumed_peer_work(
         return None
 
 
-def read_peer_outcome(writer: WriterLease, claim: DutyClaim) -> dict:
+def has_waiting_peer_work(writer: WriterLease) -> bool:
+    writer.verify()
+    with closing(_connect(writer.store, "ro")) as database:
+        database.execute("BEGIN")
+        return (
+            _exists(database)
+            and database.execute(
+                """SELECT 1 FROM work_peer_request p
+               JOIN duty d ON d.id=p.source_duty AND d.state='waiting'
+               JOIN agent a ON a.id=d.agent_id AND a.company_id=?
+               JOIN duty_run original ON original.run_id=p.source_run
+               JOIN standing_grant g ON g.id=original.grant_id AND g.scope='assessment'
+               WHERE p.resumed_run IS NULL LIMIT 1""",
+                (writer.company_id,),
+            ).fetchone()
+            is not None
+        )
+
+
+def recover_unanswered_peer_runs(writer: WriterLease) -> None:
+    writer.verify()
+    with closing(_connect(writer.store, "rw")) as database, database:
+        database.execute("BEGIN IMMEDIATE")
+        if not _exists(database):
+            return
+        recovered = database.execute(
+            """SELECT d.id FROM work_peer_request p
+               JOIN duty d ON d.id=p.response_duty AND d.state='running'
+               JOIN agent a ON a.id=d.agent_id AND a.company_id=?
+               WHERE p.outcome IS NULL""",
+            (writer.company_id,),
+        ).fetchall()
+        for (duty_id,) in recovered:
+            database.execute(
+                "UPDATE duty_run SET is_current=0 WHERE duty_id=? AND is_current=1",
+                (duty_id,),
+            )
+            database.execute("UPDATE duty SET state='scheduled' WHERE id=?", (duty_id,))
+
+
+def peer_turn_has_disposition(
+    writer: WriterLease, claim: DutyClaim, *, now: int
+) -> bool:
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "ro")) as database:
+        resolved = resolve_run(database, claim)
+        return (
+            resolved.purpose == PEER_RESPONSE
+            and database.execute(
+                """SELECT 1 FROM work_peer_request WHERE response_duty=?
+                   AND ((answered_run=? AND outcome IN ('answered','declined'))
+                     OR (outcome IS NULL AND expires_at <= ?))""",
+                (claim.duty_id, claim.run_id, now),
+            ).fetchone()
+            is not None
+        )
+
+
+def read_peer_outcome(writer: WriterLease, claim: DutyClaim) -> dict | None:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
@@ -420,7 +518,7 @@ def read_peer_outcome(writer: WriterLease, claim: DutyClaim) -> dict:
             else None
         )
         if row is None:
-            raise DutyRefused("No peer outcome belongs to this run")
+            return None
         request_key, outcome, answer, project = row
         try:
             _, members, _ = project_membership(database, project)
