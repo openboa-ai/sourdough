@@ -8,9 +8,9 @@ from sqlite3 import Connection
 from time import time
 from uuid import uuid4
 
-from .agent_desk import save_draft
-from .company_assets import shared_asset_for
+from .agent_desk import ensure_private_desk, save_draft
 from .company import _connect
+from .company_assets import require_project_onboarding_authority, shared_asset_for
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, resolve_run
 from .harness import ScopedWorkflow, tool
 from .onboarding import has_hired_acceptance, invoke_onboarding
@@ -26,6 +26,7 @@ from .writer_lease import WriterLease
 
 
 ASSESSMENT = "assessment"
+MANAGER_ASSESSMENT = "manager_assessment"
 SAVE_PRIVATE_DRAFT = tool(
     "save_private_draft",
     "Save a private Markdown draft for your next duty. No sharing. Use an empty revision for a new draft.",
@@ -349,6 +350,78 @@ def pending_publications(
     )
 
 
+def _manager_context(
+    connection: Connection, company_id: str, reference: ResultReference
+) -> tuple[DutyClaim, str, int] | None:
+    row = connection.execute(
+        """SELECT p.audience_id,h.manager_grant_id,c.duty_id,c.run_id,m.execution_profile,
+                  json_extract(s.evidence,'$.project_id'),
+                  c.decided_at + json_extract(c.terms,'$.next_check_seconds')
+           FROM assessment_publication p JOIN hire_receipt h ON h.agent_id=p.author_id
+           JOIN hire_onboarding o ON o.agent_id=h.agent_id AND o.first_duty_id=p.duty_id
+           JOIN staffing_choice c ON c.choice_id=h.choice_id
+           JOIN staffing_assignment s ON s.duty_id=c.duty_id
+           JOIN agent m ON m.id=p.audience_id AND m.company_id=?
+           JOIN standing_grant g ON g.id=h.manager_grant_id AND g.agent_id=m.id
+           WHERE p.action_id=? AND p.revision=? AND p.published_at=?
+             AND json_extract(s.evidence,'$.project_id') IS NOT NULL""",
+        (company_id, reference.resource_id, reference.revision, reference.available_at),
+    ).fetchone()
+    if row is None:
+        return None
+    manager, grant_id, duty_id, run_id, profile, project, due_at = row
+    require_project_onboarding_authority(connection, company_id, grant_id, project)
+    claim = DutyClaim(company_id, manager, grant_id, duty_id, run_id, profile)
+    return claim, project, due_at
+
+
+def manager_review_project(
+    connection: Connection, company_id: str, agent_id: str, result: ResultReference
+) -> str:
+    context = _manager_context(connection, company_id, result)
+    if context is None or context[0].founder_id != agent_id:
+        raise DutyRefused("Manager review is outside its authorized project")
+    return context[1]
+
+
+def review_result_allowed(
+    connection: Connection, agent_id: str, result: ResultReference, *, company_id: str
+) -> bool:
+    if result.kind != MANAGER_ASSESSMENT:
+        return True
+    try:
+        manager_review_project(connection, company_id, agent_id, result)
+    except DutyRefused:
+        return False
+    return True
+
+
+def _schedule_manager_review(
+    connection: Connection, company_id: str, receipt: AssessmentReceipt
+) -> None:
+    result = ResultReference(
+        MANAGER_ASSESSMENT, receipt.action_id, receipt.revision, receipt.published_at
+    )
+    try:
+        context = _manager_context(connection, company_id, result)
+    except DutyRefused:
+        return
+    if context is None:
+        return
+    manager, _, due_at = context
+    ensure_private_desk(
+        connection, company_id, manager.founder_id, manager.execution_profile
+    )
+    schedule_follow_up(
+        connection,
+        manager,
+        "manage-company",
+        result,
+        max(receipt.published_at, due_at),
+        purpose=ASSESSMENT_REVIEW,
+    )
+
+
 def settle_assessment(
     writer: WriterLease, claim: DutyClaim, receipt: AssessmentReceipt
 ) -> FollowUp:
@@ -386,6 +459,7 @@ def settle_assessment(
                 return FollowUp(existing[0], existing[1], result, ASSESSMENT_REVIEW)
         if authority.duty_state != "running":
             raise DutyRefused("The assessment duty is not eligible for settlement")
+        _schedule_manager_review(connection, claim.company_id, receipt)
         return schedule_follow_up(
             connection,
             claim,
@@ -403,6 +477,21 @@ def read_assessment_result(
     writer.verify_for(writer.store, claim.company_id)
 
     def project(connection, reference):
+        if reference.kind == MANAGER_ASSESSMENT:
+            project_id = manager_review_project(
+                connection, claim.company_id, claim.founder_id, reference
+            )
+            row = connection.execute(
+                "SELECT revision,contents FROM assessment_publication WHERE action_id=?",
+                (reference.resource_id,),
+            ).fetchone()
+            if row is None or row[0] != _digest(row[1]) or row[0] != reference.revision:
+                raise DutyRefused("The manager's published assessment is unavailable")
+            return {
+                "revision": row[0],
+                "assessment": json.loads(row[1]),
+                "project_id": project_id,
+            }
         if reference.kind == "shared_asset":
             asset = shared_asset_for(
                 connection, claim.founder_id, reference.resource_id

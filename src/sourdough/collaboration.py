@@ -100,8 +100,15 @@ def company_work_run(
     invoke: Callable[[str, dict], dict],
     *,
     clock: Callable[[], int] | None = None,
+    project_id: str | None = None,
 ) -> ScopedRun:
     projects = project_access(writer, claim, workflow.purpose)
+    if project_id is not None:
+        projects = tuple(
+            project for project in projects if project.project_id == project_id
+        )
+        if not projects:
+            raise DutyRefused("The assigned review project is unavailable")
     instruction = (
         project_review_instruction(writer, claim)
         if workflow.purpose == ASSESSMENT_REVIEW
@@ -123,9 +130,11 @@ def company_work_run(
         if projects
         else ()
     )
-    if any(project.can_publish for project in projects):
+    if project_id is not None:
+        additional = (PROJECTS, READ_DISCUSSION, POST_DISCUSSION)
+    elif any(project.can_publish for project in projects):
         additional += (PUBLISH_DRAFT,)
-    if projects and clock is not None:
+    if project_id is None and projects and clock is not None:
         additional += (HANDOFF_INBOX, ACCEPT_HANDOFF)
         if workflow.purpose == ASSESSMENT_REVIEW and any(
             project.can_publish for project in projects
@@ -133,6 +142,19 @@ def company_work_run(
             additional += (OFFER_HANDOFF,)
 
     def dispatch(name: str, arguments: dict) -> dict:
+        if project_id is not None:
+            if (
+                name in ("read_project_discussion", "post_project_message")
+                and arguments.get("project_id") != project_id
+            ):
+                raise DutyRefused("This review cannot access a different project")
+            if name == "read_project_assignments":
+                assigned = [
+                    asdict(project)
+                    for project in project_access(writer, claim, workflow.purpose)
+                    if project.project_id == project_id
+                ]
+                return {"projects": assigned, "shared_assets": [], "next_cursor": None}
         if name == "read_project_inbox":
             deliveries, next_cursor = read_inbox(
                 writer, claim, workflow.purpose, **arguments
