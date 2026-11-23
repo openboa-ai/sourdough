@@ -100,6 +100,44 @@ class ScopedHarness(unittest.TestCase):
             ],
         )
 
+    def test_the_same_harness_accepts_a_work_wait_as_a_terminal_result(self):
+        publish = self.workflow("publish_assessment")
+        wait = self.workflow("request_peer_response")
+        workflow = replace(
+            publish,
+            tools=publish.tools + wait.tools,
+            terminal_tool=("publish_assessment", "request_peer_response"),
+        )
+        run = ScopedRun(self.writer, self.claim, workflow, self.invoke)
+        manifest = self.root / "manifest.json"
+        manifest.write_text(json.dumps(run.manifest()))
+        outbox = self.root / "outbox"
+        address = str(self.root / "tools.sock")
+        with _ToolEndpoint(address, run.call) as endpoint:
+            thread = Thread(
+                target=endpoint.serve_forever, kwargs={"poll_interval": 0.05}
+            )
+            thread.start()
+            try:
+                listed, denied, accepted = self.send(
+                    address, manifest, outbox, "request_peer_response"
+                )
+            finally:
+                endpoint.shutdown()
+                thread.join()
+        self.assertEqual(
+            [tool["name"] for tool in listed["tools"]],
+            ["publish_assessment", "request_peer_response"],
+        )
+        self.assertTrue(denied["isError"])
+        self.assertFalse(accepted["isError"])
+        self.assertEqual(
+            json.loads(outbox.read_bytes()), {"receipt": "recorded-by-company"}
+        )
+        self.assertEqual(
+            self.calls, [("request_peer_response", {"record": "company document"})]
+        )
+
     def send(self, address, manifest, outbox, name):
         requests = [
             {"id": 1, "method": "tools/list"},

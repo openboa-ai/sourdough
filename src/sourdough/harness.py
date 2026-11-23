@@ -29,7 +29,7 @@ class ScopedWorkflow:
     purpose: str
     instruction: str
     tools: tuple[dict, ...]
-    terminal_tool: str
+    terminal_tool: str | tuple[str, ...]
 
 
 class ScopedRun:
@@ -45,10 +45,14 @@ class ScopedRun:
         context_current: Callable[[], bool] | None = None,
     ):
         definitions = {item["name"]: item["inputSchema"] for item in workflow.tools}
+        terminal = workflow.terminal_tool
+        terminal_names = (terminal,) if isinstance(terminal, str) else terminal
         if (
             not 1 <= len(definitions) <= 24
             or len(definitions) != len(workflow.tools)
-            or workflow.terminal_tool not in definitions
+            or not terminal_names
+            or any(name not in definitions for name in terminal_names)
+            or len(set(terminal_names)) != len(terminal_names)
             or any(
                 not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) for name in definitions
             )

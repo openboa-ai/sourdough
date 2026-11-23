@@ -27,6 +27,7 @@ from .company_assessment import (
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, count_company_runs
 from .employee_process import EmployeeProcess
 from .first_trade import TradeRefused
+from .harness import ScopedRun, ScopedWorkflow, tool
 from .hiring_run import HiringRun, prepare_hiring
 from .work import (
     FollowUp,
@@ -37,7 +38,63 @@ from .work import (
     owed_hired_follow_up_owner,
     settle_review,
 )
+from .work_peer_response import (
+    PEER_RESPONSE,
+    PeerQuestion,
+    answer_peer_question,
+    assigned_peer,
+    claim_peer_response,
+    claim_resumed_peer_work,
+    has_waiting_peer_work,
+    peer_turn_has_disposition,
+    peer_wait_for_run,
+    read_peer_outcome,
+    read_peer_question,
+    recover_unanswered_peer_runs,
+    request_peer_response,
+)
 from .writer_lease import WriterLease, hold_company_writer
+
+
+_REQUEST_PEER = tool(
+    "request_peer_response",
+    "Ask the authorized colleague a question and yield this duty until an answer or deadline.",
+    {
+        "request_key": {"type": "string"},
+        "recipient_id": {"type": "string"},
+        "question": {"type": "string"},
+        "expected_response": {"type": "string"},
+        "expires_at": {
+            "type": "integer",
+            "description": "Absolute Unix seconds, after company_time.",
+        },
+        "asset_id": {"type": "string"},
+        "asset_revision": {"type": "string"},
+    },
+)
+_READ_PEER_ROUTE = tool(
+    "read_assigned_peer", "Read your approved decision recipient.", {}
+)
+_READ_PEER_OUTCOME = tool(
+    "read_peer_outcome", "Read why your original duty resumed.", {}
+)
+_PEER_WORKFLOW = ScopedWorkflow(
+    PEER_RESPONSE,
+    "Read the scoped question and deliver your answer or decline. "
+    "Do not take over the requester's work or alter company records.",
+    (
+        tool("read_peer_question", "Read the approved Work question and evidence.", {}),
+        tool(
+            "answer_peer_question",
+            "Record the decision or why you decline.",
+            {
+                "outcome": {"enum": ["answered", "declined"]},
+                "answer": {"type": "string"},
+            },
+        ),
+    ),
+    "answer_peer_question",
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +133,7 @@ def run_assessment_company(
             settle_assessment(writer, claim, receipt)
             restored.append(receipt)
         requeue_uncommitted_work(writer, purpose=ASSESSMENT_REVIEW)
+        recover_unanswered_peer_runs(writer)
         on_ready(writer)
         used = count_company_runs(store, company_id) - budget_from
         if used < 0:
@@ -103,7 +161,7 @@ def run_assessment_company(
         agent_id = next_owner()
         hiring = None
         publication = None
-        if agent_id is None:
+        if agent_id is None and not has_waiting_peer_work(writer):
             hiring = prepare_hiring(
                 writer,
                 employee,
@@ -114,44 +172,56 @@ def run_assessment_company(
             claim = hiring.hire_claim
             if claim is None:
                 return AssessmentRun(hiring, None, tuple(restored), None)
-            try:
-                employee.run_scoped(
-                    "assessment_duty",
-                    company_work_run(
-                        writer,
-                        claim,
-                        ASSESSMENT_WORKFLOW,
-                        lambda name, args: invoke_assessment(writer, claim, name, args),
-                        clock=lambda: int(time()),
-                    ),
-                )
-            except TradeRefused:
-                if not any(
-                    original == claim for original, _ in pending_publications(writer)
-                ):
-                    raise
-            for original, receipt in pending_publications(writer):
-                if original == claim:
-                    settle_assessment(writer, claim, receipt)
-                    publication = receipt
-                    break
-            if publication is None:
-                return AssessmentRun(hiring, None, tuple(restored), None)
-            hiring = replace(hiring, accepted=True)
-            agent_id = next_owner()
             remaining = turn_budget - (
                 count_company_runs(store, company_id) - budget_from
             )
+            publication = _run_assessment(
+                writer, employee, claim, allow_peer=remaining >= 2
+            )
+            if publication is None and peer_wait_for_run(writer, claim) is None:
+                return AssessmentRun(hiring, None, tuple(restored), None)
+            hiring = replace(hiring, accepted=True)
 
         reviews = []
         deadline = monotonic() + idle_seconds
-        while agent_id and remaining > 0:
-            review = _review(writer, employee, agent_id, deadline, eligible_result)
-            if review is None:
-                break
-            reviews.append(review)
-            remaining -= 1
+        while remaining > 0:
+            now = int(time())
+            resumed = claim_resumed_peer_work(writer, employee.profile, now=now)
+            if resumed is not None:
+                result = _run_assessment(
+                    writer, employee, resumed, allow_peer=remaining >= 3
+                )
+                if result is not None:
+                    publication = result
+                remaining -= 1
+                continue
+            response = claim_peer_response(writer, employee.profile, now=now)
+            if response is not None:
+                _run_peer_answer(writer, employee, response)
+                remaining -= 1
+                continue
             agent_id = next_owner()
+            if agent_id is not None:
+                work = claim_assessment_review(
+                    store,
+                    company_id,
+                    agent_id,
+                    employee.profile,
+                    now=now,
+                    eligible_result=eligible_result,
+                )
+                if work is not None:
+                    reviews.append(_run_review(writer, employee, work, eligible_result))
+                    remaining -= 1
+                    continue
+            remaining_idle = deadline - monotonic()
+            if (
+                remaining_idle <= 0
+                or agent_id is None
+                and not has_waiting_peer_work(writer)
+            ):
+                break
+            sleep(min(remaining_idle, 0.5))
         return AssessmentRun(
             hiring,
             publication,
@@ -161,29 +231,97 @@ def run_assessment_company(
         )
 
 
-def _review(
+def _run_assessment(
     writer: WriterLease,
     employee: EmployeeProcess,
-    agent_id: str,
-    deadline: float,
-    eligible_result: ResultEligibility,
-) -> AssessmentReview | None:
-    while True:
-        writer.verify()
-        work = claim_assessment_review(
-            writer.store,
-            writer.company_id,
-            agent_id,
-            employee.profile,
-            now=int(time()),
-            eligible_result=eligible_result,
+    claim: DutyClaim,
+    *,
+    allow_peer: bool,
+) -> AssessmentReceipt | None:
+    workflow = ASSESSMENT_WORKFLOW
+    peer = assigned_peer(writer, claim) if allow_peer else None
+    if peer is not None:
+        workflow = replace(
+            workflow,
+            tools=workflow.tools + (_READ_PEER_ROUTE, _REQUEST_PEER),
+            terminal_tool=("publish_assessment", "request_peer_response"),
+            instruction=workflow.instruction
+            + " If a colleague's decision is required before "
+            "publication, read your assigned peer and request a response. This yields the duty. "
+            "A chat message does not yield or start the colleague. Use empty asset fields if no "
+            "shared asset is required.",
         )
-        if work is not None:
-            return _run_review(writer, employee, work, eligible_result)
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            return None
-        sleep(min(remaining, 0.5))
+    resumed = read_peer_outcome(writer, claim) is not None
+    peer_outcome_read = False
+    if resumed:
+        workflow = replace(
+            workflow,
+            tools=workflow.tools + (_READ_PEER_OUTCOME,),
+            instruction="Your original work resumed. Read the recorded peer outcome before "
+            "deciding the next action. " + workflow.instruction,
+        )
+
+    def invoke(name: str, args: dict) -> dict:
+        nonlocal peer_outcome_read
+        if name == "read_assigned_peer":
+            current = assigned_peer(writer, claim)
+            if current is None:
+                raise DutyRefused("The authorized decision route is unavailable")
+            return current | {"company_time": int(time())}
+        if name == "request_peer_response":
+            return asdict(
+                request_peer_response(
+                    writer, claim, PeerQuestion(**args), now=int(time())
+                )
+            )
+        if name == "read_peer_outcome":
+            result = read_peer_outcome(writer, claim)
+            if result is None:
+                raise DutyRefused("No peer response belongs to this work")
+            peer_outcome_read = True
+            return result
+        if resumed and not peer_outcome_read and name == "publish_assessment":
+            raise DutyRefused("The resumed assessment must read its peer outcome")
+        return invoke_assessment(writer, claim, name, args)
+
+    try:
+        employee.run_scoped(
+            "assessment_duty",
+            company_work_run(
+                writer, claim, workflow, invoke, clock=lambda: int(time())
+            ),
+        )
+    except TradeRefused:
+        if peer_wait_for_run(writer, claim) is None and not any(
+            original == claim for original, _ in pending_publications(writer)
+        ):
+            raise
+    for original, receipt in pending_publications(writer):
+        if original == claim:
+            settle_assessment(writer, claim, receipt)
+            return receipt
+    return None
+
+
+def _run_peer_answer(
+    writer: WriterLease, employee: EmployeeProcess, claim: DutyClaim
+) -> None:
+    def invoke(name: str, args: dict) -> dict:
+        if name == "read_peer_question":
+            return read_peer_question(writer, claim, now=int(time()))
+        if name == "answer_peer_question":
+            return answer_peer_question(writer, claim, **args, now=int(time()))
+        raise DutyRefused("Unexpected peer response tool")
+
+    try:
+        employee.run_scoped(
+            "assessment_review", ScopedRun(writer, claim, _PEER_WORKFLOW, invoke)
+        )
+    except TradeRefused:
+        if not peer_turn_has_disposition(writer, claim, now=int(time())):
+            raise
+    if not peer_turn_has_disposition(writer, claim, now=int(time())):
+        raise DutyRefused("Peer turn did not commit an answer or refusal")
 
 
 def _run_review(
