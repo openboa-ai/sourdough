@@ -1,4 +1,4 @@
-"""Seal an evaluator's offline suite and record one launch reservation per slot."""
+"""Seal an offline suite and retain its original attempts and observations."""
 
 import json
 import os
@@ -9,10 +9,12 @@ from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
 
 _FORMAT = "offline-trial-registry-v1"
 _TABLES = {"trial_suite", "trial_reservation"}
+_WITH_OBSERVATIONS = _TABLES | {"trial_observation"}
 
 
 class TrialRefused(Exception):
@@ -160,6 +162,48 @@ class TrialReservation:
     launch_permitted: bool
 
 
+@dataclass(frozen=True)
+class TrialTerminalEvidence:
+    outcome: str
+    observation_digest: str
+    decision_digest: str | None = None
+    tool_trace_digest: str | None = None
+    service_effects_digest: str | None = None
+    usage_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.outcome not in ("completed", "no-decision", "failed", "timed-out")
+            or not _digest(self.observation_digest)
+            or (self.outcome == "completed" and self.decision_digest is None)
+            or (self.outcome == "no-decision" and self.decision_digest is not None)
+            or not all(
+                value is None or _digest(value)
+                for value in (
+                    self.decision_digest,
+                    self.tool_trace_digest,
+                    self.service_effects_digest,
+                    self.usage_digest,
+                )
+            )
+        ):
+            raise TrialRefused("Invalid terminal trial evidence")
+
+
+@dataclass(frozen=True)
+class TrialRunRecord:
+    slot_id: str
+    run_id: str | None
+    result_id: str | None
+    evidence: TrialTerminalEvidence | None
+
+    @property
+    def state(self) -> str:
+        if self.evidence is not None:
+            return self.evidence.outcome
+        return "uncovered" if self.run_id is None else "incomplete"
+
+
 def _private_key(path: Path) -> tuple[int, int]:
     try:
         info = path.stat(follow_symlinks=False)
@@ -205,6 +249,20 @@ def _tables(database: sqlite3.Connection) -> set[str]:
     }
 
 
+def _sealed_slots(database: sqlite3.Connection, revision: str) -> list[dict]:
+    if _tables(database) not in (_TABLES, _WITH_OBSERVATIONS):
+        raise TrialRefused("Store is not a sealed trial registry")
+    stored = database.execute(
+        "SELECT revision,document FROM trial_suite WHERE singleton=1"
+    ).fetchone()
+    if stored is None or stored[0] != revision or _revision(stored[1]) != revision:
+        raise TrialRefused("Trial registration revision changed")
+    suite = json.loads(stored[1])
+    if suite["format"] != _FORMAT:
+        raise TrialRefused("Unsupported trial registry format")
+    return suite["slots"]
+
+
 def seal_trial_suite(path: Path, suite: TrialSuite) -> str:
     document = json.dumps(
         {"format": _FORMAT, **asdict(suite)}, separators=(",", ":"), sort_keys=True
@@ -213,7 +271,7 @@ def seal_trial_suite(path: Path, suite: TrialSuite) -> str:
     with closing(_open(path, create=True)) as database, database:
         database.execute("BEGIN IMMEDIATE")
         tables = _tables(database)
-        if tables == _TABLES:
+        if tables in (_TABLES, _WITH_OBSERVATIONS):
             prior = database.execute(
                 "SELECT revision,document FROM trial_suite WHERE singleton=1"
             ).fetchone()
@@ -256,18 +314,13 @@ def reserve_trial_launch(
         raise TrialRefused("Invalid sealed trial launch")
     with closing(_open(path)) as database, database:
         database.execute("BEGIN IMMEDIATE")
-        if _tables(database) != _TABLES:
-            raise TrialRefused("Store is not a sealed trial registry")
-        stored = database.execute(
-            "SELECT revision,document FROM trial_suite WHERE singleton=1"
-        ).fetchone()
-        if stored is None or stored[0] != revision or _revision(stored[1]) != revision:
-            raise TrialRefused("Trial registration revision changed")
-        suite = json.loads(stored[1])
-        if suite["format"] != _FORMAT:
-            raise TrialRefused("Unsupported trial registry format")
         slot = next(
-            (slot for slot in suite["slots"] if slot["slot_id"] == slot_id), None
+            (
+                slot
+                for slot in _sealed_slots(database, revision)
+                if slot["slot_id"] == slot_id
+            ),
+            None,
         )
         if slot is None or (slot["inputs"], slot["limits"]) != (
             asdict(inputs),
@@ -289,3 +342,82 @@ def reserve_trial_launch(
             "INSERT INTO trial_reservation VALUES (?,?)", (slot_id, run_id)
         )
         return TrialReservation(run_id, True)
+
+
+def commit_trial_observation(
+    path: Path,
+    *,
+    revision: str,
+    slot_id: str,
+    run_id: str,
+    evidence: TrialTerminalEvidence,
+) -> TrialRunRecord:
+    if (
+        not _digest(revision)
+        or not _label(slot_id)
+        or not _label(run_id)
+        or not isinstance(evidence, TrialTerminalEvidence)
+    ):
+        raise TrialRefused("Invalid terminal trial observation")
+    document = json.dumps(asdict(evidence), separators=(",", ":"), sort_keys=True)
+    with closing(_open(path)) as database, database:
+        database.execute("BEGIN IMMEDIATE")
+        if not any(
+            slot["slot_id"] == slot_id for slot in _sealed_slots(database, revision)
+        ):
+            raise TrialRefused("Trial slot is not registered")
+        original = database.execute(
+            "SELECT run_id FROM trial_reservation WHERE slot_id=?", (slot_id,)
+        ).fetchone()
+        if original != (run_id,):
+            raise TrialRefused(
+                "Trial observation must identify the original reservation"
+            )
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS trial_observation (
+                   run_id TEXT PRIMARY KEY NOT NULL,
+                   result_id TEXT UNIQUE NOT NULL, evidence TEXT NOT NULL
+               )"""
+        )
+        recorded = database.execute(
+            "SELECT result_id,evidence FROM trial_observation WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if recorded is not None:
+            result_id, prior = recorded
+            if document != prior:
+                raise TrialRefused("Trial observation is already committed")
+        else:
+            result_id = uuid4().hex
+            database.execute(
+                "INSERT INTO trial_observation VALUES (?,?,?)",
+                (run_id, result_id, document),
+            )
+        return TrialRunRecord(slot_id, run_id, result_id, evidence)
+
+
+def trial_run_records(path: Path, *, revision: str) -> tuple[TrialRunRecord, ...]:
+    if not _digest(revision):
+        raise TrialRefused("Invalid sealed trial revision")
+    with closing(_open(path)) as database, database:
+        database.execute("BEGIN")
+        slots = _sealed_slots(database, revision)
+        query = (
+            """SELECT trial_reservation.slot_id,trial_reservation.run_id,result_id,evidence
+               FROM trial_reservation LEFT JOIN trial_observation USING(run_id)"""
+            if _tables(database) == _WITH_OBSERVATIONS
+            else "SELECT slot_id,run_id,NULL,NULL FROM trial_reservation"
+        )
+        reservations = {
+            slot_id: TrialRunRecord(
+                slot_id,
+                run_id,
+                result_id,
+                None if raw is None else TrialTerminalEvidence(**json.loads(raw)),
+            )
+            for slot_id, run_id, result_id, raw in database.execute(query)
+        }
+        return tuple(
+            reservations.get(slot["slot_id"])
+            or TrialRunRecord(slot["slot_id"], None, None, None)
+            for slot in slots
+        )
