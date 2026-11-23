@@ -21,6 +21,7 @@ Present assigned and unassigned capacity of existing staff separately from remai
 ## Functional and quality requirements
 
 - **FR.** Allow several responses to the same backlog. A decision to hire can be submitted to the separate hiring boundary.
+- **Native submission.** One tool call can explicitly submit both the staffing choice and a bounded hire request, or submit a no-hire choice with no request. Preserve separate judgment and hire receipts. A recorded recommendation alone never creates an Agent or consumes an allocation.
 - **NFR.** A recommendation cannot create Agents, grants or spending by itself.
 
 ## Acceptance and independent evidence
