@@ -9,6 +9,7 @@ from time import monotonic, sleep, time
 
 from .abandoned_work import requeue_uncommitted_work
 from .company import _connect
+from .storage.db import open_reader, read_tx
 from .duty_run import (
     PAPER_EXECUTION,
     POSITION_REVIEW,
@@ -164,7 +165,7 @@ def _operate(
     idle_deadline = monotonic() + idle_seconds
     binding = reopen_binding(store, company_id)
     active_scope = (binding.account.account_id, binding.account.instrument_rules_digest)
-    with closing(_connect(store, "ro")) as connection:
+    with closing(open_reader(store)) as connection, read_tx(connection):
         switching = has_pending_binding_change(connection)
         suspended = effective_paper_risk(connection).suspended
     repeat_paper = repeat_paper and not (switching or suspended)

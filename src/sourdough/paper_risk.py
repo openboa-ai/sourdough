@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
@@ -102,6 +103,12 @@ def _preconditions(command: PaperSuspension) -> dict[str, object]:
 
 def _receipt_from_command(receipt: CommandReceipt) -> PaperRiskReceipt:
     if receipt.command_type not in _RISK_OPERATIONS:
+        raise PaperRiskRefused("Unsupported effective paper risk control")
+    if receipt.state not in ("applied", "denied"):
+        raise PaperRiskRefused("Unsupported effective paper risk control")
+    if receipt.state == "applied" and (
+        type(receipt.applied_seq) is not int or receipt.applied_seq <= 0
+    ):
         raise PaperRiskRefused("Unsupported effective paper risk control")
     try:
         result = json.loads(receipt.result_json) if receipt.result_json else {}
@@ -442,6 +449,8 @@ def _resume_with_evidence(
             raise PaperRiskRefused("Board authorization changed during observation")
         if current.prior is not None:
             return current.prior
+        if current.eligible and verify_local is None:
+            raise PaperRiskRefused("Paper risk state changed during observation")
         applied = current.eligible and verify_local is not None
         if applied:
             verify_local(connection)
@@ -455,6 +464,8 @@ def read_paper_risk_receipt(
     *,
     operation: str = SUSPEND_NEW_RISK,
 ) -> PaperRiskReceipt | None:
+    if operation not in _RISK_OPERATIONS:
+        raise PaperRiskRefused("Unsupported paper risk operation")
     writer.verify()
     with closing(open_reader(writer.store)) as connection, read_tx(connection):
         writer.verify()
@@ -467,8 +478,12 @@ def read_paper_risk_receipt(
                 principal=principal,
                 operation=operation,
             )
-        except (CommandUnauthorized, StorageRefused):
-            return None
+        except CommandUnauthorized as error:
+            raise PaperRiskRefused(
+                "Board receipt is not authorized for this principal or operation"
+            ) from error
+        except StorageRefused as error:
+            raise PaperRiskRefused("Corrupted paper risk command receipt") from error
         if receipt is None:
             return None
         return _receipt_from_command(receipt)
@@ -478,48 +493,77 @@ def read_local_command_receipt_status(
     store: Path,
     company_id: str,
     command_id: str,
+    *,
+    operation: str | None = None,
 ) -> dict[str, object]:
-    """Read a command receipt status read-only without disclosing actor or private reason."""
+    """Read a board risk command receipt status read-only without disclosing actor or private reason."""
     if (
         not isinstance(command_id, str)
         or not command_id.strip()
         or len(command_id) > 128
     ):
         raise PaperRiskRefused("Invalid command identifier")
+    if operation is not None and operation not in _RISK_OPERATIONS:
+        raise PaperRiskRefused("Unsupported board command operation")
+    try:
+        initial = store.stat(follow_symlinks=False)
+    except OSError as error:
+        raise PaperRiskRefused("Company store is unavailable") from error
+    if not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.geteuid():
+        raise PaperRiskRefused(
+            "Only the local company store owner can inspect command receipts"
+        )
     with closing(open_reader(store)) as connection, read_tx(connection):
         if _identity(connection) != company_id:
             raise PaperRiskRefused("Company identity mismatch")
-        row = connection.execute(
-            """SELECT command_type, state, denial_code, result_json, applied_seq,
-                      created_at_ns, finalized_at_ns
-               FROM command_receipt
-               WHERE company_id = ? AND command_id = ?""",
-            (company_id, command_id),
-        ).fetchone()
-        if row is None:
-            return {
+        receipt = _fetch_command(connection, company_id, command_id)
+        if receipt is None:
+            response: dict[str, object] = {
                 "status": "not_found",
                 "company_id": company_id,
                 "command_id": command_id,
             }
-        (
-            command_type,
-            state,
-            denial_code,
-            result_json,
-            applied_seq,
-            created_ns,
-            finalized_ns,
-        ) = row
-        return {
-            "status": "found",
-            "company_id": company_id,
-            "command_id": command_id,
-            "command_type": str(command_type),
-            "state": str(state),
-            "denial_code": denial_code,
-            "result": json.loads(str(result_json)) if result_json is not None else None,
-            "applied_seq": applied_seq,
-            "created_at_ns": int(created_ns),
-            "finalized_at_ns": None if finalized_ns is None else int(finalized_ns),
-        }
+        else:
+            if receipt.command_type not in _RISK_OPERATIONS or (
+                operation is not None and receipt.command_type != operation
+            ):
+                raise PaperRiskRefused(
+                    "Command receipt is outside the authorized board control scope"
+                )
+            effective_revision: int | None = None
+            if receipt.state in ("applied", "denied"):
+                parsed = _receipt_from_command(receipt)
+                effective_revision = parsed.effective_revision
+            elif receipt.state != "accepted":
+                raise PaperRiskRefused("Unsupported board command receipt state")
+            response = {
+                "status": "found",
+                "company_id": company_id,
+                "command_id": command_id,
+                "command_type": receipt.command_type,
+                "state": receipt.state,
+                "denial_code": receipt.denial_code,
+                "effective_revision": effective_revision,
+                "applied_seq": receipt.applied_seq,
+                "created_at_ns": int(receipt.created_at_ns),
+                "finalized_at_ns": (
+                    None
+                    if receipt.finalized_at_ns is None
+                    else int(receipt.finalized_at_ns)
+                ),
+            }
+        try:
+            current = store.stat(follow_symlinks=False)
+        except OSError as error:
+            raise PaperRiskRefused(
+                "Company store changed while inspecting command receipt"
+            ) from error
+        if (initial.st_dev, initial.st_ino, initial.st_uid) != (
+            current.st_dev,
+            current.st_ino,
+            current.st_uid,
+        ):
+            raise PaperRiskRefused(
+                "Company store changed while inspecting command receipt"
+            )
+    return response

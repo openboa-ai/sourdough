@@ -65,6 +65,8 @@ def _settled_company(connection: Connection, company_id: str) -> _SettledCompany
             scope,
         )
     )
+    if any(fee is None for _, _, _, _, fee in fills):
+        raise PaperRiskRefused("Company paper fill is missing fee record")
     return _SettledCompany(binding, order_ids, fills)
 
 

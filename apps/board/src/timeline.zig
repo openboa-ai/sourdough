@@ -66,7 +66,13 @@ pub const Transport = struct {
         fx.startTimer(.{ .key = key, .interval_ms = 5000, .on_fire = Effects.timerMsg(.deadline) });
     }
 
-    pub fn readCommandReceipt(scope: Scope, command_id: []const u8, key: u64, fx: *Effects) void {
+    pub fn readCommandReceipt(
+        scope: Scope,
+        command_id: []const u8,
+        operation: []const u8,
+        key: u64,
+        fx: *Effects,
+    ) void {
         const argv = [_][]const u8{
             scope.executable,
             "read-command-receipt",
@@ -75,6 +81,8 @@ pub const Transport = struct {
             scope.company,
             "--command-id",
             command_id,
+            "--operation",
+            operation,
         };
         fx.spawn(.{ .key = key, .argv = &argv, .output = .collect, .on_exit = Effects.exitMsg(.receipt_reply) });
         fx.startTimer(.{ .key = key, .interval_ms = 5000, .on_fire = Effects.timerMsg(.receipt_deadline) });
@@ -96,10 +104,12 @@ pub const Model = struct {
     scope: Scope = .{},
     storage: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     command_storage: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    next_effect_key: u64 = 0,
     request: u64 = 0,
     receipt_request: u64 = 0,
     pending: bool = false,
     receipt_pending: bool = false,
+    pending_recovered: bool = false,
 
     // Separated Link State (never blank-wipes verified Data State on transient loss).
     link_state: LinkState = .disconnected,
@@ -131,10 +141,12 @@ pub const Model = struct {
         "scope",
         "storage",
         "command_storage",
+        "next_effect_key",
         "request",
         "receipt_request",
         "pending",
         "receipt_pending",
+        "pending_recovered",
         "link_state",
         "stale",
         "controls_locked",
@@ -150,6 +162,11 @@ pub const Model = struct {
         self.command_storage.deinit();
     }
 
+    fn nextKey(self: *Model) u64 {
+        self.next_effect_key += 1;
+        return self.next_effect_key;
+    }
+
     fn effectiveStoreKey(scope: Scope) []const u8 {
         return if (scope.store_key.len > 0) scope.store_key else scope.store;
     }
@@ -158,6 +175,27 @@ pub const Model = struct {
         if (!self.available) return false;
         return std.mem.eql(u8, self.data_company_id, self.scope.company) and
             std.mem.eql(u8, self.data_store_key, effectiveStoreKey(self.scope));
+    }
+
+    fn clearInMemoryCommandState(self: *Model) void {
+        // Clears in-memory command state without deleting any on-disk pending file.
+        self.pending_command = null;
+        self.command_state = .idle;
+        self.receipt_pending = false;
+        self.receipt_request = 0;
+        self.pending_recovered = false;
+        self.show_command_status = false;
+        self.command_status = "";
+        _ = self.command_storage.reset(.free_all);
+    }
+
+    fn computeControlsLocked(self: *const Model) bool {
+        if (self.link_state != .connected or self.stale or !self.scopeMatchesData()) {
+            return true;
+        }
+        return self.command_state != .idle and
+            self.command_state != .applied and
+            self.command_state != .denied;
     }
 
     pub fn clearData(self: *Model, status: []const u8, link: LinkState) void {
@@ -178,6 +216,7 @@ pub const Model = struct {
         self.show_risk_control = false;
         self.duties = &.{};
         _ = self.storage.reset(.free_all);
+        self.clearInMemoryCommandState();
     }
 
     pub fn markTransientDisconnect(self: *Model, reason: []const u8) void {
@@ -251,7 +290,7 @@ pub const Model = struct {
         self.stale = false;
         self.show_stale_banner = false;
         self.stale_banner = "";
-        self.controls_locked = self.command_state != .idle and self.command_state != .applied and self.command_state != .denied;
+        self.controls_locked = self.computeControlsLocked();
         self.status = if (rows.len == 0) "No work in this view." else "Work timeline · Read only";
     }
 
@@ -273,8 +312,9 @@ pub const Model = struct {
         if (self.scope.pending_dir.len == 0) {
             return error.PendingDirectoryUnconfigured;
         }
-        _ = self.command_storage.reset(.free_all);
-        const alloc = self.command_storage.allocator();
+        var next_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer next_arena.deinit();
+        const alloc = next_arena.allocator();
         const digest = pending_store.payloadSha256Hex(payload);
         const cmd = pending_store.PendingCommand{
             .command_id = try alloc.dupe(u8, command_id),
@@ -285,7 +325,10 @@ pub const Model = struct {
             .sent_ns = sent_ns,
         };
         try pending_store.savePendingAtomic(io, alloc, self.scope.pending_dir, self.scope.company, cmd);
+        self.command_storage.deinit();
+        self.command_storage = next_arena;
         self.pending_command = cmd;
+        self.pending_recovered = true;
         self.command_state = .submitting;
         self.controls_locked = true;
         self.show_command_status = true;
@@ -299,26 +342,52 @@ pub const Model = struct {
         self.show_command_status = true;
         self.command_status = "Command outcome unknown; checking saved receipt without reissuing.";
         if (std.fs.path.isAbsolute(self.scope.executable) and std.fs.path.isAbsolute(self.scope.store)) {
-            self.receipt_request += 1;
+            if (self.receipt_pending) {
+                fx.cancel(self.receipt_request);
+                fx.cancelTimer(self.receipt_request);
+            }
+            self.receipt_request = self.nextKey();
             self.receipt_pending = true;
-            Transport.readCommandReceipt(self.scope, cmd.command_id, self.receipt_request, fx);
+            Transport.readCommandReceipt(self.scope, cmd.command_id, cmd.command_type, self.receipt_request, fx);
         }
     }
 
     pub fn recoverPendingCommand(self: *Model, io: std.Io, fx: *Effects) !void {
         if (self.scope.pending_dir.len == 0 or self.scope.company.len == 0) return;
-        _ = self.command_storage.reset(.free_all);
-        const alloc = self.command_storage.allocator();
-        const loaded = try pending_store.loadPending(io, alloc, self.scope.pending_dir, self.scope.company);
+        if (self.receipt_pending) {
+            fx.cancel(self.receipt_request);
+            fx.cancelTimer(self.receipt_request);
+        }
+        // Clear pending pointer BEFORE freeing backing arena to prevent use-after-free.
+        self.clearInMemoryCommandState();
+        self.pending_recovered = true;
+
+        var next_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer next_arena.deinit();
+        const alloc = next_arena.allocator();
+        const loaded = pending_store.loadPending(io, alloc, self.scope.pending_dir, self.scope.company) catch |err| {
+            self.command_state = .unknown;
+            self.controls_locked = true;
+            self.show_command_status = true;
+            self.command_status = "Saved pending command is unreadable; controls remain locked.";
+            return err;
+        };
         if (loaded) |cmd| {
+            self.command_storage.deinit();
+            self.command_storage = next_arena;
             self.pending_command = cmd;
             self.markCommandUnknown(fx);
+        } else {
+            next_arena.deinit();
         }
     }
 
     pub fn applyReceiptOutput(self: *Model, io: std.Io, output: []const u8) void {
         const current = self.pending_command orelse return;
-        const alloc = self.command_storage.allocator();
+        var parse_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer parse_arena.deinit();
+        const alloc = parse_arena.allocator();
+
         const parsed = pending_store.parseReceiptStatus(alloc, output) catch {
             self.command_state = .unknown;
             self.controls_locked = true;
@@ -340,34 +409,61 @@ pub const Model = struct {
             self.command_status = "Command receipt not found. Retry same command ID or discard draft.";
             return;
         }
+        if (!std.mem.eql(u8, parsed.status, "found")) {
+            self.command_state = .unknown;
+            self.controls_locked = true;
+            self.command_status = "Unexpected command receipt status; controls remain locked.";
+            return;
+        }
+        const cmd_type = parsed.command_type orelse {
+            self.command_state = .unknown;
+            self.controls_locked = true;
+            self.command_status = "Command receipt missing operation type; controls remain locked.";
+            return;
+        };
+        if (!std.mem.eql(u8, cmd_type, current.command_type)) {
+            self.command_state = .unknown;
+            self.controls_locked = true;
+            self.command_status = "Command receipt operation mismatch; controls remain locked.";
+            return;
+        }
         const state = parsed.state orelse {
             self.command_state = .unknown;
             self.controls_locked = true;
+            self.command_status = "Command receipt missing state; controls remain locked.";
             return;
         };
-        if (std.mem.eql(u8, state, "applied")) {
+        if (std.mem.eql(u8, state, "applied") or std.mem.eql(u8, state, "denied")) {
             if (self.scope.pending_dir.len > 0) {
-                pending_store.clearPending(io, alloc, self.scope.pending_dir, self.scope.company) catch {};
+                pending_store.clearPending(io, alloc, self.scope.pending_dir, self.scope.company) catch {
+                    self.command_state = .unknown;
+                    self.controls_locked = true;
+                    self.show_command_status = true;
+                    self.command_status = "Unable to clear saved pending file; controls remain locked.";
+                    return;
+                };
             }
             self.pending_command = null;
-            self.command_state = .applied;
-            self.controls_locked = self.link_state != .connected or self.stale;
-            self.show_command_status = true;
-            self.command_status = "Board command applied.";
-        } else if (std.mem.eql(u8, state, "denied")) {
-            if (self.scope.pending_dir.len > 0) {
-                pending_store.clearPending(io, alloc, self.scope.pending_dir, self.scope.company) catch {};
+            _ = self.command_storage.reset(.free_all);
+            if (std.mem.eql(u8, state, "applied")) {
+                self.command_state = .applied;
+                self.command_status = "Board command applied.";
+            } else {
+                self.command_state = .denied;
+                self.command_status = "Board command denied by company authority or revision check.";
             }
-            self.pending_command = null;
-            self.command_state = .denied;
-            self.controls_locked = self.link_state != .connected or self.stale;
+            self.controls_locked = self.computeControlsLocked();
             self.show_command_status = true;
-            self.command_status = "Board command denied by company authority or revision check.";
         } else if (std.mem.eql(u8, state, "accepted")) {
             self.command_state = .accepted;
             self.controls_locked = true;
             self.show_command_status = true;
             self.command_status = "Board command accepted and pending settlement.";
+        } else {
+            self.command_state = .unknown;
+            self.controls_locked = true;
+            self.show_command_status = true;
+            self.command_status = "Unknown command receipt state; controls remain locked.";
         }
     }
 
@@ -383,12 +479,15 @@ pub const Model = struct {
 
     pub fn discardPendingDraft(self: *Model, io: std.Io) !void {
         if (self.command_state != .not_found_retry_choice) return error.DiscardNotPermitted;
+        var tmp_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer tmp_arena.deinit();
         if (self.scope.pending_dir.len > 0) {
-            try pending_store.clearPending(io, self.command_storage.allocator(), self.scope.pending_dir, self.scope.company);
+            try pending_store.clearPending(io, tmp_arena.allocator(), self.scope.pending_dir, self.scope.company);
         }
         self.pending_command = null;
+        _ = self.command_storage.reset(.free_all);
         self.command_state = .idle;
-        self.controls_locked = self.link_state != .connected or self.stale;
+        self.controls_locked = self.computeControlsLocked();
         self.show_command_status = false;
         self.command_status = "";
     }
@@ -397,6 +496,9 @@ pub const Model = struct {
 fn isAccessDenialOutput(text: []const u8) bool {
     return std.mem.indexOf(u8, text, "401") != null or
         std.mem.indexOf(u8, text, "403") != null or
+        std.mem.indexOf(u8, text, "Unauthorized") != null or
+        std.mem.indexOf(u8, text, "Forbidden") != null or
+        std.mem.indexOf(u8, text, "Access denied") != null or
         std.mem.indexOf(u8, text, "store owner") != null or
         std.mem.indexOf(u8, text, "identity mismatch") != null;
 }
@@ -426,17 +528,38 @@ fn clockText(alloc: std.mem.Allocator, unix: i64) ![]const u8 {
 }
 
 pub fn read(model: *Model, fx: *Effects) void {
-    if (model.pending) return;
     const scope = model.scope;
     if (!std.fs.path.isAbsolute(scope.executable) or
         !std.fs.path.isAbsolute(scope.store) or scope.company.len == 0)
     {
+        if (model.pending) {
+            fx.cancel(model.request);
+            fx.cancelTimer(model.request);
+            model.pending = false;
+        }
+        if (model.receipt_pending) {
+            fx.cancel(model.receipt_request);
+            fx.cancelTimer(model.receipt_request);
+        }
         model.clearData("No local company connection configured.", .disconnected);
         return;
     }
-    // Clear cached Data State ONLY if company_id or store_key changed; routine refresh preserves it!
+
+    // Company or store switch ALWAYS wipes prior Data State & in-memory pending state immediately,
+    // even if a previous refresh was in flight.
     if (model.available and !model.scopeMatchesData()) {
+        if (model.pending) {
+            fx.cancel(model.request);
+            fx.cancelTimer(model.request);
+            model.pending = false;
+        }
+        if (model.receipt_pending) {
+            fx.cancel(model.receipt_request);
+            fx.cancelTimer(model.receipt_request);
+        }
         model.clearData("Switching company scope…", .connecting);
+    } else if (model.pending) {
+        return;
     } else if (model.available) {
         model.link_state = .connecting;
         model.controls_locked = true;
@@ -447,7 +570,20 @@ pub fn read(model: *Model, fx: *Effects) void {
         model.controls_locked = true;
         model.status = "Checking current access…";
     }
-    model.request += 1;
+
+    // Cold-start / post-switch recovery: reload any persisted pending command for this company
+    // before unlocking controls.
+    if (!model.pending_recovered and scope.pending_dir.len > 0 and model.pending_command == null) {
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        model.recoverPendingCommand(threaded.io(), fx) catch {
+            model.controls_locked = true;
+            model.command_state = .unknown;
+            model.show_command_status = true;
+            model.command_status = "Saved pending command is unreadable; controls remain locked.";
+        };
+    }
+
+    model.request = model.nextKey();
     model.pending = true;
     Transport.inspectWork(scope, model.request, fx);
 }
@@ -460,7 +596,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.pending = false;
             fx.cancelTimer(result.key);
             if (result.reason != .exited or result.code != 0 or result.output_truncated) {
-                if (isAccessDenialOutput(result.output)) {
+                if (result.reason == .exited and result.code != 0 and !result.output_truncated and
+                    isAccessDenialOutput(result.output))
+                {
+                    if (model.receipt_pending) {
+                        fx.cancel(model.receipt_request);
+                        fx.cancelTimer(model.receipt_request);
+                    }
                     model.clearData("Access denied: prior company data cleared.", .incompatible);
                     return;
                 }
@@ -468,10 +610,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             model.present(result.output) catch |err| switch (err) {
-                error.IncompatibleTimeline => model.clearData(
-                    "Company work unavailable: incompatible company or contract.",
-                    .incompatible,
-                ),
+                error.IncompatibleTimeline => {
+                    if (model.receipt_pending) {
+                        fx.cancel(model.receipt_request);
+                        fx.cancelTimer(model.receipt_request);
+                    }
+                    model.clearData(
+                        "Company work unavailable: incompatible company or contract.",
+                        .incompatible,
+                    );
+                },
                 else => model.markTransientDisconnect(
                     "Stale · Incomplete response received · Controls locked.",
                 ),
@@ -556,7 +704,15 @@ test "transient disconnect and routine refresh preserve verified Data State and 
     try std.testing.expect(model.controls_locked);
     try std.testing.expect(model.show_stale_banner);
 
+    // Truncated code==0 response containing "403" is treated as transient disconnect, not false-positive access denial
+    update(&model, .{ .reply = .{ .key = model.request, .code = 0, .output = "403-inside-json", .output_truncated = true } }, &fx);
+    try std.testing.expect(model.available);
+    try std.testing.expect(model.stale);
+    try std.testing.expectEqual(LinkState.disconnected, model.link_state);
+    try std.testing.expect(model.controls_locked);
+
     // Timeout marks stale/disconnected WITHOUT blank-wiping duties or risk_control
+    read(&model, &fx);
     update(&model, .{ .deadline = .{ .key = model.request } }, &fx);
     try std.testing.expect(model.available);
     try std.testing.expect(model.stale);
@@ -565,19 +721,30 @@ test "transient disconnect and routine refresh preserve verified Data State and 
     try std.testing.expectEqualStrings("d1", model.duties[0].duty_id);
     try std.testing.expectEqualStrings("New paper risk is suspended · Control revision 3", model.risk_control);
 
-    // Switching company_id wipes cached Data State immediately
+    // Switching company_id wipes cached Data State immediately even while refresh is pending
+    read(&model, &fx);
+    try std.testing.expect(model.pending);
     model.scope.company = "other-company";
     read(&model, &fx);
     try std.testing.expect(!model.available);
     try std.testing.expectEqual(@as(usize, 0), model.duties.len);
 }
 
-test "access denial clears cached private data immediately" {
+test "access denial clears cached private data and in-memory pending state immediately" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_dir);
+    const pending_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/board-pending", .{root_dir});
+    defer std.testing.allocator.free(pending_dir);
+
     var model = Model{
         .scope = .{
             .executable = "/usr/bin/true",
             .store = "/tmp/company.sqlite",
             .company = "company",
+            .pending_dir = pending_dir,
         },
     };
     defer model.deinit();
@@ -585,6 +752,7 @@ test "access denial clears cached private data immediately" {
         \\{"contract_revision":"work-timeline-v1","company_id":"company","revision":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","as_of_ns":1700000000000000000,"duties":[{"duty_id":"d1","owner_id":"owner","state":"due","due_at":null,"decision":null}],"paper":null}
     ;
     try model.present(body);
+    try model.stagePendingCommand(io, "cmd-secret", "suspend_new_risk", "{\"reason\":\"private\"}", 0, 1700000000_000000000);
     var fx_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer fx_arena.deinit();
     var fx: Effects = .{ .allocator = fx_arena.allocator() };
@@ -593,10 +761,12 @@ test "access denial clears cached private data immediately" {
     try std.testing.expect(!model.available);
     try std.testing.expectEqual(LinkState.incompatible, model.link_state);
     try std.testing.expectEqual(@as(usize, 0), model.duties.len);
+    try std.testing.expect(model.pending_command == null);
+    try std.testing.expect(!model.show_command_status);
     try std.testing.expect(model.controls_locked);
 }
 
-test "pending command persists before submit and recovers as unknown without reissuing ID" {
+test "cold start read automatically recovers pending command with disjoint keys and validates receipt" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -622,7 +792,7 @@ test "pending command persists before submit and recovers as unknown without rei
     try std.testing.expectEqual(pending_store.CommandLifecycle.submitting, model.command_state);
     try std.testing.expect(model.controls_locked);
 
-    // Simulate client crash and cold restart: must recover exact command_id as unknown
+    // Cold restart invokes read() directly (init_fx) -> recovers exact command_id with disjoint effect keys!
     var restarted = Model{
         .scope = .{
             .executable = "/usr/bin/true",
@@ -635,10 +805,20 @@ test "pending command persists before submit and recovers as unknown without rei
     var fx_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer fx_arena.deinit();
     var fx: Effects = .{ .allocator = fx_arena.allocator() };
-    try restarted.recoverPendingCommand(io, &fx);
+    read(&restarted, &fx);
     try std.testing.expectEqual(pending_store.CommandLifecycle.unknown, restarted.command_state);
     try std.testing.expectEqualStrings("cmd-fixed-id", restarted.pending_command.?.command_id);
+    try std.testing.expect(restarted.request != restarted.receipt_request);
     try std.testing.expect(restarted.controls_locked);
+
+    // Mismatched command_type or unknown status/state fail closed and keep controls locked
+    restarted.applyReceiptOutput(io, "{\"status\":\"found\",\"company_id\":\"company-1\",\"command_id\":\"cmd-fixed-id\",\"command_type\":\"resume_new_risk\",\"state\":\"applied\"}");
+    try std.testing.expectEqual(pending_store.CommandLifecycle.unknown, restarted.command_state);
+    try std.testing.expect(restarted.pending_command != null);
+    restarted.applyReceiptOutput(io, "{\"status\":\"bogus\",\"company_id\":\"company-1\",\"command_id\":\"cmd-fixed-id\",\"command_type\":\"suspend_new_risk\",\"state\":\"applied\"}");
+    try std.testing.expectEqual(pending_store.CommandLifecycle.unknown, restarted.command_state);
+    restarted.applyReceiptOutput(io, "{\"status\":\"found\",\"company_id\":\"company-1\",\"command_id\":\"cmd-fixed-id\",\"command_type\":\"suspend_new_risk\",\"state\":\"mystery\"}");
+    try std.testing.expectEqual(pending_store.CommandLifecycle.unknown, restarted.command_state);
 
     // 404 not_found offers explicit retry-same-ID vs discard without generating a new ID
     restarted.applyReceiptOutput(io, "{\"status\":\"not_found\",\"company_id\":\"company-1\",\"command_id\":\"cmd-fixed-id\"}");
@@ -646,10 +826,14 @@ test "pending command persists before submit and recovers as unknown without rei
     const retried = try restarted.retryPendingSameId();
     try std.testing.expectEqualStrings("cmd-fixed-id", retried.command_id);
 
-    // Applied receipt converges and removes pending file
-    restarted.applyReceiptOutput(io, "{\"status\":\"found\",\"company_id\":\"company-1\",\"command_id\":\"cmd-fixed-id\",\"state\":\"applied\"}");
+    // Applied receipt converges, removes pending file, and stays locked until Data State is verified
+    restarted.applyReceiptOutput(io, "{\"status\":\"found\",\"company_id\":\"company-1\",\"command_id\":\"cmd-fixed-id\",\"command_type\":\"suspend_new_risk\",\"state\":\"applied\"}");
     try std.testing.expectEqual(pending_store.CommandLifecycle.applied, restarted.command_state);
     try std.testing.expect(restarted.pending_command == null);
+    try std.testing.expect(restarted.controls_locked);
+    try restarted.present(body);
+    try std.testing.expect(!restarted.controls_locked);
+
     var check_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer check_arena.deinit();
     try std.testing.expect((try pending_store.loadPending(io, check_arena.allocator(), pending_dir, "company-1")) == null);

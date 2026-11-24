@@ -88,8 +88,9 @@ def _risk_control(
             """SELECT 1 FROM command_receipt
                WHERE company_id = ?
                  AND command_type IN ('suspend_new_risk', 'resume_new_risk')
+                 AND (? = 1 OR state = 'applied')
                LIMIT 1""",
-            (company_id,),
+            (company_id, int(has_paper)),
         ).fetchone()
         is not None
     )

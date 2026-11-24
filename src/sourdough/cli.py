@@ -158,6 +158,9 @@ def main() -> int:
     receipt_read.add_argument("store", type=Path)
     receipt_read.add_argument("--company-id", required=True)
     receipt_read.add_argument("--command-id", required=True)
+    receipt_read.add_argument(
+        "--operation", choices=("suspend_new_risk", "resume_new_risk")
+    )
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
     profile.add_argument("--sandbox", help="User-selected sandbox backend")
@@ -308,7 +311,10 @@ def main() -> int:
             print(
                 json.dumps(
                     read_local_command_receipt_status(
-                        args.store, args.company_id, args.command_id
+                        args.store,
+                        args.company_id,
+                        args.command_id,
+                        operation=args.operation,
                     )
                 )
             )

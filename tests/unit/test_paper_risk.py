@@ -18,9 +18,12 @@ from sourdough.paper_books import capture_position, post_confirmed_fill
 from sourdough.paper_execution import PaperIntent
 from sourdough.paper_order import OrderRefused, OrderReplyUnknown, submit_paper_order
 from sourdough.paper_risk import (
+    RESUME_NEW_RISK,
     SUSPEND_NEW_RISK,
     PaperRiskRefused,
     PaperSuspension,
+    _resume_with_evidence,
+    read_local_command_receipt_status,
     read_paper_risk_receipt,
     suspend_paper_risk,
 )
@@ -272,3 +275,104 @@ class PaperRiskControl(unittest.TestCase):
             self.rows(self.journal, "SELECT order_id FROM venue_execution"),
             [(order.order_id,)],
         )
+
+    def test_command_receipt_status_authorization_redaction_and_resume_toctou(self):
+        with self.writer() as writer:
+            applied = suspend_paper_risk(writer, self.command, self.authorize)
+            # Wrong principal or wrong operation on read_paper_risk_receipt must raise, not return None.
+            with self.assertRaisesRegex(PaperRiskRefused, "not authorized"):
+                read_paper_risk_receipt(
+                    writer,
+                    self.command.request_id,
+                    lambda db, cid, op: "other-board-principal",
+                    operation=SUSPEND_NEW_RISK,
+                )
+            with self.assertRaisesRegex(PaperRiskRefused, "not authorized"):
+                read_paper_risk_receipt(
+                    writer,
+                    self.command.request_id,
+                    lambda db, cid, op: applied.principal,
+                    operation=RESUME_NEW_RISK,
+                )
+
+        # read_local_command_receipt_status must redact principal/reason and enforce operation scope & non-symlink store.
+        status = read_local_command_receipt_status(
+            self.store,
+            self.company.company_id,
+            self.command.request_id,
+            operation=SUSPEND_NEW_RISK,
+        )
+        self.assertEqual(status["status"], "found")
+        self.assertEqual(status["state"], "applied")
+        self.assertEqual(status["effective_revision"], 1)
+        self.assertNotIn("principal", status)
+        self.assertNotIn("reason", status)
+        self.assertNotIn("result", status)
+        with self.assertRaisesRegex(PaperRiskRefused, "authorized board control scope"):
+            read_local_command_receipt_status(
+                self.store,
+                self.company.company_id,
+                self.command.request_id,
+                operation=RESUME_NEW_RISK,
+            )
+        symlink = self.root / "store-link.sqlite"
+        symlink.symlink_to(self.store)
+        with self.assertRaisesRegex(PaperRiskRefused, "store owner"):
+            read_local_command_receipt_status(
+                symlink, self.company.company_id, self.command.request_id
+            )
+
+        # TOCTOU: if resume starts BEFORE a suspension commits (not suspended -> ineligible ->
+        # verify_local is None), and a real suspension commits before Phase 2 so resume is now
+        # eligible, _resume_with_evidence must refuse without poisoning request_id!
+        with self.writer() as writer:
+            # First resume rev 1 -> rev 2 (not suspended), then test a rev 3 resume racing with a rev 3 suspension.
+            _resume_with_evidence(
+                writer,
+                PaperSuspension("resume-ok", "charter", 1, "Clean resume"),
+                lambda _db, _cid, _op: "verified-test-board",
+                lambda: (lambda _conn: None),
+            )
+            stale_cmd = PaperSuspension("resume-race", "charter", 3, "Resume race")
+            phase = 0
+
+            def racing_auth(_db, _cid, _op):
+                nonlocal phase
+                phase += 1
+                return "verified-test-board"
+
+            original_open_writer = None
+            from sourdough import paper_risk as pr_mod
+
+            original_open_writer = pr_mod.open_writer
+
+            def suspend_before_phase2(*args, **kwargs):
+                if phase == 1:
+                    pr_mod.open_writer = original_open_writer
+                    suspend_paper_risk(
+                        writer,
+                        PaperSuspension("suspend-rev3", "charter", 2, "Late suspend"),
+                        self.authorize,
+                    )
+                return original_open_writer(*args, **kwargs)
+
+            pr_mod.open_writer = suspend_before_phase2
+            try:
+                with self.assertRaisesRegex(
+                    PaperRiskRefused, "changed during observation"
+                ):
+                    _resume_with_evidence(
+                        writer,
+                        stale_cmd,
+                        racing_auth,
+                        lambda: (lambda _conn: None),
+                    )
+            finally:
+                pr_mod.open_writer = original_open_writer
+            # Request ID must NOT have been poisoned with a conflicting_revision denial receipt!
+            self.assertEqual(
+                read_local_command_receipt_status(
+                    self.store, self.company.company_id, stale_cmd.request_id
+                )["status"],
+                "not_found",
+            )

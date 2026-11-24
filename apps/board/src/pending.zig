@@ -24,12 +24,14 @@ pub const ReceiptStatus = struct {
     status: []const u8,
     company_id: []const u8,
     command_id: []const u8,
+    command_type: ?[]const u8 = null,
     state: ?[]const u8 = null,
     denial_code: ?[]const u8 = null,
 };
 
 pub fn isSafeCompanyId(company_id: []const u8) bool {
     if (company_id.len == 0 or company_id.len > 128) return false;
+    if (company_id[0] == '.') return false;
     if (std.mem.indexOf(u8, company_id, "..") != null) return false;
     for (company_id) |ch| {
         const ok = (ch >= 'a' and ch <= 'z') or
@@ -63,10 +65,27 @@ pub fn pendingFilePath(
     return std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ base_dir, company_id });
 }
 
-fn chmodPath(alloc: std.mem.Allocator, path: []const u8, mode: std.c.mode_t) !void {
-    const zpath = try alloc.dupeZ(u8, path);
-    defer alloc.free(zpath);
-    if (std.c.chmod(zpath.ptr, mode) != 0) return error.ChmodFailed;
+fn openPrivateDir(alloc: std.mem.Allocator, dir_path: []const u8) !std.c.fd_t {
+    const zdir = try alloc.dupeZ(u8, dir_path);
+    defer alloc.free(zdir);
+    const fd = std.c.open(
+        zdir.ptr,
+        .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true },
+        @as(std.c.mode_t, 0),
+    );
+    if (fd < 0) return error.OpenDirFailed;
+    errdefer _ = std.c.close(fd);
+    if (std.c.fchmod(fd, @as(std.c.mode_t, 0o700)) != 0) return error.ChmodFailed;
+    return fd;
+}
+
+fn writeAllFd(fd: std.c.fd_t, data: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const rc = std.c.write(fd, data.ptr + offset, data.len - offset);
+        if (rc <= 0) return error.WriteFailed;
+        offset += @intCast(rc);
+    }
 }
 
 pub fn savePendingAtomic(
@@ -85,21 +104,47 @@ pub fn savePendingAtomic(
     }
     const target_path = try pendingFilePath(alloc, base_dir, company_id);
     defer alloc.free(target_path);
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{target_path});
-    defer alloc.free(tmp_path);
 
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, base_dir);
-    try chmodPath(alloc, base_dir, 0o700);
+    const dir_fd = try openPrivateDir(alloc, base_dir);
+    defer _ = std.c.close(dir_fd);
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, cmd, .{});
     defer alloc.free(encoded);
 
-    try cwd.writeFile(io, .{ .sub_path = tmp_path, .data = encoded });
-    errdefer cwd.deleteFile(io, tmp_path) catch {};
-    try chmodPath(alloc, tmp_path, 0o600);
-    try std.Io.Dir.rename(cwd, tmp_path, cwd, target_path, io);
-    try chmodPath(alloc, target_path, 0o600);
+    const tmp_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/.{s}.{d}.tmp",
+        .{ base_dir, company_id, cmd.sent_ns },
+    );
+    defer alloc.free(tmp_path);
+    const z_tmp = try alloc.dupeZ(u8, tmp_path);
+    defer alloc.free(z_tmp);
+    const z_target = try alloc.dupeZ(u8, target_path);
+    defer alloc.free(z_target);
+
+    // Create strictly private (0o600) exclusive file without following symlinks.
+    _ = std.c.unlink(z_tmp.ptr);
+    const fd = std.c.open(
+        z_tmp.ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true },
+        @as(std.c.mode_t, 0o600),
+    );
+    if (fd < 0) return error.CreatePendingFailed;
+    var closed = false;
+    errdefer {
+        if (!closed) _ = std.c.close(fd);
+        _ = std.c.unlink(z_tmp.ptr);
+    }
+    if (std.c.fchmod(fd, @as(std.c.mode_t, 0o600)) != 0) return error.ChmodFailed;
+    try writeAllFd(fd, encoded);
+    if (std.c.fsync(fd) != 0) return error.FsyncFailed;
+    _ = std.c.close(fd);
+    closed = true;
+
+    if (std.c.rename(z_tmp.ptr, z_target.ptr) != 0) return error.RenamePendingFailed;
+    if (std.c.fsync(dir_fd) != 0) return error.FsyncFailed;
 }
 
 pub fn loadPending(
@@ -115,10 +160,11 @@ pub fn loadPending(
         error.FileNotFound => return null,
         else => return err,
     };
-    const parsed = try std.json.parseFromSliceLeaky(PendingCommand, alloc, raw, .{
+    defer alloc.free(raw);
+    const parsed = std.json.parseFromSliceLeaky(PendingCommand, alloc, raw, .{
         .ignore_unknown_fields = false,
         .allocate = .alloc_always,
-    });
+    }) catch return error.CorruptedPendingCommand;
     const expected_hex = payloadSha256Hex(parsed.payload);
     if (parsed.command_id.len == 0 or
         parsed.command_type.len == 0 or
@@ -142,6 +188,9 @@ pub fn clearPending(
         error.FileNotFound => {},
         else => return err,
     };
+    const dir_fd = openPrivateDir(alloc, base_dir) catch return;
+    defer _ = std.c.close(dir_fd);
+    _ = std.c.fsync(dir_fd);
 }
 
 pub fn parseReceiptStatus(alloc: std.mem.Allocator, body: []const u8) !ReceiptStatus {
@@ -151,7 +200,7 @@ pub fn parseReceiptStatus(alloc: std.mem.Allocator, body: []const u8) !ReceiptSt
     });
 }
 
-test "pending command persists atomically and reloads with digest verification" {
+test "pending command persists atomically with 0o600 permissions and reloads cleanly" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -174,6 +223,15 @@ test "pending command persists atomically and reloads with digest verification" 
     };
 
     try savePendingAtomic(io, alloc, pending_dir, "company-abc", cmd);
+    const target = try pendingFilePath(alloc, pending_dir, "company-abc");
+    const z_target = try alloc.dupeZ(u8, target);
+    const check_fd = std.c.open(z_target.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+    try std.testing.expect(check_fd >= 0);
+    defer _ = std.c.close(check_fd);
+    var st: std.c.Stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fstat(check_fd, &st));
+    try std.testing.expectEqual(@as(std.c.mode_t, 0o600), st.mode & 0o777);
+
     const reloaded = (try loadPending(io, alloc, pending_dir, "company-abc")) orelse return error.MissingPending;
     try std.testing.expectEqualStrings("cmd-suspend-001", reloaded.command_id);
     try std.testing.expectEqualStrings("suspend_new_risk", reloaded.command_type);
@@ -184,7 +242,7 @@ test "pending command persists atomically and reloads with digest verification" 
     try std.testing.expect((try loadPending(io, alloc, pending_dir, "company-abc")) == null);
 }
 
-test "pending path rejects traversal and tampered payload digest" {
+test "pending path rejects traversal, leading dot, and tampered payload digest" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -193,6 +251,10 @@ test "pending path rejects traversal and tampered payload digest" {
     try std.testing.expectError(
         error.InvalidCompanyId,
         pendingFilePath(alloc, "/tmp/board-pending", "../escape"),
+    );
+    try std.testing.expectError(
+        error.InvalidCompanyId,
+        pendingFilePath(alloc, "/tmp/board-pending", ".hidden"),
     );
     const bad = PendingCommand{
         .command_id = "cmd-1",

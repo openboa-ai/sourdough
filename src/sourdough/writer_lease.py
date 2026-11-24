@@ -9,7 +9,8 @@ from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .company import _connect, _require_writable_store, reopen
+from .company import _require_writable_store, reopen
+from .storage.db import open_reader, read_tx
 
 
 class WriterRefused(Exception):
@@ -131,7 +132,7 @@ def hold_company_writer(
         )
         lease.verify()
         reopen(store, company_id)
-        with closing(_connect(lease.store, "ro")) as connection:
+        with closing(open_reader(lease.store)) as connection, read_tx(connection):
             _require_writable_store(connection)
         lease.verify()
         yield lease
