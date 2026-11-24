@@ -135,6 +135,9 @@ class StorageMigrations(unittest.TestCase):
     def test_upgrade_from_existing_v9_store_preserves_0008_checksum_and_adds_digest_table(
         self,
     ):
+        from sourdough.company import reopen
+        from sourdough.runtime import CompanyRuntime, DutyRegistry
+
         receipt = found(self.store, self.terms)
         # Simulate an existing v9 store that already applied migrations 1, 8, and 9
         # before migration 10 existed.
@@ -145,7 +148,14 @@ class StorageMigrations(unittest.TestCase):
             raw.execute("UPDATE company SET schema_revision = 9 WHERE singleton = 1")
             raw.execute("PRAGMA user_version = 9")
 
-        upgrade_work_schema(self.store, receipt.company_id)
+        # Reopening and starting CompanyRuntime must accept revision 9 and auto-upgrade to v10.
+        reopened = reopen(self.store, receipt.company_id)
+        self.assertEqual(reopened.company_id, receipt.company_id)
+        leases = self.store.parent / "leases-v9"
+        runtime = CompanyRuntime(
+            self.store, receipt.company_id, DutyRegistry(), lease_directory=leases
+        )
+        runtime.step(now_ns=1_000_000_000)
 
         with closing(open_reader(self.store)) as reader:
             self.assertEqual(

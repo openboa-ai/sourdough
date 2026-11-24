@@ -1206,6 +1206,70 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                     lease_directory=self.leases,
                 )
 
+    def test_restore_fsyncs_nested_desk_directories_bottom_up_before_retirement(self):
+        from unittest.mock import patch
+
+        from sourdough.storage import checkpoint as cp_mod
+
+        desk = self.root / "desk-nested-src"
+        nested_file = desk / "agent-1" / "workspace" / "notes" / "state.md"
+        nested_file.parent.mkdir(parents=True)
+        nested_file.write_text("deep-state\n", encoding="utf-8")
+        archive = self.root / "checkpoint-nested-desk.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            desk_root=desk,
+            lease_directory=self.leases,
+        )
+
+        synced_dirs: list[Path] = []
+        real_fsync_dir = cp_mod._fsync_dir
+
+        def record_fsync_dir(directory: Path) -> None:
+            synced_dirs.append(directory)
+            real_fsync_dir(directory)
+
+        replacement = self.root / "recovered-nested.sqlite"
+        desk_dest = self.root / "desk-nested-dest"
+        with patch(
+            "sourdough.storage.checkpoint._fsync_dir", side_effect=record_fsync_dir
+        ):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                desk_destination=desk_dest,
+                lease_directory=self.leases,
+            )
+
+        # Verify staging synced every nested directory bottom-up inside .sourdough-desk-tmp-*
+        stage_syncs = [
+            path for path in synced_dirs if ".sourdough-desk-tmp-" in str(path)
+        ]
+        stage_tails = [
+            "/".join(path.parts[path.parts.index("desk") :])
+            for path in stage_syncs
+            if "desk" in path.parts
+        ]
+        self.assertEqual(
+            stage_tails,
+            [
+                "desk/agent-1/workspace/notes",
+                "desk/agent-1/workspace",
+                "desk/agent-1",
+                "desk",
+            ],
+        )
+        self.assertEqual(
+            (desk_dest / "agent-1" / "workspace" / "notes" / "state.md").read_text(
+                encoding="utf-8"
+            ),
+            "deep-state\n",
+        )
+
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)
