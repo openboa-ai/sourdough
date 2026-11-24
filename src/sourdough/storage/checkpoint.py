@@ -360,6 +360,7 @@ def _stage_pinned_desk(
         raise CheckpointRefused("Desk snapshot root is not a safe directory") from error
 
     dest_root.mkdir(mode=0o700, parents=True)
+    created_dirs: set[Path] = {dest_root}
     collected: list[str] = []
 
     def _walk(dir_fd: int, prefix: PurePosixPath) -> None:
@@ -413,6 +414,10 @@ def _stage_pinned_desk(
                     )
                 target = dest_root.joinpath(*rel_path.parts)
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                ancestor = target.parent
+                while ancestor != dest_root and ancestor not in created_dirs:
+                    created_dirs.add(ancestor)
+                    ancestor = ancestor.parent
                 with target.open("xb") as out:
                     os.fchmod(out.fileno(), 0o600)
                     shutil.copyfileobj(pinned, out)
@@ -425,7 +430,10 @@ def _stage_pinned_desk(
     finally:
         os.close(root_fd)
     if fsync_files:
-        _fsync_dir(dest_root)
+        for directory in sorted(
+            created_dirs, key=lambda path: len(path.parts), reverse=True
+        ):
+            _fsync_dir(directory)
     return tuple(collected)
 
 
