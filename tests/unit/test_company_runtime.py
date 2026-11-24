@@ -164,6 +164,18 @@ class UnifiedCompanyRuntime(unittest.TestCase):
         self.assertEqual(sum(seg.active_seconds for seg in segments), 124)
         self.assertTrue(all(seg.work_seconds >= 3 for seg in segments))
 
+        # Tight cap (10s): 24s validly partitions as [8, 8, 8]; 14s has no valid [8, 10] split
+        tight = BoundedVenueCoordinator(
+            self.store,
+            venue,
+            policy=VenueSegmentPolicy(segment_seconds=10, drain_margin_seconds=5),
+        )
+        self.assertEqual(
+            [seg.active_seconds for seg in tight.plan_segments(24)], [8, 8, 8]
+        )
+        with self.assertRaisesRegex(VenueRefused, "cannot be partitioned"):
+            tight.plan_segments(14)
+
     def test_runtime_step_releases_agent_slot_on_handler_exception_and_peer_wait(self):
         peer_id = "peer-colleague"
         with closing(open_writer(self.store)) as conn, write_tx(conn):

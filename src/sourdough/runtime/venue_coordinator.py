@@ -75,32 +75,28 @@ class BoundedVenueCoordinator:
 
     def plan_segments(self, total_seconds: int) -> tuple[VenueSegment, ...]:
         """Partition a bounded operating window into rotating venue activation segments."""
-        if type(total_seconds) is not int or total_seconds < MIN_SEGMENT_SECONDS:
+        min_active = max(MIN_SEGMENT_SECONDS, self._policy.drain_margin_seconds + 1)
+        cap = self._policy.segment_seconds
+        if type(total_seconds) is not int or total_seconds < min_active:
             raise VenueRefused(
-                f"Total venue activation window must be at least {MIN_SEGMENT_SECONDS} seconds"
+                f"Total venue activation window must be at least {min_active} seconds"
+            )
+        count = (total_seconds + cap - 1) // cap
+        if count * min_active > total_seconds:
+            raise VenueRefused(
+                "Total venue activation window cannot be partitioned within segment bounds"
             )
         segments: list[VenueSegment] = []
         remaining = total_seconds
-        sequence = 1
-        while remaining > 0:
-            if remaining <= self._policy.segment_seconds:
-                active = remaining
-            else:
-                active = self._policy.segment_seconds
-                # Avoid leaving a tail shorter than MIN_SEGMENT_SECONDS
-                if remaining - active < MIN_SEGMENT_SECONDS:
-                    active = remaining - MIN_SEGMENT_SECONDS
-            if active <= self._policy.drain_margin_seconds:
-                raise VenueRefused(
-                    "Segment length leaves no work window before drain margin"
-                )
+        for index in range(count):
+            remaining_after = count - index - 1
+            active = min(cap, remaining - remaining_after * min_active)
             segments.append(
                 VenueSegment(
-                    sequence=sequence,
+                    sequence=index + 1,
                     active_seconds=active,
                     drain_margin_seconds=self._policy.drain_margin_seconds,
                 )
             )
             remaining -= active
-            sequence += 1
         return tuple(segments)
