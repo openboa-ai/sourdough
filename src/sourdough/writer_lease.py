@@ -5,11 +5,11 @@ import os
 import pwd
 import stat
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .company import reopen
+from .company import _connect, _require_writable_store, reopen
 
 
 class WriterRefused(Exception):
@@ -131,5 +131,7 @@ def hold_company_writer(
         )
         lease.verify()
         reopen(store, company_id)
+        with closing(_connect(lease.store, "ro")) as connection:
+            _require_writable_store(connection)
         lease.verify()
         yield lease

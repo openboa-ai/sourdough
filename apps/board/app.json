@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.native-sdk.dev/app/v1.json",
+  "id": "dev.openboa.sourdough.board",
+  "name": "sourdough-board",
+  "display_name": "Sourdough Board",
+  "description": "Inspect the company work timeline.",
+  "version": "0.1.0",
+  "platforms": ["macos"],
+  "icons": ["assets/sourdough.svg"],
+  "permissions": ["view"],
+  "capabilities": ["native_views", "gpu_surfaces"],
+  "security": {
+    "navigation": {
+      "allowed_origins": ["zero://app", "zero://inline"],
+      "external_links": {"action": "deny"}
+    }
+  },
+  "web_engine": "system"
+}

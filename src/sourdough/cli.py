@@ -10,6 +10,11 @@ from pathlib import Path
 from sourdough.assessment_run import run_assessment_company
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
 from sourdough.company_assessment import SourceRecord, seal_assessment_source
+from sourdough.company_checkpoint import (
+    CheckpointRefused,
+    checkpoint_company,
+    inspect_company_checkpoint,
+)
 from sourdough.company_run import run_paper_company
 from sourdough.duty_run import count_company_runs
 from sourdough.employee_process import EmployeeProcess
@@ -31,6 +36,7 @@ from sourdough.paper_books import PostingRefused
 from sourdough.paper_execution import VenueRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
+from sourdough.paper_risk import PaperRiskRefused, read_local_command_receipt_status
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.runtime.registry import RuntimeRefused
 from sourdough.runtime.work_kernel import WorkKernelRefused
@@ -39,7 +45,7 @@ from sourdough.storage.db import StorageRefused
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.trading_engine import EngineRefused, prepare_engine
 from sourdough.writer_lease import WriterRefused, hold_company_writer
-from sourdough.work_projection import read_local_board_timeline
+from sourdough.work_projection import WORK_TIMELINE_REVISION, read_local_board_timeline
 
 
 def _store_key(value: str) -> tuple[int, int]:
@@ -132,11 +138,26 @@ def main() -> int:
     )
     opening.add_argument("store", type=Path)
     opening.add_argument("--company-id", required=True)
+    checkpoint = commands.add_parser("checkpoint-company")
+    checkpoint.add_argument("store", type=Path)
+    checkpoint.add_argument("archive", type=Path)
+    checkpoint.add_argument("--company-id", required=True)
+    checkpoint_read = commands.add_parser("inspect-company-checkpoint")
+    checkpoint_read.add_argument("archive", type=Path)
+    checkpoint_read.add_argument("--company-id", required=True)
     inspection = commands.add_parser(
         "inspect-work", help="Inspect the local read-only company timeline"
     )
     inspection.add_argument("store", type=Path)
     inspection.add_argument("--company-id", required=True)
+    inspection.add_argument("--contract-revision", default=WORK_TIMELINE_REVISION)
+    receipt_read = commands.add_parser(
+        "read-command-receipt",
+        help="Read the local status of a previously submitted board command receipt",
+    )
+    receipt_read.add_argument("store", type=Path)
+    receipt_read.add_argument("--company-id", required=True)
+    receipt_read.add_argument("--command-id", required=True)
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
     profile.add_argument("--sandbox", help="User-selected sandbox backend")
@@ -268,8 +289,29 @@ def main() -> int:
             )
         elif args.command == "reopen":
             result = reopen(args.store, args.company_id)
+        elif args.command == "checkpoint-company":
+            result = checkpoint_company(args.store, args.company_id, args.archive)
+        elif args.command == "inspect-company-checkpoint":
+            result = inspect_company_checkpoint(args.archive, args.company_id)
         elif args.command == "inspect-work":
-            print(json.dumps(read_local_board_timeline(args.store, args.company_id)))
+            print(
+                json.dumps(
+                    read_local_board_timeline(
+                        args.store,
+                        args.company_id,
+                        contract_revision=args.contract_revision,
+                    )
+                )
+            )
+            return 0
+        elif args.command == "read-command-receipt":
+            print(
+                json.dumps(
+                    read_local_command_receipt_status(
+                        args.store, args.company_id, args.command_id
+                    )
+                )
+            )
             return 0
         elif args.command == "employee-profile":
             employee = EmployeeProcess(args.executable)
@@ -496,6 +538,7 @@ def main() -> int:
                     idle_seconds=args.idle_seconds,
                 )
     except (
+        CheckpointRefused,
         FoundingRefused,
         BindingRefused,
         DutyRefused,
@@ -503,6 +546,7 @@ def main() -> int:
         EngineRefused,
         MarketRefused,
         OrderRefused,
+        PaperRiskRefused,
         PostingRefused,
         RuntimeRefused,
         StorageRefused,

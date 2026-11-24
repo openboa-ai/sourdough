@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import sys
@@ -20,6 +19,7 @@ from .nautilus_paper import (
     current_quote_times,
 )
 from .paper_execution import VenueRefused
+from .paper_sender_lease import verify_worker_sender
 from .spot_cash import QUOTE_SCALE, SpotCashUnits
 
 
@@ -353,27 +353,16 @@ def main() -> None:
     parser.add_argument("seconds", type=int)
     parser.add_argument("--ready-fd", required=True, type=int)
     parser.add_argument("--store-key", required=True)
+    parser.add_argument("--sender-lease-fd", required=True, type=int)
     args = parser.parse_args()
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-    lease_file = args.journal.with_suffix(".writer-lock")
-    descriptor = os.open(
-        lease_file, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600
-    )
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        info = os.fstat(descriptor)
-        identity = journal_key(args.journal)
-        if (
-            journal_key(lease_file) != (info.st_dev, info.st_ino)
-            or args.store_key != f"{identity[0]}:{identity[1]}"
-            or not 1 <= args.seconds <= 600
-        ):
-            raise VenueRefused(
-                "Original sandbox journal or activation bounds do not match"
-            )
+        verify_worker_sender(args.journal, args.sender_lease_fd, args.store_key)
+        if not 1 <= args.seconds <= 600:
+            raise VenueRefused("Invalid managed sandbox activation bounds")
         venue = NautilusPaperVenue(args.journal)
         checkpoint = venue.start_generation()
         asyncio.run(serve(venue, args.ready_fd, args.seconds, checkpoint))
     finally:
         os.close(args.ready_fd)
-        os.close(descriptor)
+        os.close(args.sender_lease_fd)
