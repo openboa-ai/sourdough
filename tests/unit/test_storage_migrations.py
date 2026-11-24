@@ -69,6 +69,7 @@ class StorageMigrations(unittest.TestCase):
                         "external_actions",
                         "company_restore_receipt",
                         "company_store_retired",
+                        "company_store_retired_digest",
                         "work_peer_requests",
                         "work_condition_occurrences",
                         "work_conditions",
@@ -130,3 +131,31 @@ class StorageMigrations(unittest.TestCase):
             raw.execute("PRAGMA user_version = 0")
         with self.assertRaisesRegex(StorageRefused, "legacy upgrade hook"):
             migrate_store(self.store, receipt.company_id)
+
+    def test_upgrade_from_existing_v9_store_preserves_0008_checksum_and_adds_digest_table(
+        self,
+    ):
+        receipt = found(self.store, self.terms)
+        # Simulate an existing v9 store that already applied migrations 1, 8, and 9
+        # before migration 10 existed.
+        with closing(sqlite3.connect(self.store)) as raw, raw:
+            raw.execute("PRAGMA journal_mode = DELETE")
+            raw.execute("DROP TABLE IF EXISTS company_store_retired_digest")
+            raw.execute("DELETE FROM schema_migrations WHERE version >= 10")
+            raw.execute("UPDATE company SET schema_revision = 9 WHERE singleton = 1")
+            raw.execute("PRAGMA user_version = 9")
+
+        upgrade_work_schema(self.store, receipt.company_id)
+
+        with closing(open_reader(self.store)) as reader:
+            self.assertEqual(
+                reader.execute("PRAGMA user_version").fetchone()[0], MAX_SCHEMA_VERSION
+            )
+            self.assertEqual(
+                verify_applied_migrations(reader),
+                [spec.version for spec in load_migrations()],
+            )
+            table_row = reader.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'company_store_retired_digest'"
+            ).fetchone()
+            self.assertEqual(table_row, ("company_store_retired_digest",))

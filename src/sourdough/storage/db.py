@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from ..writer_lease import WriterLease
 
 
-MAX_SCHEMA_VERSION = 9
+MAX_SCHEMA_VERSION = 10
 RETIRED_SCHEMA_REVISION = -1
 BUSY_TIMEOUT_MS = 5000
 JOURNAL_SIZE_LIMIT_BYTES = 67_108_864
@@ -27,6 +27,7 @@ class StorageRefused(Exception):
 class StoreRetirement:
     request_revision: str
     original_schema: int
+    replacement_sha256: str = ""
 
 
 class ManagedConnection(sqlite3.Connection):
@@ -61,7 +62,19 @@ def read_retirement(connection: sqlite3.Connection) -> StoreRetirement | None:
     ).fetchone()
     if row is None:
         return None
-    return StoreRetirement(str(row[0]), int(row[1]))
+    request_revision = str(row[0])
+    original_schema = int(row[1])
+    replacement_sha256 = ""
+    if _has_table(connection, "company_store_retired_digest"):
+        digest_row = connection.execute(
+            """SELECT replacement_sha256
+               FROM company_store_retired_digest
+               WHERE singleton = 1 AND request_revision = ?""",
+            (request_revision,),
+        ).fetchone()
+        if digest_row is not None:
+            replacement_sha256 = str(digest_row[0])
+    return StoreRetirement(request_revision, original_schema, replacement_sha256)
 
 
 def _check_user_version(connection: sqlite3.Connection) -> int:

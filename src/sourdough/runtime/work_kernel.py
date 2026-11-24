@@ -633,11 +633,8 @@ def assert_run_fencing(
         raise RunFenced(
             f"Run {run_id} is fenced (status={run.status}, token={run.fencing_token} != {fencing_token})"
         )
-    if (
-        now_ns is not None
-        and run.lease_expires_at_ns is not None
-        and now_ns >= run.lease_expires_at_ns
-    ):
+    effective_now = time_ns() if now_ns is None else now_ns
+    if run.lease_expires_at_ns is not None and effective_now >= run.lease_expires_at_ns:
         raise RunFenced(f"Run {run_id} lease has expired")
     return run
 
@@ -889,8 +886,8 @@ def fail_work_run(
     now_ns: int | None = None,
 ) -> WorkRun:
     """Record a failed active run and release the Agent's active execution slot."""
-    run = assert_run_fencing(connection, run_id, fencing_token)
     timestamp = time_ns() if now_ns is None else now_ns
+    run = assert_run_fencing(connection, run_id, fencing_token, now_ns=timestamp)
     outcome_json = _canonical_json({"disposition": "failed", "error": error_summary})
     changed = connection.execute(
         """UPDATE work_runs
@@ -973,6 +970,29 @@ def complete_work_run(
     )
     armed: WorkCondition | None = None
     if next_condition is not None:
+        source_identity = next_condition.get("source_identity")
+        if "condition_revision" in next_condition:
+            next_revision = next_condition["condition_revision"]
+        elif source_identity:
+            max_cond_rev = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(condition_revision), 0)
+                       FROM work_conditions
+                       WHERE company_id = ? AND source_identity = ?""",
+                    (run.company_id, source_identity),
+                ).fetchone()[0]
+            )
+            max_occ_rev = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(condition_revision), 0)
+                       FROM work_condition_occurrences
+                       WHERE company_id = ? AND source_identity = ?""",
+                    (run.company_id, source_identity),
+                ).fetchone()[0]
+            )
+            next_revision = max(max_cond_rev, max_occ_rev) + 1
+        else:
+            next_revision = 1
         armed = set_condition(
             connection,
             company_id=run.company_id,
@@ -981,9 +1001,10 @@ def complete_work_run(
             responsibility_id=next_condition.get("responsibility_id"),
             work_item_id=run.work_item_id,
             due_at_ns=next_condition.get("due_at_ns"),
-            source_identity=next_condition.get("source_identity"),
+            source_identity=source_identity,
             expected_revision=next_condition.get("expected_revision"),
             expires_at_ns=next_condition.get("expires_at_ns"),
+            condition_revision=next_revision,
             now_ns=timestamp,
         )
     append_audit_event(
@@ -1662,7 +1683,7 @@ def resolve_peer_request(
                 "Peer response requires an active response_run_id and response_fencing_token"
             )
         resp_run = assert_run_fencing(
-            connection, response_run_id, response_fencing_token
+            connection, response_run_id, response_fencing_token, now_ns=timestamp
         )
         if (
             resp_run.lease_expires_at_ns is not None
