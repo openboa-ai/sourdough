@@ -25,29 +25,6 @@ MAX_PROVISIONING_ATTEMPTS = 3
 PROVISIONING_RETRY_SECONDS = 60
 _SCOPE = {"assessment": "assessment", PAPER_EXECUTION: "paper"}
 ResumeWork = Callable[[Connection, str], bool]
-SCHEMA = (
-    """CREATE TABLE IF NOT EXISTS hire_onboarding (
-        agent_id TEXT PRIMARY KEY NOT NULL REFERENCES hire_receipt(agent_id),
-        purpose TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('provisioning', 'blocked', 'ready', 'accepted')),
-        attempts INTEGER NOT NULL,
-        retry_at INTEGER, reason TEXT,
-        first_duty_id TEXT UNIQUE REFERENCES duty(id)
-    )""",
-    """CREATE TABLE IF NOT EXISTS private_desk (
-        agent_id TEXT PRIMARY KEY NOT NULL REFERENCES agent(id),
-        manifest_revision TEXT NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS onboarding_read (
-        run_id TEXT PRIMARY KEY NOT NULL REFERENCES duty_run(run_id),
-        revision TEXT NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS onboarding_acceptance (
-        duty_id TEXT PRIMARY KEY NOT NULL REFERENCES hire_onboarding(first_duty_id),
-        run_id TEXT NOT NULL REFERENCES onboarding_read(run_id),
-        revision TEXT NOT NULL, rationale TEXT NOT NULL
-    )""",
-)
 
 
 @dataclass(frozen=True)
@@ -181,8 +158,6 @@ def provision_hire(
             profile, _, scope = _active_hire(connection, writer.company_id, agent_id)
             if _SCOPE.get(purpose) != scope:
                 raise DutyRefused("First duty purpose does not match the hire scope")
-            for statement in SCHEMA:
-                connection.execute(statement)
             connection.execute(
                 """INSERT OR IGNORE INTO hire_onboarding (agent_id, purpose, state, attempts)
                    VALUES (?, ?, 'provisioning', 0)""",

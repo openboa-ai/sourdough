@@ -451,36 +451,3 @@ class ManagedPaperChangeover(unittest.TestCase):
             ),
             [("new", current_plan["revision"]), ("old", original_plan["revision"])],
         )
-
-    def test_recognizes_legacy_plan_and_reseals_only_the_new_scope(self):
-        old_plan = stage_research_inputs(
-            self.store, self.company_id, self.observations("old")
-        )
-        with closing(sqlite3.connect(self.store)) as database, database:
-            database.execute("ALTER TABLE paper_research_plan RENAME TO seeded_plan")
-            database.execute(
-                "CREATE TABLE paper_research_plan (company_id TEXT PRIMARY KEY, revision TEXT, inputs TEXT)"
-            )
-            database.execute(
-                "INSERT INTO paper_research_plan SELECT company_id,revision,inputs FROM seeded_plan"
-            )
-            database.execute("DROP TABLE seeded_plan")
-        self.assertIsNotNone(self.switch().effective_at_ns)
-        new_plan = stage_research_inputs(
-            self.store, self.company_id, self.observations("new")
-        )
-        claim = claim_first_duty(self.store, self.company_id, "employee")
-        snapshot = ResearchTools(self.store, claim, 100, 0, 800).invoke(
-            "read_research_inputs", {}, now=100
-        )
-        self.assertEqual(
-            (snapshot["account_id"], snapshot["source_plan_revision"]),
-            ("new", new_plan["revision"]),
-        )
-        self.assertEqual(
-            rows(
-                self.store,
-                "SELECT account_id,revision FROM paper_research_plan ORDER BY account_id",
-            ),
-            [("new", new_plan["revision"]), ("old", old_plan["revision"])],
-        )

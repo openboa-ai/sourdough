@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from .company import _connect, _identity
 from .duty_run import PAPER_EXECUTION
+from .storage.schema import enable_domain_v1, is_domain_installed, require_domain
 
 if TYPE_CHECKING:
     from .writer_lease import WriterLease
@@ -55,16 +56,6 @@ class BindingChange:
     blocked_by: str | None = None
 
 
-_CREATE_BINDING = """CREATE TABLE IF NOT EXISTS paper_binding (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    revision TEXT NOT NULL, company_id TEXT NOT NULL REFERENCES company(id),
-    charter_revision TEXT NOT NULL, exposure_limit_minor_units INTEGER NOT NULL,
-    account_id TEXT NOT NULL, connector_revision TEXT NOT NULL,
-    instrument_rules_digest TEXT NOT NULL, currency TEXT NOT NULL,
-    starting_minor_units INTEGER NOT NULL,
-    environment TEXT NOT NULL CHECK (environment = 'paper'),
-    destination_id TEXT NOT NULL
-)"""
 _SELECT_BINDING = """SELECT revision, company_id, charter_revision,
     exposure_limit_minor_units, account_id, connector_revision,
     instrument_rules_digest, currency, starting_minor_units, environment, destination_id
@@ -133,7 +124,12 @@ def bind(store: Path, mandate: PaperMandate, observer: AccountObserver) -> Paper
             mandate.charter_revision,
         ):
             raise BindingRefused("Company or charter mismatch")
-        connection.execute(_CREATE_BINDING)
+        enable_domain_v1(
+            connection,
+            "paper",
+            company_id=mandate.company_id,
+            actor_id="paper.bind",
+        )
         existing = connection.execute(_SELECT_BINDING).fetchone()
         terms = _terms(mandate)
         if existing is None:
@@ -143,18 +139,9 @@ def bind(store: Path, mandate: PaperMandate, observer: AccountObserver) -> Paper
     return mandate
 
 
-def _has_table(connection, name: str) -> bool:
-    return (
-        connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (name,)
-        ).fetchone()
-        is not None
-    )
-
-
 def has_pending_binding_change(connection) -> bool:
     return (
-        _has_table(connection, "paper_binding_change")
+        is_domain_installed(connection, "paper")
         and connection.execute(
             "SELECT 1 FROM paper_binding_change WHERE effective_at_ns IS NULL"
         ).fetchone()
@@ -163,6 +150,8 @@ def has_pending_binding_change(connection) -> bool:
 
 
 def _has_unsubmitted_buy(connection, mandate: PaperMandate) -> bool:
+    if not is_domain_installed(connection, "paper"):
+        return False
     sources = (
         (
             "paper_research_decision",
@@ -178,21 +167,20 @@ def _has_unsubmitted_buy(connection, mandate: PaperMandate) -> bool:
                AND decision.instrument_rules_digest = ?""",
         ),
     )
-    order_check = (
-        """AND NOT EXISTS (
-            SELECT 1 FROM paper_order o WHERE o.action_id = decision.decision_id
-                AND o.account_id = ? AND o.mandate_revision = ?
-        )"""
-        if _has_table(connection, "paper_order")
-        else ""
-    )
+    order_check = """AND NOT EXISTS (
+        SELECT 1 FROM paper_order o WHERE o.action_id = decision.decision_id
+            AND o.account_id = ? AND o.mandate_revision = ?
+    )"""
     account = mandate.account
-    terms = (PAPER_EXECUTION, account.account_id, account.instrument_rules_digest)
-    if order_check:
-        terms += (account.account_id, mandate.revision)
+    terms = (
+        PAPER_EXECUTION,
+        account.account_id,
+        account.instrument_rules_digest,
+        account.account_id,
+        mandate.revision,
+    )
     return any(
-        _has_table(connection, table)
-        and connection.execute(
+        connection.execute(
             f"""SELECT 1 FROM {table} decision {snapshot}
                 JOIN duty d ON d.id = decision.duty_id
                 JOIN duty_run r ON r.duty_id = d.id AND r.is_current = 1
@@ -208,7 +196,7 @@ def _has_unsubmitted_buy(connection, mandate: PaperMandate) -> bool:
 
 
 def _open_effect(connection, mandate: PaperMandate) -> bool:
-    if not _has_table(connection, "paper_order"):
+    if not is_domain_installed(connection, "paper"):
         return False
     return (
         connection.execute(
@@ -224,7 +212,7 @@ def _open_effect(connection, mandate: PaperMandate) -> bool:
 
 
 def _previous_change(connection, revision: str):
-    if not _has_table(connection, "paper_binding_change"):
+    if not is_domain_installed(connection, "paper"):
         return None
     return connection.execute(
         """SELECT previous_revision,old_terms,new_terms,requested_at_ns,effective_at_ns
@@ -253,7 +241,7 @@ def read_applied_binding(
 def is_retired_account_scope(
     connection, company_id: str, account_id: str, instrument_revision: str
 ) -> bool:
-    if not _has_table(connection, "paper_binding_change"):
+    if not is_domain_installed(connection, "paper"):
         return False
     return any(
         (terms[1], terms[4], terms[6]) == (company_id, account_id, instrument_revision)
@@ -332,17 +320,11 @@ def change_paper_binding(
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         writer.verify()
+        require_domain(connection, "paper")
         if connection.execute(_SELECT_BINDING).fetchone() != _terms(current):
             raise BindingRefused("Paper binding changed before transition")
         if _has_unsubmitted_buy(connection, current):
             raise BindingRefused("Finish the original buy decision before changeover")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS paper_binding_change (
-                   revision TEXT PRIMARY KEY NOT NULL, previous_revision TEXT NOT NULL,
-                   old_terms TEXT NOT NULL, new_terms TEXT NOT NULL,
-                   requested_at_ns INTEGER NOT NULL, effective_at_ns INTEGER
-               )"""
-        )
         if saved is None:
             if has_pending_binding_change(connection):
                 raise BindingRefused("Another paper binding change is pending")
@@ -392,9 +374,7 @@ def reopen_binding(store: Path, expected_company_id: str) -> PaperMandate:
         connection.execute("BEGIN")
         if _identity(connection) != expected_company_id:
             raise BindingRefused("Company identity mismatch")
-        if not connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_binding'"
-        ).fetchone():
+        if not is_domain_installed(connection, "paper"):
             raise BindingRefused("Paper binding is absent")
         row = connection.execute(_SELECT_BINDING).fetchone()
         charter = connection.execute(

@@ -18,7 +18,7 @@ from sourdough.storage.checkpoint import (
     snapshot_normalized_store,
 )
 from sourdough.storage.db import (
-    MAX_SCHEMA_VERSION,
+    SCHEMA_VERSION,
     StorageRefused,
     open_reader,
     open_writer,
@@ -252,7 +252,7 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         with closing(open_writer(self.store)) as writer:
             self.assertEqual(
                 writer.execute("SELECT schema_revision FROM company").fetchone(),
-                (MAX_SCHEMA_VERSION,),
+                (SCHEMA_VERSION,),
             )
 
     def test_intervening_write_during_reconcile_refuses_before_retirement(self):
@@ -294,7 +294,7 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         with closing(open_writer(self.store)) as writer:
             self.assertEqual(
                 writer.execute("SELECT schema_revision FROM company").fetchone(),
-                (MAX_SCHEMA_VERSION,),
+                (SCHEMA_VERSION,),
             )
             count = writer.execute(
                 "SELECT COUNT(*) FROM audit_event WHERE entity_id = 'duty-race'"
@@ -388,9 +388,11 @@ class StorageCheckpointAndRestore(unittest.TestCase):
             zf.writestr("manifest.json", json.dumps(manifest, sort_keys=True))
             zf.write(db_path, "company.sqlite")
 
-        # Live store logical watermark includes full sqlite_schema, so restore refuses
+        # Canonical v1 schema verification refuses the dropped index immediately
         replacement = self.root / "never-restored-index.sqlite"
-        with self.assertRaisesRegex(CheckpointRefused, "logical watermark"):
+        with self.assertRaisesRegex(
+            CheckpointRefused, "sqlite_schema does not match canonical v1 schema"
+        ):
             restore_store(
                 self.store,
                 self.company_id,
@@ -402,7 +404,7 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         with closing(open_writer(self.store)) as writer:
             self.assertEqual(
                 writer.execute("SELECT schema_revision FROM company").fetchone(),
-                (MAX_SCHEMA_VERSION,),
+                (SCHEMA_VERSION,),
             )
 
     def test_tampered_desk_bytes_are_refused_with_or_without_manifest_rewrite(self):
@@ -469,7 +471,7 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         with closing(open_writer(self.store)) as writer:
             self.assertEqual(
                 writer.execute("SELECT schema_revision FROM company").fetchone(),
-                (MAX_SCHEMA_VERSION,),
+                (SCHEMA_VERSION,),
             )
 
     def test_interrupted_post_retirement_publication_resumes_cleanly(self):
@@ -1059,7 +1061,7 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         with closing(open_writer(self.store)) as writer:
             self.assertEqual(
                 writer.execute("SELECT schema_revision FROM company").fetchone(),
-                (MAX_SCHEMA_VERSION,),
+                (SCHEMA_VERSION,),
             )
 
     def test_crash_after_final_link_recovers_orphaned_pub_link_and_permissions(self):
@@ -1273,9 +1275,163 @@ class StorageCheckpointAndRestore(unittest.TestCase):
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)
-        self.assertEqual(wm1.schema_version, MAX_SCHEMA_VERSION)
+        self.assertEqual(wm1.schema_version, SCHEMA_VERSION)
         snapshot = self.root / "copy.sqlite"
         snapshot_normalized_store(self.store, snapshot)
         with closing(open_reader(snapshot)) as reader, read_tx(reader):
             wm2 = compute_logical_watermark(reader, self.company_id)
         self.assertEqual(wm1, wm2)
+
+    def test_check_original_runs_preflight_and_inside_retirement_tx(self):
+        archive = self.root / "checkpoint-check-original.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+
+        # Case 1: check_original refuses on the second (in-tx retirement) call -> store stays live
+        calls: list[int] = []
+
+        def fail_on_second(connection: sqlite3.Connection) -> None:
+            self.assertTrue(connection.in_transaction)
+            calls.append(int(connection.execute("PRAGMA query_only").fetchone()[0]))
+            if len(calls) == 2:
+                raise CheckpointRefused("obligation check failed inside retirement tx")
+
+        replacement_blocked = self.root / "blocked-by-check.sqlite"
+        with self.assertRaisesRegex(CheckpointRefused, "obligation check failed"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement_blocked,
+                check_original=fail_on_second,
+                lease_directory=self.leases,
+            )
+        self.assertEqual(calls, [1, 0])
+        self.assertFalse(replacement_blocked.exists())
+        # Original store remains live and unretired
+        with closing(open_writer(self.store)) as writer:
+            self.assertEqual(
+                writer.execute("SELECT schema_revision FROM company").fetchone(),
+                (SCHEMA_VERSION,),
+            )
+
+        # Case 2: check_original succeeds on both calls -> retirement stores replacement_sha256 in company_store_retired
+        ok_calls: list[int] = []
+
+        def allow_both(connection: sqlite3.Connection) -> None:
+            self.assertTrue(connection.in_transaction)
+            ok_calls.append(int(connection.execute("PRAGMA query_only").fetchone()[0]))
+
+        replacement = self.root / "allowed-by-check.sqlite"
+        restore_store(
+            self.store,
+            self.company_id,
+            archive,
+            replacement,
+            check_original=allow_both,
+            lease_directory=self.leases,
+        )
+        self.assertEqual(ok_calls, [1, 0])
+        self.assertTrue(replacement.exists())
+        expected_digest = sha256(replacement.read_bytes()).hexdigest()
+        with closing(open_reader(self.store)) as reader, read_tx(reader):
+            row = reader.execute(
+                "SELECT original_schema, replacement_sha256 FROM company_store_retired WHERE singleton = 1"
+            ).fetchone()
+        self.assertEqual(row, (SCHEMA_VERSION, expected_digest))
+
+    def test_external_scope_binds_request_revision_and_blocks_mismatched_retry(self):
+        from unittest.mock import patch
+
+        archive = self.root / "checkpoint-ext-scope.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "restored-scoped.sqlite"
+        real_link = os.link
+
+        def fail_publish(src, dst, *args, **kwargs):
+            if dst == replacement.name or Path(dst) == replacement.resolve(
+                strict=False
+            ):
+                raise OSError("simulated publish error")
+            return real_link(src, dst, *args, **kwargs)
+
+        with patch("sourdough.storage.checkpoint.os.link", side_effect=fail_publish):
+            with self.assertRaisesRegex(OSError, "simulated publish error"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    external_scope="venue:account-a:rev-1",
+                    lease_directory=self.leases,
+                )
+
+        # Retry with a different external_scope must refuse
+        with self.assertRaisesRegex(CheckpointRefused, "different restore request"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                external_scope="venue:account-b:rev-2",
+                lease_directory=self.leases,
+            )
+
+        # Retry with the exact external_scope completes cleanly
+        receipt = restore_store(
+            self.store,
+            self.company_id,
+            archive,
+            replacement,
+            external_scope="venue:account-a:rev-1",
+            lease_directory=self.leases,
+        )
+        self.assertEqual(receipt.company_id, self.company_id)
+        self.assertTrue(replacement.exists())
+
+    def test_paper_domain_checkpoint_and_restore_roundtrip(self):
+        from sourdough.storage.schema import enable_domain_v1, is_domain_installed
+
+        with closing(open_writer(self.store)) as writer, write_tx(writer):
+            enable_domain_v1(
+                writer, "paper", company_id=self.company_id, actor_id="test"
+            )
+            writer.execute(
+                """INSERT INTO paper_binding VALUES (
+                       1, 'mandate-1', ?, 'charter-v1', 500, 'acct-1',
+                       'conn-1', 'rules-1', 'USD', 1000, 'paper', 'dest-1'
+                   )""",
+                (self.company_id,),
+            )
+
+        archive = self.root / "checkpoint-paper.zip"
+        manifest = checkpoint_store(
+            self.store, self.company_id, archive, lease_directory=self.leases
+        )
+        self.assertEqual(inspect_checkpoint(archive, self.company_id), manifest)
+        restored = self.root / "restored-paper.sqlite"
+        restore_store(
+            self.store,
+            self.company_id,
+            archive,
+            restored,
+            lease_directory=self.leases,
+        )
+        verify_no_wal_sidecars(restored)
+        with closing(open_reader(restored)) as reader, read_tx(reader):
+            self.assertTrue(is_domain_installed(reader, "paper"))
+            self.assertEqual(
+                reader.execute(
+                    "SELECT revision, account_id FROM paper_binding WHERE singleton = 1"
+                ).fetchone(),
+                ("mandate-1", "acct-1"),
+            )

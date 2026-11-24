@@ -10,6 +10,7 @@ from sqlite3 import Connection
 from time import time_ns
 
 from .company import FoundingRefused, _connect, _identity
+from .storage.schema import is_domain_installed
 
 
 def _rows(connection: Connection, sql: str) -> list[dict]:
@@ -30,41 +31,27 @@ def read_local_board_timeline(store: Path, company_id: str) -> dict:
         if _identity(connection) != company_id:
             raise FoundingRefused("Company identity mismatch")
         as_of_ns = time_ns()
-        tables = {
-            name
-            for (name,) in connection.execute(
-                "SELECT name FROM sqlite_schema WHERE type = 'table'"
-            )
-        }
-        next_join = (
-            "LEFT JOIN work_follow_up wake ON wake.duty_id = d.id"
-            if "work_follow_up" in tables
-            else ""
-        )
-        run_join = (
-            "LEFT JOIN duty_run active ON active.duty_id = d.id AND active.is_current = 1"
-            if "duty_run" in tables
-            else ""
-        )
-        owner_column = "agent_id" if "agent" in tables else "founder_id"
+        has_paper = is_domain_installed(connection, "paper")
         duties = _rows(
             connection,
-            f"""
-            SELECT d.id AS duty_id, d.{owner_column} AS owner_id, d.state,
-                   {"wake.due_at" if next_join else "NULL"} AS due_at,
-                   {"active.run_id" if run_join else "NULL"} AS run_id
-            FROM duty d {next_join} {run_join}
+            """
+            SELECT d.id AS duty_id, d.agent_id AS owner_id, d.state,
+                   wake.due_at AS due_at,
+                   active.run_id AS run_id
+            FROM duty d
+            LEFT JOIN work_follow_up wake ON wake.duty_id = d.id
+            LEFT JOIN duty_run active ON active.duty_id = d.id AND active.is_current = 1
             ORDER BY d.rowid
         """,
         )
-        decisions = _decisions(connection, tables)
+        decisions = _decisions(connection, has_paper)
         for duty in duties:
             duty["decision"] = decisions.get(duty["duty_id"])
         body = {
             "company_id": company_id,
             "access": "local_store_owner",
             "duties": duties,
-            "paper": _paper_projection(connection, tables),
+            "paper": _paper_projection(connection, has_paper),
         }
         current = store.stat(follow_symlinks=False)
         if (initial.st_dev, initial.st_ino, initial.st_uid) != (
@@ -77,9 +64,9 @@ def read_local_board_timeline(store: Path, company_id: str) -> dict:
     return body | {"revision": revision, "as_of_ns": as_of_ns}
 
 
-def _decisions(connection: Connection, tables: set[str]) -> dict:
+def _decisions(connection: Connection, has_paper: bool) -> dict:
     decisions = {}
-    if "paper_research_decision" in tables:
+    if has_paper:
         rows = _rows(
             connection,
             """
@@ -95,16 +82,15 @@ def _decisions(connection: Connection, tables: set[str]) -> dict:
             proposal = json.loads(row.pop("content"))
             row.update(action=proposal["action"], rationale=proposal["rationale"])
             decisions[row["duty_id"]] = row
-    if "work_review_decision" in tables:
-        for row in _rows(
-            connection,
-            """
-            SELECT duty_id,call_id AS decision_id,result_revision,action,rationale,decided_at
-            FROM work_review_decision
-        """,
-        ):
-            decisions[row["duty_id"]] = row
-    if "paper_decision" in tables:
+    for row in _rows(
+        connection,
+        """
+        SELECT duty_id,call_id AS decision_id,result_revision,action,rationale,decided_at
+        FROM work_review_decision
+    """,
+    ):
+        decisions[row["duty_id"]] = row
+    if has_paper:
         for row in _rows(
             connection,
             """
@@ -116,43 +102,29 @@ def _decisions(connection: Connection, tables: set[str]) -> dict:
     return decisions
 
 
-def _paper_projection(connection: Connection, tables: set[str]) -> dict | None:
-    if "paper_order" not in tables:
+def _paper_projection(connection: Connection, has_paper: bool) -> dict | None:
+    if not has_paper:
         return None
-    have_fills = "paper_fill" in tables
-    have_fees = have_fills and "paper_fill_fee" in tables
-    have_cancellations = "paper_cancellation" in tables
-    terminal = "NULL"
-    if have_cancellations:
-        columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(paper_cancellation)")
-        }
-        outcome = "c.outcome" if "outcome" in columns else "'cancelled'"
-        terminal = f"CASE WHEN c.released=1 THEN {outcome} END"
-    details = (
-        """(SELECT latest.fill_id FROM paper_fill latest WHERE order_id=o.order_id
-            ORDER BY latest.rowid DESC LIMIT 1) AS fill_id,
-           SUM(p.quantity) AS quantity,
-           CASE WHEN COUNT(p.fill_id)=1 THEN MAX(p.price_minor_units) END AS price_minor_units"""
-        if have_fills
-        else "NULL AS fill_id,NULL AS quantity,NULL AS price_minor_units"
-    )
     trades = _rows(
         connection,
-        f"""
+        """
         SELECT o.order_id,o.run_id,o.action_id,o.account_id,o.instrument_rules_digest,
                o.quantity AS ordered_quantity,o.reserved_minor_units,o.limit_minor_units,
-               {details},
-               {"SUM(f.fee_minor_units)" if have_fees else "NULL"} AS fee_minor_units,
-               {terminal} AS terminal
+               (SELECT latest.fill_id FROM paper_fill latest WHERE order_id=o.order_id
+                ORDER BY latest.rowid DESC LIMIT 1) AS fill_id,
+               SUM(p.quantity) AS quantity,
+               CASE WHEN COUNT(p.fill_id)=1 THEN MAX(p.price_minor_units) END AS price_minor_units,
+               SUM(f.fee_minor_units) AS fee_minor_units,
+               CASE WHEN c.released=1 THEN c.outcome END AS terminal
         FROM paper_order o
-        {"LEFT JOIN paper_fill p ON o.order_id=p.order_id" if have_fills else ""}
-        {"LEFT JOIN paper_fill_fee f ON f.fill_id=p.fill_id" if have_fees else ""}
-        {"LEFT JOIN paper_cancellation c ON c.order_id=o.order_id" if have_cancellations else ""}
+        LEFT JOIN paper_fill p ON o.order_id=p.order_id
+        LEFT JOIN paper_fill_fee f ON f.fill_id=p.fill_id
+        LEFT JOIN paper_cancellation c ON c.order_id=o.order_id
         GROUP BY o.order_id ORDER BY o.rowid
     """,
     )
+    if not trades:
+        return None
     for order in trades:
         order["remaining_quantity"] = order["ordered_quantity"] - (
             order["quantity"] or 0

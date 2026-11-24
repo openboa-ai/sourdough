@@ -4,7 +4,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .company import _connect, _identity, upgrade_work_schema
+from .company import _connect, _identity
 from .duty_run import (
     PAPER_EXECUTION,
     DutyClaim,
@@ -35,7 +35,6 @@ def founding_duty_due(store: Path, company_id: str) -> bool:
 
 
 def claim_first_duty(store: Path, company_id: str, execution_profile: str) -> DutyClaim:
-    upgrade_work_schema(store, company_id)
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         if _identity(connection) != company_id:
