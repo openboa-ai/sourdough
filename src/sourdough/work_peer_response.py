@@ -642,26 +642,49 @@ def recover_unanswered_peer_runs(writer: WriterLease) -> None:
     with closing(_connect(writer.store, "rw")) as database, database:
         database.execute("BEGIN IMMEDIATE")
         recovered = database.execute(
-            """SELECT d.id FROM work_peer_requests p
-               JOIN duty d ON d.id = p.response_work_item_id AND d.state = 'running'
-               JOIN agent a ON a.id = d.agent_id AND a.company_id = p.company_id
-               WHERE p.company_id = ? AND p.state = 'open'""",
+            """SELECT p.response_work_item_id, p.state
+               FROM work_peer_requests p
+               JOIN agent a ON a.id = p.recipient_agent_id AND a.company_id = p.company_id
+               LEFT JOIN duty d ON d.id = p.response_work_item_id
+               WHERE p.company_id = ?
+                 AND (
+                     d.state = 'running'
+                     OR EXISTS (
+                         SELECT 1 FROM work_runs wr
+                         WHERE wr.work_item_id = p.response_work_item_id
+                           AND wr.status = 'running'
+                     )
+                 )""",
             (writer.company_id,),
         ).fetchall()
-        for (duty_id,) in recovered:
+        for duty_id, peer_state in recovered:
+            item_id = str(duty_id)
             database.execute(
                 "UPDATE duty_run SET is_current=0 WHERE duty_id=? AND is_current=1",
-                (str(duty_id),),
+                (item_id,),
             )
-            database.execute(
-                "UPDATE duty SET state='scheduled' WHERE id=?", (str(duty_id),)
-            )
-            sync_duty_terminal(
-                database,
-                str(duty_id),
-                item_state="due",
-                run_status="fenced",
-            )
+            if str(peer_state) == "open":
+                database.execute(
+                    "UPDATE duty SET state='scheduled' WHERE id=?", (item_id,)
+                )
+                sync_duty_terminal(
+                    database,
+                    item_id,
+                    item_state="due",
+                    run_status="fenced",
+                )
+            else:
+                database.execute(
+                    "UPDATE duty SET state='settled' WHERE id=?", (item_id,)
+                )
+                sync_duty_terminal(
+                    database,
+                    item_id,
+                    item_state="settled"
+                    if str(peer_state) == "answered"
+                    else "cancelled",
+                    run_status="fenced",
+                )
 
 
 def peer_turn_has_disposition(

@@ -69,8 +69,10 @@ from sourdough.work_peer_response import (
     claim_resumed_peer_work,
     read_peer_outcome,
     read_peer_question,
+    recover_unanswered_peer_runs,
     request_peer_response,
 )
+from sourdough.runtime.work_kernel import wake_waiting_runs
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -395,6 +397,63 @@ class CompanyAssets(unittest.TestCase):
             self.assertEqual(
                 database.execute("PRAGMA foreign_key_check").fetchall(), []
             )
+
+    def test_interrupted_peer_response_releases_recipient_slot_after_expiry_wake(self):
+        now, claim, question, _ = self.prepare_peer_question()
+        waiting = request_peer_response(self.writer, claim, question, now=now)
+        response = claim_peer_response(self.writer, "profile", now=now)
+        self.assertEqual(response.duty_id, waiting.response_duty)
+        # Simulate crash during response run and restart after deadline where
+        # CompanyRuntime.run_bound_handler() wakes waiting runs before recovery.
+        with closing(_connect(self.writer.store, "rw")) as database, database:
+            database.execute("BEGIN IMMEDIATE")
+            wake_waiting_runs(
+                database,
+                claim.company_id,
+                now_ns=question.expires_at * 1_000_000_000,
+            )
+        recover_unanswered_peer_runs(self.writer)
+        with closing(_connect(self.writer.store, "ro")) as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT state FROM duty WHERE id = ?", (waiting.response_duty,)
+                ).fetchone(),
+                ("settled",),
+            )
+            self.assertEqual(
+                database.execute(
+                    "SELECT is_current FROM duty_run WHERE run_id = ?",
+                    (response.run_id,),
+                ).fetchone(),
+                (0,),
+            )
+            self.assertEqual(
+                database.execute(
+                    "SELECT status FROM work_runs WHERE run_id = ?",
+                    (response.run_id,),
+                ).fetchone(),
+                ("fenced",),
+            )
+            self.assertEqual(
+                database.execute(
+                    "SELECT state FROM work_items WHERE work_item_id = ?",
+                    (waiting.response_duty,),
+                ).fetchone(),
+                ("cancelled",),
+            )
+            # Manager's active execution slot is fully released
+            self.assertEqual(
+                database.execute(
+                    "SELECT COUNT(*) FROM work_runs WHERE agent_id = ? AND status = 'running'",
+                    (self.founder,),
+                ).fetchone(),
+                (0,),
+            )
+        resumed = claim_resumed_peer_work(
+            self.writer, "profile", now=question.expires_at
+        )
+        self.assertEqual(resumed.duty_id, claim.duty_id)
+        self.assertEqual(read_peer_outcome(self.writer, resumed)["outcome"], "expired")
 
     def settle_project_assessment(self):
         now, _, _, hire = self.prepare_project_hire()
