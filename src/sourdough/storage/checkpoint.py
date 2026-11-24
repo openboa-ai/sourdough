@@ -20,6 +20,7 @@ from .db import (
     MAX_SCHEMA_VERSION,
     RETIRED_SCHEMA_REVISION,
     StorageRefused,
+    StoreRetirement,
     open_reader,
     open_writer,
     read_retirement,
@@ -745,6 +746,8 @@ def _verify_staged_replacement(
     company_id: str,
     request_revision: str,
     manifest: CheckpointManifest,
+    *,
+    expected_sha256: str | None,
 ) -> None:
     """Verify a staged or published replacement DB matches this restore request."""
     try:
@@ -753,13 +756,24 @@ def _verify_staged_replacement(
         raise CheckpointRefused(
             "Staged replacement database is missing or unsafe"
         ) from error
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+    with os.fdopen(fd, "rb") as pinned:
+        if not stat.S_ISREG(os.fstat(pinned.fileno()).st_mode):
             raise CheckpointRefused(
                 "Staged replacement database must be a regular file"
             )
-    finally:
-        os.close(fd)
+        if expected_sha256 is not None:
+            if (
+                not isinstance(expected_sha256, str)
+                or len(expected_sha256) != 64
+                or any(ch not in "0123456789abcdef" for ch in expected_sha256)
+            ):
+                raise CheckpointRefused(
+                    "Retired store is missing authenticated replacement digest"
+                )
+            if file_digest(pinned, "sha256").hexdigest() != expected_sha256:
+                raise CheckpointRefused(
+                    "Staged replacement database digest does not match retired store record"
+                )
     try:
         verify_no_wal_sidecars(candidate)
         with closing(open_reader(candidate)) as reader, read_tx(reader):
@@ -824,7 +838,7 @@ def _resume_retired_restore(
     archive: Path,
     target: Path,
     desk_target: Path | None,
-    retirement_revision: str,
+    retirement: StoreRetirement,
 ) -> CoreRestoreReceipt:
     """Finish publishing an interrupted restore without re-enabling the retired original."""
     manifest = inspect_checkpoint(archive, company_id)
@@ -841,7 +855,7 @@ def _resume_retired_restore(
     request_revision = _restore_request_revision(
         company_id, store_key, manifest, target
     )
-    if retirement_revision != request_revision:
+    if retirement.request_revision != request_revision:
         raise CheckpointRefused(
             "Original store is already retired by a different restore request"
         )
@@ -864,26 +878,43 @@ def _resume_retired_restore(
             has_pending_desk = True
 
     if not has_pending_db and not has_pending_desk:
+        _verify_staged_replacement(
+            target,
+            company_id,
+            request_revision,
+            manifest,
+            expected_sha256=retirement.replacement_sha256,
+        )
         if os.path.lexists(staged_db_sibling):
-            _verify_staged_replacement(target, company_id, request_revision, manifest)
             os.unlink(staged_db_sibling)
-            _fsync_dir(target.parent)
-            return CoreRestoreReceipt(
-                company_id=company_id,
-                request_revision=request_revision,
-                checkpoint_sha256=manifest.sha256,
-                watermark=manifest.watermark,
-            )
-        raise CheckpointRefused("Replacement destination already exists")
+        _fsync_dir(target.parent)
+        if staged_desk_sibling is not None and desk_target is not None:
+            _fsync_dir(desk_target.parent)
+        return CoreRestoreReceipt(
+            company_id=company_id,
+            request_revision=request_revision,
+            checkpoint_sha256=manifest.sha256,
+            watermark=manifest.watermark,
+        )
 
     if has_pending_db:
         _verify_staged_replacement(
-            staged_db_sibling, company_id, request_revision, manifest
+            staged_db_sibling,
+            company_id,
+            request_revision,
+            manifest,
+            expected_sha256=retirement.replacement_sha256,
         )
         _publish_file(staged_db_sibling, target)
         verify_no_wal_sidecars(target)
     else:
-        _verify_staged_replacement(target, company_id, request_revision, manifest)
+        _verify_staged_replacement(
+            target,
+            company_id,
+            request_revision,
+            manifest,
+            expected_sha256=retirement.replacement_sha256,
+        )
 
     if has_pending_desk and staged_desk_sibling is not None and desk_target is not None:
         os.rename(staged_desk_sibling, desk_target)
@@ -891,7 +922,7 @@ def _resume_retired_restore(
 
     if os.path.lexists(staged_db_sibling):
         os.unlink(staged_db_sibling)
-        _fsync_dir(target.parent)
+    _fsync_dir(target.parent)
 
     return CoreRestoreReceipt(
         company_id=company_id,
@@ -953,7 +984,7 @@ def restore_store(
             archive,
             target,
             desk_target,
-            existing_retirement.request_revision,
+            existing_retirement,
         )
 
     if os.path.lexists(target):
@@ -1028,13 +1059,25 @@ def restore_store(
 
         # Persist durable staged artifacts on destination filesystems BEFORE retiring
         # the original store so any post-retirement publication I/O error is resumable.
+        # Under the live writer lease, verify and discard any uncommitted deterministic
+        # stages left behind by a prior pre-retirement process crash before restaging.
         staged_db_sibling, staged_desk_sibling = _staged_restore_paths(
             target, desk_target, request_revision, bool(manifest.desk_files)
         )
         if os.path.lexists(staged_db_sibling):
-            raise CheckpointRefused("Staged replacement path already exists")
+            _verify_staged_replacement(
+                staged_db_sibling,
+                company_id,
+                request_revision,
+                manifest,
+                expected_sha256=None,
+            )
+            os.unlink(staged_db_sibling)
+            _fsync_dir(staged_db_sibling.parent)
         if staged_desk_sibling is not None and os.path.lexists(staged_desk_sibling):
-            raise CheckpointRefused("Staged Desk recovery path already exists")
+            _verify_staged_desk_snapshot(staged_desk_sibling, manifest)
+            shutil.rmtree(staged_desk_sibling)
+            _fsync_dir(staged_desk_sibling.parent)
 
         retired = False
         db_staged = False
@@ -1054,6 +1097,7 @@ def restore_store(
             _fsync_dir(staged_db_sibling.parent)
             os.unlink(shadow)
             _fsync_dir(shadow.parent)
+            replacement_sha256 = _hash_file(staged_db_sibling)
             if staged_desk_sibling is not None and desk_target is not None:
                 if os.path.lexists(desk_target):
                     raise CheckpointRefused("Desk restore destination already exists")
@@ -1092,14 +1136,30 @@ def restore_store(
                         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                         request_revision TEXT NOT NULL,
                         original_schema INTEGER NOT NULL,
+                        replacement_sha256 TEXT NOT NULL DEFAULT '',
                         retired_at_ns INTEGER NOT NULL
                     ) STRICT"""
                 )
+                retired_cols = {
+                    str(col[1])
+                    for col in original_writer.execute(
+                        'PRAGMA table_info("company_store_retired")'
+                    ).fetchall()
+                }
+                if "replacement_sha256" not in retired_cols:
+                    original_writer.execute(
+                        "ALTER TABLE company_store_retired ADD COLUMN replacement_sha256 TEXT NOT NULL DEFAULT ''"
+                    )
                 original_writer.execute(
                     """INSERT INTO company_store_retired (
-                           singleton, request_revision, original_schema, retired_at_ns
-                       ) VALUES (1, ?, ?, ?)""",
-                    (request_revision, manifest.schema_version, time_ns()),
+                           singleton, request_revision, original_schema, replacement_sha256, retired_at_ns
+                       ) VALUES (1, ?, ?, ?, ?)""",
+                    (
+                        request_revision,
+                        manifest.schema_version,
+                        replacement_sha256,
+                        time_ns(),
+                    ),
                 )
                 original_writer.execute(
                     "UPDATE company SET schema_revision = ? WHERE singleton = 1",

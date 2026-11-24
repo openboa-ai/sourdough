@@ -660,6 +660,226 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         )
         self.assertEqual(replacement.stat(follow_symlinks=False).st_nlink, 1)
 
+    def test_tampered_staged_database_refuses_resumed_restore(self):
+        from unittest.mock import patch
+
+        archive = self.root / "checkpoint-tamper-stage.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "recovered-tamper.sqlite"
+        real_link = os.link
+
+        def fail_final_publish(src, dst, *args, **kwargs):
+            if Path(dst) == replacement.resolve(strict=False):
+                raise OSError("simulated publish I/O error")
+            return real_link(src, dst, *args, **kwargs)
+
+        with patch(
+            "sourdough.storage.checkpoint.os.link", side_effect=fail_final_publish
+        ):
+            with self.assertRaisesRegex(OSError, "simulated publish I/O error"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    lease_directory=self.leases,
+                )
+
+        staged_dbs = list(self.root.glob(".sourdough-restore-*.sqlite"))
+        self.assertEqual(len(staged_dbs), 1)
+        # Tamper a domain row in the staged DB while leaving company_restore_receipt intact
+        with closing(
+            open_writer(staged_dbs[0], create=False, journal_mode="DELETE")
+        ) as conn:
+            with write_tx(conn):
+                conn.execute("UPDATE standing_grant SET scope = 'escalated'")
+
+        with self.assertRaisesRegex(CheckpointRefused, "digest does not match"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                lease_directory=self.leases,
+            )
+        self.assertFalse(replacement.exists())
+
+    def test_pre_retirement_crash_leftover_stages_recover_cleanly(self):
+        from unittest.mock import patch
+
+        desk = self.root / "desk-crash"
+        desk.mkdir()
+        (desk / "state.md").write_text("pre-retirement-desk\n", encoding="utf-8")
+        archive = self.root / "checkpoint-pre-crash.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            desk_root=desk,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "recovered-after-crash.sqlite"
+        desk_dest = self.root / "desk-after-crash"
+
+        # Simulate a process crash after durable DB + Desk staging (skipping finally
+        # cleanup) by capturing the staged artifacts and aborting before retirement.
+        preserved_db: bytes | None = None
+        staged_db_name: str | None = None
+        staged_desk_name: str | None = None
+        real_open_writer = open_writer
+
+        def crash_before_retirement(path, *args, **kwargs):
+            nonlocal preserved_db, staged_db_name, staged_desk_name
+            if Path(path).resolve(strict=False) == self.store.resolve(strict=False):
+                staged_dbs = list(self.root.glob(".sourdough-restore-*.sqlite"))
+                staged_desks = list(self.root.glob(".sourdough-desk-stage-*"))
+                self.assertEqual(len(staged_dbs), 1)
+                self.assertEqual(len(staged_desks), 1)
+                preserved_db = staged_dbs[0].read_bytes()
+                staged_db_name = staged_dbs[0].name
+                staged_desk_name = staged_desks[0].name
+                raise RuntimeError("simulated pre-retirement crash")
+            return real_open_writer(path, *args, **kwargs)
+
+        with patch(
+            "sourdough.storage.checkpoint.open_writer",
+            side_effect=crash_before_retirement,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated pre-retirement crash"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    desk_destination=desk_dest,
+                    lease_directory=self.leases,
+                )
+
+        # Recreate the orphaned deterministic stages that a SIGKILL would leave behind
+        # (including an orphaned shadow hard link giving st_nlink == 2).
+        assert preserved_db is not None and staged_db_name is not None
+        assert staged_desk_name is not None
+        orphaned_shadow = self.root / "orphaned-shadow.sqlite"
+        orphaned_shadow.write_bytes(preserved_db)
+        os.link(orphaned_shadow, self.root / staged_db_name)
+        leftover_desk = self.root / staged_desk_name
+        leftover_desk.mkdir()
+        (leftover_desk / "state.md").write_text(
+            "pre-retirement-desk\n", encoding="utf-8"
+        )
+
+        # Retry under the live writer lease verifies, discards uncommitted stages,
+        # and completes cleanly with a fresh single-link replacement.
+        receipt = restore_store(
+            self.store,
+            self.company_id,
+            archive,
+            replacement,
+            desk_destination=desk_dest,
+            lease_directory=self.leases,
+        )
+        self.assertEqual(receipt.company_id, self.company_id)
+        self.assertEqual(replacement.stat(follow_symlinks=False).st_nlink, 1)
+        self.assertEqual(
+            (desk_dest / "state.md").read_text(encoding="utf-8"),
+            "pre-retirement-desk\n",
+        )
+        self.assertEqual(list(self.root.glob(".sourdough-restore-*")), [])
+        self.assertEqual(list(self.root.glob(".sourdough-desk-stage-*")), [])
+
+    def test_interrupted_final_fsync_after_staging_unlink_recovers_receipt(self):
+        from unittest.mock import patch
+
+        from sourdough.storage import checkpoint as cp_mod
+
+        desk = self.root / "desk-fsync"
+        desk.mkdir()
+        (desk / "state.md").write_text("fsync-desk\n", encoding="utf-8")
+        archive = self.root / "checkpoint-fsync.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            desk_root=desk,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "recovered-fsync.sqlite"
+        desk_dest = self.root / "desk-fsync-out"
+
+        real_fsync_dir = cp_mod._fsync_dir
+
+        def fail_after_staging_unlink(directory: Path) -> None:
+            # Trigger failure strictly on the final directory fsync after target and
+            # desk_dest exist and the DB staging link has already been unlinked.
+            if (
+                directory == replacement.parent.resolve(strict=False)
+                and replacement.exists()
+                and desk_dest.exists()
+                and not list(self.root.glob(".sourdough-restore-*.sqlite"))
+            ):
+                raise OSError("simulated final fsync error")
+            real_fsync_dir(directory)
+
+        with patch(
+            "sourdough.storage.checkpoint._fsync_dir",
+            side_effect=fail_after_staging_unlink,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated final fsync error"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    desk_destination=desk_dest,
+                    lease_directory=self.leases,
+                )
+
+        # Both destinations are published and no staging link remains.
+        self.assertTrue(replacement.exists())
+        self.assertTrue(desk_dest.exists())
+        self.assertEqual(list(self.root.glob(".sourdough-restore-*.sqlite")), [])
+
+        # Matching retry verifies the authenticated replacement and recovers the receipt.
+        receipt = restore_store(
+            self.store,
+            self.company_id,
+            archive,
+            replacement,
+            desk_destination=desk_dest,
+            lease_directory=self.leases,
+        )
+        self.assertEqual(receipt.company_id, self.company_id)
+
+        # Once the replacement diverges (or is an unrelated file), retry must refuse.
+        with closing(
+            open_writer(replacement, create=False, journal_mode="DELETE")
+        ) as conn:
+            with write_tx(conn):
+                append_audit_event(
+                    conn,
+                    company_id=self.company_id,
+                    domain="ops",
+                    entity_type="restore",
+                    entity_id="post-use",
+                    event_type="restore.post_use_mutation",
+                    actor_id="operator",
+                    payload={"used": True},
+                )
+        with self.assertRaisesRegex(CheckpointRefused, "digest does not match"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                desk_destination=desk_dest,
+                lease_directory=self.leases,
+            )
+
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)

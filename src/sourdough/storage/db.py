@@ -27,6 +27,7 @@ class StorageRefused(Exception):
 class StoreRetirement:
     request_revision: str
     original_schema: int
+    replacement_sha256: str = ""
 
 
 class ManagedConnection(sqlite3.Connection):
@@ -56,6 +57,20 @@ def _has_table(connection: sqlite3.Connection, table: str) -> bool:
 def read_retirement(connection: sqlite3.Connection) -> StoreRetirement | None:
     if not _has_table(connection, "company_store_retired"):
         return None
+    columns = {
+        str(col[1])
+        for col in connection.execute(
+            'PRAGMA table_info("company_store_retired")'
+        ).fetchall()
+    }
+    if "replacement_sha256" in columns:
+        row = connection.execute(
+            """SELECT request_revision, original_schema, replacement_sha256
+               FROM company_store_retired WHERE singleton = 1"""
+        ).fetchone()
+        if row is None:
+            return None
+        return StoreRetirement(str(row[0]), int(row[1]), str(row[2]))
     row = connection.execute(
         "SELECT request_revision, original_schema FROM company_store_retired WHERE singleton = 1"
     ).fetchone()
