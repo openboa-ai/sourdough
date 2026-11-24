@@ -6,13 +6,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from .storage.db import (
+    MAX_SCHEMA_VERSION,
+    StorageRefused,
+    open_reader,
+    open_writer,
+    read_tx,
+    write_tx,
+)
+from .storage.kernel import append_audit_event
+from .storage.migrations import apply_fresh_migrations, migrate_store
+
 
 LEGACY_SCHEMA_REVISION = 1
 CONTINUATION_SCHEMA_REVISION = 2
 RUN_SCHEMA_REVISION = 3
 PURPOSE_SCHEMA_REVISION = 4
 RUN_READ_SCHEMA_REVISION = 5
-SCHEMA_REVISION = 6
+AGENT_SCHEMA_REVISION = 6
+PAPER_CONTROL_SCHEMA_REVISION = 7
+STORAGE_KERNEL_SCHEMA_REVISION = 8
+WORK_KERNEL_SCHEMA_REVISION = 9
+SCHEMA_REVISION = MAX_SCHEMA_VERSION
+
+_SUPPORTED_REVISIONS = tuple(range(LEGACY_SCHEMA_REVISION, SCHEMA_REVISION + 1))
+
 AGENT_SCHEMA = """CREATE TABLE agent (
     id TEXT PRIMARY KEY NOT NULL, company_id TEXT NOT NULL REFERENCES company(id),
     execution_profile TEXT NOT NULL
@@ -50,29 +68,6 @@ RESULT_READ_SCHEMA = """CREATE TABLE IF NOT EXISTS work_result_read (
     result_revision TEXT NOT NULL,
     read_at INTEGER NOT NULL
 )"""
-SCHEMA = (
-    """CREATE TABLE company (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        id TEXT NOT NULL UNIQUE, schema_revision INTEGER NOT NULL,
-        charter_revision TEXT NOT NULL
-    )""",
-    AGENT_SCHEMA,
-    """CREATE TABLE standing_grant (
-        id TEXT PRIMARY KEY NOT NULL, agent_id TEXT NOT NULL UNIQUE REFERENCES agent(id),
-        scope TEXT NOT NULL
-    )""",
-    DUTY_SCHEMA,
-    """CREATE TABLE founding_receipt (
-        setup_identity TEXT PRIMARY KEY NOT NULL,
-        company_id TEXT NOT NULL UNIQUE REFERENCES company(id),
-        founder_id TEXT NOT NULL UNIQUE REFERENCES agent(id),
-        grant_id TEXT NOT NULL UNIQUE REFERENCES standing_grant(id),
-        due_work_id TEXT NOT NULL UNIQUE REFERENCES duty(id)
-    )""",
-    FOLLOW_UP_SCHEMA,
-    DUTY_RUN_SCHEMA,
-    CURRENT_RUN_INDEX,
-)
 
 
 class FoundingRefused(Exception):
@@ -114,27 +109,22 @@ class OpenCompany:
 
 
 def _connect(store: Path, mode: str) -> sqlite3.Connection:
-    connection = sqlite3.connect(
-        f"{store.absolute().as_uri()}?mode={mode}", uri=True, timeout=3
-    )
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    if mode == "ro":
+        return open_reader(store)
+    if mode == "rw":
+        return open_writer(store, create=False)
+    if mode == "rwc":
+        return open_writer(store, create=True)
+    raise FoundingRefused(f"Unsupported SQLite open mode: {mode}")
 
 
 def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
     row = connection.execute(
         "SELECT id, schema_revision FROM company WHERE singleton = 1"
     ).fetchone()
-    if row is None or row[1] not in (
-        LEGACY_SCHEMA_REVISION,
-        CONTINUATION_SCHEMA_REVISION,
-        RUN_SCHEMA_REVISION,
-        PURPOSE_SCHEMA_REVISION,
-        RUN_READ_SCHEMA_REVISION,
-        SCHEMA_REVISION,
-    ):
+    if row is None or row[1] not in _SUPPORTED_REVISIONS:
         raise FoundingRefused("Unsupported company store schema")
-    return row
+    return str(row[0]), int(row[1])
 
 
 def _identity(connection: sqlite3.Connection) -> str:
@@ -200,35 +190,6 @@ def _consolidate_runs(connection: sqlite3.Connection, revision: int) -> None:
     connection.execute(CURRENT_RUN_INDEX)
 
 
-def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
-    with closing(_connect(store, "rw")) as connection:
-        connection.execute("PRAGMA foreign_keys = OFF")
-        with connection:
-            connection.execute("BEGIN IMMEDIATE")
-            company_id, revision = _company_version(connection)
-            if company_id != expected_company_id:
-                raise FoundingRefused("Company identity mismatch")
-            if revision == SCHEMA_REVISION:
-                return
-            if revision == RUN_SCHEMA_REVISION:
-                connection.execute(
-                    "ALTER TABLE work_follow_up ADD COLUMN purpose TEXT NOT NULL DEFAULT 'position_review'"
-                )
-            elif revision < PURPOSE_SCHEMA_REVISION:
-                if revision == LEGACY_SCHEMA_REVISION:
-                    _upgrade_duties(connection)
-                _consolidate_runs(connection, revision)
-            if revision < RUN_READ_SCHEMA_REVISION:
-                _upgrade_result_reads(connection)
-            _upgrade_agent_registry(connection)
-            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-                raise FoundingRefused("Company store failed foreign-key validation")
-            connection.execute(
-                "UPDATE company SET schema_revision = ? WHERE singleton = 1",
-                (SCHEMA_REVISION,),
-            )
-
-
 def _upgrade_agent_registry(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE founder RENAME TO agent")
     connection.execute(
@@ -261,16 +222,44 @@ def _upgrade_result_reads(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE work_result_read_next RENAME TO work_result_read")
 
 
+def _legacy_upgrade_step(connection: sqlite3.Connection, revision: int) -> None:
+    if revision < AGENT_SCHEMA_REVISION:
+        if revision == RUN_SCHEMA_REVISION:
+            connection.execute(
+                "ALTER TABLE work_follow_up ADD COLUMN purpose TEXT NOT NULL DEFAULT 'position_review'"
+            )
+        elif revision < PURPOSE_SCHEMA_REVISION:
+            if revision == LEGACY_SCHEMA_REVISION:
+                _upgrade_duties(connection)
+            _consolidate_runs(connection, revision)
+        if revision < RUN_READ_SCHEMA_REVISION:
+            _upgrade_result_reads(connection)
+        _upgrade_agent_registry(connection)
+
+
+def upgrade_work_schema(store: Path, expected_company_id: str) -> None:
+    try:
+        migrate_store(
+            store,
+            expected_company_id,
+            legacy_upgrade_hook=_legacy_upgrade_step,
+        )
+    except StorageRefused as error:
+        raise FoundingRefused(str(error)) from error
+
+
 def found(store: Path, terms: FoundingTerms) -> FoundingReceipt:
     """Explicit setup may initialize a store. SQLite serializes setup and replay."""
-    with closing(_connect(store, "rwc")) as connection, connection:
-        connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection = _connect(store, "rwc")
+    except StorageRefused as error:
+        raise FoundingRefused(str(error)) from error
+    with closing(connection), write_tx(connection):
         if connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone():
             _identity(connection)
             return _replay(connection, terms)
 
-        for statement in SCHEMA:
-            connection.execute(statement)
+        apply_fresh_migrations(connection)
         receipt = FoundingReceipt(*(uuid4().hex for _ in range(4)))
         connection.execute(
             "INSERT INTO company VALUES (1, ?, ?, ?)",
@@ -298,12 +287,27 @@ def found(store: Path, terms: FoundingTerms) -> FoundingReceipt:
                 receipt.due_work_id,
             ),
         )
+        append_audit_event(
+            connection,
+            company_id=receipt.company_id,
+            domain="org",
+            entity_type="company",
+            entity_id=receipt.company_id,
+            event_type="company.founded",
+            actor_id=terms.setup_identity,
+            payload={
+                "charter_revision": terms.charter_revision,
+                "founder_id": receipt.founder_id,
+                "grant_id": receipt.grant_id,
+                "due_work_id": receipt.due_work_id,
+            },
+        )
     return receipt
 
 
 def _replay(connection: sqlite3.Connection, terms: FoundingTerms) -> FoundingReceipt:
     _, revision = _company_version(connection)
-    registry = "agent" if revision >= SCHEMA_REVISION else "founder"
+    registry = "agent" if revision >= AGENT_SCHEMA_REVISION else "founder"
     row = connection.execute(
         f"""SELECT c.charter_revision, g.scope, f.execution_profile,
                   r.company_id, r.founder_id, r.grant_id, r.due_work_id
@@ -327,7 +331,7 @@ def founding_execution_profile(
     connection: sqlite3.Connection, company_id: str
 ) -> str | None:
     _, revision = _company_version(connection)
-    registry = "agent" if revision >= SCHEMA_REVISION else "founder"
+    registry = "agent" if revision >= AGENT_SCHEMA_REVISION else "founder"
     row = connection.execute(
         f"""SELECT a.execution_profile FROM founding_receipt r
             JOIN {registry} a ON a.id = r.founder_id AND a.company_id = r.company_id
@@ -341,10 +345,9 @@ def reopen(store: Path, expected_company_id: str) -> OpenCompany:
     """Check compatibility and inventory due work in one read-only snapshot."""
     try:
         connection = _connect(store, "ro")
-    except sqlite3.OperationalError as error:
-        raise FoundingRefused("Expected company store could not be opened") from error
-    with closing(connection), connection:
-        connection.execute("BEGIN")
+    except (sqlite3.OperationalError, StorageRefused) as error:
+        raise FoundingRefused(str(error)) from error
+    with closing(connection), read_tx(connection):
         if _identity(connection) != expected_company_id:
             raise FoundingRefused("Company identity mismatch")
         rows = connection.execute(

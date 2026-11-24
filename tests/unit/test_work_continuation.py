@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.company import (
+    SCHEMA_REVISION,
     FoundingRefused,
     FoundingTerms,
     found,
@@ -50,6 +51,9 @@ class WorkContinuation(unittest.TestCase):
                         f"ALTER TABLE {table} RENAME COLUMN agent_id TO founder_id"
                     )
                 connection.execute("DROP TABLE duty_run")
+                connection.execute("DROP TABLE IF EXISTS work_result_read")
+                connection.execute("DROP TABLE IF EXISTS schema_migrations")
+                connection.execute("PRAGMA user_version = 0")
                 if legacy == 1:
                     connection.execute("DROP TABLE work_follow_up")
                     connection.execute(
@@ -157,7 +161,9 @@ class WorkContinuation(unittest.TestCase):
         before = [self.rows(query) for query in queries]
         upgrade_work_schema(self.store, self.company_id)
         upgrade_work_schema(self.store, self.company_id)
-        self.assertEqual(self.rows("SELECT schema_revision FROM company"), [(6,)])
+        self.assertEqual(
+            self.rows("SELECT schema_revision FROM company"), [(SCHEMA_REVISION,)]
+        )
         self.assertEqual(
             self.rows("SELECT duty_id, run_id FROM duty_run"),
             [(original.duty_id, original.run_id)],

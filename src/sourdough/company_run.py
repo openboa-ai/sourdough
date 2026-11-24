@@ -54,7 +54,9 @@ from .paper_order import reserved_exposure
 from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
 from .paper_review import bind_review_quote, observe_review_quote
-from .writer_lease import WriterLease, hold_company_writer
+from .runtime.engine import CompanyRuntime, build_default_registry
+from .runtime.registry import DutyOutcome
+from .writer_lease import WriterLease
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -113,11 +115,18 @@ def run_paper_company(
 ) -> CompanyRun:
     if not 1 <= turn_budget <= 8 or not 0 <= idle_seconds <= 900:
         raise TradeRefused("Invalid company turn or idle budget")
-    venue.require_independent_from(store)
-    with hold_company_writer(
-        store, company_id, expected_store_key=expected_store_key
-    ) as writer:
-        return _operate(
+    registry = build_default_registry(
+        {"paper.company_operation": lambda _ctx: DutyOutcome("completed")}
+    )
+    company_runtime = CompanyRuntime(
+        store,
+        company_id,
+        registry,
+        expected_store_key=expected_store_key,
+    )
+    return company_runtime.run_bound_handler(
+        "paper.company_operation",
+        lambda writer: _operate(
             writer,
             venue,
             runtime,
@@ -126,7 +135,9 @@ def run_paper_company(
             idle_seconds,
             budget_from,
             on_ready,
-        )
+        ),
+        venue=venue,
+    )
 
 
 def _operate(

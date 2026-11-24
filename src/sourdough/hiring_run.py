@@ -16,9 +16,11 @@ from .onboarding import (
     pending_onboarding,
     provision_hire,
 )
+from .runtime.engine import CompanyRuntime, build_default_registry
+from .runtime.registry import DutyOutcome
 from .staffing import StaffingOutcome, claim_staffing, read_staffing_outcome
 from .staffing_tools import StaffingTools
-from .writer_lease import WriterLease, hold_company_writer
+from .writer_lease import WriterLease
 
 
 @dataclass(frozen=True)
@@ -33,7 +35,7 @@ class HiringRun:
 def run_hiring(
     store: Path, company_id: str, runtime: EmployeeProcess, *, first_purpose: str
 ) -> HiringRun:
-    with hold_company_writer(store, company_id) as writer:
+    def _execute(writer: WriterLease) -> HiringRun:
         prepared = prepare_hiring(writer, runtime, first_purpose=first_purpose)
         hire_claim = prepared.hire_claim
         if hire_claim is None:
@@ -46,6 +48,13 @@ def run_hiring(
             if not first_duty_accepted(writer, hire_claim):
                 raise
         return replace(prepared, accepted=first_duty_accepted(writer, hire_claim))
+
+    registry = build_default_registry(
+        {"org.hiring": lambda _ctx: DutyOutcome("completed")}
+    )
+    return CompanyRuntime(store, company_id, registry).run_bound_handler(
+        "org.hiring", _execute
+    )
 
 
 def prepare_hiring(
