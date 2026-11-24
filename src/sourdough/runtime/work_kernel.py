@@ -757,7 +757,19 @@ def wake_waiting_runs(
                         recorded_at_ns=now_ns,
                     )
             elif has_actor:
-                event_matched = True
+                if isinstance(wait_event_key, str) and wait_event_key.startswith(
+                    "peer_response:"
+                ):
+                    linked_req_id = wait_event_key.removeprefix("peer_response:")
+                    peer_row = connection.execute(
+                        """SELECT state FROM work_peer_requests
+                           WHERE company_id = ? AND request_id = ?""",
+                        (company_id, linked_req_id),
+                    ).fetchone()
+                    if peer_row is not None and str(peer_row[0]) != "open":
+                        event_matched = True
+                else:
+                    event_matched = True
         if not timer_due and not event_matched:
             continue
         reason = "event" if event_matched else "timer"

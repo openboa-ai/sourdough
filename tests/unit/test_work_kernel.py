@@ -373,6 +373,19 @@ class WorkKernel(unittest.TestCase):
             self.assertTrue(replayed2)
             self.assertEqual(req, req_replay)
 
+            # Premature peer_response event while request is still open MUST NOT wake requester
+            with write_tx(conn):
+                self.assertEqual(
+                    wake_waiting_runs(
+                        conn,
+                        self.company_id,
+                        now_ns=2_150,
+                        event_key="peer_response:req-1",
+                        triggering_actor_id=self.peer_id,
+                    ),
+                    (),
+                )
+
             # Claim recipient's response duty, fence a stale run, and verify only the
             # active fenced recipient run can answer or decline
             with write_tx(conn):
