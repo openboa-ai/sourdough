@@ -771,6 +771,7 @@ def _copy_and_verify_replacement(
     manifest: CheckpointManifest,
     *,
     expected_sha256: str | None,
+    pinned_src_fd: int | None = None,
 ) -> tuple[int, tuple[int, int]]:
     """Stream candidate from a pinned O_NOFOLLOW fd into a private file and return its open pinned fd."""
     if expected_sha256 is not None and (
@@ -785,12 +786,16 @@ def _copy_and_verify_replacement(
         verify_no_wal_sidecars(candidate)
     except StorageRefused as error:
         raise CheckpointRefused(str(error)) from error
-    try:
-        src_fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError as error:
-        raise CheckpointRefused(
-            "Staged replacement database is missing or unsafe"
-        ) from error
+    if pinned_src_fd is not None:
+        src_fd = os.dup(pinned_src_fd)
+        os.lseek(src_fd, 0, os.SEEK_SET)
+    else:
+        try:
+            src_fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as error:
+            raise CheckpointRefused(
+                "Staged replacement database is missing or unsafe"
+            ) from error
     out_fd: int | None = None
     try:
         with os.fdopen(src_fd, "rb") as pinned:
@@ -870,6 +875,7 @@ def _verify_staged_replacement(
     manifest: CheckpointManifest,
     *,
     expected_sha256: str | None,
+    pinned_src_fd: int | None = None,
 ) -> None:
     """Verify a staged or published replacement DB via a private pinned copy."""
     with TemporaryDirectory(prefix="sd-db-verify-") as check_dir:
@@ -884,6 +890,7 @@ def _verify_staged_replacement(
                 request_revision,
                 manifest,
                 expected_sha256=expected_sha256,
+                pinned_src_fd=pinned_src_fd,
             )
             os.close(pinned_fd)
         finally:
@@ -902,14 +909,7 @@ def _finalize_published_replacement(
     *,
     expected_sha256: str,
 ) -> None:
-    """Verify an already-published replacement, recover orphaned pub links/mode, and assert st_nlink == 1."""
-    _verify_staged_replacement(
-        target,
-        company_id,
-        request_revision,
-        manifest,
-        expected_sha256=expected_sha256,
-    )
+    """Pin target first, authenticate that pinned inode, recover pub links/mode, and confirm identity."""
     parent_fd = _open_private_parent_dir(target.parent)
     try:
         try:
@@ -929,6 +929,27 @@ def _finalize_published_replacement(
                     "Published replacement database must be a regular file"
                 )
             target_key = (pub_st.st_dev, pub_st.st_ino)
+            _verify_staged_replacement(
+                target,
+                company_id,
+                request_revision,
+                manifest,
+                expected_sha256=expected_sha256,
+                pinned_src_fd=pub_fd,
+            )
+            try:
+                pre_st = os.lstat(target.name, dir_fd=parent_fd)
+            except OSError as error:
+                raise CheckpointRefused(
+                    "Published replacement disappeared during recovery"
+                ) from error
+            if (
+                not stat.S_ISREG(pre_st.st_mode)
+                or (pre_st.st_dev, pre_st.st_ino) != target_key
+            ):
+                raise CheckpointRefused(
+                    "Published replacement inode changed during recovery"
+                )
             pub_dir = _pub_dir_path(target, request_revision)
             try:
                 pub_dir_fd = os.open(
@@ -968,12 +989,43 @@ def _finalize_published_replacement(
                 os.rmdir(pub_dir.name, dir_fd=parent_fd)
                 os.fsync(parent_fd)
 
-            os.fchmod(pub_fd, 0o600)
-            os.fsync(pub_fd)
-            if os.fstat(pub_fd).st_nlink != 1:
+            try:
+                os.fchmod(pub_fd, 0o600)
+                os.fsync(pub_fd)
+            except OSError as error:
+                raise CheckpointRefused(
+                    "Published replacement inode changed during recovery"
+                ) from error
+            final_st = os.fstat(pub_fd)
+            if final_st.st_nlink != 1:
                 raise CheckpointRefused(
                     "Published replacement has unexpected hard-link aliases"
                 )
+            # Confirm destination still names the exact authenticated inode and bytes.
+            try:
+                cur_st = os.lstat(target.name, dir_fd=parent_fd)
+            except OSError as error:
+                raise CheckpointRefused(
+                    "Published replacement disappeared during recovery"
+                ) from error
+            if (
+                not stat.S_ISREG(cur_st.st_mode)
+                or (cur_st.st_dev, cur_st.st_ino) != target_key
+            ):
+                raise CheckpointRefused(
+                    "Published replacement inode changed during recovery"
+                )
+            dup_fd = os.dup(pub_fd)
+            os.lseek(dup_fd, 0, os.SEEK_SET)
+            with os.fdopen(dup_fd, "rb") as verified:
+                if file_digest(verified, "sha256").hexdigest() != expected_sha256:
+                    raise CheckpointRefused(
+                        "Published replacement digest changed during recovery"
+                    )
+            try:
+                verify_no_wal_sidecars(target)
+            except StorageRefused as error:
+                raise CheckpointRefused(str(error)) from error
         finally:
             os.close(pub_fd)
         os.fsync(parent_fd)

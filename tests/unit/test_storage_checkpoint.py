@@ -1141,6 +1141,71 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                         payload={"ok": True},
                     )
 
+    def test_swapping_published_target_during_recovery_is_refused(self):
+        from unittest.mock import patch
+
+        from sourdough.storage import checkpoint as cp_mod
+
+        archive = self.root / "checkpoint-swap-recovery.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "recovered-swap-target.sqlite"
+
+        # Simulate crash immediately after final os.link (leaving replacement + pub_dir)
+        real_fchmod = os.fchmod
+
+        def crash_after_link(fd, mode):
+            if mode == 0o600 and replacement.exists():
+                raise RuntimeError("simulated post-link crash")
+            return real_fchmod(fd, mode)
+
+        with patch(
+            "sourdough.storage.checkpoint.os.fchmod", side_effect=crash_after_link
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated post-link crash"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    lease_directory=self.leases,
+                )
+
+        # Prepare a tampered DB with escalated standing_grant.scope
+        tampered = self.root / "tampered-recovery.sqlite"
+        tampered.write_bytes(replacement.read_bytes())
+        with closing(
+            open_writer(tampered, create=False, journal_mode="DELETE")
+        ) as conn:
+            with write_tx(conn):
+                conn.execute("UPDATE standing_grant SET scope = 'escalated'")
+
+        # Simulate replacing `replacement` immediately after _verify_staged_replacement returns
+        real_verify = cp_mod._verify_staged_replacement
+
+        def swap_target_after_verify(*args, **kwargs):
+            real_verify(*args, **kwargs)
+            os.replace(tampered, replacement)
+
+        with patch(
+            "sourdough.storage.checkpoint._verify_staged_replacement",
+            side_effect=swap_target_after_verify,
+        ):
+            with self.assertRaisesRegex(
+                CheckpointRefused, "inode changed during recovery"
+            ):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    lease_directory=self.leases,
+                )
+
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)
