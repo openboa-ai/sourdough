@@ -75,6 +75,20 @@ def has_turn_capacity(connection: sqlite3.Connection, agent_id: str) -> bool:
     return row != (0,)
 
 
+def has_active_work_run(connection: sqlite3.Connection, agent_id: str) -> bool:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name = 'work_runs' AND type = 'table'"
+    ).fetchone():
+        return False
+    return (
+        connection.execute(
+            "SELECT 1 FROM work_runs WHERE agent_id = ? AND status = 'running' LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        is not None
+    )
+
+
 def start_run(
     connection: sqlite3.Connection,
     company_id: str,
@@ -86,6 +100,8 @@ def start_run(
     purpose: str,
     grant_scope: str,
 ) -> DutyClaim:
+    if has_active_work_run(connection, founder_id):
+        raise DutyRefused("Agent already has an active running execution")
     if not has_turn_capacity(connection, founder_id):
         raise DutyRefused("Agent has no remaining turn allocation")
     claim = DutyClaim(

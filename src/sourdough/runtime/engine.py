@@ -24,6 +24,7 @@ from .venue_coordinator import BoundedVenueCoordinator, VenueSegmentPolicy
 from .work_kernel import (
     RunFenced,
     WorkItem,
+    cancel_closed_peer_response_item,
     claim_work_run,
     complete_work_run,
     evaluate_conditions,
@@ -253,12 +254,22 @@ class CompanyRuntime:
                      AND owner_agent_id NOT IN (
                          SELECT agent_id FROM work_runs WHERE status = 'running'
                      )
+                     AND owner_agent_id NOT IN (
+                         SELECT agent_id FROM duty WHERE state = 'running'
+                     )
                    ORDER BY created_at_ns, work_item_id""",
                 (self._company_id,),
             ).fetchall()
             for row in rows:
                 item = WorkItem(*row)
                 if item.work_item_id in blocked:
+                    continue
+                if (
+                    item.duty_kind == "work.peer_response"
+                    and cancel_closed_peer_response_item(
+                        conn, self._company_id, item.work_item_id, now_ns=now_ns
+                    )
+                ):
                     continue
                 descriptor = self._registry.get(item.duty_kind)
                 if not has_active_grant(

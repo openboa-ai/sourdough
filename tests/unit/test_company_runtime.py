@@ -403,3 +403,105 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                         lease_ttl_ns=10_000,
                         now_ns=2_500,
                     )
+
+    def test_cross_path_active_agent_exclusion_and_expired_peer_response_skip(self):
+        from sourdough.first_duty import DutyRefused, claim_first_duty
+        from sourdough.runtime.work_kernel import WorkKernelRefused
+
+        # Upgrade founding grant to paper scope so claim_first_duty is otherwise eligible
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "UPDATE standing_grant SET scope = 'paper' WHERE agent_id = ?",
+                (self.founder_id,),
+            )
+            kernel_item, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.active",
+                source_kind="manual",
+                source_id="a1",
+                now_ns=1_000,
+            )
+            active_run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=kernel_item.work_item_id,
+                lease_owner="kernel-worker",
+                lease_ttl_ns=60_000,
+                now_ns=1_100,
+            )
+
+        # Legacy claim_first_duty MUST refuse while kernel run is active for the same Agent
+        with self.assertRaisesRegex(DutyRefused, "active running execution"):
+            claim_first_duty(self.store, self.company_id, "profile-v1")
+
+        # Yield kernel run to peer wait, then claim legacy duty -> kernel must now exclude founder
+        peer_id = "peer-expired"
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "INSERT INTO agent VALUES (?, ?, ?)",
+                (peer_id, self.company_id, "profile-peer"),
+            )
+            conn.execute(
+                "INSERT INTO standing_grant VALUES ('grant-peer-exp', ?, 'manage')",
+                (peer_id,),
+            )
+            open_peer_request(
+                conn,
+                company_id=self.company_id,
+                requester_work_item_id=kernel_item.work_item_id,
+                requester_run_id=active_run.run_id,
+                fencing_token=active_run.fencing_token,
+                recipient_agent_id=peer_id,
+                question="Too late?",
+                expected_decision="yes_no",
+                evidence_refs=[],
+                deadline_ns=5_000,
+                request_id="req-expired-step",
+                now_ns=1_200,
+            )
+        claim_first_duty(self.store, self.company_id, "profile-v1")
+
+        peer_ran = False
+        founder_ran = False
+
+        def peer_handler(_ctx: DutyContext) -> DutyOutcome:
+            nonlocal peer_ran
+            peer_ran = True
+            return DutyOutcome("completed")
+
+        def founder_handler(_ctx: DutyContext) -> DutyOutcome:
+            nonlocal founder_ran
+            founder_ran = True
+            return DutyOutcome("completed")
+
+        runtime = CompanyRuntime(
+            self.store,
+            self.company_id,
+            build_default_registry(
+                {
+                    "work.active": founder_handler,
+                    "work.peer_response": peer_handler,
+                }
+            ),
+            lease_directory=self.leases,
+        )
+        # Step past peer deadline:
+        # 1) Peer request expires & cancels response item -> peer_handler MUST NOT run
+        # 2) Founder still has active legacy duty -> founder_handler MUST NOT run either
+        s_exp = runtime.step(max_dispatches=4, now_ns=10_000)
+        self.assertFalse(peer_ran)
+        self.assertFalse(founder_ran)
+        self.assertEqual(s_exp.executed_runs, ())
+        with closing(open_writer(self.store)) as conn:
+            with self.assertRaisesRegex(WorkKernelRefused, "active running execution"):
+                with write_tx(conn):
+                    claim_work_run(
+                        conn,
+                        company_id=self.company_id,
+                        work_item_id=kernel_item.work_item_id,
+                        lease_owner="direct-worker",
+                        lease_ttl_ns=10_000,
+                        now_ns=10_100,
+                    )

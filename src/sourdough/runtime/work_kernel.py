@@ -275,6 +275,31 @@ def create_work_item(
     )
 
 
+def cancel_closed_peer_response_item(
+    connection: sqlite3.Connection,
+    company_id: str,
+    work_item_id: str,
+    *,
+    now_ns: int,
+) -> bool:
+    """Cancel a pending peer_response work item if its linked peer request is closed."""
+    req_state = connection.execute(
+        """SELECT state FROM work_peer_requests
+           WHERE company_id = ? AND response_work_item_id = ?""",
+        (company_id, work_item_id),
+    ).fetchone()
+    if req_state is None or str(req_state[0]) == "open":
+        return False
+    connection.execute(
+        """UPDATE work_items
+           SET state = 'cancelled', updated_at_ns = ?
+           WHERE company_id = ? AND work_item_id = ?
+             AND state IN ('due', 'scheduled')""",
+        (now_ns, company_id, work_item_id),
+    )
+    return True
+
+
 def claim_work_run(
     connection: sqlite3.Connection,
     *,
@@ -306,6 +331,22 @@ def claim_work_run(
     _, _, agent_id, duty_kind, state = item_row
     if state != "due":
         raise WorkKernelRefused(f"Work item is not claimable in state {state}")
+    if (
+        connection.execute(
+            "SELECT 1 FROM duty WHERE agent_id = ? AND state = 'running' LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        is not None
+    ):
+        raise WorkKernelRefused("Agent already has an active running execution")
+    if duty_kind == "work.peer_response":
+        req_state = connection.execute(
+            """SELECT state FROM work_peer_requests
+               WHERE company_id = ? AND response_work_item_id = ?""",
+            (company_id, work_item_id),
+        ).fetchone()
+        if req_state is not None and str(req_state[0]) != "open":
+            raise WorkKernelRefused("Linked peer request is no longer open")
     if not has_active_grant(
         connection, company_id, agent_id, required_scope=required_scope
     ):
@@ -540,14 +581,27 @@ def wake_waiting_runs(
             and wait_event_key.startswith("peer_response:")
         ):
             expired_req_id = wait_event_key.removeprefix("peer_response:")
-            connection.execute(
-                """UPDATE work_peer_requests
-                   SET state = 'expired',
-                       response_json = COALESCE(response_json, '{"reason":"deadline_elapsed"}'),
-                       resolved_at_ns = ?
+            open_peer = connection.execute(
+                """SELECT response_work_item_id FROM work_peer_requests
                    WHERE company_id = ? AND request_id = ? AND state = 'open'""",
-                (now_ns, company_id, expired_req_id),
-            )
+                (company_id, expired_req_id),
+            ).fetchone()
+            if open_peer is not None:
+                connection.execute(
+                    """UPDATE work_peer_requests
+                       SET state = 'expired',
+                           response_json = COALESCE(response_json, '{"reason":"deadline_elapsed"}'),
+                           resolved_at_ns = ?
+                       WHERE company_id = ? AND request_id = ? AND state = 'open'""",
+                    (now_ns, company_id, expired_req_id),
+                )
+                connection.execute(
+                    """UPDATE work_items
+                       SET state = 'cancelled', updated_at_ns = ?
+                       WHERE company_id = ? AND work_item_id = ?
+                         AND state IN ('due', 'scheduled')""",
+                    (now_ns, company_id, str(open_peer[0])),
+                )
         audit_actor = (
             triggering_actor_id
             if reason == "event" and triggering_actor_id
@@ -1072,9 +1126,46 @@ def evaluate_conditions(
         ):
             eligible = True
         elif trigger_kind == "shared_asset_revision" and source_identity in assets:
-            if triggering_actor_id == owner_agent_id:
-                continue  # anti-self-wake
             observed_rev = assets[source_identity]
+            rev_entity = f"{source_identity}@{observed_rev}"
+            if triggering_actor_id == owner_agent_id:
+                recorded = connection.execute(
+                    """SELECT 1 FROM audit_event
+                       WHERE company_id = ? AND domain = 'work'
+                         AND entity_type = 'shared_asset_revision'
+                         AND entity_id = ? AND actor_id = ?
+                         AND event_type = 'work.self_authored_revision_suppressed'
+                       LIMIT 1""",
+                    (company_id, rev_entity, owner_agent_id),
+                ).fetchone()
+                if recorded is None:
+                    append_audit_event(
+                        connection,
+                        company_id=company_id,
+                        domain="work",
+                        entity_type="shared_asset_revision",
+                        entity_id=rev_entity,
+                        event_type="work.self_authored_revision_suppressed",
+                        actor_id=owner_agent_id,
+                        payload={
+                            "source_identity": source_identity,
+                            "revision": observed_rev,
+                            "condition_id": cid,
+                        },
+                        recorded_at_ns=now_ns,
+                    )
+                continue  # anti-self-wake persisted for subsequent actor-less sweeps
+            self_authored = connection.execute(
+                """SELECT 1 FROM audit_event
+                   WHERE company_id = ? AND domain = 'work'
+                     AND entity_type = 'shared_asset_revision'
+                     AND entity_id = ? AND actor_id = ?
+                     AND event_type = 'work.self_authored_revision_suppressed'
+                   LIMIT 1""",
+                (company_id, rev_entity, owner_agent_id),
+            ).fetchone()
+            if self_authored is not None:
+                continue
             if expected_revision is None or observed_rev == expected_revision:
                 eligible = True
                 matched_revision = observed_rev
@@ -1365,6 +1456,15 @@ def resolve_peer_request(
     )
     if changed.rowcount != 1:
         return prior, False
+
+    if resolution_state == "expired":
+        connection.execute(
+            """UPDATE work_items
+               SET state = 'cancelled', updated_at_ns = ?
+               WHERE company_id = ? AND work_item_id = ?
+                 AND state IN ('due', 'scheduled')""",
+            (timestamp, company_id, prior.response_work_item_id),
+        )
 
     # Wake the waiting requester work item once (anti-self-wake respected)
     wake_waiting_runs(

@@ -211,7 +211,7 @@ class WorkKernel(unittest.TestCase):
                     owner_agent_id=self.founder_id,
                     trigger_kind="shared_asset_revision",
                     source_identity="asset:memo-1",
-                    expected_revision="rev-2",
+                    expected_revision=None,
                     now_ns=2_000,
                 )
                 extra_cond = set_condition(
@@ -239,18 +239,27 @@ class WorkKernel(unittest.TestCase):
                 admitted_none = evaluate_conditions(
                     conn, self.company_id, now_ns=10_000
                 )
-                # Self-authored asset revision must NOT wake owner (anti-self-wake)
+                # Self-authored asset revision rev-1 must NOT wake owner (anti-self-wake)
                 admitted_self = evaluate_conditions(
                     conn,
                     self.company_id,
                     now_ns=10_000,
-                    observed_assets={"asset:memo-1": "rev-2"},
+                    observed_assets={"asset:memo-1": "rev-1"},
                     triggering_actor_id=self.founder_id,
+                )
+                # Subsequent actor-less sweep observing the same self-authored rev-1 MUST stay suppressed
+                admitted_self_later = evaluate_conditions(
+                    conn,
+                    self.company_id,
+                    now_ns=10_200,
+                    observed_assets={"asset:memo-1": "rev-1"},
+                    triggering_actor_id=None,
                 )
             self.assertEqual(admitted_none, ())
             self.assertEqual(admitted_self, ())
+            self.assertEqual(admitted_self_later, ())
 
-            # Peer-authored matching revision fires once and deduplicates on replay
+            # Peer-authored rev-2 fires once and deduplicates on replay
             with write_tx(conn):
                 admitted = evaluate_conditions(
                     conn,
@@ -541,14 +550,20 @@ class WorkKernel(unittest.TestCase):
                     now_ns=2_000,
                 )
 
-            # Timer wake past deadline must wake item AND expire the open peer request
+            # Timer wake past deadline must wake item, expire open peer request, AND
+            # cancel its pending response work item so recipient never burns a turn
             with write_tx(conn):
                 woken = wake_waiting_runs(conn, self.company_id, now_ns=12_000)
                 self.assertEqual(woken, (item.work_item_id,))
-                req_state = conn.execute(
-                    "SELECT state FROM work_peer_requests WHERE request_id = 'req-timeout-1'"
+                req_row = conn.execute(
+                    "SELECT state, response_work_item_id FROM work_peer_requests WHERE request_id = 'req-timeout-1'"
                 ).fetchone()
-                self.assertEqual(req_state, ("expired",))
+                self.assertEqual(req_row[0], "expired")
+                resp_item_state = conn.execute(
+                    "SELECT state FROM work_items WHERE work_item_id = ?",
+                    (req_row[1],),
+                ).fetchone()
+                self.assertEqual(resp_item_state, ("cancelled",))
                 # Requester can now re-claim and open a fresh peer request without conflict
                 run2 = claim_work_run(
                     conn,
