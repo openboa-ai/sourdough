@@ -61,6 +61,7 @@ class CompanyRuntime:
         lease_ttl_ns: int = 300_000_000_000,
         lease_directory: Path | None = None,
         expected_store_key: tuple[int, int] | None = None,
+        clock: Callable[[], int] | None = None,
     ) -> None:
         self._store = store.absolute()
         self._company_id = company_id
@@ -69,6 +70,7 @@ class CompanyRuntime:
         self._lease_ttl_ns = lease_ttl_ns
         self._lease_directory = lease_directory
         self._expected_store_key = expected_store_key
+        self._clock = clock or time_ns
 
     def step(
         self,
@@ -84,7 +86,9 @@ class CompanyRuntime:
         """Run one durable recovery, wake, condition-evaluation, and dispatch cycle."""
         if max_dispatches < 0:
             raise RuntimeRefused("max_dispatches must be nonnegative")
-        timestamp = time_ns() if now_ns is None else now_ns
+        read_clock: Callable[[], int] = (
+            self._clock if now_ns is None else (lambda: now_ns)
+        )
         with hold_company_writer(
             self._store,
             self._company_id,
@@ -95,22 +99,23 @@ class CompanyRuntime:
             if on_ready is not None:
                 on_ready(writer)
 
+            sweep_now = read_clock()
             with (
                 closing(open_writer(self._store, lease=writer)) as conn,
                 write_tx(conn),
             ):
-                fenced = reclaim_expired_runs(conn, self._company_id, now_ns=timestamp)
+                fenced = reclaim_expired_runs(conn, self._company_id, now_ns=sweep_now)
                 woken = wake_waiting_runs(
                     conn,
                     self._company_id,
-                    now_ns=timestamp,
+                    now_ns=sweep_now,
                     event_key=event_key,
                     triggering_actor_id=triggering_actor_id,
                 )
                 admitted_items = evaluate_conditions(
                     conn,
                     self._company_id,
-                    now_ns=timestamp,
+                    now_ns=sweep_now,
                     observed_assets=observed_assets,
                     triggering_actor_id=triggering_actor_id,
                 )
@@ -119,18 +124,20 @@ class CompanyRuntime:
             blocked: list[str] = []
             for _ in range(max_dispatches):
                 writer.verify()
-                claimed = self._claim_next(writer, timestamp, blocked)
+                claim_now = read_clock()
+                claimed = self._claim_next(writer, claim_now, blocked)
                 if claimed is None:
                     break
                 item, run, descriptor = claimed
-                # Execute outside any open SQLite write transaction!
+                # Execute outside any open SQLite write transaction with a live clock!
                 try:
                     outcome = descriptor.execute(
-                        DutyContext(writer, self._company_id, item, run, timestamp)
+                        DutyContext(writer, self._company_id, item, run, read_clock)
                     )
                 except Exception as error:
                     try:
                         writer.verify()
+                        fail_now = read_clock()
                         with (
                             closing(open_writer(self._store, lease=writer)) as conn,
                             write_tx(conn),
@@ -141,12 +148,13 @@ class CompanyRuntime:
                                 run.fencing_token,
                                 error_summary=type(error).__name__,
                                 return_to_due=True,
-                                now_ns=timestamp,
+                                now_ns=fail_now,
                             )
                     except RunFenced:
                         pass
                     raise
                 writer.verify()
+                commit_now = read_clock()
                 with (
                     closing(open_writer(self._store, lease=writer)) as conn,
                     write_tx(conn),
@@ -167,7 +175,7 @@ class CompanyRuntime:
                                 wait_until_ns=outcome.wait_until_ns,
                                 wait_event_key=outcome.wait_event_key,
                                 reason=outcome.wait_reason,
-                                now_ns=timestamp,
+                                now_ns=commit_now,
                             )
                     elif outcome.disposition == "blocked":
                         complete_work_run(
@@ -176,7 +184,7 @@ class CompanyRuntime:
                             run.fencing_token,
                             outcome=outcome.result,
                             item_state="blocked",
-                            now_ns=timestamp,
+                            now_ns=commit_now,
                         )
                         blocked.append(item.work_item_id)
                     else:
@@ -187,7 +195,7 @@ class CompanyRuntime:
                             outcome=outcome.result,
                             item_state="settled",
                             next_condition=outcome.next_condition,
-                            now_ns=timestamp,
+                            now_ns=commit_now,
                         )
                 executed.append(run.run_id)
 
@@ -219,7 +227,7 @@ class CompanyRuntime:
                 self._store, venue, policy=venue_policy
             )
             coordinator.verify_independence()
-        timestamp = time_ns() if now_ns is None else now_ns
+        timestamp = self._clock() if now_ns is None else now_ns
         with hold_company_writer(
             self._store,
             self._company_id,

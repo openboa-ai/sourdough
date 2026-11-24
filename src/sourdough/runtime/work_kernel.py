@@ -610,9 +610,13 @@ def claim_work_run(
 
 
 def assert_run_fencing(
-    connection: sqlite3.Connection, run_id: str, fencing_token: int
+    connection: sqlite3.Connection,
+    run_id: str,
+    fencing_token: int,
+    *,
+    now_ns: int | None = None,
 ) -> WorkRun:
-    """Verify the run is still active at the exact fencing_token."""
+    """Verify the run is still active at the exact fencing_token and unexpired lease."""
     row = connection.execute(
         """SELECT run_id, company_id, work_item_id, agent_id, duty_kind, status,
                   fencing_token, lease_owner, lease_expires_at_ns, wait_until_ns,
@@ -629,6 +633,12 @@ def assert_run_fencing(
         raise RunFenced(
             f"Run {run_id} is fenced (status={run.status}, token={run.fencing_token} != {fencing_token})"
         )
+    if (
+        now_ns is not None
+        and run.lease_expires_at_ns is not None
+        and now_ns >= run.lease_expires_at_ns
+    ):
+        raise RunFenced(f"Run {run_id} lease has expired")
     return run
 
 
@@ -645,8 +655,8 @@ def yield_run_to_wait(
     """Transition an active run into a zero-compute durable wait, releasing its active slot."""
     if wait_until_ns is None and (not wait_event_key or not wait_event_key.strip()):
         raise WorkKernelRefused("Durable wait requires wait_until_ns or wait_event_key")
-    run = assert_run_fencing(connection, run_id, fencing_token)
     timestamp = time_ns() if now_ns is None else now_ns
+    run = assert_run_fencing(connection, run_id, fencing_token, now_ns=timestamp)
     outcome_json = _canonical_json({"disposition": "waiting", "reason": reason})
     changed = connection.execute(
         """UPDATE work_runs
@@ -907,8 +917,8 @@ def complete_work_run(
     """Atomically settle an active run, its work item, and an optional next condition."""
     if item_state not in ("settled", "blocked", "cancelled"):
         raise WorkKernelRefused(f"Unsupported terminal item state: {item_state}")
-    run = assert_run_fencing(connection, run_id, fencing_token)
     timestamp = time_ns() if now_ns is None else now_ns
+    run = assert_run_fencing(connection, run_id, fencing_token, now_ns=timestamp)
     outcome_json = _canonical_json(outcome)
     changed = connection.execute(
         """UPDATE work_runs
@@ -1464,13 +1474,15 @@ def open_peer_request(
             raise WorkKernelRefused("Peer request ID reused with conflicting terms")
         return prior, True
 
-    run = assert_run_fencing(connection, requester_run_id, fencing_token)
+    timestamp = time_ns() if now_ns is None else now_ns
+    run = assert_run_fencing(
+        connection, requester_run_id, fencing_token, now_ns=timestamp
+    )
     if run.work_item_id != requester_work_item_id or run.company_id != company_id:
         raise WorkKernelRefused("Peer request does not match active run identity")
     if run.agent_id == recipient_agent_id:
         raise WorkKernelRefused("An Agent cannot open a peer request to itself")
 
-    timestamp = time_ns() if now_ns is None else now_ns
     if deadline_ns <= timestamp:
         raise WorkKernelRefused("Peer request deadline must be in the future")
 

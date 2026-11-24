@@ -3,6 +3,7 @@
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from time import time_ns
 from typing import Any, Literal
 
 from ..writer_lease import WriterLease
@@ -19,7 +20,11 @@ class DutyContext:
     company_id: str
     work_item: WorkItem
     run: WorkRun
-    now_ns: int
+    _clock: int | Callable[[], int] = field(default=time_ns, repr=False)
+
+    @property
+    def now_ns(self) -> int:
+        return self._clock() if callable(self._clock) else self._clock
 
 
 @dataclass(frozen=True)

@@ -529,3 +529,171 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                         lease_ttl_ns=10_000,
                         now_ns=10_100,
                     )
+
+    def test_runtime_step_refreshes_clock_between_dispatches_and_during_handler_commits(
+        self,
+    ):
+        from sourdough.runtime.work_kernel import WorkKernelRefused
+
+        peer_id = "peer-clock"
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "INSERT INTO agent VALUES (?, ?, ?)",
+                (peer_id, self.company_id, "profile-peer"),
+            )
+            conn.execute(
+                "INSERT INTO standing_grant VALUES ('grant-peer-clock', ?, 'manage')",
+                (peer_id,),
+            )
+            register_responsibility(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=peer_id,
+                duty_kind="work.peer_response",
+                remit="Review peer requests",
+                readable_scope={
+                    "allowed_requesters": [self.founder_id],
+                    "evidence_prefixes": ["asset:"],
+                },
+                now_ns=500,
+            )
+            item_first, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.slow_first",
+                source_kind="manual",
+                source_id="sf1",
+                now_ns=1_000,
+            )
+
+        # Case 1: Handler 1 opens a peer request (deadline 5_000) and advances the clock
+        # past 5_000 before returning; the next dispatch in the SAME step() MUST see
+        # fresh clock >= 5_000, cancel the expired response item, and skip peer_handler!
+        now = [2_000]
+        peer_called = False
+
+        def slow_first(ctx: DutyContext) -> DutyOutcome:
+            with closing(open_writer(self.store, lease=ctx.writer)) as conn:
+                with write_tx(conn):
+                    open_peer_request(
+                        conn,
+                        company_id=ctx.company_id,
+                        requester_work_item_id=ctx.work_item.work_item_id,
+                        requester_run_id=ctx.run.run_id,
+                        fencing_token=ctx.run.fencing_token,
+                        recipient_agent_id=peer_id,
+                        question="Fast answer?",
+                        expected_decision="yes_no",
+                        evidence_refs=[],
+                        deadline_ns=5_000,
+                        request_id="req-clock-1",
+                        now_ns=ctx.now_ns,
+                    )
+            now[0] = 6_000  # elapsed past deadline before next dispatch
+            return DutyOutcome(disposition="waiting", wait_reason="peer")
+
+        def peer_handler(_ctx: DutyContext) -> DutyOutcome:
+            nonlocal peer_called
+            peer_called = True
+            return DutyOutcome("completed")
+
+        runtime1 = CompanyRuntime(
+            self.store,
+            self.company_id,
+            build_default_registry(
+                {
+                    "work.slow_first": slow_first,
+                    "work.peer_response": peer_handler,
+                }
+            ),
+            lease_ttl_ns=10_000,
+            lease_directory=self.leases,
+            clock=lambda: now[0],
+        )
+        runtime1.step(max_dispatches=4)
+        self.assertFalse(peer_called)
+
+        # Case 2: Peer handler starts before deadline, advances clock past deadline during
+        # execution, and attempts resolve_peer_request(..., now_ns=ctx.now_ns) -> MUST fail!
+        now2 = [10_000]
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            item2, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.opener",
+                source_kind="manual",
+                source_id="op2",
+                now_ns=9_000,
+            )
+            run2 = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=item2.work_item_id,
+                lease_owner="opener",
+                lease_ttl_ns=20_000,
+                now_ns=9_500,
+            )
+            open_peer_request(
+                conn,
+                company_id=self.company_id,
+                requester_work_item_id=item2.work_item_id,
+                requester_run_id=run2.run_id,
+                fencing_token=run2.fencing_token,
+                recipient_agent_id=peer_id,
+                question="Do not exceed deadline",
+                expected_decision="yes_no",
+                evidence_refs=[],
+                deadline_ns=15_000,
+                request_id="req-clock-2",
+                now_ns=9_600,
+            )
+
+        def slow_peer_handler(ctx: DutyContext) -> DutyOutcome:
+            # Advance clock past deadline (15_000) while handler is executing
+            now2[0] = 16_000
+            with closing(open_writer(self.store, lease=ctx.writer)) as conn:
+                with write_tx(conn):
+                    resolve_peer_request(
+                        conn,
+                        company_id=ctx.company_id,
+                        request_id="req-clock-2",
+                        actor_id=peer_id,
+                        resolution_state="answered",
+                        response_payload={"answer": "too-late"},
+                        response_run_id=ctx.run.run_id,
+                        response_fencing_token=ctx.run.fencing_token,
+                        now_ns=ctx.now_ns,
+                    )
+            return DutyOutcome("completed")
+
+        runtime2 = CompanyRuntime(
+            self.store,
+            self.company_id,
+            build_default_registry(
+                {
+                    "work.slow_first": lambda _ctx: DutyOutcome("completed"),
+                    "work.peer_response": slow_peer_handler,
+                }
+            ),
+            lease_ttl_ns=5_000,
+            lease_directory=self.leases,
+            clock=lambda: now2[0],
+        )
+        with self.assertRaisesRegex(WorkKernelRefused, "deadline has elapsed"):
+            runtime2.step(max_dispatches=2)
+        with closing(open_reader(self.store)) as reader, read_tx(reader):
+            self.assertEqual(
+                reader.execute(
+                    "SELECT state FROM work_peer_requests WHERE request_id = 'req-clock-2'"
+                ).fetchone(),
+                ("open",),
+            )
+            self.assertEqual(
+                reader.execute(
+                    "SELECT state FROM work_items WHERE work_item_id = ?",
+                    (item2.work_item_id,),
+                ).fetchone(),
+                ("waiting",),
+            )
