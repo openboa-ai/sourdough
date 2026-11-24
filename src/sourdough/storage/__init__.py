@@ -1,4 +1,4 @@
-"""Unified SQLite storage kernel: connections, migrations, receipts, and restore."""
+"""Unified SQLite storage kernel: connections, canonical v1 schema, receipts, and restore."""
 
 from .checkpoint import (
     CHECKPOINT_FORMAT,
@@ -15,8 +15,8 @@ from .checkpoint import (
 from .db import (
     BUSY_TIMEOUT_MS,
     JOURNAL_SIZE_LIMIT_BYTES,
-    MAX_SCHEMA_VERSION,
     RETIRED_SCHEMA_REVISION,
+    SCHEMA_VERSION,
     ManagedConnection,
     StorageRefused,
     StoreRetirement,
@@ -43,16 +43,23 @@ from .kernel import (
     read_command_receipt,
     settle_external_action,
 )
-from .migrations import (
-    MigrationSpec,
-    apply_fresh_migrations,
-    load_migrations,
-    migrate_store,
-    verify_applied_migrations,
-)
 from .ownership import (
     DOMAIN_TABLE_OWNERS,
     audit_domain_write_ownership,
+)
+from .schema import (
+    VALID_DOMAINS,
+    SchemaPack,
+    apply_core_v1,
+    compute_sqlite_schema_sha256,
+    enable_domain_v1,
+    expected_sqlite_schema_sha256,
+    installed_domains,
+    is_domain_installed,
+    load_domain_pack,
+    require_domain,
+    trusted_triggers_and_views,
+    verify_v1_schema,
 )
 
 __all__ = [
@@ -70,34 +77,41 @@ __all__ = [
     "ExternalActionConflict",
     "JOURNAL_SIZE_LIMIT_BYTES",
     "LogicalWatermark",
-    "MAX_SCHEMA_VERSION",
     "ManagedConnection",
-    "MigrationSpec",
     "RETIRED_SCHEMA_REVISION",
+    "SCHEMA_VERSION",
+    "SchemaPack",
     "StorageRefused",
     "StoreRetirement",
+    "VALID_DOMAINS",
     "admit_command_receipt",
     "append_audit_event",
-    "apply_fresh_migrations",
+    "apply_core_v1",
     "audit_domain_write_ownership",
     "checkpoint_store",
     "compute_logical_watermark",
+    "compute_sqlite_schema_sha256",
+    "enable_domain_v1",
+    "expected_sqlite_schema_sha256",
     "finalize_command_receipt",
     "inspect_checkpoint",
-    "load_migrations",
+    "installed_domains",
+    "is_domain_installed",
+    "load_domain_pack",
     "max_event_seq",
-    "migrate_store",
     "open_reader",
     "open_writer",
     "prepare_external_action",
     "read_command_receipt",
     "read_retirement",
     "read_tx",
+    "require_domain",
     "restore_store",
     "settle_external_action",
     "snapshot_normalized_store",
-    "verify_applied_migrations",
+    "trusted_triggers_and_views",
     "verify_no_wal_sidecars",
+    "verify_v1_schema",
     "wal_checkpoint",
     "write_tx",
 ]

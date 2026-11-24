@@ -16,6 +16,7 @@ from .paper_books import (
     read_position,
     resolved_order_sql,
 )
+from .storage.schema import is_domain_installed
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -105,23 +106,8 @@ def persist_paper_decision(
             "paper_binding",
         ):
             raise DutyRefused("Duty is not authorized for this paper decision")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS paper_decision (
-                duty_id TEXT PRIMARY KEY NOT NULL REFERENCES work_follow_up(duty_id),
-                run_id TEXT NOT NULL REFERENCES duty_run(run_id),
-                decision_id TEXT NOT NULL UNIQUE,
-                decided_at INTEGER NOT NULL,
-                call_id TEXT NOT NULL,
-                result_revision TEXT NOT NULL,
-                rationale TEXT NOT NULL,
-                next_check_seconds INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                quantity INTEGER,
-                limit_minor_units INTEGER,
-                account_id TEXT NOT NULL,
-                instrument_rules_digest TEXT NOT NULL
-            )"""
-        )
+        if not is_domain_installed(connection, "paper"):
+            raise DutyRefused("Paper domain is not enabled")
         prior = connection.execute(
             """SELECT decision_id, decided_at, call_id, result_revision, rationale,
                       next_check_seconds, action, quantity, limit_minor_units
@@ -170,10 +156,7 @@ def has_matching_paper_decision(
     quantity: int,
     limit_minor_units: int,
 ) -> bool:
-    has_decisions = connection.execute(
-        "SELECT 1 FROM sqlite_schema WHERE name = 'paper_decision' AND type = 'table'"
-    ).fetchone()
-    if not has_decisions:
+    if not is_domain_installed(connection, "paper"):
         return False
     return connection.execute(
         """SELECT action, account_id, instrument_rules_digest, quantity, limit_minor_units
@@ -194,6 +177,8 @@ def reopen_paper_decision(
     with closing(_connect(store, "ro")) as connection:
         connection.execute("BEGIN")
         follow_up_state(connection, follow_up, PAPER_EXECUTION)
+        if not is_domain_installed(connection, "paper"):
+            raise DutyRefused("No original paper decision to recover")
         row = connection.execute(
             """SELECT decision_id, decided_at, call_id, result_revision, rationale,
                       next_check_seconds, action, quantity, limit_minor_units
@@ -210,9 +195,7 @@ def reopen_unsubmitted_decisions(
 ) -> tuple[tuple[FollowUpClaim, PaperDecisionReceipt], ...]:
     with closing(_connect(store, "ro")) as connection:
         connection.execute("BEGIN")
-        if not connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_decision'"
-        ).fetchone():
+        if not is_domain_installed(connection, "paper"):
             return ()
         account = reopen_binding(store, company_id).account
         rows = connection.execute(

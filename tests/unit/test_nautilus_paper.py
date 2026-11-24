@@ -219,10 +219,8 @@ class NautilusPaperPort(unittest.TestCase):
                     submit_paper_order(store, claim, invalid, self.venue)
         self.assertEqual(self.venue.check_order_terms("paper", supported), account)
         with closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as company:
-            self.assertIsNone(
-                company.execute(
-                    "SELECT 1 FROM sqlite_schema WHERE name='paper_order'"
-                ).fetchone()
+            self.assertEqual(
+                company.execute("SELECT COUNT(*) FROM paper_order").fetchone(), (0,)
             )
         with closing(
             sqlite3.connect(self.venue.journal.as_uri() + "?mode=ro", uri=True)

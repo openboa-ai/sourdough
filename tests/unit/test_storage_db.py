@@ -8,8 +8,8 @@ from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found
 from sourdough.storage.db import (
-    MAX_SCHEMA_VERSION,
     RETIRED_SCHEMA_REVISION,
+    SCHEMA_VERSION,
     StorageRefused,
     open_reader,
     open_writer,
@@ -53,7 +53,7 @@ class StorageDatabaseAndKernel(unittest.TestCase):
             self.assertEqual(writer.execute("PRAGMA trusted_schema").fetchone()[0], 0)
             self.assertEqual(writer.execute("PRAGMA synchronous").fetchone()[0], 2)
             self.assertEqual(
-                writer.execute("PRAGMA user_version").fetchone()[0], MAX_SCHEMA_VERSION
+                writer.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION
             )
             busy, log_frames, checkpointed = wal_checkpoint(writer, "PASSIVE")
             self.assertEqual(busy, 0)
@@ -70,16 +70,18 @@ class StorageDatabaseAndKernel(unittest.TestCase):
                     "UPDATE company SET charter_revision = 'tampered' WHERE singleton = 1"
                 )
 
-    def test_future_user_version_and_retired_store_fail_closed(self):
-        with closing(sqlite3.connect(self.store)) as raw, raw:
-            raw.execute(f"PRAGMA user_version = {MAX_SCHEMA_VERSION + 1}")
-        with self.assertRaisesRegex(StorageRefused, "Unsupported future"):
-            open_writer(self.store)
-        with self.assertRaisesRegex(StorageRefused, "Unsupported future"):
-            open_reader(self.store)
+    def test_non_canonical_user_version_and_retired_store_fail_closed(self):
+        for bad_version in (0, SCHEMA_VERSION + 1):
+            with self.subTest(user_version=bad_version):
+                with closing(sqlite3.connect(self.store)) as raw, raw:
+                    raw.execute(f"PRAGMA user_version = {bad_version}")
+                with self.assertRaisesRegex(StorageRefused, "Unsupported"):
+                    open_writer(self.store)
+                with self.assertRaisesRegex(StorageRefused, "Unsupported"):
+                    open_reader(self.store)
 
         with closing(sqlite3.connect(self.store)) as raw, raw:
-            raw.execute(f"PRAGMA user_version = {MAX_SCHEMA_VERSION}")
+            raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             raw.execute(
                 "UPDATE company SET schema_revision = ? WHERE singleton = 1",
                 (RETIRED_SCHEMA_REVISION,),

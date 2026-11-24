@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from .company import _connect, _identity
 from .paper_account import read_applied_binding, reopen_binding
 from .paper_execution import TERMINAL_OUTCOMES, observe_bound_position
+from .storage.schema import is_domain_installed, require_domain
 
 if TYPE_CHECKING:
     from .paper_execution import (
@@ -102,56 +103,9 @@ def read_binding_position(
     )
 
 
-_FILL_SCHEMA = """(
-    fill_id TEXT PRIMARY KEY NOT NULL,
-    order_id TEXT NOT NULL REFERENCES paper_order(order_id),
-    quantity INTEGER NOT NULL,
-    price_minor_units INTEGER NOT NULL
-)"""
 FILLED_QUANTITY = (
     "COALESCE((SELECT SUM(quantity) FROM paper_fill WHERE order_id=o.order_id),0)"
 )
-
-
-def _has_table(connection: sqlite3.Connection, name: str) -> bool:
-    return (
-        connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (name,)
-        ).fetchone()
-        is not None
-    )
-
-
-def _has_legacy_order_index(connection: sqlite3.Connection) -> bool:
-    return (
-        connection.execute(
-            """SELECT 1 FROM pragma_index_list('paper_fill') indexes
-           JOIN pragma_index_info(indexes.name) columns
-           WHERE indexes.origin='u' AND columns.name='order_id'"""
-        ).fetchone()
-        is not None
-    )
-
-
-def _ensure_fill_schema(connection: sqlite3.Connection, legacy: bool) -> None:
-    if legacy and _has_legacy_order_index(connection):
-        connection.execute("CREATE TABLE paper_fill_next " + _FILL_SCHEMA)
-        connection.execute(
-            "INSERT INTO paper_fill_next SELECT * FROM paper_fill ORDER BY rowid"
-        )
-        connection.execute("DROP TABLE paper_fill")
-        connection.execute("ALTER TABLE paper_fill_next RENAME TO paper_fill")
-    else:
-        connection.execute("CREATE TABLE IF NOT EXISTS paper_fill " + _FILL_SCHEMA)
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS paper_fill_by_order ON paper_fill(order_id)"
-    )
-    connection.execute(
-        """CREATE TABLE IF NOT EXISTS paper_fill_fee (
-            fill_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_fill(fill_id),
-            fee_minor_units INTEGER NOT NULL
-        )"""
-    )
 
 
 def _post_fill(db: sqlite3.Connection, order_id: str, observed: VenueExecution) -> None:
@@ -225,19 +179,6 @@ def _apply_cancellation(
             or (evidence.outcome in ("rejected", "denied") and evidence.filled_quantity)
         ):
             raise PostingRefused("Cancellation does not match the original order")
-        db.execute(
-            """CREATE TABLE IF NOT EXISTS paper_cancellation (
-                order_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_order(order_id),
-                event_id TEXT NOT NULL UNIQUE, filled_quantity INTEGER NOT NULL,
-                released INTEGER NOT NULL CHECK (released IN (0,1)),
-                position_quantity INTEGER, available_at INTEGER,
-                outcome TEXT NOT NULL DEFAULT 'cancelled'
-            )"""
-        )
-        if "outcome" not in _cancellation_columns(db):
-            db.execute(
-                "ALTER TABLE paper_cancellation ADD COLUMN outcome TEXT NOT NULL DEFAULT 'cancelled'"
-            )
         previous = db.execute(
             """SELECT order_id,event_id,filled_quantity,outcome
                FROM paper_cancellation WHERE order_id=? OR event_id=?""",
@@ -259,12 +200,6 @@ def _apply_cancellation(
             raise PostingRefused(
                 "Cancellation conflicts with recorded terminal evidence"
             )
-    if not _has_table(db, "paper_cancellation"):
-        return
-    columns = _cancellation_columns(db)
-    for name in ("position_quantity", "available_at"):
-        if name not in columns:
-            db.execute(f"ALTER TABLE paper_cancellation ADD COLUMN {name} INTEGER")
     pending = db.execute(
         "SELECT filled_quantity,released,available_at FROM paper_cancellation WHERE order_id=?",
         (order_id,),
@@ -294,22 +229,16 @@ def _apply_cancellation(
         )
 
 
-def _cancellation_columns(db: sqlite3.Connection) -> set[str]:
-    return {row[1] for row in db.execute("PRAGMA table_info(paper_cancellation)")}
-
-
 def read_no_fill(
     connection: sqlite3.Connection, company_id: str, order_id: str
 ) -> NoFillObservation | None:
     if _identity(connection) != company_id:
         raise PostingRefused("Company identity mismatch")
-    columns = _cancellation_columns(connection)
-    if not {"position_quantity", "available_at"} <= columns:
+    if not is_domain_installed(connection, "paper"):
         return None
-    outcome = "c.outcome" if "outcome" in columns else "'cancelled'"
     row = connection.execute(
-        f"""SELECT o.order_id,c.event_id,o.account_id,o.instrument_rules_digest,
-                   c.position_quantity,c.available_at,{outcome}
+        """SELECT o.order_id,c.event_id,o.account_id,o.instrument_rules_digest,
+                  c.position_quantity,c.available_at,c.outcome
            FROM paper_cancellation c JOIN paper_order o USING(order_id)
            WHERE c.order_id=? AND c.released=1 AND c.filled_quantity=0 AND c.available_at IS NOT NULL""",
         (order_id,),
@@ -342,14 +271,13 @@ def read_book_observation(
 
 
 def resolved_order_sql(db: sqlite3.Connection) -> str:
-    filled = f"{FILLED_QUANTITY}=o.quantity" if _has_table(db, "paper_fill") else "0"
-    if not _has_table(db, "paper_cancellation"):
-        return filled
-    return f"({filled} OR EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id AND c.released=1))"
+    if not is_domain_installed(db, "paper"):
+        return "0"
+    return f"({FILLED_QUANTITY}=o.quantity OR EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id AND c.released=1))"
 
 
 def pending_no_fill_observation_sql(db: sqlite3.Connection) -> str:
-    if "available_at" not in _cancellation_columns(db):
+    if not is_domain_installed(db, "paper"):
         return "0"
     return """EXISTS (
         SELECT 1 FROM paper_cancellation c JOIN duty_run r ON r.run_id=o.run_id
@@ -392,14 +320,12 @@ def post_confirmed_fill(
     ):
         cancellation = None
     with closing(_connect(store, "rw")) as db, db:
-        legacy = _has_legacy_order_index(db)
-        if legacy:
-            db.execute("PRAGMA foreign_keys=OFF")
         db.execute("BEGIN IMMEDIATE")
         if writer is not None:
             writer.verify_for(store, company_id)
         if _identity(db) != company_id or reopen_binding(store, company_id) != binding:
             raise PostingRefused("Company binding changed")
+        require_domain(db, "paper")
         order = db.execute(
             """SELECT mandate_revision, account_id, instrument_rules_digest,
                       quantity, limit_minor_units
@@ -408,7 +334,6 @@ def post_confirmed_fill(
         ).fetchone()
         if order is None or order[:2] != (binding.revision, binding.account.account_id):
             raise PostingRefused("Order evidence does not match an admitted order")
-        _ensure_fill_schema(db, legacy)
         for observed in observations:
             if observed.order_id != order_id or order != (
                 binding.revision,
@@ -420,8 +345,6 @@ def post_confirmed_fill(
                 raise PostingRefused("Fill does not match admitted order")
             _post_fill(db, order_id, observed)
         _apply_cancellation(db, order_id, order, cancellation, position)
-        if legacy and db.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise PostingRefused("Legacy fill migration did not retain its references")
         return _completed_posting(db, order_id)
 
 
@@ -430,9 +353,7 @@ def position_quantity(store: Path, company_id: str) -> int:
         db.execute("BEGIN")
         if _identity(db) != company_id:
             raise PostingRefused("Company identity mismatch")
-        if not db.execute(
-            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_fill'"
-        ).fetchone():
+        if not is_domain_installed(db, "paper"):
             return 0
         return db.execute(
             "SELECT COALESCE(SUM(quantity), 0) FROM paper_fill"
@@ -440,7 +361,7 @@ def position_quantity(store: Path, company_id: str) -> int:
 
 
 def _completed_posting(connection: sqlite3.Connection, order_id: str) -> Posting | None:
-    if not _has_table(connection, "paper_fill"):
+    if not is_domain_installed(connection, "paper"):
         return None
     row = connection.execute(
         f"""SELECT p.fill_id,p.order_id,p.quantity,p.price_minor_units
@@ -451,11 +372,9 @@ def _completed_posting(connection: sqlite3.Connection, order_id: str) -> Posting
     ).fetchone()
     if row is None:
         return None
-    fee = None
-    if _has_table(connection, "paper_fill_fee"):
-        fee = connection.execute(
-            "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id=?", (row[0],)
-        ).fetchone()
+    fee = connection.execute(
+        "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id=?", (row[0],)
+    ).fetchone()
     return Posting(*row, fee[0] if fee else 0)
 
 
@@ -474,13 +393,7 @@ def capture_position(
         db.execute("BEGIN IMMEDIATE")
         if _identity(db) != company_id:
             raise PostingRefused("Company identity mismatch")
-        db.execute(
-            """CREATE TABLE IF NOT EXISTS paper_position_observation (
-                fill_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_fill(fill_id),
-                position_quantity INTEGER NOT NULL,
-                available_at INTEGER NOT NULL
-            )"""
-        )
+        require_domain(db, "paper")
         db.execute(
             """INSERT INTO paper_position_observation
                SELECT target.fill_id, ?, ?
@@ -538,7 +451,7 @@ def _lookup_position(
 ) -> PositionObservation | None:
     if _identity(connection) != company_id:
         raise PostingRefused("Company identity mismatch")
-    if not _has_table(connection, "paper_position_observation"):
+    if not is_domain_installed(connection, "paper"):
         return None
     row = connection.execute(
         """SELECT fill.fill_id, fill.order_id, source.account_id,

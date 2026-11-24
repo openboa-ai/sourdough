@@ -8,7 +8,6 @@ import stat
 from collections.abc import Callable, Iterable
 from contextlib import closing
 from dataclasses import asdict, dataclass
-from functools import lru_cache
 from hashlib import file_digest, sha256
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -17,8 +16,8 @@ from uuid import uuid4
 from zipfile import ZIP_STORED, BadZipFile, ZipFile
 
 from .db import (
-    MAX_SCHEMA_VERSION,
     RETIRED_SCHEMA_REVISION,
+    SCHEMA_VERSION,
     StorageRefused,
     StoreRetirement,
     open_reader,
@@ -29,6 +28,7 @@ from .db import (
     write_tx,
 )
 from .kernel import append_audit_event, max_event_seq
+from .schema import trusted_triggers_and_views, verify_v1_schema
 
 
 CHECKPOINT_FORMAT = "sourdough-checkpoint-v2"
@@ -40,7 +40,6 @@ _WATERMARK_EXCLUDED_TABLES = frozenset(
     {
         "company_restore_receipt",
         "company_store_retired",
-        "company_store_retired_digest",
     }
 )
 
@@ -61,7 +60,7 @@ class LogicalWatermark:
             not isinstance(self.company_id, str)
             or not self.company_id
             or type(self.schema_version) is not int
-            or not 1 <= self.schema_version <= MAX_SCHEMA_VERSION
+            or self.schema_version != SCHEMA_VERSION
             or type(self.max_event_seq) is not int
             or self.max_event_seq < 0
             or not isinstance(self.domain_digest, str)
@@ -164,7 +163,7 @@ def compute_logical_watermark(
         if retirement is None:
             raise CheckpointRefused("Retired store is missing retirement metadata")
         schema_version = retirement.original_schema
-    if not 1 <= schema_version <= MAX_SCHEMA_VERSION:
+    if schema_version != SCHEMA_VERSION:
         raise CheckpointRefused(f"Unsupported company schema version: {schema_version}")
 
     schema_objects = [
@@ -237,32 +236,12 @@ def compute_logical_watermark(
     )
 
 
-@lru_cache(maxsize=16)
-def _trusted_triggers_and_views(
-    schema_version: int,
-) -> tuple[tuple[str, str, str, str], ...]:
-    """Return the canonical trigger and view definitions bundled up to schema_version."""
-    from .migrations import _execute_sql_script_in_tx, load_migrations
-
-    with closing(sqlite3.connect(":memory:", autocommit=True)) as reference:
-        reference.execute("PRAGMA foreign_keys = ON")
-        reference.execute("PRAGMA trusted_schema = OFF")
-        for migration in load_migrations():
-            if migration.version <= schema_version:
-                _execute_sql_script_in_tx(reference, migration.sql)
-        rows = reference.execute(
-            """SELECT type, name, tbl_name, COALESCE(sql, '')
-               FROM sqlite_schema
-               WHERE type IN ('trigger', 'view') AND name NOT LIKE 'sqlite_%'
-               ORDER BY type, name, tbl_name, COALESCE(sql, '')"""
-        ).fetchall()
-    return tuple((str(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows)
-
-
-def _verify_trusted_schema_objects(
-    connection: sqlite3.Connection, schema_version: int
-) -> None:
-    """Refuse archives containing untrusted, altered, or missing triggers or views."""
+def _verify_trusted_schema_objects(connection: sqlite3.Connection) -> frozenset[str]:
+    """Refuse archives containing untrusted, altered, or missing schema objects."""
+    try:
+        active_domains = verify_v1_schema(connection)
+    except StorageRefused as error:
+        raise CheckpointRefused(str(error)) from error
     actual = tuple(
         (str(r[0]), str(r[1]), str(r[2]), str(r[3]))
         for r in connection.execute(
@@ -272,11 +251,12 @@ def _verify_trusted_schema_objects(
                ORDER BY type, name, tbl_name, COALESCE(sql, '')"""
         ).fetchall()
     )
-    expected = _trusted_triggers_and_views(schema_version)
+    expected = trusted_triggers_and_views(active_domains)
     if actual != expected:
         raise CheckpointRefused(
             "Checkpoint database contains unexpected, altered, or missing triggers or views"
         )
+    return active_domains
 
 
 def _normalize_database_to_delete_mode(database: Path) -> None:
@@ -663,7 +643,7 @@ def _extract_checkpoint(
             if reader.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise CheckpointRefused("Extracted checkpoint failed foreign_key_check")
             actual_watermark = compute_logical_watermark(reader, company_id)
-            _verify_trusted_schema_objects(reader, actual_watermark.schema_version)
+            _verify_trusted_schema_objects(reader)
             cut_rows = reader.execute(
                 """SELECT payload_json FROM audit_event
                    WHERE company_id = ? AND domain = 'ops'
@@ -726,8 +706,10 @@ def _restore_request_revision(
     store_key: tuple[int, int],
     manifest: CheckpointManifest,
     target: Path,
+    *,
+    external_scope: tuple[object, ...] | None = None,
 ) -> str:
-    terms = [
+    terms: list[object] = [
         company_id,
         list(store_key),
         manifest.captured_ns,
@@ -735,6 +717,8 @@ def _restore_request_revision(
         manifest.watermark.domain_digest,
         str(target),
     ]
+    if external_scope is not None:
+        terms.append(list(external_scope))
     return sha256(json.dumps(terms, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -853,7 +837,7 @@ def _copy_and_verify_replacement(
                 ).fetchone()
                 if company_row is None or str(company_row[0]) != company_id:
                     raise CheckpointRefused("Staged replacement company mismatch")
-                _verify_trusted_schema_objects(reader, manifest.schema_version)
+                _verify_trusted_schema_objects(reader)
                 row = reader.execute(
                     """SELECT checkpoint_sha256, watermark_json
                        FROM company_restore_receipt
@@ -1278,6 +1262,9 @@ def _resume_retired_restore(
     target: Path,
     desk_target: Path | None,
     retirement: StoreRetirement,
+    *,
+    check_original: Callable[[sqlite3.Connection], None] | None = None,
+    external_scope: tuple[object, ...] | None = None,
 ) -> CoreRestoreReceipt:
     """Finish publishing an interrupted restore without re-enabling the retired original."""
     manifest = inspect_checkpoint(archive, company_id)
@@ -1286,13 +1273,15 @@ def _resume_retired_restore(
             "Checkpoint archive bundles Desk files; desk_destination is required"
         )
     with closing(open_reader(store)) as original, read_tx(original):
+        if check_original is not None:
+            check_original(original)
         live_watermark = compute_logical_watermark(original, company_id)
     if live_watermark != manifest.watermark:
         raise CheckpointRefused(
             "Retired store logical watermark does not match the checkpoint cut"
         )
     request_revision = _restore_request_revision(
-        company_id, store_key, manifest, target
+        company_id, store_key, manifest, target, external_scope=external_scope
     )
     if retirement.request_revision != request_revision:
         raise CheckpointRefused(
@@ -1380,6 +1369,8 @@ def restore_store(
     *,
     desk_destination: Path | None = None,
     reconcile: Callable[[Path], None] | None = None,
+    check_original: Callable[[sqlite3.Connection], None] | None = None,
+    external_scope: tuple[object, ...] | None = None,
     lease_directory: Path | None = None,
 ) -> CoreRestoreReceipt:
     """Restore a verified checkpoint into a new isolated store and retire the original.
@@ -1427,6 +1418,8 @@ def restore_store(
             target,
             desk_target,
             existing_retirement,
+            check_original=check_original,
+            external_scope=external_scope,
         )
 
     if os.path.lexists(target):
@@ -1457,6 +1450,8 @@ def restore_store(
         with closing(open_reader(lease.store)) as original, read_tx(original):
             if read_retirement(original) is not None:
                 raise CheckpointRefused("Original store is already retired")
+            if check_original is not None:
+                check_original(original)
             live_watermark = compute_logical_watermark(original, company_id)
         if live_watermark != manifest.watermark:
             raise CheckpointRefused(
@@ -1464,7 +1459,11 @@ def restore_store(
             )
 
         request_revision = _restore_request_revision(
-            company_id, lease.store_key, manifest, target
+            company_id,
+            lease.store_key,
+            manifest,
+            target,
+            external_scope=external_scope,
         )
 
         if reconcile is not None:
@@ -1478,14 +1477,6 @@ def restore_store(
             ) as replacement,
             write_tx(replacement),
         ):
-            replacement.execute(
-                """CREATE TABLE IF NOT EXISTS company_restore_receipt (
-                    request_revision TEXT PRIMARY KEY,
-                    checkpoint_sha256 TEXT NOT NULL,
-                    watermark_json TEXT NOT NULL,
-                    restored_at_ns INTEGER NOT NULL
-                ) STRICT"""
-            )
             replacement.execute(
                 """INSERT INTO company_restore_receipt (
                        request_revision, checkpoint_sha256, watermark_json, restored_at_ns
@@ -1558,6 +1549,8 @@ def restore_store(
             ):
                 if read_retirement(original_writer) is not None:
                     raise CheckpointRefused("Original store is already retired")
+                if check_original is not None:
+                    check_original(original_writer)
                 current_watermark = compute_logical_watermark(
                     original_writer, company_id
                 )
@@ -1574,35 +1567,15 @@ def restore_store(
                 ):
                     raise CheckpointRefused("Desk restore destination already exists")
                 original_writer.execute(
-                    """CREATE TABLE IF NOT EXISTS company_store_retired (
-                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                        request_revision TEXT NOT NULL,
-                        original_schema INTEGER NOT NULL,
-                        retired_at_ns INTEGER NOT NULL
-                    ) STRICT"""
-                )
-                original_writer.execute(
-                    """CREATE TABLE IF NOT EXISTS company_store_retired_digest (
-                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                        request_revision TEXT NOT NULL,
-                        replacement_sha256 TEXT NOT NULL
-                    ) STRICT"""
-                )
-                original_writer.execute(
                     """INSERT INTO company_store_retired (
-                           singleton, request_revision, original_schema, retired_at_ns
-                       ) VALUES (1, ?, ?, ?)""",
+                           singleton, request_revision, original_schema, replacement_sha256, retired_at_ns
+                       ) VALUES (1, ?, ?, ?, ?)""",
                     (
                         request_revision,
                         manifest.schema_version,
+                        replacement_sha256,
                         time_ns(),
                     ),
-                )
-                original_writer.execute(
-                    """INSERT INTO company_store_retired_digest (
-                           singleton, request_revision, replacement_sha256
-                       ) VALUES (1, ?, ?)""",
-                    (request_revision, replacement_sha256),
                 )
                 original_writer.execute(
                     "UPDATE company SET schema_revision = ? WHERE singleton = 1",

@@ -10,7 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sourdough.company import FoundingTerms, found, upgrade_work_schema
+from sourdough.company import FoundingTerms, found, reopen
 from sourdough.paper_execution import VenueRefused
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.runtime.engine import CompanyRuntime, build_default_registry
@@ -32,7 +32,7 @@ from sourdough.runtime.work_kernel import (
 )
 from sourdough.storage.checkpoint import checkpoint_store, restore_store
 from sourdough.storage.db import (
-    MAX_SCHEMA_VERSION,
+    SCHEMA_VERSION,
     StorageRefused,
     open_reader,
     open_writer,
@@ -47,7 +47,7 @@ from sourdough.storage.kernel import (
     append_audit_event,
     read_command_receipt,
 )
-from sourdough.storage.migrations import load_migrations, verify_applied_migrations
+from sourdough.storage.schema import is_domain_installed, verify_v1_schema
 
 
 def _cli(*args: object) -> dict:
@@ -94,119 +94,81 @@ class ConnectedFlow(unittest.TestCase):
         root = Path(self.enterContext(TemporaryDirectory()))
         leases = root / "leases"
 
-        # 1. Legacy v5 and v7 upgrades + future user_version fail-closed (API & CLI)
-        legacy_terms = FoundingTerms("legacy-setup", "charter-v1", "paper", "profile-1")
-        v5_store = root / "legacy-v5.sqlite"
-        with closing(sqlite3.connect(v5_store)) as raw, raw:
-            raw.executescript(
-                """
-                CREATE TABLE company (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    id TEXT NOT NULL UNIQUE,
-                    schema_revision INTEGER NOT NULL,
-                    charter_revision TEXT NOT NULL
-                );
-                CREATE TABLE founder (
-                    id TEXT PRIMARY KEY,
-                    company_id TEXT NOT NULL REFERENCES company(id),
-                    execution_profile TEXT NOT NULL
-                );
-                CREATE TABLE standing_grant (
-                    id TEXT PRIMARY KEY,
-                    founder_id TEXT NOT NULL REFERENCES founder(id),
-                    scope TEXT NOT NULL
-                );
-                CREATE TABLE duty (
-                    id TEXT PRIMARY KEY,
-                    founder_id TEXT NOT NULL REFERENCES founder(id),
-                    state TEXT NOT NULL
-                );
-                CREATE TABLE founding_receipt (
-                    setup_identity TEXT PRIMARY KEY,
-                    company_id TEXT NOT NULL REFERENCES company(id),
-                    founder_id TEXT NOT NULL REFERENCES founder(id),
-                    grant_id TEXT NOT NULL REFERENCES standing_grant(id),
-                    due_work_id TEXT NOT NULL REFERENCES duty(id)
-                );
-                INSERT INTO company VALUES (1, 'co-v5', 5, 'charter-v1');
-                INSERT INTO founder VALUES ('ag-v5', 'co-v5', 'profile-1');
-                INSERT INTO standing_grant VALUES ('gr-v5', 'ag-v5', 'paper');
-                INSERT INTO duty VALUES ('du-v5', 'ag-v5', 'due');
-                INSERT INTO founding_receipt VALUES ('setup-v5', 'co-v5', 'ag-v5', 'gr-v5', 'du-v5');
-                """
-            )
-        upgrade_work_schema(v5_store, "co-v5")
-        with closing(open_reader(v5_store)) as reader, read_tx(reader):
+        # 1. Canonical v1 schema guarantees: core-only founding (zero paper_* tables),
+        # PRAGMA user_version != 1 (0 and 2) and schema tamper fail closed across API & CLI.
+        canonical_terms = FoundingTerms(
+            "canonical-setup", "charter-v1", "paper", "profile-1"
+        )
+        core_store = root / "core-only.sqlite"
+        found(core_store, canonical_terms)
+        with closing(open_reader(core_store)) as reader, read_tx(reader):
             self.assertEqual(
-                reader.execute("PRAGMA user_version").fetchone()[0], MAX_SCHEMA_VERSION
+                reader.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION
             )
+            self.assertEqual(verify_v1_schema(reader), frozenset({"core"}))
+            self.assertFalse(is_domain_installed(reader, "paper"))
             self.assertEqual(
                 reader.execute(
-                    "SELECT id FROM agent WHERE company_id = 'co-v5'"
-                ).fetchone(),
-                ("ag-v5",),
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE 'paper_%'"
+                ).fetchall(),
+                [],
             )
             self.assertEqual(reader.execute("PRAGMA foreign_key_check").fetchall(), [])
 
-        legacy_store = root / "legacy-v7.sqlite"
-        legacy_receipt = found(legacy_store, legacy_terms)
-        with closing(sqlite3.connect(legacy_store)) as raw, raw:
-            raw.execute("PRAGMA journal_mode = DELETE")
-            for table in (
-                "schema_migrations",
-                "audit_event",
-                "command_receipt",
-                "external_actions",
-                "company_restore_receipt",
-                "company_store_retired",
-                "company_store_retired_digest",
-                "work_peer_requests",
-                "work_condition_occurrences",
-                "work_conditions",
-                "work_responsibilities",
-                "work_runs",
-                "work_items",
-            ):
-                raw.execute(f"DROP TABLE IF EXISTS {table}")
-            raw.execute("UPDATE company SET schema_revision = 7 WHERE singleton = 1")
-            raw.execute("PRAGMA user_version = 0")
-
-        upgrade_work_schema(legacy_store, legacy_receipt.company_id)
-        with closing(open_reader(legacy_store)) as reader, read_tx(reader):
-            self.assertEqual(
-                reader.execute("PRAGMA user_version").fetchone()[0], MAX_SCHEMA_VERSION
+        for bad_version in (0, SCHEMA_VERSION + 1):
+            bad_store = root / f"bad-v{bad_version}.sqlite"
+            bad_receipt = found(bad_store, canonical_terms)
+            with closing(sqlite3.connect(bad_store)) as raw, raw:
+                raw.execute(f"PRAGMA user_version = {bad_version}")
+            with self.assertRaises(StorageRefused):
+                open_reader(bad_store)
+            with self.assertRaises(StorageRefused):
+                open_writer(bad_store)
+            with self.assertRaises(Exception):
+                reopen(bad_store, bad_receipt.company_id)
+            bad_cli = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "sourdough.cli",
+                    "inspect-work",
+                    str(bad_store),
+                    "--company-id",
+                    bad_receipt.company_id,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
-            self.assertEqual(
-                verify_applied_migrations(reader),
-                [spec.version for spec in load_migrations()],
-            )
-            self.assertEqual(reader.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(bad_cli.returncode, 1)
+            self.assertIn("Company command refused", bad_cli.stderr)
 
-        future_store = root / "future.sqlite"
-        future_receipt = found(future_store, legacy_terms)
-        with closing(sqlite3.connect(future_store)) as raw, raw:
-            raw.execute(f"PRAGMA user_version = {MAX_SCHEMA_VERSION + 5}")
+        tampered_store = root / "tampered.sqlite"
+        tampered_receipt = found(tampered_store, canonical_terms)
+        with closing(sqlite3.connect(tampered_store)) as raw, raw:
+            raw.execute("DROP INDEX idx_audit_event_company_seq")
         with self.assertRaises(StorageRefused):
-            open_reader(future_store)
+            open_reader(tampered_store)
         with self.assertRaises(StorageRefused):
-            open_writer(future_store)
-        future_cli = subprocess.run(
+            open_writer(tampered_store)
+        tampered_cli = subprocess.run(
             [
                 sys.executable,
                 "-I",
                 "-m",
                 "sourdough.cli",
                 "inspect-work",
-                str(future_store),
+                str(tampered_store),
                 "--company-id",
-                future_receipt.company_id,
+                tampered_receipt.company_id,
             ],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        self.assertEqual(future_cli.returncode, 1)
-        self.assertIn("Company command refused", future_cli.stderr)
+        self.assertEqual(tampered_cli.returncode, 1)
+        self.assertIn("Company command refused", tampered_cli.stderr)
 
         # 2. Installed CLI paper trade + continuation through unified CompanyRuntime & WAL store
         store = root / "company.sqlite"
@@ -474,6 +436,13 @@ class ConnectedFlow(unittest.TestCase):
 
         restored_db = root / "restored.sqlite"
         restored_desk = root / "desk-restored"
+        check_calls: list[int] = []
+
+        def check_original_live(conn: sqlite3.Connection) -> None:
+            self.assertTrue(conn.in_transaction)
+            check_calls.append(int(conn.execute("PRAGMA query_only").fetchone()[0]))
+            self.assertTrue(is_domain_installed(conn, "paper"))
+
         restore_receipt = restore_store(
             store,
             company_id,
@@ -481,8 +450,11 @@ class ConnectedFlow(unittest.TestCase):
             restored_db,
             desk_destination=restored_desk,
             reconcile=reconcile_shadow,
+            check_original=check_original_live,
+            external_scope="paper:acct-1:mandate-v1",
             lease_directory=leases,
         )
+        self.assertEqual(check_calls, [1, 0])
         verify_no_wal_sidecars(restored_db)
 
         with closing(open_reader(restored_db)) as reader, read_tx(reader):

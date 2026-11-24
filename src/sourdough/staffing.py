@@ -8,7 +8,7 @@ from sqlite3 import Connection
 from time import time
 from uuid import uuid4
 
-from .company import _connect, upgrade_work_schema
+from .company import _connect
 from .duty_run import (
     DutyClaim,
     DutyRefused,
@@ -22,50 +22,6 @@ from .writer_lease import WriterLease
 
 STAFFING_REVIEW = "staffing_review"
 CHOICES = frozenset(("hire", "reassign", "defer"))
-_CREATE_FOLLOW_UP = """CREATE TABLE IF NOT EXISTS staffing_follow_up (
-    previous_duty_id TEXT PRIMARY KEY NOT NULL REFERENCES staffing_assignment(duty_id),
-    duty_id TEXT NOT NULL UNIQUE REFERENCES staffing_assignment(duty_id)
-)"""
-_CREATE_ADMISSION_RUN = """CREATE TABLE IF NOT EXISTS hire_admission_run (
-    request_id TEXT PRIMARY KEY NOT NULL REFERENCES hire_receipt(request_id),
-    run_id TEXT NOT NULL REFERENCES duty_run(run_id)
-)"""
-SCHEMA = (
-    """CREATE TABLE IF NOT EXISTS staffing_authority (
-        grant_id TEXT PRIMARY KEY NOT NULL REFERENCES standing_grant(id),
-        execution_profile TEXT NOT NULL, allowed_scope TEXT NOT NULL,
-        slots INTEGER NOT NULL CHECK (slots > 0),
-        turns INTEGER NOT NULL CHECK (turns > 0),
-        manager_scope TEXT NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS staffing_assignment (
-        duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
-        manager_grant_id TEXT NOT NULL REFERENCES staffing_authority(grant_id),
-        evidence TEXT NOT NULL, evidence_revision TEXT NOT NULL,
-        available_at INTEGER NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS staffing_read (
-        run_id TEXT PRIMARY KEY NOT NULL REFERENCES duty_run(run_id),
-        snapshot TEXT NOT NULL, revision TEXT NOT NULL, read_at INTEGER NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS staffing_choice (
-        duty_id TEXT PRIMARY KEY NOT NULL REFERENCES staffing_assignment(duty_id),
-        run_id TEXT NOT NULL REFERENCES staffing_read(run_id),
-        choice_id TEXT NOT NULL UNIQUE,
-        terms TEXT NOT NULL, decided_at INTEGER NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS hire_receipt (
-        request_id TEXT PRIMARY KEY NOT NULL,
-        choice_id TEXT NOT NULL UNIQUE REFERENCES staffing_choice(choice_id),
-        manager_grant_id TEXT NOT NULL REFERENCES staffing_authority(grant_id),
-        agent_id TEXT NOT NULL UNIQUE REFERENCES agent(id),
-        grant_id TEXT NOT NULL UNIQUE REFERENCES standing_grant(id),
-        allocated_turns INTEGER NOT NULL CHECK (allocated_turns > 0),
-        terms TEXT NOT NULL, hired_at INTEGER NOT NULL
-    )""",
-    _CREATE_FOLLOW_UP,
-    _CREATE_ADMISSION_RUN,
-)
 
 
 def _canonical(value: dict) -> str:
@@ -132,11 +88,8 @@ def stage_staffing(
     writer: WriterLease, authority: StaffingAuthority, need: StaffingNeed
 ) -> str:
     writer.verify()
-    upgrade_work_schema(writer.store, writer.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        for statement in SCHEMA:
-            connection.execute(statement)
         row = connection.execute(
             """SELECT g.agent_id, g.scope FROM standing_grant g JOIN agent a ON a.id = g.agent_id
                WHERE g.id = ? AND a.company_id = ? AND g.scope != 'revoked'""",
@@ -370,7 +323,6 @@ def record_choice(writer: WriterLease, claim: DutyClaim, choice: StaffingChoice)
 def _schedule_staffing_review(
     connection: Connection, claim: DutyClaim, evidence: str, due_at: int
 ) -> None:
-    connection.execute(_CREATE_FOLLOW_UP)
     successor = uuid4().hex
     carried = _canonical(json.loads(evidence) | {"duty_id": successor})
     connection.execute(
@@ -540,7 +492,6 @@ def admit_hire(
         connection.execute(
             "UPDATE duty SET state = 'settled' WHERE id = ?", (claim.duty_id,)
         )
-        connection.execute(_CREATE_ADMISSION_RUN)
         connection.execute(
             "INSERT INTO hire_admission_run VALUES (?, ?)",
             (request.request_id, claim.run_id),

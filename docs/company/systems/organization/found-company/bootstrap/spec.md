@@ -20,7 +20,7 @@ Use one atomic founding receipt rather than creating the founder, grant and firs
 
 - **FR.** Repeated setup with the same identity returns the original receipt. Reopening loads its store and due work.
 - **NFR.** Reject incompatible founding replay. Keep one active company writer.
-- **Store compatibility.** Record the company identity and schema revision in the founding transaction. Before scheduling on reopen, compare the expected identity and supported schema; an absent expected store, identity mismatch or unsupported revision must not create a replacement or start work. A later schema upgrade is an explicit storage operation, not a side effect of founding.
+- **Store compatibility.** Record the company identity, canonical `v1` `core` domain registration (`installed_domains`) and `PRAGMA user_version = 1` in the founding transaction. Before scheduling on reopen, compare the expected identity, `PRAGMA user_version == 1` and canonical `sqlite_schema` digest; an absent expected store, identity mismatch, tampered schema or any `PRAGMA user_version != 1` fails closed without creating a replacement or starting work. Opt-in profile domains (such as `paper`) activate explicitly at profile binding rather than at company founding.
 
 ## Acceptance and independent evidence
 
@@ -30,7 +30,7 @@ Use one atomic founding receipt rather than creating the founder, grant and firs
 | --- | --- |
 | Normal | Found a company with no industry profile, close the UI and reopen. One founder and due item remain. In the quant integration separately bind the simulated account to that same company. |
 | Failure or contention | Interrupt after commit before reply and retry: one founder, grant and due item. Changing the mandate under the same request conflicts. |
-| Incompatible reopen | Open a copy stamped with a newer, unsupported schema. Observe a compatibility refusal, unchanged company records and zero duty starts; no second store is created. |
+| Incompatible reopen | Open a copy stamped with `PRAGMA user_version != 1` (such as `0` on a non-empty store or `2`) or an altered schema digest. Observe a compatibility refusal, unchanged company records and zero duty starts; no second store is created. |
 
 ## Operations and change review
 

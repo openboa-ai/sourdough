@@ -8,7 +8,7 @@ from sqlite3 import Connection
 from time import monotonic, sleep, time
 
 from .abandoned_work import requeue_uncommitted_work
-from .company import _connect, upgrade_work_schema
+from .company import _connect
 from .duty_run import (
     PAPER_EXECUTION,
     POSITION_REVIEW,
@@ -152,7 +152,6 @@ def _operate(
 ) -> CompanyRun:
     store, company_id = writer.store, writer.company_id
     writer.verify()
-    upgrade_work_schema(store, company_id)
     if budget_from is not None:
         consumed = count_company_runs(store, company_id) - budget_from
         if consumed < 0:

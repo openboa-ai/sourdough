@@ -14,6 +14,7 @@ from .paper_account import has_pending_binding_change, reopen_binding
 from .paper_decision import has_matching_paper_decision
 from .paper_execution import PaperDestination, PaperIntent, VenueRefused
 from .paper_research import allows_hired_research_order, allows_research_order
+from .storage.schema import is_domain_installed, require_domain
 from .writer_lease import WriterLease
 
 
@@ -42,9 +43,7 @@ def reserved_exposure(connection: Connection, account_id: str) -> int:
 
 
 def _historical_receipt(connection, claim, intent):
-    if not connection.execute(
-        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'paper_order'"
-    ).fetchone():
+    if not is_domain_installed(connection, "paper"):
         return None
     previous = connection.execute(
         """SELECT o.order_id, o.instrument_rules_digest, o.quantity, o.limit_minor_units
@@ -148,20 +147,7 @@ def submit_paper_order(
             raise OrderRefused(
                 "Later paper order requires its persisted decision and exact terms"
             )
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS paper_order (
-                order_id TEXT PRIMARY KEY NOT NULL,
-                run_id TEXT NOT NULL REFERENCES duty_run(run_id),
-                mandate_revision TEXT NOT NULL,
-                account_id TEXT NOT NULL,
-                action_id TEXT NOT NULL,
-                instrument_rules_digest TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                limit_minor_units INTEGER NOT NULL,
-                reserved_minor_units INTEGER NOT NULL,
-                UNIQUE (run_id, action_id)
-            )"""
-        )
+        require_domain(connection, "paper")
         reservation = intent.quantity * intent.limit_minor_units
         pending = reserved_exposure(connection, account.account_id)
         if reservation + pending > observed_binding.exposure_limit_minor_units:
