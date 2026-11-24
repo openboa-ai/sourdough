@@ -16,43 +16,44 @@ _SQL_MUTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SQL_DDL_RE = re.compile(
+    r"\b(?:"
+    r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+\"?([a-z][a-z0-9_]*)\"?(?:\s*\(|\s+AS\b)"
+    r"|ALTER\s+TABLE\s+\"?([a-z][a-z0-9_]*)\"?\s+(?:ADD|RENAME|DROP)\b"
+    r"|DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+\"?([a-z][a-z0-9_]*)\"?"
+    r")",
+    re.IGNORECASE,
+)
+
+# Modules that manage physically separate SQLite databases outside company.sqlite.
+SEPARATE_DB_MODULES: frozenset[str] = frozenset(
+    {
+        "paper_venue.py",
+        "market_worker.py",
+        "nautilus_paper.py",
+    }
+)
+
 # Maps each authoritative SQLite table to the set of module paths (relative to
 # src/sourdough/) authorized to execute SQL mutations against it.
 DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Storage & kernel tables
-    "schema_migrations": frozenset({"storage/migrations.py"}),
-    "audit_event": frozenset({"storage/kernel.py", "storage/migrations.py"}),
-    "command_receipt": frozenset({"storage/kernel.py", "storage/migrations.py"}),
-    "external_actions": frozenset({"storage/kernel.py", "storage/migrations.py"}),
-    "company_restore_receipt": frozenset(
-        {"storage/checkpoint.py", "storage/migrations.py"}
-    ),
-    "company_store_retired": frozenset(
-        {"storage/checkpoint.py", "storage/migrations.py"}
-    ),
-    "company_store_retired_digest": frozenset(
-        {"storage/checkpoint.py", "storage/migrations.py"}
-    ),
+    "installed_domains": frozenset({"storage/schema.py"}),
+    "audit_event": frozenset({"storage/kernel.py"}),
+    "command_receipt": frozenset({"storage/kernel.py"}),
+    "external_actions": frozenset({"storage/kernel.py"}),
+    "company_restore_receipt": frozenset({"storage/checkpoint.py"}),
+    "company_store_retired": frozenset({"storage/checkpoint.py"}),
     # Three-entity Work kernel tables
-    "work_items": frozenset({"runtime/work_kernel.py", "storage/migrations.py"}),
-    "work_runs": frozenset({"runtime/work_kernel.py", "storage/migrations.py"}),
-    "work_responsibilities": frozenset(
-        {"runtime/work_kernel.py", "storage/migrations.py"}
-    ),
-    "work_conditions": frozenset({"runtime/work_kernel.py", "storage/migrations.py"}),
-    "work_condition_occurrences": frozenset(
-        {"runtime/work_kernel.py", "storage/migrations.py"}
-    ),
-    "work_peer_requests": frozenset(
-        {"runtime/work_kernel.py", "storage/migrations.py"}
-    ),
+    "work_items": frozenset({"runtime/work_kernel.py"}),
+    "work_runs": frozenset({"runtime/work_kernel.py"}),
+    "work_responsibilities": frozenset({"runtime/work_kernel.py"}),
+    "work_conditions": frozenset({"runtime/work_kernel.py"}),
+    "work_condition_occurrences": frozenset({"runtime/work_kernel.py"}),
+    "work_peer_requests": frozenset({"runtime/work_kernel.py"}),
     # Core company & staffing tables
-    "company": frozenset(
-        {"company.py", "storage/migrations.py", "storage/checkpoint.py"}
-    ),
-    "founder": frozenset({"company.py"}),
+    "company": frozenset({"company.py", "storage/checkpoint.py"}),
     "agent": frozenset({"company.py", "staffing.py"}),
-    "agent_next": frozenset({"company.py"}),
     "standing_grant": frozenset({"company.py", "staffing.py"}),
     "founding_receipt": frozenset({"company.py"}),
     "staffing_authority": frozenset({"staffing.py"}),
@@ -80,10 +81,8 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
             "company_assessment.py",
         }
     ),
-    "duty_next": frozenset({"company.py"}),
     "duty_run": frozenset(
         {
-            "company.py",
             "duty_run.py",
             "first_duty.py",
             "abandoned_work.py",
@@ -91,22 +90,17 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
             "staffing.py",
         }
     ),
-    "duty_run_next": frozenset({"company.py"}),
-    "first_duty_claim": frozenset({"company.py"}),
-    "work_follow_up": frozenset({"company.py", "work.py", "abandoned_work.py"}),
-    "follow_up_next": frozenset({"company.py"}),
-    "work_result_read": frozenset({"company.py", "work.py"}),
-    "work_result_read_next": frozenset({"company.py"}),
+    "work_follow_up": frozenset({"work.py", "abandoned_work.py"}),
+    "work_result_read": frozenset({"work.py"}),
     "work_review_decision": frozenset({"work.py"}),
     "assessment_source": frozenset({"company_assessment.py"}),
     "assessment_read": frozenset({"company_assessment.py"}),
     "assessment_publication": frozenset({"company_assessment.py"}),
-    # Quant profile tables (company store)
+    # Opt-in paper domain tables (company store)
     "paper_binding": frozenset({"paper_account.py"}),
     "paper_binding_change": frozenset({"paper_account.py"}),
     "paper_order": frozenset({"paper_order.py", "paper_books.py"}),
     "paper_fill": frozenset({"paper_books.py"}),
-    "paper_fill_next": frozenset({"paper_books.py"}),
     "paper_fill_fee": frozenset({"paper_books.py"}),
     "paper_cancellation": frozenset({"paper_reconcile.py", "paper_books.py"}),
     "paper_reconciliation": frozenset({"paper_reconcile.py"}),
@@ -114,13 +108,12 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "paper_decision": frozenset({"paper_decision.py"}),
     "paper_review_quote": frozenset({"paper_decision.py", "paper_review.py"}),
     "paper_research_plan": frozenset({"paper_research.py"}),
-    "paper_research_plan_legacy": frozenset({"paper_research.py"}),
     "paper_research_snapshot": frozenset({"paper_research.py"}),
     "paper_research_finding": frozenset({"paper_research.py"}),
     "paper_research_decision": frozenset({"paper_research.py"}),
     "hired_research_order_request": frozenset({"paper_research.py"}),
-    "replay_decision_cut": frozenset({"paper_research.py", "nautilus_paper.py"}),
     # Separate venue / market SQLite databases (outside company store)
+    "replay_decision_cut": frozenset({"nautilus_paper.py"}),
     "venue_account": frozenset({"paper_venue.py"}),
     "venue_execution": frozenset({"paper_venue.py"}),
     "venue_fee_policy": frozenset({"paper_venue.py"}),
@@ -141,7 +134,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
 }
 
 
-def _extract_mutated_tables(source: str) -> set[str]:
+def _extract_tables(source: str, pattern: re.Pattern[str]) -> set[str]:
     tree = ast.parse(source)
     tables: set[str] = set()
     for node in ast.walk(tree):
@@ -156,20 +149,21 @@ def _extract_mutated_tables(source: str) -> set[str]:
             )
         if text is None:
             continue
-        for match in _SQL_MUTATION_RE.finditer(text):
+        for match in pattern.finditer(text):
             name = next(group for group in match.groups() if group is not None)
             tables.add(name.lower())
     return tables
 
 
 def audit_domain_write_ownership(src_root: Path) -> list[str]:
-    """Return a list of unauthorized or unregistered SQL table write violations."""
+    """Return unauthorized table mutations or prohibited company-store inline DDL."""
     violations: list[str] = []
     for path in sorted(src_root.rglob("*.py")):
         rel = path.relative_to(src_root).as_posix()
         if rel == "storage/ownership.py":
             continue
-        mutated = _extract_mutated_tables(path.read_text(encoding="utf-8"))
+        source = path.read_text(encoding="utf-8")
+        mutated = _extract_tables(source, _SQL_MUTATION_RE)
         for table in sorted(mutated):
             owners = DOMAIN_TABLE_OWNERS.get(table)
             if owners is None:
@@ -177,5 +171,10 @@ def audit_domain_write_ownership(src_root: Path) -> list[str]:
             elif rel not in owners:
                 violations.append(
                     f"{rel}: unauthorized mutation of table '{table}' (owners: {sorted(owners)})"
+                )
+        if rel not in SEPARATE_DB_MODULES:
+            for ddl_table in sorted(_extract_tables(source, _SQL_DDL_RE)):
+                violations.append(
+                    f"{rel}: inline company-store DDL prohibited for '{ddl_table}' (declare in storage/schema/v1/)"
                 )
     return violations

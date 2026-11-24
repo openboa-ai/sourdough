@@ -11,6 +11,12 @@ from pathlib import Path
 from sourdough.company import SCHEMA_REVISION
 
 TABLES = (
+    "installed_domains",
+    "audit_event",
+    "command_receipt",
+    "external_actions",
+    "company_restore_receipt",
+    "company_store_retired",
     "company",
     "agent",
     "standing_grant",
@@ -19,19 +25,27 @@ TABLES = (
     "work_follow_up",
     "duty_run",
     "work_result_read",
-    "schema_migrations",
-    "audit_event",
-    "command_receipt",
-    "external_actions",
-    "company_restore_receipt",
-    "company_store_retired",
-    "company_store_retired_digest",
+    "work_review_decision",
     "work_items",
     "work_runs",
     "work_responsibilities",
     "work_conditions",
     "work_condition_occurrences",
     "work_peer_requests",
+    "staffing_authority",
+    "staffing_assignment",
+    "staffing_read",
+    "staffing_choice",
+    "hire_receipt",
+    "staffing_follow_up",
+    "hire_admission_run",
+    "hire_onboarding",
+    "private_desk",
+    "onboarding_read",
+    "onboarding_acceptance",
+    "assessment_source",
+    "assessment_read",
+    "assessment_publication",
 )
 
 
@@ -125,14 +139,16 @@ class Founding(unittest.TestCase):
         )
         self.assertEqual(self.store.read_bytes(), original)
 
-        with closing(sqlite3.connect(self.store)) as db, db:
-            db.execute("UPDATE company SET schema_revision = 999")
-        incompatible = self.store.read_bytes()
-        self.refusal(
-            self.command("reopen", **{"company-id": receipt["company_id"]}),
-            "Unsupported",
-        )
-        self.assertEqual(self.store.read_bytes(), incompatible)
+        for bad_version in (2, 0):
+            with self.subTest(user_version=bad_version):
+                with closing(sqlite3.connect(self.store)) as db, db:
+                    db.execute(f"PRAGMA user_version = {bad_version}")
+                incompatible = self.store.read_bytes()
+                self.refusal(
+                    self.command("reopen", **{"company-id": receipt["company_id"]}),
+                    "Unsupported",
+                )
+                self.assertEqual(self.store.read_bytes(), incompatible)
         files = {path.name for path in self.store.parent.iterdir()}
         self.assertIn(self.store.name, files)
         self.assertTrue(
@@ -168,4 +184,4 @@ class Founding(unittest.TestCase):
             [1, 1, 1, 1, 1, 0, 0],
         )
         self.assertEqual(len(inv["audit_event"]), 1)
-        self.assertGreaterEqual(len(inv["schema_migrations"]), 2)
+        self.assertEqual(len(inv["installed_domains"]), 1)

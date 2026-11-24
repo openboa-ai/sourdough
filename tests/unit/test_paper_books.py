@@ -182,50 +182,6 @@ class PaperBooksTests(unittest.TestCase):
                 [(order_id,)],
             )
 
-    def test_legacy_single_fill_preserves_posting_fees_and_position_snapshot(self):
-        order_id = self.submit(110)
-        original = self.venue.observe_execution(order_id)
-        with closing(sqlite3.connect(self.store)) as book, book:
-            book.execute(
-                """CREATE TABLE paper_fill (fill_id TEXT PRIMARY KEY NOT NULL,
-                   order_id TEXT UNIQUE NOT NULL REFERENCES paper_order(order_id),
-                   quantity INTEGER NOT NULL, price_minor_units INTEGER NOT NULL)"""
-            )
-            book.execute(
-                """CREATE TABLE paper_fill_fee (fill_id TEXT PRIMARY KEY NOT NULL
-                   REFERENCES paper_fill(fill_id), fee_minor_units INTEGER NOT NULL)"""
-            )
-            book.execute(
-                "INSERT INTO paper_fill VALUES (?,?,?,?)",
-                (
-                    original.fill_id,
-                    order_id,
-                    original.quantity,
-                    original.fill_price_minor_units,
-                ),
-            )
-            book.execute(
-                "INSERT INTO paper_fill_fee VALUES (?,?)",
-                (original.fill_id, original.fee_minor_units),
-            )
-        source = self.venue.read_order_position("account", order_id)
-        before = capture_position(
-            self.store, self.company_id, original.fill_id, source, now=101
-        )
-        self.assertEqual(self.post(order_id).fill_id, original.fill_id)
-        self.assertEqual(
-            capture_position(
-                self.store, self.company_id, original.fill_id, source, now=102
-            ),
-            before,
-        )
-        with closing(sqlite3.connect(self.store)) as book:
-            self.assertEqual(book.execute("PRAGMA foreign_key_check").fetchall(), [])
-            self.assertEqual(
-                book.execute("SELECT * FROM paper_fill_fee").fetchall(),
-                [(original.fill_id, original.fee_minor_units)],
-            )
-
     def test_history_batch_rolls_back_if_one_fill_conflicts(self):
         order_id = self.submit(99)
         unfilled = self.venue.observe_execution(order_id)

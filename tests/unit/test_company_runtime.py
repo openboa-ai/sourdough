@@ -308,16 +308,26 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                 (hired_id,),
             )
             conn.execute(
-                """CREATE TABLE IF NOT EXISTS hire_receipt (
-                       request_id TEXT PRIMARY KEY NOT NULL,
-                       choice_id TEXT NOT NULL UNIQUE,
-                       manager_grant_id TEXT NOT NULL,
-                       agent_id TEXT NOT NULL UNIQUE REFERENCES agent(id),
-                       grant_id TEXT NOT NULL UNIQUE REFERENCES standing_grant(id),
-                       allocated_turns INTEGER NOT NULL CHECK (allocated_turns > 0),
-                       terms TEXT NOT NULL,
-                       hired_at INTEGER NOT NULL
-                   )"""
+                "INSERT INTO staffing_authority VALUES (?, 'profile-hired', 'assessment', 1, 1, 'manage')",
+                (self.receipt.grant_id,),
+            )
+            conn.execute(
+                "INSERT INTO duty VALUES ('staffing-duty-1', ?, 'running')",
+                (self.receipt.founder_id,),
+            )
+            conn.execute(
+                "INSERT INTO duty_run VALUES ('staffing-run-1', 'staffing-duty-1', ?, 'manage', 'staffing', 1)",
+                (self.receipt.grant_id,),
+            )
+            conn.execute(
+                "INSERT INTO staffing_assignment VALUES ('staffing-duty-1', ?, '{}', 'rev-1', 10)",
+                (self.receipt.grant_id,),
+            )
+            conn.execute(
+                "INSERT INTO staffing_read VALUES ('staffing-run-1', '{}', 'rev-1', 10)"
+            )
+            conn.execute(
+                "INSERT INTO staffing_choice VALUES ('staffing-duty-1', 'staffing-run-1', 'ch-h1', '{}', 100)"
             )
             conn.execute(
                 """INSERT INTO hire_receipt VALUES (

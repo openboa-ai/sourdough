@@ -22,24 +22,6 @@ from .writer_lease import WriterLease
 
 
 ASSESSMENT = "assessment"
-SCHEMA = (
-    """CREATE TABLE IF NOT EXISTS assessment_source (
-        company_id TEXT PRIMARY KEY NOT NULL REFERENCES company(id),
-        revision TEXT NOT NULL, records TEXT NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS assessment_read (
-        run_id TEXT PRIMARY KEY NOT NULL REFERENCES duty_run(run_id),
-        revision TEXT NOT NULL, contents TEXT NOT NULL, read_at INTEGER NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS assessment_publication (
-        duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
-        run_id TEXT NOT NULL REFERENCES assessment_read(run_id),
-        action_id TEXT NOT NULL UNIQUE, revision TEXT NOT NULL, contents TEXT NOT NULL,
-        author_id TEXT NOT NULL REFERENCES agent(id),
-        audience_id TEXT NOT NULL REFERENCES agent(id),
-        published_at INTEGER NOT NULL, review_at INTEGER NOT NULL
-    )""",
-)
 
 
 def _json(value) -> str:
@@ -88,8 +70,6 @@ def seal_assessment_source(
     revision = _digest(body)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        for statement in SCHEMA:
-            connection.execute(statement)
         existing = connection.execute(
             "SELECT revision, records FROM assessment_source WHERE company_id = ?",
             (writer.company_id,),

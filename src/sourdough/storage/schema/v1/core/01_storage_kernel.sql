@@ -1,7 +1,16 @@
--- Unified storage kernel tables: append-only audit log, idempotent command receipts,
--- external action outbox, restore receipts, and store retirement fencing.
+-- Canonical v1 storage kernel tables: domain registry, append-only audit log,
+-- idempotent command receipts, external action outbox, restore receipts, and
+-- unified store retirement fencing with replacement digest.
 
-CREATE TABLE IF NOT EXISTS audit_event (
+CREATE TABLE installed_domains (
+    domain TEXT PRIMARY KEY CHECK (domain IN ('core', 'paper')),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    pack_sha256 TEXT NOT NULL,
+    sqlite_schema_sha256 TEXT NOT NULL,
+    activated_at_ns INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE audit_event (
     event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id TEXT NOT NULL,
     domain TEXT NOT NULL,
@@ -15,22 +24,22 @@ CREATE TABLE IF NOT EXISTS audit_event (
     recorded_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX IF NOT EXISTS idx_audit_event_company_seq
+CREATE INDEX idx_audit_event_company_seq
     ON audit_event(company_id, event_seq);
 
-CREATE TRIGGER IF NOT EXISTS tr_audit_event_no_update
+CREATE TRIGGER tr_audit_event_no_update
 BEFORE UPDATE ON audit_event
 BEGIN
     SELECT RAISE(ABORT, 'audit_event is append-only');
 END;
 
-CREATE TRIGGER IF NOT EXISTS tr_audit_event_no_delete
+CREATE TRIGGER tr_audit_event_no_delete
 BEFORE DELETE ON audit_event
 BEGIN
     SELECT RAISE(ABORT, 'audit_event is append-only');
 END;
 
-CREATE TRIGGER IF NOT EXISTS tr_audit_event_no_replace
+CREATE TRIGGER tr_audit_event_no_replace
 BEFORE INSERT ON audit_event
 WHEN NEW.event_seq IS NOT NULL AND EXISTS (
     SELECT 1 FROM audit_event WHERE event_seq = NEW.event_seq
@@ -39,7 +48,7 @@ BEGIN
     SELECT RAISE(ABORT, 'audit_event is append-only');
 END;
 
-CREATE TABLE IF NOT EXISTS command_receipt (
+CREATE TABLE command_receipt (
     company_id TEXT NOT NULL,
     command_id TEXT NOT NULL,
     actor_id TEXT NOT NULL,
@@ -57,7 +66,7 @@ CREATE TABLE IF NOT EXISTS command_receipt (
     PRIMARY KEY (company_id, command_id)
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS external_actions (
+CREATE TABLE external_actions (
     idempotency_key TEXT PRIMARY KEY,
     company_id TEXT NOT NULL,
     run_id TEXT,
@@ -71,19 +80,20 @@ CREATE TABLE IF NOT EXISTS external_actions (
     updated_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX IF NOT EXISTS idx_external_actions_company_status
+CREATE INDEX idx_external_actions_company_status
     ON external_actions(company_id, status);
 
-CREATE TABLE IF NOT EXISTS company_restore_receipt (
+CREATE TABLE company_restore_receipt (
     request_revision TEXT PRIMARY KEY,
     checkpoint_sha256 TEXT NOT NULL,
     watermark_json TEXT NOT NULL,
     restored_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS company_store_retired (
+CREATE TABLE company_store_retired (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     request_revision TEXT NOT NULL,
-    original_schema INTEGER NOT NULL,
+    original_schema INTEGER NOT NULL CHECK (original_schema = 1),
+    replacement_sha256 TEXT NOT NULL,
     retired_at_ns INTEGER NOT NULL
 ) STRICT;

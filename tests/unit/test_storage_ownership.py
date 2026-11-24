@@ -22,3 +22,14 @@ class StorageDomainOwnership(unittest.TestCase):
             self.assertEqual(len(violations), 1)
             self.assertIn("paper_order.py", violations[0])
             self.assertIn("company", violations[0])
+
+    def test_checker_flags_inline_ddl_in_company_store_module(self):
+        with TemporaryDirectory() as directory:
+            fake_root = Path(directory)
+            (fake_root / "paper_order.py").write_text(
+                'def bad(conn):\n    conn.execute("CREATE TABLE IF NOT EXISTS paper_order (order_id TEXT)")\n',
+                encoding="utf-8",
+            )
+            violations = audit_domain_write_ownership(fake_root)
+            self.assertEqual(len(violations), 1)
+            self.assertIn("inline company-store DDL", violations[0])

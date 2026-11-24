@@ -226,9 +226,7 @@ class ExecutionProtocolParity(unittest.TestCase):
                     bind(store, mandate, wrong)
                 with self.assertRaisesRegex(OrderRefused, "destination mismatch"):
                     submit_paper_order(store, claim, intent, wrong)
-        self.assertEqual(
-            rows(store, "SELECT name FROM sqlite_schema WHERE name='paper_order'"), []
-        )
+        self.assertEqual(rows(store, "SELECT COUNT(*) FROM paper_order"), [(0,)])
 
         with self.assertRaises(TimeoutError):
             submit_paper_order(store, claim, intent, original)
@@ -386,9 +384,7 @@ class ExecutionProtocolParity(unittest.TestCase):
                 venue,
             )
         self.assertEqual(rows(journal, outside), [])
-        self.assertEqual(
-            rows(store, "SELECT name FROM sqlite_schema WHERE name='paper_order'"), []
-        )
+        self.assertEqual(rows(store, "SELECT COUNT(*) FROM paper_order"), [(0,)])
         intent = PaperIntent("company-action", account.instrument_rules_digest, 2, 110)
         if withhold:
             with self.assertRaises(TimeoutError):

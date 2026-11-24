@@ -230,10 +230,7 @@ def observe(output: Path, employee: Path):
                 "SELECT order_id, fill_id, quantity, fill_price_minor_units FROM venue_execution",
             )
             assert known[0] == cut["order_id"] and known[1] is not None
-            assert (
-                read(store, "SELECT name FROM sqlite_schema WHERE name = 'paper_fill'")
-                == []
-            )
+            assert read(store, "SELECT COUNT(*) FROM paper_fill") == [(0,)]
             original, finding, decision, research_receipt = check_research(
                 store, setup, known
             )

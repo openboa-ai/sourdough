@@ -20,6 +20,7 @@ from .paper_books import (
     resolved_order_sql,
 )
 from .paper_execution import PaperExecution
+from .storage.schema import is_domain_installed
 from .writer_lease import WriterLease
 
 
@@ -41,15 +42,6 @@ class PaperReconciliation:
     next_query_at: int | None
 
 
-def _has_table(connection: Connection, table: str) -> bool:
-    return (
-        connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
-        ).fetchone()
-        is not None
-    )
-
-
 def _open_recovery(
     store: Path, company_id: str, account_id: str, now: int, limit: int
 ) -> list[tuple]:
@@ -57,17 +49,8 @@ def _open_recovery(
         db.execute("BEGIN IMMEDIATE")
         if _identity(db) != company_id:
             raise PostingRefused("Company identity mismatch")
-        if not _has_table(db, "paper_order"):
+        if not is_domain_installed(db, "paper"):
             return []
-        db.execute(
-            """CREATE TABLE IF NOT EXISTS paper_reconciliation (
-                order_id TEXT PRIMARY KEY NOT NULL REFERENCES paper_order(order_id),
-                attempts INTEGER NOT NULL,
-                next_query_at INTEGER,
-                fill_id TEXT,
-                sources TEXT NOT NULL
-            )"""
-        )
         return db.execute(
             f"""SELECT o.order_id, f.id, e.grant_id, d.id, e.run_id,
                        f.execution_profile, COALESCE(j.attempts, 0)
@@ -90,7 +73,7 @@ def _pending_recovery(connection: Connection) -> str:
 
 
 def _has_booked_fill(connection: Connection) -> str:
-    return f"{FILLED_QUANTITY}>0" if _has_table(connection, "paper_fill") else "0"
+    return f"{FILLED_QUANTITY}>0" if is_domain_installed(connection, "paper") else "0"
 
 
 def _record_lookup(
@@ -108,11 +91,7 @@ def _record_lookup(
             raise PostingRefused("Company identity mismatch")
         next_query = None
         if posting is None:
-            pending_cancellation = (
-                "EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id)"
-                if _has_table(db, "paper_cancellation")
-                else "0"
-            )
+            pending_cancellation = "EXISTS (SELECT 1 FROM paper_cancellation c WHERE c.order_id=o.order_id)"
             unresolved, has_evidence = db.execute(
                 f"""SELECT {_pending_recovery(db)}, ({_has_booked_fill(db)} OR {pending_cancellation})
                     FROM paper_order o WHERE o.order_id=?""",
@@ -209,7 +188,7 @@ def reconcile_paper_orders(
             )
             recovered.append(ReconciledOrder(claim, posting, sources, no_fill))
     with closing(_connect(store, "ro")) as db:
-        if not _has_table(db, "paper_order"):
+        if not is_domain_installed(db, "paper"):
             return PaperReconciliation((), 0, None)
         unresolved, next_query = db.execute(
             f"""SELECT count(*), min(CASE WHEN j.order_id IS NULL THEN ? ELSE j.next_query_at END)

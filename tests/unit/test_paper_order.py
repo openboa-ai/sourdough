@@ -85,10 +85,8 @@ class PaperOrderTests(unittest.TestCase):
             self.submit(self.intent)
         self.assertEqual(self.destination.submissions, [])
         with closing(sqlite3.connect(f"{self.store.as_uri()}?mode=ro", uri=True)) as db:
-            self.assertIsNone(
-                db.execute(
-                    "SELECT 1 FROM sqlite_schema WHERE name='paper_order'"
-                ).fetchone()
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM paper_order").fetchone(), (0,)
             )
 
     def test_revoked_grant_replays_only_the_original_receipt(self):

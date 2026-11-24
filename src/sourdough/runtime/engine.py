@@ -8,7 +8,6 @@ from time import time_ns
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from ..company import upgrade_work_schema
 from ..duty_run import has_turn_capacity
 from ..paper_execution import PaperExecution
 from ..storage.db import open_writer, wal_checkpoint, write_tx
@@ -95,7 +94,6 @@ class CompanyRuntime:
             lease_directory=self._lease_directory,
             expected_store_key=self._expected_store_key,
         ) as writer:
-            upgrade_work_schema(self._store, self._company_id)
             if on_ready is not None:
                 on_ready(writer)
 
@@ -234,7 +232,6 @@ class CompanyRuntime:
             lease_directory=self._lease_directory,
             expected_store_key=self._expected_store_key,
         ) as writer:
-            upgrade_work_schema(self._store, self._company_id)
             with (
                 closing(open_writer(self._store, lease=writer)) as conn,
                 write_tx(conn),

@@ -1,9 +1,8 @@
--- Three-entity Work kernel: work_items, fenced work_runs with virtual-object
--- active uniqueness and zero-compute waits, standing responsibilities, versioned
--- next conditions with (source_identity, condition_revision) deduplication, and
--- explicit blocking peer requests.
+-- Canonical v1 three-entity Work kernel: work_items, fenced work_runs with
+-- single active execution per agent/item and zero-compute waits, standing
+-- responsibilities, versioned conditions, and explicit blocking peer requests.
 
-CREATE TABLE IF NOT EXISTS work_items (
+CREATE TABLE work_items (
     work_item_id TEXT PRIMARY KEY,
     company_id TEXT NOT NULL REFERENCES company(id),
     owner_agent_id TEXT NOT NULL REFERENCES agent(id),
@@ -20,10 +19,10 @@ CREATE TABLE IF NOT EXISTS work_items (
     updated_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX IF NOT EXISTS idx_work_items_company_state
+CREATE INDEX idx_work_items_company_state
     ON work_items(company_id, state, created_at_ns);
 
-CREATE TABLE IF NOT EXISTS work_runs (
+CREATE TABLE work_runs (
     run_id TEXT PRIMARY KEY,
     company_id TEXT NOT NULL REFERENCES company(id),
     work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id),
@@ -44,16 +43,16 @@ CREATE TABLE IF NOT EXISTS work_runs (
     updated_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_work_runs_active_agent
+CREATE UNIQUE INDEX ux_work_runs_active_agent
     ON work_runs(agent_id) WHERE status = 'running';
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_work_runs_active_item
+CREATE UNIQUE INDEX ux_work_runs_active_item
     ON work_runs(work_item_id) WHERE status = 'running';
 
-CREATE INDEX IF NOT EXISTS idx_work_runs_waiting
+CREATE INDEX idx_work_runs_waiting
     ON work_runs(company_id, status, wait_until_ns, wait_event_key);
 
-CREATE TABLE IF NOT EXISTS work_responsibilities (
+CREATE TABLE work_responsibilities (
     responsibility_id TEXT PRIMARY KEY,
     company_id TEXT NOT NULL REFERENCES company(id),
     owner_agent_id TEXT NOT NULL REFERENCES agent(id),
@@ -65,7 +64,7 @@ CREATE TABLE IF NOT EXISTS work_responsibilities (
     updated_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS work_conditions (
+CREATE TABLE work_conditions (
     condition_id TEXT PRIMARY KEY,
     company_id TEXT NOT NULL REFERENCES company(id),
     owner_agent_id TEXT NOT NULL REFERENCES agent(id),
@@ -86,10 +85,10 @@ CREATE TABLE IF NOT EXISTS work_conditions (
     updated_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX IF NOT EXISTS idx_work_conditions_armed
+CREATE INDEX idx_work_conditions_armed
     ON work_conditions(company_id, status, trigger_kind, due_at_ns);
 
-CREATE TABLE IF NOT EXISTS work_condition_occurrences (
+CREATE TABLE work_condition_occurrences (
     company_id TEXT NOT NULL REFERENCES company(id),
     source_identity TEXT NOT NULL,
     condition_revision INTEGER NOT NULL,
@@ -99,7 +98,7 @@ CREATE TABLE IF NOT EXISTS work_condition_occurrences (
     PRIMARY KEY (company_id, source_identity, condition_revision)
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS work_peer_requests (
+CREATE TABLE work_peer_requests (
     request_id TEXT PRIMARY KEY,
     company_id TEXT NOT NULL REFERENCES company(id),
     requester_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id),
@@ -117,5 +116,5 @@ CREATE TABLE IF NOT EXISTS work_peer_requests (
     created_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_work_peer_requests_open_duty
+CREATE UNIQUE INDEX ux_work_peer_requests_open_duty
     ON work_peer_requests(requester_work_item_id) WHERE state = 'open';

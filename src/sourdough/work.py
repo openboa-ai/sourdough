@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from .company import RESULT_READ_SCHEMA, SCHEMA_REVISION, _company_version, _connect
+from .company import SCHEMA_REVISION, _company_version, _connect
 from .duty_run import (
     ASSESSMENT_REVIEW,
     PAPER_EXECUTION,
@@ -395,7 +395,6 @@ def read_follow_up_result(
         result = read(connection, follow_up.result)
         if result.get("revision") != follow_up.result.revision:
             raise DutyRefused("Review result revision changed")
-        connection.execute(RESULT_READ_SCHEMA)
         connection.execute(
             """INSERT OR IGNORE INTO work_result_read VALUES (?, ?, ?, ?)""",
             (claim.duty_id, claim.run_id, follow_up.result.revision, now),
@@ -462,18 +461,6 @@ def settle_review(
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         state, scope = follow_up_state(connection, follow_up, follow_up.purpose)
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS work_review_decision (
-                duty_id TEXT PRIMARY KEY NOT NULL REFERENCES work_follow_up(duty_id),
-                run_id TEXT NOT NULL,
-                call_id TEXT NOT NULL UNIQUE,
-                result_revision TEXT NOT NULL,
-                action TEXT NOT NULL,
-                rationale TEXT NOT NULL,
-                next_check_seconds INTEGER NOT NULL,
-                decided_at INTEGER NOT NULL
-            )"""
-        )
         terms = (
             claim.run_id,
             decision.call_id,

@@ -7,7 +7,7 @@ from pathlib import Path
 from time import monotonic, sleep, time
 
 from .abandoned_work import requeue_uncommitted_work
-from .company import _connect, upgrade_work_schema
+from .company import _connect
 from .company_run import (
     PositionReview,
     _order_reference,
@@ -225,7 +225,6 @@ def _run_hired_paper(
     budget_from: int,
     on_ready: Callable[[WriterLease], None],
 ) -> HiredPaperRun:
-    upgrade_work_schema(store, company_id)
     reconciled, blocked = _recover(writer, venue, POSITION_REVIEW)
     requeue_uncommitted_work(writer, purpose=POSITION_REVIEW, hired_only=True)
     on_ready(writer)

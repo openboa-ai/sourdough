@@ -528,11 +528,8 @@ raise SystemExit(0 if bound.completed else 1)
             self.assertEqual(original[0], cut["order_id"])
             self.assertIsNotNone(original[1])
             self.assertEqual(
-                self.read(
-                    self.store,
-                    "SELECT name FROM sqlite_schema WHERE name = 'paper_fill'",
-                ),
-                [],
+                self.read(self.store, "SELECT COUNT(*) FROM paper_fill"),
+                [(0,)],
             )
             os.kill(cut["pid"], signal.SIGKILL)
             output, diagnostic = parent.communicate(timeout=14)

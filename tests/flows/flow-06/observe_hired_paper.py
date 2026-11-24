@@ -117,10 +117,7 @@ def observe(output, employee):
                 """SELECT order_id,fill_id,quantity,fill_price_minor_units FROM venue_execution""",
             )
             assert cut["order_id"] == original[0] and original[1]
-            assert (
-                rows(company, "SELECT name FROM sqlite_schema WHERE name='paper_fill'")
-                == []
-            )
+            assert rows(company, "SELECT COUNT(*) FROM paper_fill") == [(0,)]
             (accepted,) = rows(
                 company, "SELECT duty_id,run_id FROM onboarding_acceptance"
             )

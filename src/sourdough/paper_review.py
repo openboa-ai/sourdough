@@ -7,6 +7,8 @@ from time import time
 
 from .paper_account import BindingRefused, reopen_binding
 from .paper_execution import PaperExecution, VenueRefused
+from .storage.db import StorageRefused
+from .storage.schema import require_domain
 
 
 @dataclass(frozen=True)
@@ -27,7 +29,7 @@ def observe_review_quote(
             return ReviewQuote(
                 account.account_id, account.connector_revision, price, int(time())
             )
-    except (BindingRefused, VenueRefused, OperationalError):
+    except (BindingRefused, StorageRefused, VenueRefused, OperationalError):
         pass
     return ReviewQuote(None, None, None, int(time()))
 
@@ -35,15 +37,9 @@ def observe_review_quote(
 def bind_review_quote(
     connection: Connection, run_id: str, position: dict, quote: ReviewQuote
 ) -> dict:
+    require_domain(connection, "paper")
     if quote.account_id != position["account_id"]:
         quote = ReviewQuote(None, None, None, quote.observed_at)
-    connection.execute(
-        """CREATE TABLE IF NOT EXISTS paper_review_quote (
-            run_id TEXT PRIMARY KEY NOT NULL REFERENCES duty_run(run_id),
-            account_id TEXT, connector_revision TEXT, quote_minor_units INTEGER,
-            observed_at INTEGER NOT NULL
-        )"""
-    )
     connection.execute(
         "INSERT OR IGNORE INTO paper_review_quote VALUES (?, ?, ?, ?, ?)",
         (run_id, *astuple(quote)),

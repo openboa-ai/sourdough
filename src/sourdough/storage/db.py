@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from ..writer_lease import WriterLease
 
 
-MAX_SCHEMA_VERSION = 10
+SCHEMA_VERSION = 1
 RETIRED_SCHEMA_REVISION = -1
 BUSY_TIMEOUT_MS = 5000
 JOURNAL_SIZE_LIMIT_BYTES = 67_108_864
@@ -34,6 +34,7 @@ class ManagedConnection(sqlite3.Connection):
     """Autocommit connection that closes open explicit transactions on context exit."""
 
     _allow_retired: bool = False
+    _allow_initialize: bool = False
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> Literal[False]:
         if self.in_transaction:
@@ -58,32 +59,25 @@ def read_retirement(connection: sqlite3.Connection) -> StoreRetirement | None:
     if not _has_table(connection, "company_store_retired"):
         return None
     row = connection.execute(
-        "SELECT request_revision, original_schema FROM company_store_retired WHERE singleton = 1"
+        """SELECT request_revision, original_schema, replacement_sha256
+           FROM company_store_retired WHERE singleton = 1"""
     ).fetchone()
     if row is None:
         return None
-    request_revision = str(row[0])
-    original_schema = int(row[1])
-    replacement_sha256 = ""
-    if _has_table(connection, "company_store_retired_digest"):
-        digest_row = connection.execute(
-            """SELECT replacement_sha256
-               FROM company_store_retired_digest
-               WHERE singleton = 1 AND request_revision = ?""",
-            (request_revision,),
-        ).fetchone()
-        if digest_row is not None:
-            replacement_sha256 = str(digest_row[0])
-    return StoreRetirement(request_revision, original_schema, replacement_sha256)
+    return StoreRetirement(str(row[0]), int(row[1]), str(row[2]))
 
 
-def _check_user_version(connection: sqlite3.Connection) -> int:
-    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version < 0 or version > MAX_SCHEMA_VERSION:
-        raise StorageRefused(
-            f"Unsupported future company store schema version: {version}"
-        )
-    return version
+def _verify_store_schema(connection: sqlite3.Connection, *, allow_empty: bool) -> None:
+    from .schema import has_user_schema_objects, verify_v1_schema
+
+    if allow_empty and not has_user_schema_objects(connection):
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != 0:
+            raise StorageRefused(
+                f"Empty company store has unexpected schema version: {version}"
+            )
+        return
+    verify_v1_schema(connection)
 
 
 def _check_writable_state(
@@ -101,9 +95,11 @@ def _check_writable_state(
                 raise StorageRefused(
                     "Company store is retired and cannot accept writes"
                 )
-            if revision > MAX_SCHEMA_VERSION:
+            if revision != SCHEMA_VERSION and not (
+                allow_retired and revision == RETIRED_SCHEMA_REVISION
+            ):
                 raise StorageRefused(
-                    f"Unsupported future company store schema revision: {revision}"
+                    f"Unsupported company store schema revision: {revision}"
                 )
 
 
@@ -129,6 +125,7 @@ def open_writer(
     store: Path,
     *,
     create: bool = False,
+    initialize: bool = False,
     lease: "WriterLease | None" = None,
     journal_mode: Literal["WAL", "DELETE", "PRESERVE"] = "WAL",
     allow_retired: bool = False,
@@ -150,8 +147,9 @@ def open_writer(
     try:
         connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA trusted_schema = OFF")
-        _check_user_version(connection)
-        _check_writable_state(connection, allow_retired=allow_retired)
+        with read_tx(connection):
+            _verify_store_schema(connection, allow_empty=initialize)
+            _check_writable_state(connection, allow_retired=allow_retired)
         if journal_mode == "WAL":
             _set_journal_mode_with_retry(connection, "WAL")
             connection.execute(
@@ -166,6 +164,7 @@ def open_writer(
         connection.execute("PRAGMA recursive_triggers = ON")
         connection.execute("PRAGMA temp_store = MEMORY")
         connection._allow_retired = allow_retired
+        connection._allow_initialize = initialize
     except BaseException:
         connection.close()
         raise
@@ -188,7 +187,8 @@ def open_reader(store: Path) -> ManagedConnection:
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.execute("PRAGMA foreign_keys = ON")
-        _check_user_version(connection)
+        with read_tx(connection):
+            _verify_store_schema(connection, allow_empty=False)
     except BaseException:
         connection.close()
         raise
@@ -200,7 +200,10 @@ def write_tx(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """Run an atomic BEGIN IMMEDIATE write transaction."""
     connection.execute("BEGIN IMMEDIATE")
     try:
-        _check_user_version(connection)
+        _verify_store_schema(
+            connection,
+            allow_empty=bool(getattr(connection, "_allow_initialize", False)),
+        )
         _check_writable_state(
             connection,
             allow_retired=bool(getattr(connection, "_allow_retired", False)),
