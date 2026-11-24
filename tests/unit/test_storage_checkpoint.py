@@ -506,7 +506,9 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         real_link = os.link
 
         def fail_only_final_publish(src, dst, *args, **kwargs):
-            if Path(dst) == replacement.resolve(strict=False):
+            if dst == replacement.name or Path(dst) == replacement.resolve(
+                strict=False
+            ):
                 raise OSError("simulated publish I/O error")
             return real_link(src, dst, *args, **kwargs)
 
@@ -674,7 +676,9 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         real_link = os.link
 
         def fail_final_publish(src, dst, *args, **kwargs):
-            if Path(dst) == replacement.resolve(strict=False):
+            if dst == replacement.name or Path(dst) == replacement.resolve(
+                strict=False
+            ):
                 raise OSError("simulated publish I/O error")
             return real_link(src, dst, *args, **kwargs)
 
@@ -898,7 +902,9 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         real_link = os.link
 
         def fail_final_publish(src, dst, *args, **kwargs):
-            if Path(dst) == replacement.resolve(strict=False):
+            if dst == replacement.name or Path(dst) == replacement.resolve(
+                strict=False
+            ):
                 raise OSError("simulated publish I/O error")
             return real_link(src, dst, *args, **kwargs)
 
@@ -932,8 +938,9 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         real_copy_and_verify = cp_mod._copy_and_verify_replacement
 
         def swap_stage_right_after_verify(*args, **kwargs):
-            real_copy_and_verify(*args, **kwargs)
+            result = real_copy_and_verify(*args, **kwargs)
             os.replace(tampered, staged_db)
+            return result
 
         with patch(
             "sourdough.storage.checkpoint._copy_and_verify_replacement",
@@ -957,6 +964,103 @@ class StorageCheckpointAndRestore(unittest.TestCase):
             ]
         self.assertNotIn("escalated", scopes)
         self.assertIn("manage", scopes)
+
+    def test_swapping_private_copy_before_link_is_detected_and_unlinked(self):
+        from unittest.mock import patch
+
+        from sourdough.storage import checkpoint as cp_mod
+
+        archive = self.root / "checkpoint-swap-private.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "never-publish-tampered.sqlite"
+        real_link = os.link
+
+        def fail_final_publish(src, dst, *args, **kwargs):
+            if dst == replacement.name or Path(dst) == replacement.resolve(
+                strict=False
+            ):
+                raise OSError("simulated publish I/O error")
+            return real_link(src, dst, *args, **kwargs)
+
+        with patch(
+            "sourdough.storage.checkpoint.os.link", side_effect=fail_final_publish
+        ):
+            with self.assertRaisesRegex(OSError, "simulated publish I/O error"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    lease_directory=self.leases,
+                )
+
+        staged_db = next(self.root.glob(".sourdough-restore-*.sqlite"))
+        tampered = self.root / "tampered-private.sqlite"
+        tampered.write_bytes(staged_db.read_bytes())
+        with closing(
+            open_writer(tampered, create=False, journal_mode="DELETE")
+        ) as conn:
+            with write_tx(conn):
+                conn.execute("UPDATE standing_grant SET scope = 'escalated'")
+
+        # Simulate a same-UID attacker replacing the private copy itself after
+        # _copy_and_verify_replacement returns and before os.link executes.
+        real_copy_and_verify = cp_mod._copy_and_verify_replacement
+
+        def swap_private_copy(candidate, private_dir_fd, private_copy, *args, **kwargs):
+            result = real_copy_and_verify(
+                candidate, private_dir_fd, private_copy, *args, **kwargs
+            )
+            os.replace(tampered, private_copy)
+            return result
+
+        with patch(
+            "sourdough.storage.checkpoint._copy_and_verify_replacement",
+            side_effect=swap_private_copy,
+        ):
+            with self.assertRaisesRegex(
+                CheckpointRefused, "inode or digest changed during publication"
+            ):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    lease_directory=self.leases,
+                )
+        # Tampered replacement MUST be unlinked and never left published!
+        self.assertFalse(replacement.exists())
+
+    def test_restore_refuses_non_private_destination_parent_directory(self):
+        archive = self.root / "checkpoint-perms.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        shared_dir = self.root / "shared-dest"
+        shared_dir.mkdir(mode=0o755)
+        os.chmod(shared_dir, 0o755)
+        with self.assertRaisesRegex(CheckpointRefused, "owner-only"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                shared_dir / "restored.sqlite",
+                lease_directory=self.leases,
+            )
+        # Original store remains live and writable
+        with closing(open_writer(self.store)) as writer:
+            self.assertEqual(
+                writer.execute("SELECT schema_revision FROM company").fetchone(),
+                (MAX_SCHEMA_VERSION,),
+            )
 
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):

@@ -159,6 +159,7 @@ class ConnectedFlow(unittest.TestCase):
                 "external_actions",
                 "company_restore_receipt",
                 "company_store_retired",
+                "company_store_retired_digest",
                 "work_peer_requests",
                 "work_condition_occurrences",
                 "work_conditions",

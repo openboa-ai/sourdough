@@ -40,6 +40,7 @@ _WATERMARK_EXCLUDED_TABLES = frozenset(
     {
         "company_restore_receipt",
         "company_store_retired",
+        "company_store_retired_digest",
     }
 )
 
@@ -741,16 +742,37 @@ def _staged_restore_paths(
     return db_stage, desk_stage
 
 
+def _open_private_parent_dir(directory: Path) -> int:
+    """Open and verify a destination parent directory is owner-only (0o700)."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise CheckpointRefused(
+            "Restore destination parent directory is missing or unsafe"
+        ) from error
+    try:
+        info = os.fstat(dir_fd)
+        if info.st_uid != os.geteuid() or (info.st_mode & 0o077) != 0:
+            raise CheckpointRefused(
+                "Restore destination parent directory must be owner-only (0o700)"
+            )
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
+
+
 def _copy_and_verify_replacement(
     candidate: Path,
+    private_dir_fd: int,
     private_copy: Path,
     company_id: str,
     request_revision: str,
     manifest: CheckpointManifest,
     *,
     expected_sha256: str | None,
-) -> None:
-    """Stream candidate from a pinned O_NOFOLLOW fd into a private file and verify it."""
+) -> tuple[int, tuple[int, int]]:
+    """Stream candidate from a pinned O_NOFOLLOW fd into a private file and return its open pinned fd."""
     if expected_sha256 is not None and (
         not isinstance(expected_sha256, str)
         or len(expected_sha256) != 64
@@ -764,60 +786,81 @@ def _copy_and_verify_replacement(
     except StorageRefused as error:
         raise CheckpointRefused(str(error)) from error
     try:
-        fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        src_fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as error:
         raise CheckpointRefused(
             "Staged replacement database is missing or unsafe"
         ) from error
-    hasher = sha256()
-    with os.fdopen(fd, "rb") as pinned:
-        if not stat.S_ISREG(os.fstat(pinned.fileno()).st_mode):
-            raise CheckpointRefused(
-                "Staged replacement database must be a regular file"
+    out_fd: int | None = None
+    try:
+        with os.fdopen(src_fd, "rb") as pinned:
+            if not stat.S_ISREG(os.fstat(pinned.fileno()).st_mode):
+                raise CheckpointRefused(
+                    "Staged replacement database must be a regular file"
+                )
+            out_fd = os.open(
+                private_copy.name,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=private_dir_fd,
             )
-        with private_copy.open("xb") as out:
-            os.fchmod(out.fileno(), 0o600)
+            os.fchmod(out_fd, 0o600)
+            hasher = sha256()
             while chunk := pinned.read(131_072):
                 hasher.update(chunk)
-                out.write(chunk)
-            out.flush()
-            os.fsync(out.fileno())
-    if expected_sha256 is not None and hasher.hexdigest() != expected_sha256:
-        raise CheckpointRefused(
-            "Staged replacement database digest does not match retired store record"
-        )
-    try:
-        with closing(open_reader(private_copy)) as reader, read_tx(reader):
-            mode = str(reader.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-            if mode != "delete":
-                raise CheckpointRefused(
-                    f"Staged replacement must be in DELETE mode, got {mode}"
-                )
-            if reader.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                raise CheckpointRefused("Staged replacement failed quick_check")
-            if reader.execute("PRAGMA foreign_key_check").fetchone() is not None:
-                raise CheckpointRefused("Staged replacement failed foreign_key_check")
-            company_row = reader.execute(
-                "SELECT id FROM company WHERE singleton = 1"
-            ).fetchone()
-            if company_row is None or str(company_row[0]) != company_id:
-                raise CheckpointRefused("Staged replacement company mismatch")
-            _verify_trusted_schema_objects(reader, manifest.schema_version)
-            row = reader.execute(
-                """SELECT checkpoint_sha256, watermark_json
-                   FROM company_restore_receipt
-                   WHERE request_revision = ?""",
-                (request_revision,),
-            ).fetchone()
-    except (StorageRefused, sqlite3.Error) as error:
-        raise CheckpointRefused(
-            f"Staged replacement verification failed: {error}"
-        ) from error
-    expected_wm = json.dumps(asdict(manifest.watermark), sort_keys=True)
-    if row is None or row[0] != manifest.sha256 or row[1] != expected_wm:
-        raise CheckpointRefused(
-            "Staged replacement receipt does not match this restore request"
-        )
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(out_fd, view)
+                    view = view[written:]
+        assert out_fd is not None
+        os.fsync(out_fd)
+        os.fchmod(out_fd, 0o400)
+        computed_sha256 = hasher.hexdigest()
+        if expected_sha256 is not None and computed_sha256 != expected_sha256:
+            raise CheckpointRefused(
+                "Staged replacement database digest does not match retired store record"
+            )
+        out_st = os.fstat(out_fd)
+        verified_key = (out_st.st_dev, out_st.st_ino)
+        try:
+            with closing(open_reader(private_copy)) as reader, read_tx(reader):
+                mode = str(reader.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                if mode != "delete":
+                    raise CheckpointRefused(
+                        f"Staged replacement must be in DELETE mode, got {mode}"
+                    )
+                if reader.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    raise CheckpointRefused("Staged replacement failed quick_check")
+                if reader.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise CheckpointRefused(
+                        "Staged replacement failed foreign_key_check"
+                    )
+                company_row = reader.execute(
+                    "SELECT id FROM company WHERE singleton = 1"
+                ).fetchone()
+                if company_row is None or str(company_row[0]) != company_id:
+                    raise CheckpointRefused("Staged replacement company mismatch")
+                _verify_trusted_schema_objects(reader, manifest.schema_version)
+                row = reader.execute(
+                    """SELECT checkpoint_sha256, watermark_json
+                       FROM company_restore_receipt
+                       WHERE request_revision = ?""",
+                    (request_revision,),
+                ).fetchone()
+        except (StorageRefused, sqlite3.Error) as error:
+            raise CheckpointRefused(
+                f"Staged replacement verification failed: {error}"
+            ) from error
+        expected_wm = json.dumps(asdict(manifest.watermark), sort_keys=True)
+        if row is None or row[0] != manifest.sha256 or row[1] != expected_wm:
+            raise CheckpointRefused(
+                "Staged replacement receipt does not match this restore request"
+            )
+        return out_fd, verified_key
+    except BaseException:
+        if out_fd is not None:
+            os.close(out_fd)
+        raise
 
 
 def _verify_staged_replacement(
@@ -830,14 +873,21 @@ def _verify_staged_replacement(
 ) -> None:
     """Verify a staged or published replacement DB via a private pinned copy."""
     with TemporaryDirectory(prefix="sd-db-verify-") as check_dir:
-        _copy_and_verify_replacement(
-            candidate,
-            Path(check_dir) / "replacement.sqlite",
-            company_id,
-            request_revision,
-            manifest,
-            expected_sha256=expected_sha256,
-        )
+        check_path = Path(check_dir)
+        check_dir_fd = os.open(check_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            pinned_fd, _key = _copy_and_verify_replacement(
+                candidate,
+                check_dir_fd,
+                check_path / "replacement.sqlite",
+                company_id,
+                request_revision,
+                manifest,
+                expected_sha256=expected_sha256,
+            )
+            os.close(pinned_fd)
+        finally:
+            os.close(check_dir_fd)
 
 
 def _publish_authenticated_replacement(
@@ -849,20 +899,73 @@ def _publish_authenticated_replacement(
     *,
     expected_sha256: str,
 ) -> None:
-    """Verify staged DB from a pinned fd into a private 0o700 copy and publish it."""
-    with TemporaryDirectory(dir=target.parent, prefix=".sourdough-pub-") as private_dir:
-        private_copy = Path(private_dir) / "replacement.sqlite"
-        _copy_and_verify_replacement(
-            staged_db_sibling,
-            private_copy,
-            company_id,
-            request_revision,
-            manifest,
-            expected_sha256=expected_sha256,
-        )
-        _publish_file(private_copy, target)
-        os.unlink(private_copy)
-        _fsync_dir(private_copy.parent)
+    """Verify staged DB via a pinned fd in an owner-only parent and verify post-link inode/digest."""
+    parent_fd = _open_private_parent_dir(target.parent)
+    try:
+        with TemporaryDirectory(
+            dir=target.parent, prefix=".sourdough-pub-"
+        ) as private_dir:
+            private_dir_path = Path(private_dir)
+            private_dir_fd = os.open(
+                private_dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                private_copy = private_dir_path / "replacement.sqlite"
+                pinned_fd, verified_key = _copy_and_verify_replacement(
+                    staged_db_sibling,
+                    private_dir_fd,
+                    private_copy,
+                    company_id,
+                    request_revision,
+                    manifest,
+                    expected_sha256=expected_sha256,
+                )
+                try:
+                    os.fsync(pinned_fd)
+                    try:
+                        os.link(
+                            private_copy.name,
+                            target.name,
+                            src_dir_fd=private_dir_fd,
+                            dst_dir_fd=parent_fd,
+                        )
+                    except FileExistsError as error:
+                        raise CheckpointRefused("Destination already exists") from error
+                    try:
+                        pub_fd = os.open(
+                            target.name,
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                            dir_fd=parent_fd,
+                        )
+                        with os.fdopen(pub_fd, "rb") as published:
+                            pub_st = os.fstat(published.fileno())
+                            if (
+                                not stat.S_ISREG(pub_st.st_mode)
+                                or (pub_st.st_dev, pub_st.st_ino) != verified_key
+                                or file_digest(published, "sha256").hexdigest()
+                                != expected_sha256
+                            ):
+                                raise CheckpointRefused(
+                                    "Published replacement inode or digest changed during publication"
+                                )
+                    except BaseException:
+                        try:
+                            os.unlink(target.name, dir_fd=parent_fd)
+                            os.fsync(parent_fd)
+                        except OSError:
+                            pass
+                        raise
+                    os.fchmod(pinned_fd, 0o600)
+                    os.fsync(pinned_fd)
+                    os.fsync(parent_fd)
+                    os.unlink(private_copy.name, dir_fd=private_dir_fd)
+                    os.fsync(private_dir_fd)
+                finally:
+                    os.close(pinned_fd)
+            finally:
+                os.close(private_dir_fd)
+    finally:
+        os.close(parent_fd)
     verify_no_wal_sidecars(target)
 
 
@@ -871,29 +974,87 @@ def _publish_authenticated_desk(
     desk_target: Path,
     manifest: CheckpointManifest,
 ) -> None:
-    """Pin, verify, and atomically publish a staged Desk tree from a private 0o700 dir."""
-    with TemporaryDirectory(
-        dir=desk_target.parent, prefix=".sourdough-desk-pub-"
-    ) as private_dir:
-        private_desk = Path(private_dir) / "desk"
-        files = _stage_pinned_desk(staged_desk_sibling, private_desk, fsync_files=True)
-        digest = _compute_desk_digest(
-            (
-                rel,
-                _hash_file(
-                    private_desk.joinpath(*_validate_desk_relative_path(rel).parts)
-                ),
+    """Pin, verify, and atomically publish a staged Desk tree inside an owner-only parent."""
+    parent_fd = _open_private_parent_dir(desk_target.parent)
+    try:
+        with TemporaryDirectory(
+            dir=desk_target.parent, prefix=".sourdough-desk-pub-"
+        ) as private_dir:
+            private_dir_path = Path(private_dir)
+            private_dir_fd = os.open(
+                private_dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
             )
-            for rel in files
-        )
-        if files != manifest.desk_files or digest != manifest.desk_digest:
-            raise CheckpointRefused(
-                "Staged Desk snapshot does not match authenticated checkpoint digest"
-            )
-        if os.path.lexists(desk_target):
-            raise CheckpointRefused("Desk restore destination already exists")
-        os.rename(private_desk, desk_target)
-    _fsync_dir(desk_target.parent)
+            try:
+                private_desk = private_dir_path / "desk"
+                files = _stage_pinned_desk(
+                    staged_desk_sibling, private_desk, fsync_files=True
+                )
+                digest = _compute_desk_digest(
+                    (
+                        rel,
+                        _hash_file(
+                            private_desk.joinpath(
+                                *_validate_desk_relative_path(rel).parts
+                            )
+                        ),
+                    )
+                    for rel in files
+                )
+                if files != manifest.desk_files or digest != manifest.desk_digest:
+                    raise CheckpointRefused(
+                        "Staged Desk snapshot does not match authenticated checkpoint digest"
+                    )
+                pinned_desk_fd = os.open(
+                    "desk",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=private_dir_fd,
+                )
+                try:
+                    desk_st = os.fstat(pinned_desk_fd)
+                    verified_desk_key = (desk_st.st_dev, desk_st.st_ino)
+                    try:
+                        os.lstat(desk_target.name, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise CheckpointRefused(
+                            "Desk restore destination already exists"
+                        )
+                    os.rename(
+                        "desk",
+                        desk_target.name,
+                        src_dir_fd=private_dir_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                    try:
+                        pub_desk_fd = os.open(
+                            desk_target.name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=parent_fd,
+                        )
+                        try:
+                            pub_st = os.fstat(pub_desk_fd)
+                            if (pub_st.st_dev, pub_st.st_ino) != verified_desk_key:
+                                raise CheckpointRefused(
+                                    "Published Desk inode changed during publication"
+                                )
+                        finally:
+                            os.close(pub_desk_fd)
+                        _verify_staged_desk_snapshot(desk_target, manifest)
+                    except BaseException:
+                        shutil.rmtree(desk_target, ignore_errors=True)
+                        try:
+                            os.fsync(parent_fd)
+                        except OSError:
+                            pass
+                        raise
+                finally:
+                    os.close(pinned_desk_fd)
+            finally:
+                os.close(private_dir_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
     shutil.rmtree(staged_desk_sibling, ignore_errors=True)
     _fsync_dir(staged_desk_sibling.parent)
 
@@ -1043,11 +1204,13 @@ def restore_store(
     from ..writer_lease import hold_company_writer
 
     target = destination.parent.resolve(strict=True) / destination.name
+    os.close(_open_private_parent_dir(target.parent))
     desk_target: Path | None = None
     if desk_destination is not None:
         desk_target = (
             desk_destination.parent.resolve(strict=True) / desk_destination.name
         )
+        os.close(_open_private_parent_dir(desk_target.parent))
 
     # Check whether the original store was already retired by an interrupted publication
     # of this exact restore request; if so, finish publication read-only without
@@ -1226,30 +1389,31 @@ def restore_store(
                         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                         request_revision TEXT NOT NULL,
                         original_schema INTEGER NOT NULL,
-                        replacement_sha256 TEXT NOT NULL DEFAULT '',
                         retired_at_ns INTEGER NOT NULL
                     ) STRICT"""
                 )
-                retired_cols = {
-                    str(col[1])
-                    for col in original_writer.execute(
-                        'PRAGMA table_info("company_store_retired")'
-                    ).fetchall()
-                }
-                if "replacement_sha256" not in retired_cols:
-                    original_writer.execute(
-                        "ALTER TABLE company_store_retired ADD COLUMN replacement_sha256 TEXT NOT NULL DEFAULT ''"
-                    )
+                original_writer.execute(
+                    """CREATE TABLE IF NOT EXISTS company_store_retired_digest (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        request_revision TEXT NOT NULL,
+                        replacement_sha256 TEXT NOT NULL
+                    ) STRICT"""
+                )
                 original_writer.execute(
                     """INSERT INTO company_store_retired (
-                           singleton, request_revision, original_schema, replacement_sha256, retired_at_ns
-                       ) VALUES (1, ?, ?, ?, ?)""",
+                           singleton, request_revision, original_schema, retired_at_ns
+                       ) VALUES (1, ?, ?, ?)""",
                     (
                         request_revision,
                         manifest.schema_version,
-                        replacement_sha256,
                         time_ns(),
                     ),
+                )
+                original_writer.execute(
+                    """INSERT INTO company_store_retired_digest (
+                           singleton, request_revision, replacement_sha256
+                       ) VALUES (1, ?, ?)""",
+                    (request_revision, replacement_sha256),
                 )
                 original_writer.execute(
                     "UPDATE company SET schema_revision = ? WHERE singleton = 1",

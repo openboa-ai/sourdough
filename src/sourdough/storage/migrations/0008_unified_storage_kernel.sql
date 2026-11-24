@@ -85,6 +85,5 @@ CREATE TABLE IF NOT EXISTS company_store_retired (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     request_revision TEXT NOT NULL,
     original_schema INTEGER NOT NULL,
-    replacement_sha256 TEXT NOT NULL DEFAULT '',
     retired_at_ns INTEGER NOT NULL
 ) STRICT;
