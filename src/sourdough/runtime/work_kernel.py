@@ -725,13 +725,39 @@ def wake_waiting_runs(
         (company_id,),
     ).fetchall()
     woken_items: list[str] = []
+    has_actor = isinstance(triggering_actor_id, str) and bool(
+        triggering_actor_id.strip()
+    )
     for run_id, work_item_id, agent_id, wait_until_ns, wait_event_key in rows:
         timer_due = wait_until_ns is not None and now_ns >= int(wait_until_ns)
-        event_matched = (
-            event_key is not None
-            and wait_event_key == event_key
-            and triggering_actor_id != agent_id
-        )
+        event_matched = False
+        if event_key is not None and wait_event_key == event_key:
+            if has_actor and triggering_actor_id == agent_id:
+                event_entity = f"{run_id}:{event_key}"
+                recorded = connection.execute(
+                    """SELECT 1 FROM audit_event
+                       WHERE company_id = ? AND domain = 'work'
+                         AND entity_type = 'wait_event' AND entity_id = ?
+                         AND actor_id = ?
+                         AND event_type = 'work.self_authored_event_suppressed'
+                       LIMIT 1""",
+                    (company_id, event_entity, agent_id),
+                ).fetchone()
+                if recorded is None:
+                    append_audit_event(
+                        connection,
+                        company_id=company_id,
+                        domain="work",
+                        entity_type="wait_event",
+                        entity_id=event_entity,
+                        event_type="work.self_authored_event_suppressed",
+                        actor_id=agent_id,
+                        run_id=run_id,
+                        payload={"event_key": event_key},
+                        recorded_at_ns=now_ns,
+                    )
+            elif has_actor:
+                event_matched = True
         if not timer_due and not event_matched:
             continue
         reason = "event" if event_matched else "timer"
@@ -1340,6 +1366,11 @@ def evaluate_conditions(
             ).fetchone()
             if self_authored is not None:
                 continue
+            if (
+                not isinstance(triggering_actor_id, str)
+                or not triggering_actor_id.strip()
+            ):
+                continue  # fail closed: asset revision wakes require non-self producer identity
             if expected_revision is None or observed_rev == expected_revision:
                 eligible = True
                 matched_revision = observed_rev

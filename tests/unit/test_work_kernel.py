@@ -141,7 +141,7 @@ class WorkKernel(unittest.TestCase):
                 )
             self.assertEqual(run2.fencing_token, 1)
 
-            # Anti-self-wake: founder's own event must NOT wake run1
+            # Anti-self-wake: founder's own event AND actorless replay must NOT wake run1
             with write_tx(conn):
                 self.assertEqual(
                     wake_waiting_runs(
@@ -150,6 +150,16 @@ class WorkKernel(unittest.TestCase):
                         now_ns=4_000,
                         event_key="asset:doc-1",
                         triggering_actor_id=self.founder_id,
+                    ),
+                    (),
+                )
+                self.assertEqual(
+                    wake_waiting_runs(
+                        conn,
+                        self.company_id,
+                        now_ns=4_050,
+                        event_key="asset:doc-1",
+                        triggering_actor_id=None,
                     ),
                     (),
                 )
