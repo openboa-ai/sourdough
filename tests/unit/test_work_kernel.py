@@ -42,6 +42,10 @@ class WorkKernel(unittest.TestCase):
                 "INSERT INTO agent VALUES (?, ?, ?)",
                 (self.peer_id, self.company_id, "profile-v2"),
             )
+            conn.execute(
+                "INSERT INTO standing_grant VALUES ('grant-peer-1', ?, 'manage')",
+                (self.peer_id,),
+            )
 
     def test_active_uniqueness_fencing_lease_reclamation_and_zero_compute_wait(self):
         with closing(open_writer(self.store)) as conn:
@@ -441,10 +445,29 @@ class WorkKernel(unittest.TestCase):
                     now_ns=4_200,
                     triggering_actor_id=self.peer_id,
                 )
+                # Recipient arming a peer_response condition against its own answer must NOT
+                # self-wake on subsequent ordinary sweeps (even with triggering_actor_id=None)
+                set_condition(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.peer_id,
+                    work_item_id=req.response_work_item_id,
+                    trigger_kind="peer_response",
+                    source_identity="peer_response:req-1",
+                    expected_revision="answered",
+                    now_ns=4_250,
+                )
+                self_wake_after_sweep = evaluate_conditions(
+                    conn,
+                    self.company_id,
+                    now_ns=4_300,
+                    triggering_actor_id=None,
+                )
             self.assertEqual(len(admitted_from_peer), 1)
             self.assertEqual(admitted_from_peer[0].source_id, peer_cond.condition_id)
             self.assertEqual(admitted_from_peer[0].duty_kind, "work.assessment")
             self.assertEqual(admitted_replay, ())
+            self.assertEqual(self_wake_after_sweep, ())
             self.assertTrue(changed)
             self.assertFalse(changed_late)
             self.assertEqual(resolved.state, "answered")

@@ -171,6 +171,10 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                 "INSERT INTO agent VALUES (?, ?, ?)",
                 (peer_id, self.company_id, "profile-peer"),
             )
+            conn.execute(
+                "INSERT INTO standing_grant VALUES ('grant-peer-colleague', ?, 'manage')",
+                (peer_id,),
+            )
             item, _ = create_work_item(
                 conn,
                 company_id=self.company_id,
@@ -347,6 +351,54 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                         conn,
                         company_id=self.company_id,
                         work_item_id=item2.work_item_id,
+                        lease_owner="direct-worker",
+                        lease_ttl_ns=10_000,
+                        now_ns=2_500,
+                    )
+
+    def test_revoked_standing_grant_refuses_kernel_claim_and_runtime_dispatch(self):
+        from sourdough.runtime.work_kernel import WorkKernelRefused
+
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            item, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.guarded",
+                source_kind="manual",
+                source_id="g1",
+                now_ns=1_000,
+            )
+            conn.execute(
+                "UPDATE standing_grant SET scope = 'revoked' WHERE agent_id = ?",
+                (self.founder_id,),
+            )
+
+        executed = False
+
+        def guarded_handler(_ctx: DutyContext) -> DutyOutcome:
+            nonlocal executed
+            executed = True
+            return DutyOutcome("completed")
+
+        runtime = CompanyRuntime(
+            self.store,
+            self.company_id,
+            build_default_registry({"work.guarded": guarded_handler}),
+            lease_directory=self.leases,
+        )
+        summary = runtime.step(max_dispatches=2, now_ns=2_000)
+        self.assertFalse(executed)
+        self.assertEqual(summary.executed_runs, ())
+        self.assertEqual(summary.blocked_items, (item.work_item_id,))
+
+        with closing(open_writer(self.store)) as conn:
+            with self.assertRaisesRegex(WorkKernelRefused, "no active standing grant"):
+                with write_tx(conn):
+                    claim_work_run(
+                        conn,
+                        company_id=self.company_id,
+                        work_item_id=item.work_item_id,
                         lease_owner="direct-worker",
                         lease_ttl_ns=10_000,
                         now_ns=2_500,

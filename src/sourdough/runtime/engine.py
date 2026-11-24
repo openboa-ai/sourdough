@@ -28,6 +28,7 @@ from .work_kernel import (
     complete_work_run,
     evaluate_conditions,
     fail_work_run,
+    has_active_grant,
     reclaim_expired_runs,
     wake_waiting_runs,
     yield_run_to_wait,
@@ -259,10 +260,18 @@ class CompanyRuntime:
                 item = WorkItem(*row)
                 if item.work_item_id in blocked:
                     continue
+                descriptor = self._registry.get(item.duty_kind)
+                if not has_active_grant(
+                    conn,
+                    self._company_id,
+                    item.owner_agent_id,
+                    required_scope=descriptor.required_scope,
+                ):
+                    blocked.append(item.work_item_id)
+                    continue
                 if not has_turn_capacity(conn, item.owner_agent_id):
                     blocked.append(item.work_item_id)
                     continue
-                descriptor = self._registry.get(item.duty_kind)
                 if descriptor.precondition is not None:
                     ready, _reason = descriptor.precondition(conn, item)
                     if not ready:
@@ -274,6 +283,7 @@ class CompanyRuntime:
                     work_item_id=item.work_item_id,
                     lease_owner=self._lease_owner,
                     lease_ttl_ns=self._lease_ttl_ns,
+                    required_scope=descriptor.required_scope,
                     now_ns=now_ns,
                 )
                 return item, run, descriptor

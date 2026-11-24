@@ -126,6 +126,35 @@ def _require_agent(
         raise WorkKernelRefused("Agent does not belong to this company")
 
 
+def has_active_grant(
+    connection: sqlite3.Connection,
+    company_id: str,
+    agent_id: str,
+    *,
+    required_scope: str | None = None,
+) -> bool:
+    """Return True iff the Agent holds a current non-revoked standing grant in this company."""
+    if required_scope is not None:
+        row = connection.execute(
+            """SELECT 1
+               FROM standing_grant g
+               JOIN agent a ON a.id = g.agent_id
+               WHERE a.company_id = ? AND a.id = ?
+                 AND g.scope = ? AND lower(trim(g.scope)) != 'revoked'""",
+            (company_id, agent_id, required_scope),
+        ).fetchone()
+    else:
+        row = connection.execute(
+            """SELECT 1
+               FROM standing_grant g
+               JOIN agent a ON a.id = g.agent_id
+               WHERE a.company_id = ? AND a.id = ?
+                 AND trim(g.scope) != '' AND lower(trim(g.scope)) != 'revoked'""",
+            (company_id, agent_id),
+        ).fetchone()
+    return row is not None
+
+
 def create_work_item(
     connection: sqlite3.Connection,
     *,
@@ -255,11 +284,13 @@ def claim_work_run(
     lease_ttl_ns: int,
     budget_ceiling_minor: int = 0,
     dedupe_key: str | None = None,
+    required_scope: str | None = None,
     now_ns: int | None = None,
 ) -> WorkRun:
     """Atomically claim a due work item with a monotonic fencing_token.
 
-    Enforces single active running execution per agent_id and per work_item_id.
+    Enforces single active running execution per agent_id and per work_item_id,
+    current non-revoked standing grant authority, and hired-Agent turn capacity.
     """
     _require_nonempty(lease_owner, "lease_owner")
     if lease_ttl_ns <= 0 or budget_ceiling_minor < 0:
@@ -275,6 +306,10 @@ def claim_work_run(
     _, _, agent_id, duty_kind, state = item_row
     if state != "due":
         raise WorkKernelRefused(f"Work item is not claimable in state {state}")
+    if not has_active_grant(
+        connection, company_id, agent_id, required_scope=required_scope
+    ):
+        raise WorkKernelRefused("Agent has no active standing grant")
     if not has_turn_capacity(connection, agent_id):
         raise WorkKernelRefused("Agent has no remaining turn allocation")
     if dedupe_key is not None:
@@ -1046,17 +1081,18 @@ def evaluate_conditions(
         elif trigger_kind == "peer_response" and source_identity:
             req_id = str(source_identity).removeprefix("peer_response:")
             peer_row = connection.execute(
-                """SELECT state FROM work_peer_requests
+                """SELECT state, recipient_agent_id FROM work_peer_requests
                    WHERE company_id = ? AND request_id = ?""",
                 (company_id, req_id),
             ).fetchone()
             if peer_row is not None and str(peer_row[0]) != "open":
                 res_state = str(peer_row[0])
-                if (
-                    res_state in ("answered", "declined")
-                    and triggering_actor_id == owner_agent_id
+                persisted_responder = str(peer_row[1])
+                if res_state in ("answered", "declined") and (
+                    owner_agent_id == persisted_responder
+                    or triggering_actor_id == owner_agent_id
                 ):
-                    continue  # anti-self-wake
+                    continue  # anti-self-wake against persisted responder
                 if expected_revision is None or res_state == expected_revision:
                     eligible = True
                     matched_revision = res_state
@@ -1300,6 +1336,8 @@ def resolve_peer_request(
             raise WorkKernelRefused(
                 "Only the named recipient Agent may answer or decline a peer request"
             )
+        if not has_active_grant(connection, company_id, prior.recipient_agent_id):
+            raise WorkKernelRefused("Recipient Agent has no active standing grant")
         if not response_run_id or response_fencing_token is None:
             raise WorkKernelRefused(
                 "Peer response requires an active response_run_id and response_fencing_token"

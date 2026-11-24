@@ -39,6 +39,7 @@ class DutyDescriptor:
     precondition: (
         Callable[[sqlite3.Connection, WorkItem], tuple[bool, str | None]] | None
     ) = None
+    required_scope: str | None = None
 
 
 class DutyRegistry:
