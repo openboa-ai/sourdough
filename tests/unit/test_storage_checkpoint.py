@@ -525,11 +525,31 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                     lease_directory=self.leases,
                 )
 
-        # Original store remains permanently retired; destination not yet published
+        # Original store remains permanently retired; destination not yet published;
+        # durable staged replacement has st_nlink == 1 (temporary shadow unlinked before retirement)
         self.assertFalse(replacement.exists())
         self.assertFalse(desk_dest.exists())
+        staged_dbs = list(self.root.glob(".sourdough-restore-*.sqlite"))
+        self.assertEqual(len(staged_dbs), 1)
+        self.assertEqual(staged_dbs[0].stat(follow_symlinks=False).st_nlink, 1)
         with self.assertRaisesRegex(StorageRefused, "retired"):
             open_writer(self.store)
+
+        # If an unrelated directory occupies desk_dest before retry, resumed restore MUST refuse!
+        desk_dest.mkdir()
+        (desk_dest / "unrelated.txt").write_text("rogue\n", encoding="utf-8")
+        with self.assertRaisesRegex(CheckpointRefused, "Desk restore destination"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                desk_destination=desk_dest,
+                lease_directory=self.leases,
+            )
+        self.assertFalse(replacement.exists())
+        (desk_dest / "unrelated.txt").unlink()
+        desk_dest.rmdir()
 
         # A different restore destination against the retired store must fail closed
         with self.assertRaisesRegex(CheckpointRefused, "different restore request"):
@@ -552,6 +572,13 @@ class StorageCheckpointAndRestore(unittest.TestCase):
             lease_directory=self.leases,
         )
         verify_no_wal_sidecars(replacement)
+        self.assertEqual(replacement.stat(follow_symlinks=False).st_nlink, 1)
+        from sourdough.writer_lease import hold_company_writer
+
+        with hold_company_writer(
+            replacement, self.company_id, lease_directory=self.leases
+        ) as active_lease:
+            active_lease.verify()
         self.assertEqual(
             (desk_dest / "state.md").read_text(encoding="utf-8"),
             "durable-desk\n",
@@ -578,6 +605,60 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         self.assertEqual(list(self.root.glob(".sourdough-desk-stage-*")), [])
         with self.assertRaisesRegex(StorageRefused, "retired"):
             open_writer(self.store)
+
+    def test_pre_retirement_desk_staging_failure_cleans_up_for_retry(self):
+        from unittest.mock import patch
+
+        desk = self.root / "desk-fail"
+        desk.mkdir()
+        (desk / "state.md").write_text("desk-body\n", encoding="utf-8")
+        archive = self.root / "checkpoint-desk-fail.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            desk_root=desk,
+            lease_directory=self.leases,
+        )
+
+        replacement = self.root / "recovered-retry.sqlite"
+        desk_dest = self.root / "desk-retry"
+
+        with patch(
+            "sourdough.storage.checkpoint._stage_pinned_desk",
+            side_effect=OSError("simulated desk copy failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated desk copy failure"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    desk_destination=desk_dest,
+                    lease_directory=self.leases,
+                )
+
+        # Pre-retirement failure leaves zero durable staging artifacts and keeps store live.
+        self.assertEqual(list(self.root.glob(".sourdough-restore-*")), [])
+        self.assertEqual(list(self.root.glob(".sourdough-desk-stage-*")), [])
+        self.assertEqual(list(self.root.glob(".sourdough-desk-tmp-*")), [])
+        self.assertFalse(replacement.exists())
+        self.assertFalse(desk_dest.exists())
+
+        receipt = restore_store(
+            self.store,
+            self.company_id,
+            archive,
+            replacement,
+            desk_destination=desk_dest,
+            lease_directory=self.leases,
+        )
+        self.assertEqual(receipt.company_id, self.company_id)
+        self.assertEqual(
+            (desk_dest / "state.md").read_text(encoding="utf-8"),
+            "desk-body\n",
+        )
+        self.assertEqual(replacement.stat(follow_symlinks=False).st_nlink, 1)
 
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):

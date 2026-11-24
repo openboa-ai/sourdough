@@ -696,7 +696,19 @@ def inspect_checkpoint(archive: Path, company_id: str) -> CheckpointManifest:
 def _copy_desk_tree(source_root: Path, dest_root: Path) -> None:
     if os.path.lexists(dest_root):
         raise CheckpointRefused("Desk restore destination already exists")
-    _stage_pinned_desk(source_root, dest_root, fsync_files=True)
+    with TemporaryDirectory(
+        dir=dest_root.parent, prefix=".sourdough-desk-tmp-"
+    ) as staging:
+        candidate = Path(staging) / "desk"
+        _stage_pinned_desk(source_root, candidate, fsync_files=True)
+        if os.path.lexists(dest_root):
+            raise CheckpointRefused("Desk restore destination already exists")
+        os.rename(candidate, dest_root)
+    try:
+        _fsync_dir(dest_root.parent)
+    except Exception:
+        shutil.rmtree(dest_root, ignore_errors=True)
+        raise
 
 
 def _restore_request_revision(
@@ -837,11 +849,20 @@ def _resume_retired_restore(
         target, desk_target, request_revision, bool(manifest.desk_files)
     )
     has_pending_db = not os.path.lexists(target)
-    has_pending_desk = (
-        staged_desk_sibling is not None
-        and desk_target is not None
-        and not os.path.lexists(desk_target)
-    )
+    has_pending_desk = False
+    if staged_desk_sibling is not None and desk_target is not None:
+        if os.path.lexists(desk_target):
+            if os.path.lexists(staged_desk_sibling):
+                raise CheckpointRefused(
+                    "Desk restore destination already exists while staged Desk is unpublished"
+                )
+            _verify_staged_desk_snapshot(desk_target, manifest)
+        else:
+            if not os.path.lexists(staged_desk_sibling):
+                raise CheckpointRefused("Staged Desk recovery snapshot is missing")
+            _verify_staged_desk_snapshot(staged_desk_sibling, manifest)
+            has_pending_desk = True
+
     if not has_pending_db and not has_pending_desk:
         if os.path.lexists(staged_db_sibling):
             _verify_staged_replacement(target, company_id, request_revision, manifest)
@@ -865,9 +886,6 @@ def _resume_retired_restore(
         _verify_staged_replacement(target, company_id, request_revision, manifest)
 
     if has_pending_desk and staged_desk_sibling is not None and desk_target is not None:
-        if not os.path.lexists(staged_desk_sibling):
-            raise CheckpointRefused("Staged Desk recovery snapshot is missing")
-        _verify_staged_desk_snapshot(staged_desk_sibling, manifest)
         os.rename(staged_desk_sibling, desk_target)
         _fsync_dir(desk_target.parent)
 
@@ -1022,8 +1040,20 @@ def restore_store(
         db_staged = False
         desk_staged = False
         try:
-            _publish_file(shadow, staged_db_sibling)
+            # Publish durable DB stage atomically, record ownership immediately on link
+            # creation, and unlink temporary shadow so staged_db_sibling keeps
+            # st_nlink == 1 across process crashes.
+            _fsync_file(shadow)
+            try:
+                os.link(shadow, staged_db_sibling)
+            except FileExistsError as error:
+                raise CheckpointRefused(
+                    "Staged replacement path already exists"
+                ) from error
             db_staged = True
+            _fsync_dir(staged_db_sibling.parent)
+            os.unlink(shadow)
+            _fsync_dir(shadow.parent)
             if staged_desk_sibling is not None and desk_target is not None:
                 if os.path.lexists(desk_target):
                     raise CheckpointRefused("Desk restore destination already exists")
