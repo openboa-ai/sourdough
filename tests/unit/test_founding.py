@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 
+from sourdough.company import SCHEMA_REVISION
+
 TABLES = (
     "company",
     "agent",
@@ -16,6 +18,13 @@ TABLES = (
     "founding_receipt",
     "work_follow_up",
     "duty_run",
+    "work_result_read",
+    "schema_migrations",
+    "audit_event",
+    "command_receipt",
+    "external_actions",
+    "company_restore_receipt",
+    "company_store_retired",
 )
 
 
@@ -56,7 +65,7 @@ class Founding(unittest.TestCase):
         with closing(sqlite3.connect(self.store.as_uri() + "?mode=ro", uri=True)) as db:
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             names = db.execute(
-                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
             self.assertCountEqual(names, [(table,) for table in TABLES])
             return {
@@ -70,7 +79,9 @@ class Founding(unittest.TestCase):
         original = self.inventory()
         [[setup, company, founder, grant, duty]] = original["founding_receipt"]
         self.assertEqual(setup, "board-setup")
-        self.assertEqual(original["company"], [(1, company, 6, "charter-v1")])
+        self.assertEqual(
+            original["company"], [(1, company, SCHEMA_REVISION, "charter-v1")]
+        )
         self.assertEqual(original["agent"], [(founder, company, "profile-v1")])
         self.assertEqual(
             original["standing_grant"], [(grant, founder, "manage-company")]
@@ -115,7 +126,16 @@ class Founding(unittest.TestCase):
             "Unsupported",
         )
         self.assertEqual(self.store.read_bytes(), incompatible)
-        self.assertEqual(list(self.store.parent.iterdir()), [self.store])
+        files = {path.name for path in self.store.parent.iterdir()}
+        self.assertIn(self.store.name, files)
+        self.assertTrue(
+            files
+            <= {
+                self.store.name,
+                f"{self.store.name}-wal",
+                f"{self.store.name}-shm",
+            }
+        )
 
     def test_concurrent_setup_converges_on_one_receipt(self):
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -124,6 +144,21 @@ class Founding(unittest.TestCase):
             ]
         first, second = [self.success(attempt.result()) for attempt in attempts]
         self.assertEqual(first, second)
+        inv = self.inventory()
         self.assertEqual(
-            [len(rows) for rows in self.inventory().values()], [1, 1, 1, 1, 1, 0, 0]
+            [
+                len(inv[t])
+                for t in (
+                    "company",
+                    "agent",
+                    "standing_grant",
+                    "duty",
+                    "founding_receipt",
+                    "work_follow_up",
+                    "duty_run",
+                )
+            ],
+            [1, 1, 1, 1, 1, 0, 0],
         )
+        self.assertEqual(len(inv["audit_event"]), 1)
+        self.assertGreaterEqual(len(inv["schema_migrations"]), 2)
