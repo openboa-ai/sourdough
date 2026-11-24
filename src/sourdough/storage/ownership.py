@@ -110,6 +110,9 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "assessment_source": frozenset({"company_assessment.py"}),
     "assessment_read": frozenset({"company_assessment.py"}),
     "assessment_publication": frozenset({"company_assessment.py"}),
+    # Evidence review qualification and activation tables
+    "review_qualification": frozenset({"review_qualification_store.py"}),
+    "review_tool_activation": frozenset({"review_tool_activation.py"}),
     # Opt-in paper domain tables (company store)
     "paper_binding": frozenset({"paper_account.py"}),
     "paper_binding_change": frozenset({"paper_account.py"}),
