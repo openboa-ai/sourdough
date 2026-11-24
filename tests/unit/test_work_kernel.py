@@ -673,7 +673,8 @@ class WorkKernel(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
-                # 3. Valid authorized request succeeds, then revoking responsibility blocks claiming it
+                # 3. Valid authorized request succeeds; revoking responsibility mid-run
+                # refuses committing the answer AND refuses any new claim
                 req, _ = open_peer_request(
                     conn,
                     company_id=self.company_id,
@@ -688,6 +689,14 @@ class WorkKernel(unittest.TestCase):
                     request_id="req-auth-ok",
                     now_ns=1_300,
                 )
+                claimed_resp = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=req.response_work_item_id,
+                    lease_owner="peer-worker",
+                    lease_ttl_ns=60_000,
+                    now_ns=1_350,
+                )
                 revoke_responsibility(
                     conn,
                     self.company_id,
@@ -697,11 +706,27 @@ class WorkKernel(unittest.TestCase):
                 with self.assertRaisesRegex(
                     WorkKernelRefused, "no active peer_response responsibility"
                 ):
+                    resolve_peer_request(
+                        conn,
+                        company_id=self.company_id,
+                        request_id="req-auth-ok",
+                        actor_id=self.peer_id,
+                        resolution_state="answered",
+                        response_payload={"choice": "approve"},
+                        response_run_id=claimed_resp.run_id,
+                        response_fencing_token=claimed_resp.fencing_token,
+                        now_ns=1_450,
+                    )
+                # Reclaiming the expired run and attempting a fresh claim must also fail
+                reclaim_expired_runs(conn, self.company_id, now_ns=70_000)
+                with self.assertRaisesRegex(
+                    WorkKernelRefused, "no active peer_response responsibility"
+                ):
                     claim_work_run(
                         conn,
                         company_id=self.company_id,
                         work_item_id=req.response_work_item_id,
-                        lease_owner="peer-worker",
+                        lease_owner="peer-worker-2",
                         lease_ttl_ns=60_000,
-                        now_ns=1_500,
+                        now_ns=70_100,
                     )

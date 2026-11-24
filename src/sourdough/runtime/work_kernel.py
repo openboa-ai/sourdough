@@ -286,13 +286,14 @@ def _authorize_peer_route(
     recipient_agent_id: str,
     evidence_refs: list[str],
     check_open_quota: bool = False,
+    check_turn_capacity: bool = True,
 ) -> None:
     """Atomically verify peer-request route, recipient grant/responsibility, evidence scope, and budget."""
     if not has_active_grant(connection, company_id, requester_agent_id):
         raise WorkKernelRefused("Requester Agent has no active standing grant")
     if not has_active_grant(connection, company_id, recipient_agent_id):
         raise WorkKernelRefused("Recipient Agent has no active standing grant")
-    if not has_turn_capacity(connection, recipient_agent_id):
+    if check_turn_capacity and not has_turn_capacity(connection, recipient_agent_id):
         raise WorkKernelRefused("Recipient Agent has no remaining turn allocation")
     if (
         not isinstance(evidence_refs, list)
@@ -1584,8 +1585,6 @@ def resolve_peer_request(
             raise WorkKernelRefused(
                 "Only the named recipient Agent may answer or decline a peer request"
             )
-        if not has_active_grant(connection, company_id, prior.recipient_agent_id):
-            raise WorkKernelRefused("Recipient Agent has no active standing grant")
         if not response_run_id or response_fencing_token is None:
             raise WorkKernelRefused(
                 "Peer response requires an active response_run_id and response_fencing_token"
@@ -1601,6 +1600,19 @@ def resolve_peer_request(
             raise WorkKernelRefused(
                 "Response run does not match the named recipient's response duty"
             )
+        try:
+            refs = json.loads(prior.evidence_refs_json)
+        except json.JSONDecodeError as error:
+            raise WorkKernelRefused("Malformed peer request evidence refs") from error
+        _authorize_peer_route(
+            connection,
+            company_id=company_id,
+            requester_agent_id=prior.requester_agent_id,
+            recipient_agent_id=prior.recipient_agent_id,
+            evidence_refs=refs if isinstance(refs, list) else [],
+            check_open_quota=False,
+            check_turn_capacity=False,
+        )
     elif timestamp < prior.deadline_ns:
         raise WorkKernelRefused("Peer request has not reached its deadline")
 
