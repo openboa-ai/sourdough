@@ -10,6 +10,7 @@ from hashlib import sha256
 REVIEW_FORMAT = "evidence-review-v1"
 EVALUATOR_REVISION = "evidence-review-evaluator-v1"
 PASS_K_TRIALS = 3
+MAX_REVIEW_CASES = 32
 
 
 class ReviewRuleRefused(ValueError):
@@ -98,12 +99,17 @@ class ReviewQualification:
     criteria_digest: str
     outcomes: tuple[CheckOutcome, ...]
     evaluator_revision: str = EVALUATOR_REVISION
+    gate_passed: bool = True
 
     @property
     def passed(self) -> bool:
-        return bool(self.outcomes) and all(
-            outcome.candidate_missing == outcome.expected_missing
-            for outcome in self.outcomes
+        return (
+            bool(self.gate_passed)
+            and bool(self.outcomes)
+            and all(
+                outcome.candidate_missing == outcome.expected_missing
+                for outcome in self.outcomes
+            )
         )
 
 
@@ -133,10 +139,31 @@ TrialEvaluator = Callable[
 
 
 def review_criteria_digest(cases: tuple[ReviewCase, ...]) -> str:
-    if type(cases) is not tuple or not 1 <= len(cases) <= 32:
+    if (
+        type(cases) is not tuple
+        or not 1 <= len(cases) <= MAX_REVIEW_CASES
+        or any(not isinstance(case, ReviewCase) for case in cases)
+    ):
         raise ReviewRuleRefused("Expected a bounded set of independent cases")
     return _digest(
         [EVALUATOR_REVISION, [(case.present, case.expected_missing) for case in cases]]
+    )
+
+
+def negative_criteria_digest(negative_cases: tuple[ReviewCase, ...]) -> str | None:
+    if (
+        type(negative_cases) is not tuple
+        or len(negative_cases) > MAX_REVIEW_CASES
+        or any(not isinstance(case, ReviewCase) for case in negative_cases)
+    ):
+        raise ReviewRuleRefused("Expected a bounded tuple of negative-trigger cases")
+    if not negative_cases:
+        return None
+    return _digest(
+        [
+            EVALUATOR_REVISION,
+            [(case.present, case.expected_missing) for case in negative_cases],
+        ]
     )
 
 
@@ -161,6 +188,25 @@ def qualify_review_rule(
     )
 
 
+def _validate_trial_result(
+    trial: ReviewQualification,
+    candidate: ReviewRule,
+    baseline: ReviewRule | None,
+    expected_criteria: str,
+) -> None:
+    expected_baseline = baseline.digest if baseline is not None else None
+    if (
+        not isinstance(trial, ReviewQualification)
+        or trial.evaluator_revision != EVALUATOR_REVISION
+        or trial.candidate_digest != candidate.digest
+        or trial.baseline_digest != expected_baseline
+        or trial.criteria_digest != expected_criteria
+    ):
+        raise ReviewRuleRefused(
+            "Trial evaluator returned mismatched qualification pins"
+        )
+
+
 def qualify_review_rule_gated(
     candidate: ReviewRule,
     baseline: ReviewRule | None,
@@ -175,13 +221,10 @@ def qualify_review_rule_gated(
         raise ReviewRuleRefused("Candidate must be a valid ReviewRule")
     if baseline is not None and not isinstance(baseline, ReviewRule):
         raise ReviewRuleRefused("Baseline must be a valid ReviewRule or None")
-    if type(negative_cases) is not tuple or any(
-        not isinstance(case, ReviewCase) for case in negative_cases
-    ):
-        raise ReviewRuleRefused("Expected a tuple of negative-trigger cases")
+    negative_criteria_digest(negative_cases)
     if type(trials) is not int or not 1 <= trials <= 16:
         raise ReviewRuleRefused("Expected a bounded positive trial count")
-    review_criteria_digest(cases)
+    expected_criteria = review_criteria_digest(cases)
 
     # Stage 1: Structure & negative-trigger check (complete evidence never yields false positives).
     complete_present = tuple(EvidenceClass)
@@ -194,13 +237,13 @@ def qualify_review_rule_gated(
         for case in stage1_cases
     )
 
-    # Stage 2: Harmlessness (read-only evaluation produces exact expected detections
-    # without dropping required detections covered by the pinned cases).
+    # Stage 2: Harmlessness (read-only evaluation produces exact expected detections).
     first = (
         trial_evaluator(candidate, baseline, cases, 0)
         if trial_evaluator is not None
         else qualify_review_rule(candidate, baseline, cases)
     )
+    _validate_trial_result(first, candidate, baseline, expected_criteria)
     stage2_ok = first.passed
 
     # Stage 3: pass^k stability across k independent trials with identical digests & outcomes.
@@ -212,7 +255,17 @@ def qualify_review_rule_gated(
                 if trial_evaluator is not None
                 else qualify_review_rule(candidate, baseline, cases)
             )
-            if not trial.passed or trial != first:
+            if not isinstance(trial, ReviewQualification):
+                stage3_ok = False
+                break
+            if (
+                trial.evaluator_revision != EVALUATOR_REVISION
+                or trial.candidate_digest != candidate.digest
+                or trial.baseline_digest != first.baseline_digest
+                or trial.criteria_digest != expected_criteria
+                or not trial.passed
+                or trial != first
+            ):
                 stage3_ok = False
                 break
     else:
@@ -226,11 +279,21 @@ def qualify_review_rule_gated(
     elif not stage3_ok:
         failure_stage = "stage3_pass_k_stability"
 
+    gate_ok = stage1_ok and stage2_ok and stage3_ok
+    gated_qualification = ReviewQualification(
+        candidate_digest=first.candidate_digest,
+        baseline_digest=first.baseline_digest,
+        criteria_digest=first.criteria_digest,
+        outcomes=first.outcomes,
+        evaluator_revision=first.evaluator_revision,
+        gate_passed=gate_ok,
+    )
+
     return ThreeStageVerdict(
         stage1_structure_and_negative=stage1_ok,
         stage2_harmlessness=stage2_ok,
         stage3_pass_k_stability=stage3_ok,
         trial_count=trials,
-        qualification=first,
+        qualification=gated_qualification,
         failure_stage=failure_stage,
     )

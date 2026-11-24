@@ -34,6 +34,10 @@ from .writer_lease import WriterLease
 
 
 ACTIVATION_CONTRACT_VERSION = "review-tool-activation-v1"
+_AUDIT_EVENT_BY_OP = {
+    "activate": "ops.review_tool_activated",
+    "revert": "ops.review_tool_reverted",
+}
 
 
 def _identity_value(value: str) -> bool:
@@ -138,6 +142,7 @@ def _history_row(
     request_id: str | None = None,
     before: int | None = None,
     exclude_quarantined: bool = False,
+    exclude_candidate_id: str | None = None,
 ) -> _ActivationRow | None:
     row = database.execute(
         """SELECT request_id, operation, candidate_id, qualification_id, revision,
@@ -148,6 +153,7 @@ def _history_row(
              AND (? IS NULL OR request_id = ?)
              AND (? IS NULL OR revision < ?)
              AND (? = 0 OR quarantined = 0)
+             AND (? IS NULL OR candidate_id != ?)
            ORDER BY revision DESC
            LIMIT 1""",
         (
@@ -157,6 +163,8 @@ def _history_row(
             before,
             before,
             int(exclude_quarantined),
+            exclude_candidate_id,
+            exclude_candidate_id,
         ),
     ).fetchone()
     if row is None:
@@ -206,13 +214,46 @@ def _is_asset_quarantined(database: Connection, company_id: str, asset_id: str) 
     return row is not None
 
 
+def _asset_was_activated(database: Connection, company_id: str, asset_id: str) -> bool:
+    row = database.execute(
+        """SELECT 1 FROM review_tool_activation
+           WHERE company_id = ? AND candidate_id = ?
+           LIMIT 1""",
+        (company_id, asset_id),
+    ).fetchone()
+    return row is not None
+
+
+def _all_lineage_edges(
+    database: Connection, company_id: str
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Return (parent -> children, child -> parents) across activation and qualification records."""
+    children_by_parent: dict[str, set[str]] = {}
+    parents_by_child: dict[str, set[str]] = {}
+    for sql in (
+        """SELECT parent_asset_id, candidate_id
+           FROM review_tool_activation
+           WHERE company_id = ? AND parent_asset_id IS NOT NULL""",
+        """SELECT parent_asset_id, candidate_asset_id
+           FROM review_qualification
+           WHERE company_id = ? AND parent_asset_id IS NOT NULL""",
+    ):
+        for parent_id, child_id in database.execute(sql, (company_id,)).fetchall():
+            p = str(parent_id)
+            c = str(child_id)
+            children_by_parent.setdefault(p, set()).add(c)
+            parents_by_child.setdefault(c, set()).add(p)
+    return children_by_parent, parents_by_child
+
+
 def _has_quarantined_ancestor(
-    database: Connection, company_id: str, parent_asset_id: str | None
+    database: Connection, company_id: str, start_asset_id: str | None
 ) -> bool:
+    if start_asset_id is None:
+        return False
+    _, parents_by_child = _all_lineage_edges(database, company_id)
     visited: set[str] = set()
-    frontier: deque[str] = deque()
-    if parent_asset_id is not None:
-        frontier.append(parent_asset_id)
+    frontier: deque[str] = deque([start_asset_id])
     while frontier:
         current = frontier.popleft()
         if current in visited:
@@ -220,33 +261,21 @@ def _has_quarantined_ancestor(
         visited.add(current)
         if _is_asset_quarantined(database, company_id, current):
             return True
-        parent_rows = database.execute(
-            """SELECT DISTINCT parent_asset_id FROM review_tool_activation
-               WHERE company_id = ? AND candidate_id = ? AND parent_asset_id IS NOT NULL""",
-            (company_id, current),
-        ).fetchall()
-        for (ancestor,) in parent_rows:
+        for ancestor in parents_by_child.get(current, ()):
             if ancestor not in visited:
-                frontier.append(str(ancestor))
+                frontier.append(ancestor)
     return False
 
 
 def _collect_lineage_descendants(
     database: Connection, company_id: str, faulted_asset_id: str
 ) -> tuple[str, ...]:
-    edges: dict[str, set[str]] = {}
-    for parent_id, child_id in database.execute(
-        """SELECT parent_asset_id, candidate_id
-           FROM review_tool_activation
-           WHERE company_id = ? AND parent_asset_id IS NOT NULL""",
-        (company_id,),
-    ).fetchall():
-        edges.setdefault(str(parent_id), set()).add(str(child_id))
+    children_by_parent, _ = _all_lineage_edges(database, company_id)
     visited: set[str] = {faulted_asset_id}
     queue: deque[str] = deque([faulted_asset_id])
     while queue:
         node = queue.popleft()
-        for child in edges.get(node, ()):
+        for child in children_by_parent.get(node, ()):
             if child not in visited:
                 visited.add(child)
                 queue.append(child)
@@ -301,7 +330,7 @@ def apply_review_activation(
             ):
                 raise ReviewRuleRefused("Activation request identity already in use")
             try:
-                admit_command_receipt(
+                cmd_receipt, _ = admit_command_receipt(
                     database,
                     company_id=company_id,
                     command_id=command.request_id,
@@ -318,6 +347,8 @@ def apply_review_activation(
                 raise ReviewRuleRefused(
                     "Activation request identity already in use"
                 ) from error
+            if cmd_receipt.state != "applied":
+                raise ReviewRuleRefused("Activation request identity already in use")
             return prior
 
         current_row = _history_row(database, company_id)
@@ -333,16 +364,40 @@ def apply_review_activation(
             or outcome.criteria_digest != review_criteria_digest(cases)
         ):
             raise ReviewRuleRefused("Independent qualification is stale")
+
+        # Authoritative lineage binding: caller cannot override or sever qualified.parent_asset_id.
+        if (
+            command.parent_asset_id is not None
+            and qualified.parent_asset_id is not None
+            and command.parent_asset_id != qualified.parent_asset_id
+        ):
+            raise ReviewRuleRefused(
+                "Activation parent does not match qualified lineage parent"
+            )
+        if command.operation == "revert" and command.parent_asset_id is not None:
+            raise ReviewRuleRefused("Revert cannot introduce a new lineage parent")
         effective_parent = (
-            command.parent_asset_id
-            if command.parent_asset_id is not None
-            else qualified.parent_asset_id
+            qualified.parent_asset_id
+            if qualified.parent_asset_id is not None
+            else command.parent_asset_id
         )
         if effective_parent == command.candidate_id:
             raise ReviewRuleRefused("Review asset cannot be its own lineage parent")
-        if _is_asset_quarantined(
-            database, company_id, command.candidate_id
-        ) or _has_quarantined_ancestor(database, company_id, effective_parent):
+        if effective_parent is not None:
+            if not _asset_was_activated(database, company_id, effective_parent):
+                raise ReviewRuleRefused(
+                    "Lineage parent asset must exist in activation history"
+                )
+            descendants = _collect_lineage_descendants(
+                database, company_id, command.candidate_id
+            )
+            if effective_parent in descendants:
+                raise ReviewRuleRefused("Lineage parent would create a lineage cycle")
+        if (
+            _is_asset_quarantined(database, company_id, command.candidate_id)
+            or _has_quarantined_ancestor(database, company_id, command.candidate_id)
+            or _has_quarantined_ancestor(database, company_id, effective_parent)
+        ):
             raise ReviewRuleRefused("Candidate or ancestor is quarantined")
 
         _rule(database, company_id, qualified, resolve)
@@ -361,15 +416,16 @@ def apply_review_activation(
                 "Qualification does not cover the effective baseline"
             )
         if command.operation == "revert":
-            previous_row = (
-                _history_row(
-                    database,
-                    company_id,
-                    before=current.revision,
-                    exclude_quarantined=True,
+            if current is None or command.candidate_id == current.candidate_id:
+                raise ReviewRuleRefused(
+                    "Revert must target a distinct prior eligible artifact"
                 )
-                if current
-                else None
+            previous_row = _history_row(
+                database,
+                company_id,
+                before=current.revision,
+                exclude_quarantined=True,
+                exclude_candidate_id=current.candidate_id,
             )
             previous = None if previous_row is None else previous_row.receipt
             if previous is None or previous.candidate_id != command.candidate_id:
@@ -399,7 +455,7 @@ def apply_review_activation(
             domain="ops",
             entity_type="review_tool_activation",
             entity_id=command.candidate_id,
-            event_type=f"ops.review_tool_{command.operation}d",
+            event_type=_AUDIT_EVENT_BY_OP[command.operation],
             actor_id=authority.principal_id,
             command_id=command.request_id,
             payload={
@@ -414,7 +470,7 @@ def apply_review_activation(
             recorded_at_ns=now_ns,
         )
         try:
-            admit_command_receipt(
+            _cmd_receipt, replayed = admit_command_receipt(
                 database,
                 company_id=company_id,
                 command_id=command.request_id,
@@ -433,6 +489,8 @@ def apply_review_activation(
             raise ReviewRuleRefused(
                 "Activation request identity already in use"
             ) from error
+        if replayed:
+            raise ReviewRuleRefused("Activation request identity already in use")
         database.execute(
             """INSERT INTO review_tool_activation (
                    company_id, request_id, operation, candidate_id, qualification_id,
@@ -491,7 +549,8 @@ def quarantine_review_tool_lineage(
         )
         preconditions = {"faulted_asset_id": faulted_asset_id}
         existing_cmd = database.execute(
-            """SELECT actor_id, command_type, payload_sha256, preconditions_json, result_json
+            """SELECT actor_id, command_type, contract_version, payload_sha256,
+                      preconditions_json, state, result_json
                FROM command_receipt
                WHERE company_id = ? AND command_id = ?""",
             (company_id, request_id),
@@ -500,13 +559,15 @@ def quarantine_review_tool_lineage(
             if (
                 existing_cmd[0] != authority.principal_id
                 or existing_cmd[1] != "review_tool.quarantine"
-                or existing_cmd[2] != payload_digest
-                or existing_cmd[3]
+                or existing_cmd[2] != ACTIVATION_CONTRACT_VERSION
+                or existing_cmd[3] != payload_digest
+                or existing_cmd[4]
                 != json.dumps(preconditions, sort_keys=True, separators=(",", ":"))
-                or existing_cmd[4] is None
+                or existing_cmd[5] != "applied"
+                or existing_cmd[6] is None
             ):
                 raise ReviewRuleRefused("Quarantine request identity already in use")
-            stored = json.loads(existing_cmd[4])
+            stored = json.loads(existing_cmd[6])
             return QuarantineReceipt(
                 request_id=stored["request_id"],
                 faulted_asset_id=stored["faulted_asset_id"],
@@ -518,13 +579,7 @@ def quarantine_review_tool_lineage(
                 owner_id=stored["owner_id"],
             )
 
-        exists = database.execute(
-            """SELECT 1 FROM review_tool_activation
-               WHERE company_id = ? AND candidate_id = ?
-               LIMIT 1""",
-            (company_id, faulted_asset_id),
-        ).fetchone()
-        if exists is None:
+        if not _asset_was_activated(database, company_id, faulted_asset_id):
             raise ReviewRuleRefused(
                 "Faulted review tool asset is not in activation history"
             )
@@ -536,7 +591,8 @@ def quarantine_review_tool_lineage(
         database.execute(
             f"""UPDATE review_tool_activation
                 SET quarantined = 1, quarantine_reason = ?
-                WHERE company_id = ? AND candidate_id IN ({placeholders})""",
+                WHERE company_id = ? AND quarantined = 0
+                  AND candidate_id IN ({placeholders})""",
             (reason, company_id, *quarantined_assets),
         )
 
@@ -562,8 +618,10 @@ def quarantine_review_tool_lineage(
                     quarantined=bool(raw[9]),
                     quarantine_reason=None if raw[10] is None else str(raw[10]),
                 )
-                if _has_quarantined_ancestor(
-                    database, company_id, candidate.parent_asset_id
+                if _is_asset_quarantined(
+                    database, company_id, candidate.receipt.candidate_id
+                ) or _has_quarantined_ancestor(
+                    database, company_id, candidate.receipt.candidate_id
                 ):
                     continue
                 try:
@@ -573,6 +631,11 @@ def quarantine_review_tool_lineage(
                         candidate.receipt.qualification_id,
                         candidate.receipt.candidate_id,
                     )
+                    if (
+                        qual.receipt.qualification.evaluator_revision
+                        != EVALUATOR_REVISION
+                    ):
+                        continue
                     _rule(database, company_id, qual, resolve)
                 except ReviewRuleRefused:
                     continue
@@ -623,7 +686,7 @@ def quarantine_review_tool_lineage(
             "owner_id": receipt.owner_id,
         }
         try:
-            admit_command_receipt(
+            _cmd_receipt, replayed = admit_command_receipt(
                 database,
                 company_id=company_id,
                 command_id=request_id,
@@ -642,6 +705,8 @@ def quarantine_review_tool_lineage(
             raise ReviewRuleRefused(
                 "Quarantine request identity already in use"
             ) from error
+        if replayed:
+            raise ReviewRuleRefused("Quarantine request identity already in use")
         if fallback_row is not None and restored_revision is not None:
             database.execute(
                 """INSERT INTO review_tool_activation (
@@ -704,7 +769,9 @@ def inspect_with_review_tool(
         current_row = _history_row(database, company_id)
         if current_row is None or revision != current_row.receipt.revision:
             raise ReviewRuleRefused("Review tool revision is not effective")
-        if current_row.quarantined:
+        if current_row.quarantined or _has_quarantined_ancestor(
+            database, company_id, current_row.receipt.candidate_id
+        ):
             raise ReviewRuleRefused("Review tool revision is quarantined")
         current = current_row.receipt
         authority = _authorize(
@@ -712,7 +779,7 @@ def inspect_with_review_tool(
         )
         source = read_input(database, company_id, authority.principal_id, result_id)
         if (
-            source is None
+            not isinstance(source, ReviewWorkInput)
             or (source.company_id, source.result_id) != (company_id, result_id)
             or not _identity_value(source.revision)
         ):
@@ -720,6 +787,8 @@ def inspect_with_review_tool(
         qualified = _qualification(
             database, company_id, current.qualification_id, current.candidate_id
         )
+        if qualified.receipt.qualification.evaluator_revision != EVALUATOR_REVISION:
+            raise ReviewRuleRefused("Independent qualification is stale")
         rule = _rule(database, company_id, qualified, resolve)
         return ReviewToolInspection(
             revision,

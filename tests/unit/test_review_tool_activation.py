@@ -358,7 +358,168 @@ class ReviewToolActivation(unittest.TestCase):
         self.assertIsNone(root_quarantine.restored_candidate_id)
         self.assertIsNone(root_quarantine.restored_revision)
         self.assertEqual(
-            root_quarantine.quarantined_assets, ("base", "candidate", "descendant")
+            root_quarantine.quarantined_assets,
+            ("base", "candidate", "child_of_faulted", "descendant"),
         )
         with self.assertRaisesRegex(ReviewRuleRefused, "quarantined"):
             self.inspect(4)
+
+    def test_lineage_bypass_cycles_post_quarantine_revert_and_event_names(self):
+        repro = EvidenceClass.REPRODUCTION
+        self.assets["root_z"] = ReviewRule((SOURCE,))
+        self.assets["node_a"] = ReviewRule((SOURCE, VERIFIED))
+        self.assets["node_b"] = ReviewRule((SOURCE, VERIFIED, repro))
+        self.assets["unactivated_mid"] = ReviewRule((SOURCE, repro))
+        self.assets["grandchild"] = ReviewRule((VERIFIED, repro))
+        z_cases = (ReviewCase((), (SOURCE,)), ReviewCase((SOURCE,), ()))
+        a_cases = (
+            ReviewCase((SOURCE,), (VERIFIED,)),
+            ReviewCase((SOURCE, VERIFIED), ()),
+        )
+        b_cases = (
+            ReviewCase((SOURCE, VERIFIED), (repro,)),
+            ReviewCase((SOURCE, VERIFIED, repro), ()),
+        )
+        mid_cases = (ReviewCase((SOURCE,), (repro,)), ReviewCase((SOURCE, repro), ()))
+        gc_cases = (
+            ReviewCase((VERIFIED,), (repro,)),
+            ReviewCase((VERIFIED, repro), ()),
+        )
+
+        qz = self.qualification("root_z", None, z_cases)
+        self.apply(ReviewActivation("req-z", "activate", "root_z", qz, 0), z_cases)
+        with self.hold_writer() as writer:
+            qa = record_review_qualification(
+                writer,
+                "node_a",
+                "root_z",
+                resolve=self.asset,
+                cases=a_cases,
+                parent_asset_id="root_z",
+            ).receipt_id
+        # Caller cannot override qualified.parent_asset_id with a different parent.
+        with self.assertRaisesRegex(ReviewRuleRefused, "lineage parent"):
+            self.apply(
+                ReviewActivation("req-a-bad", "activate", "node_a", qa, 1, "node_b"),
+                a_cases,
+            )
+        self.apply(
+            ReviewActivation("req-a", "activate", "node_a", qa, 1, "root_z"), a_cases
+        )
+
+        # Transitive cycle root_z -> node_a -> root_z must be refused.
+        with self.hold_writer() as writer:
+            qz_cycle = record_review_qualification(
+                writer,
+                "root_z",
+                "node_a",
+                resolve=self.asset,
+                cases=z_cases,
+                parent_asset_id="node_a",
+            ).receipt_id
+        with self.assertRaisesRegex(ReviewRuleRefused, "cycle"):
+            self.apply(
+                ReviewActivation(
+                    "req-cycle", "activate", "root_z", qz_cycle, 2, "node_a"
+                ),
+                z_cases,
+            )
+
+        # Activate node_b (child of node_a), then quarantine node_b -> restores node_a (rev 4).
+        with self.hold_writer() as writer:
+            qb = record_review_qualification(
+                writer,
+                "node_b",
+                "node_a",
+                resolve=self.asset,
+                cases=b_cases,
+                parent_asset_id="node_a",
+            ).receipt_id
+        self.apply(
+            ReviewActivation("req-b", "activate", "node_b", qb, 2, "node_a"), b_cases
+        )
+        with self.hold_writer() as writer:
+            quar = quarantine_review_tool_lineage(
+                writer,
+                request_id="req-q-b",
+                faulted_asset_id="node_b",
+                reason="bad-b",
+                authorize=self.authority,
+                resolve=self.asset,
+            )
+        self.assertEqual(
+            (quar.restored_candidate_id, quar.restored_revision), ("node_a", 4)
+        )
+
+        # Unactivated intermediate node_b -> unactivated_mid -> grandchild must be blocked.
+        with self.hold_writer() as writer:
+            record_review_qualification(
+                writer,
+                "unactivated_mid",
+                "node_a",
+                resolve=self.asset,
+                cases=mid_cases,
+                parent_asset_id="node_b",
+            )
+            q_gc = record_review_qualification(
+                writer,
+                "grandchild",
+                "node_a",
+                resolve=self.asset,
+                cases=gc_cases,
+                parent_asset_id="unactivated_mid",
+            ).receipt_id
+        with self.assertRaisesRegex(
+            ReviewRuleRefused, "activation history|quarantined"
+        ):
+            self.apply(
+                ReviewActivation(
+                    "req-gc", "activate", "grandchild", q_gc, 4, "unactivated_mid"
+                ),
+                gc_cases,
+            )
+
+        # No-op self-revert (node_a -> node_a) refused; revert past quarantine rollback (node_a -> root_z) succeeds!
+        with self.hold_writer() as writer:
+            qa_self = record_review_qualification(
+                writer, "node_a", "node_a", resolve=self.asset, cases=a_cases
+            ).receipt_id
+            qz_rev = record_review_qualification(
+                writer, "root_z", "node_a", resolve=self.asset, cases=z_cases
+            ).receipt_id
+        with self.assertRaisesRegex(ReviewRuleRefused, "distinct"):
+            self.apply(
+                ReviewActivation("req-self-rev", "revert", "node_a", qa_self, 4),
+                a_cases,
+            )
+        # Cross-operation request_id collision against quarantine receipt must fail closed.
+        with self.assertRaisesRegex(ReviewRuleRefused, "already in use"):
+            self.apply(
+                ReviewActivation("req-q-b", "revert", "root_z", qz_rev, 4), z_cases
+            )
+        reverted = self.apply(
+            ReviewActivation("req-rev-z", "revert", "root_z", qz_rev, 4), z_cases
+        )
+        self.assertEqual((reverted.revision, reverted.candidate_id), (5, "root_z"))
+        self.assertEqual(self.inspect(5).missing, ())
+
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            events = [
+                row[0]
+                for row in db.execute(
+                    """SELECT event_type FROM audit_event
+                       WHERE company_id = ? AND entity_type = 'review_tool_activation'
+                       ORDER BY event_seq""",
+                    (self.company_id,),
+                ).fetchall()
+            ]
+            self.assertEqual(
+                events,
+                [
+                    "ops.review_tool_activated",
+                    "ops.review_tool_activated",
+                    "ops.review_tool_activated",
+                    "ops.review_lineage_quarantined",
+                    "ops.review_tool_reverted",
+                ],
+            )

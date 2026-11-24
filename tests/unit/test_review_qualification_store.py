@@ -284,4 +284,66 @@ class QualificationStore(unittest.TestCase):
             )
             self.assertIsNotNone(flaky_record)
             self.assertFalse(flaky_record.passed)
+            self.assertFalse(flaky_receipt.qualification.passed)
             self.assertEqual(flaky_record.trial_count, PASS_K_TRIALS)
+
+    def test_lineage_and_column_tampering_and_self_eval_fail_closed(self):
+        leases = self.root / "leases"
+        # Different parent_asset_id / trial_count must yield distinct receipts (no ON CONFLICT loss).
+        with hold_company_writer(
+            self.store, self.company.company_id, lease_directory=leases
+        ) as writer:
+            r_plain = record_review_qualification(
+                writer, "new", "original", resolve=self.resolve, cases=self.cases
+            )
+            r_lineage = record_review_qualification(
+                writer,
+                "new",
+                "original",
+                resolve=self.resolve,
+                cases=self.cases,
+                parent_asset_id="original",
+                trials=PASS_K_TRIALS,
+            )
+        self.assertNotEqual(r_plain.receipt_id, r_lineage.receipt_id)
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            rec = read_review_qualification_record(
+                db, r_lineage.receipt_id, company_id=self.company.company_id
+            )
+            self.assertIsNotNone(rec)
+            self.assertEqual(rec.parent_asset_id, "original")
+            self.assertEqual(rec.trial_count, PASS_K_TRIALS)
+
+        # Direct self-evaluation with author_id == actor_id must refuse.
+        def authored_resolve(db, company_id, asset_id):
+            base = self.resolve(db, company_id, asset_id)
+            if base is None:
+                return None
+            return PublishedReviewRule(
+                base.company_id, base.asset_id, base.rule, author_id="same-agent"
+            )
+
+        with hold_company_writer(
+            self.store, self.company.company_id, lease_directory=leases
+        ) as writer:
+            with self.assertRaisesRegex(ReviewRuleRefused, "self-evaluate"):
+                record_review_qualification(
+                    writer,
+                    "new",
+                    "original",
+                    resolve=authored_resolve,
+                    cases=self.cases,
+                    actor_id="same-agent",
+                )
+
+        # Unhashed column tampering (e.g. clearing parent_asset_id) must fail integrity check.
+        with closing(sqlite3.connect(self.store)) as db, db:
+            db.execute(
+                "UPDATE review_qualification SET parent_asset_id = NULL WHERE receipt_id = ?",
+                (r_lineage.receipt_id,),
+            )
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            with self.assertRaisesRegex(ReviewRuleRefused, "integrity"):
+                read_review_qualification_record(
+                    db, r_lineage.receipt_id, company_id=self.company.company_id
+                )
