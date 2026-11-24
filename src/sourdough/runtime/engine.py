@@ -30,6 +30,7 @@ from .work_kernel import (
     evaluate_conditions,
     fail_work_run,
     has_active_grant,
+    has_authorized_peer_response_item,
     reclaim_expired_runs,
     wake_waiting_runs,
     yield_run_to_wait,
@@ -264,13 +265,16 @@ class CompanyRuntime:
                 item = WorkItem(*row)
                 if item.work_item_id in blocked:
                     continue
-                if (
-                    item.duty_kind == "work.peer_response"
-                    and cancel_closed_peer_response_item(
+                if item.duty_kind == "work.peer_response":
+                    if cancel_closed_peer_response_item(
                         conn, self._company_id, item.work_item_id, now_ns=now_ns
-                    )
-                ):
-                    continue
+                    ):
+                        continue
+                    if not has_authorized_peer_response_item(
+                        conn, self._company_id, item.work_item_id
+                    ):
+                        blocked.append(item.work_item_id)
+                        continue
                 descriptor = self._registry.get(item.duty_kind)
                 if not has_active_grant(
                     conn,

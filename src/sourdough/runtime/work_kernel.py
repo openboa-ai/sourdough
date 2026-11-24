@@ -275,6 +275,142 @@ def create_work_item(
     )
 
 
+MAX_PEER_EVIDENCE_REFS = 32
+
+
+def _authorize_peer_route(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    requester_agent_id: str,
+    recipient_agent_id: str,
+    evidence_refs: list[str],
+    check_open_quota: bool = False,
+) -> None:
+    """Atomically verify peer-request route, recipient grant/responsibility, evidence scope, and budget."""
+    if not has_active_grant(connection, company_id, requester_agent_id):
+        raise WorkKernelRefused("Requester Agent has no active standing grant")
+    if not has_active_grant(connection, company_id, recipient_agent_id):
+        raise WorkKernelRefused("Recipient Agent has no active standing grant")
+    if not has_turn_capacity(connection, recipient_agent_id):
+        raise WorkKernelRefused("Recipient Agent has no remaining turn allocation")
+    if (
+        not isinstance(evidence_refs, list)
+        or len(evidence_refs) > MAX_PEER_EVIDENCE_REFS
+    ):
+        raise WorkKernelRefused("Peer request evidence references exceed allowed limit")
+    for ref in evidence_refs:
+        if (
+            not isinstance(ref, str)
+            or not ref.strip()
+            or ".." in ref
+            or any(ord(ch) < 32 for ch in ref)
+        ):
+            raise WorkKernelRefused("Invalid peer request evidence reference")
+
+    rows = connection.execute(
+        """SELECT readable_scope_json FROM work_responsibilities
+           WHERE company_id = ? AND owner_agent_id = ?
+             AND duty_kind = 'work.peer_response' AND status = 'active'
+           ORDER BY created_at_ns, responsibility_id""",
+        (company_id, recipient_agent_id),
+    ).fetchall()
+    if not rows:
+        raise WorkKernelRefused(
+            "Recipient Agent has no active peer_response responsibility"
+        )
+
+    open_count: int | None = None
+    for (scope_raw,) in rows:
+        try:
+            scope = json.loads(str(scope_raw))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(scope, dict):
+            continue
+        requesters = scope.get("allowed_requesters")
+        if (
+            not isinstance(requesters, list)
+            or not all(isinstance(a, str) and a.strip() for a in requesters)
+            or requester_agent_id not in requesters
+        ):
+            continue
+        required_scope = scope.get("required_scope")
+        if required_scope is not None:
+            if not isinstance(required_scope, str) or not has_active_grant(
+                connection,
+                company_id,
+                recipient_agent_id,
+                required_scope=required_scope,
+            ):
+                continue
+        if evidence_refs:
+            prefixes = scope.get("evidence_prefixes")
+            if not isinstance(prefixes, list) or not all(
+                isinstance(p, str) and p.strip() for p in prefixes
+            ):
+                continue
+            if not all(
+                any(ref.startswith(prefix) for prefix in prefixes)
+                for ref in evidence_refs
+            ):
+                continue
+        max_open = scope.get("max_open_requests")
+        if check_open_quota and max_open is not None:
+            if type(max_open) is not int or max_open <= 0:
+                continue
+            if open_count is None:
+                open_count = int(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM work_peer_requests
+                           WHERE company_id = ? AND recipient_agent_id = ? AND state = 'open'""",
+                        (company_id, recipient_agent_id),
+                    ).fetchone()[0]
+                )
+            if open_count >= max_open:
+                raise WorkKernelRefused(
+                    "Recipient Agent has reached its open peer-request quota"
+                )
+        return
+
+    raise WorkKernelRefused(
+        "Peer request route or evidence scope is not authorized by recipient responsibility"
+    )
+
+
+def has_authorized_peer_response_item(
+    connection: sqlite3.Connection, company_id: str, work_item_id: str
+) -> bool:
+    """Verify a peer_response work item's linked request is open and currently authorized."""
+    row = connection.execute(
+        """SELECT requester_agent_id, recipient_agent_id, evidence_refs_json, state
+           FROM work_peer_requests
+           WHERE company_id = ? AND response_work_item_id = ?""",
+        (company_id, work_item_id),
+    ).fetchone()
+    if row is None:
+        return True
+    requester_id, recipient_id, evidence_json, state = row
+    if str(state) != "open":
+        return False
+    try:
+        refs = json.loads(str(evidence_json))
+    except json.JSONDecodeError:
+        return False
+    try:
+        _authorize_peer_route(
+            connection,
+            company_id=company_id,
+            requester_agent_id=str(requester_id),
+            recipient_agent_id=str(recipient_id),
+            evidence_refs=refs if isinstance(refs, list) else [],
+            check_open_quota=False,
+        )
+    except WorkKernelRefused:
+        return False
+    return True
+
+
 def cancel_closed_peer_response_item(
     connection: sqlite3.Connection,
     company_id: str,
@@ -340,13 +476,25 @@ def claim_work_run(
     ):
         raise WorkKernelRefused("Agent already has an active running execution")
     if duty_kind == "work.peer_response":
-        req_state = connection.execute(
-            """SELECT state FROM work_peer_requests
+        req_row = connection.execute(
+            """SELECT requester_agent_id, recipient_agent_id, evidence_refs_json, state
+               FROM work_peer_requests
                WHERE company_id = ? AND response_work_item_id = ?""",
             (company_id, work_item_id),
         ).fetchone()
-        if req_state is not None and str(req_state[0]) != "open":
-            raise WorkKernelRefused("Linked peer request is no longer open")
+        if req_row is not None:
+            requester_id, recipient_id, evidence_json, req_state = req_row
+            if str(req_state) != "open":
+                raise WorkKernelRefused("Linked peer request is no longer open")
+            refs = json.loads(str(evidence_json))
+            _authorize_peer_route(
+                connection,
+                company_id=company_id,
+                requester_agent_id=str(requester_id),
+                recipient_agent_id=str(recipient_id),
+                evidence_refs=refs if isinstance(refs, list) else [],
+                check_open_quota=False,
+            )
     if not has_active_grant(
         connection, company_id, agent_id, required_scope=required_scope
     ):
@@ -1309,6 +1457,15 @@ def open_peer_request(
     timestamp = time_ns() if now_ns is None else now_ns
     if deadline_ns <= timestamp:
         raise WorkKernelRefused("Peer request deadline must be in the future")
+
+    _authorize_peer_route(
+        connection,
+        company_id=company_id,
+        requester_agent_id=run.agent_id,
+        recipient_agent_id=recipient_agent_id,
+        evidence_refs=evidence_refs,
+        check_open_quota=True,
+    )
 
     response_item, _ = create_work_item(
         connection,

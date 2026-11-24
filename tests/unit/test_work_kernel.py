@@ -46,6 +46,20 @@ class WorkKernel(unittest.TestCase):
                 "INSERT INTO standing_grant VALUES ('grant-peer-1', ?, 'manage')",
                 (self.peer_id,),
             )
+            self.peer_responsibility = register_responsibility(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.peer_id,
+                duty_kind="work.peer_response",
+                remit="Review authorized founder peer requests",
+                readable_scope={
+                    "allowed_requesters": [self.founder_id],
+                    "evidence_prefixes": ["asset:"],
+                    "required_scope": "manage",
+                    "max_open_requests": 2,
+                },
+                now_ns=500,
+            )
 
     def test_active_uniqueness_fencing_lease_reclamation_and_zero_compute_wait(self):
         with closing(open_writer(self.store)) as conn:
@@ -588,3 +602,106 @@ class WorkKernel(unittest.TestCase):
                     now_ns=12_200,
                 )
                 self.assertEqual(req2.state, "open")
+
+    def test_peer_request_authorizes_route_evidence_scope_and_responsibility(self):
+        unrelated_id = "unrelated-agent"
+        with closing(open_writer(self.store)) as conn:
+            with write_tx(conn):
+                conn.execute(
+                    "INSERT INTO agent VALUES (?, ?, ?)",
+                    (unrelated_id, self.company_id, "profile-unrelated"),
+                )
+                conn.execute(
+                    "INSERT INTO standing_grant VALUES ('grant-unrelated', ?, 'manage')",
+                    (unrelated_id,),
+                )
+                item, _ = create_work_item(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.assessment",
+                    source_kind="project",
+                    source_id="proj-auth",
+                    now_ns=1_000,
+                )
+                run = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    lease_owner="worker-a",
+                    lease_ttl_ns=60_000,
+                    now_ns=1_100,
+                )
+                # 1. Unrelated agent without peer_response responsibility is refused before creating work
+                with self.assertRaisesRegex(
+                    WorkKernelRefused, "no active peer_response responsibility"
+                ):
+                    open_peer_request(
+                        conn,
+                        company_id=self.company_id,
+                        requester_work_item_id=item.work_item_id,
+                        requester_run_id=run.run_id,
+                        fencing_token=run.fencing_token,
+                        recipient_agent_id=unrelated_id,
+                        question="Unauthorized route",
+                        expected_decision="yes_no",
+                        evidence_refs=[],
+                        deadline_ns=50_000,
+                        request_id="req-unauth-route",
+                        now_ns=1_200,
+                    )
+                # 2. Out-of-scope evidence ref is refused before creating work
+                with self.assertRaisesRegex(WorkKernelRefused, "not authorized"):
+                    open_peer_request(
+                        conn,
+                        company_id=self.company_id,
+                        requester_work_item_id=item.work_item_id,
+                        requester_run_id=run.run_id,
+                        fencing_token=run.fencing_token,
+                        recipient_agent_id=self.peer_id,
+                        question="Leak secret?",
+                        expected_decision="yes_no",
+                        evidence_refs=["secret:private-key"],
+                        deadline_ns=50_000,
+                        request_id="req-bad-ref",
+                        now_ns=1_250,
+                    )
+                # Verify zero recipient work items were created by refused attempts
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM work_items WHERE duty_kind = 'work.peer_response'"
+                    ).fetchone()[0],
+                    0,
+                )
+                # 3. Valid authorized request succeeds, then revoking responsibility blocks claiming it
+                req, _ = open_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    requester_run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    recipient_agent_id=self.peer_id,
+                    question="Authorized review?",
+                    expected_decision="approve",
+                    evidence_refs=["asset:public-memo"],
+                    deadline_ns=50_000,
+                    request_id="req-auth-ok",
+                    now_ns=1_300,
+                )
+                revoke_responsibility(
+                    conn,
+                    self.company_id,
+                    self.peer_responsibility.responsibility_id,
+                    now_ns=1_400,
+                )
+                with self.assertRaisesRegex(
+                    WorkKernelRefused, "no active peer_response responsibility"
+                ):
+                    claim_work_run(
+                        conn,
+                        company_id=self.company_id,
+                        work_item_id=req.response_work_item_id,
+                        lease_owner="peer-worker",
+                        lease_ttl_ns=60_000,
+                        now_ns=1_500,
+                    )

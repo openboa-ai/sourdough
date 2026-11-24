@@ -175,6 +175,18 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                 "INSERT INTO standing_grant VALUES ('grant-peer-colleague', ?, 'manage')",
                 (peer_id,),
             )
+            register_responsibility(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=peer_id,
+                duty_kind="work.peer_response",
+                remit="Review founder peer requests",
+                readable_scope={
+                    "allowed_requesters": [self.founder_id],
+                    "evidence_prefixes": ["asset:"],
+                },
+                now_ns=500,
+            )
             item, _ = create_work_item(
                 conn,
                 company_id=self.company_id,
@@ -446,6 +458,18 @@ class UnifiedCompanyRuntime(unittest.TestCase):
             conn.execute(
                 "INSERT INTO standing_grant VALUES ('grant-peer-exp', ?, 'manage')",
                 (peer_id,),
+            )
+            register_responsibility(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=peer_id,
+                duty_kind="work.peer_response",
+                remit="Review founder peer requests",
+                readable_scope={
+                    "allowed_requesters": [self.founder_id],
+                    "evidence_prefixes": ["asset:"],
+                },
+                now_ns=500,
             )
             open_peer_request(
                 conn,
