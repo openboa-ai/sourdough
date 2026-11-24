@@ -13,6 +13,7 @@ from sourdough.runtime.work_kernel import (
     complete_work_run,
     create_work_item,
     evaluate_conditions,
+    fail_work_run,
     list_conditions,
     open_peer_request,
     reclaim_expired_runs,
@@ -777,3 +778,129 @@ class WorkKernel(unittest.TestCase):
                         lease_ttl_ns=5_000,
                         now_ns=50_100,
                     )
+
+    def test_expired_lease_enforced_by_default_fencing_and_fail_work_run(self):
+        with closing(open_writer(self.store)) as conn:
+            with write_tx(conn):
+                item, _ = create_work_item(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.lease_check",
+                    source_kind="manual",
+                    source_id="lc-1",
+                    now_ns=1_000,
+                )
+                run = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    lease_owner="worker-1",
+                    lease_ttl_ns=5_000,
+                    now_ns=1_000,
+                )
+            # Even before reclaim_expired_runs sweeps, omitting now_ns uses real clock
+            # (far past lease_expires_at_ns=6_000) and fails closed!
+            with self.assertRaisesRegex(RunFenced, "lease has expired"):
+                assert_run_fencing(conn, run.run_id, run.fencing_token)
+            # Passing an expired timestamp to fail_work_run must also refuse!
+            with self.assertRaisesRegex(RunFenced, "lease has expired"):
+                with write_tx(conn):
+                    fail_work_run(
+                        conn,
+                        run.run_id,
+                        run.fencing_token,
+                        error_summary="late_crash",
+                        now_ns=6_000,
+                    )
+            # Before expiration, fail_work_run succeeds cleanly
+            with write_tx(conn):
+                failed = fail_work_run(
+                    conn,
+                    run.run_id,
+                    run.fencing_token,
+                    error_summary="timely_crash",
+                    now_ns=5_000,
+                )
+            self.assertEqual(failed.status, "failed")
+
+    def test_complete_work_run_advances_and_preserves_recurring_condition_revision(
+        self,
+    ):
+        with closing(open_writer(self.store)) as conn:
+            with write_tx(conn):
+                resp = register_responsibility(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.recurring",
+                    remit="Recurring periodic check",
+                    readable_scope=["shared"],
+                    now_ns=1_000,
+                )
+                set_condition(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=resp.responsibility_id,
+                    trigger_kind="timer",
+                    source_identity="timer:daily-check",
+                    due_at_ns=5_000,
+                    condition_revision=1,
+                    now_ns=1_000,
+                )
+                occ1 = evaluate_conditions(conn, self.company_id, now_ns=5_000)
+                self.assertEqual(len(occ1), 1)
+                run1 = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=occ1[0].work_item_id,
+                    lease_owner="worker-1",
+                    lease_ttl_ns=60_000,
+                    now_ns=5_100,
+                )
+                # Omitting condition_revision with stable source_identity auto-advances to rev 2
+                _, cond2 = complete_work_run(
+                    conn,
+                    run1.run_id,
+                    run1.fencing_token,
+                    outcome={"round": 1},
+                    next_condition={
+                        "trigger_kind": "timer",
+                        "responsibility_id": resp.responsibility_id,
+                        "source_identity": "timer:daily-check",
+                        "due_at_ns": 10_000,
+                    },
+                    now_ns=5_200,
+                )
+                self.assertIsNotNone(cond2)
+                self.assertEqual(cond2.condition_revision, 2)
+                occ2 = evaluate_conditions(conn, self.company_id, now_ns=10_000)
+                self.assertEqual(len(occ2), 1)
+                run2 = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=occ2[0].work_item_id,
+                    lease_owner="worker-1",
+                    lease_ttl_ns=60_000,
+                    now_ns=10_100,
+                )
+                # Explicitly supplying condition_revision=5 preserves exact revision 5
+                _, cond3 = complete_work_run(
+                    conn,
+                    run2.run_id,
+                    run2.fencing_token,
+                    outcome={"round": 2},
+                    next_condition={
+                        "trigger_kind": "timer",
+                        "responsibility_id": resp.responsibility_id,
+                        "source_identity": "timer:daily-check",
+                        "due_at_ns": 20_000,
+                        "condition_revision": 5,
+                    },
+                    now_ns=10_200,
+                )
+                self.assertIsNotNone(cond3)
+                self.assertEqual(cond3.condition_revision, 5)
+                occ3 = evaluate_conditions(conn, self.company_id, now_ns=20_000)
+                self.assertEqual(len(occ3), 1)

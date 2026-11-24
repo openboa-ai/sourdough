@@ -472,6 +472,113 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                 (MAX_SCHEMA_VERSION,),
             )
 
+    def test_interrupted_post_retirement_publication_resumes_cleanly(self):
+        from unittest.mock import patch
+
+        desk = self.root / "desk-recover"
+        desk.mkdir()
+        (desk / "state.md").write_text("durable-desk\n", encoding="utf-8")
+        archive = self.root / "checkpoint-recover.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            desk_root=desk,
+            lease_directory=self.leases,
+        )
+
+        replacement = self.root / "recovered.sqlite"
+        desk_dest = self.root / "desk-recovered"
+
+        def reconcile_shadow(shadow_db: Path) -> None:
+            with closing(open_writer(shadow_db)) as conn, write_tx(conn):
+                append_audit_event(
+                    conn,
+                    company_id=self.company_id,
+                    domain="ops",
+                    entity_type="restore",
+                    entity_id="rec-io",
+                    event_type="restore.reconciled_before_crash",
+                    actor_id="reconciler",
+                    payload={"ok": True},
+                )
+
+        real_link = os.link
+
+        def fail_only_final_publish(src, dst, *args, **kwargs):
+            if Path(dst) == replacement.resolve(strict=False):
+                raise OSError("simulated publish I/O error")
+            return real_link(src, dst, *args, **kwargs)
+
+        # First attempt fails on final os.link AFTER retirement commits
+        with patch(
+            "sourdough.storage.checkpoint.os.link", side_effect=fail_only_final_publish
+        ):
+            with self.assertRaisesRegex(OSError, "simulated publish I/O error"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    desk_destination=desk_dest,
+                    reconcile=reconcile_shadow,
+                    lease_directory=self.leases,
+                )
+
+        # Original store remains permanently retired; destination not yet published
+        self.assertFalse(replacement.exists())
+        self.assertFalse(desk_dest.exists())
+        with self.assertRaisesRegex(StorageRefused, "retired"):
+            open_writer(self.store)
+
+        # A different restore destination against the retired store must fail closed
+        with self.assertRaisesRegex(CheckpointRefused, "different restore request"):
+            restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                self.root / "wrong-dest.sqlite",
+                desk_destination=self.root / "wrong-desk",
+                lease_directory=self.leases,
+            )
+
+        # Retrying the exact restore resumes from durable staged artifacts cleanly!
+        receipt = restore_store(
+            self.store,
+            self.company_id,
+            archive,
+            replacement,
+            desk_destination=desk_dest,
+            lease_directory=self.leases,
+        )
+        verify_no_wal_sidecars(replacement)
+        self.assertEqual(
+            (desk_dest / "state.md").read_text(encoding="utf-8"),
+            "durable-desk\n",
+        )
+        with closing(open_reader(replacement)) as reader, read_tx(reader):
+            self.assertEqual(
+                reader.execute("PRAGMA journal_mode").fetchone()[0].lower(), "delete"
+            )
+            self.assertEqual(
+                reader.execute(
+                    "SELECT event_type FROM audit_event WHERE event_type = 'restore.reconciled_before_crash'"
+                ).fetchall(),
+                [("restore.reconciled_before_crash",)],
+            )
+            self.assertEqual(
+                reader.execute(
+                    "SELECT request_revision FROM company_restore_receipt WHERE request_revision = ?",
+                    (receipt.request_revision,),
+                ).fetchone(),
+                (receipt.request_revision,),
+            )
+        # Durable staging files are cleaned up and original store stays retired
+        self.assertEqual(list(self.root.glob(".sourdough-restore-*")), [])
+        self.assertEqual(list(self.root.glob(".sourdough-desk-stage-*")), [])
+        with self.assertRaisesRegex(StorageRefused, "retired"):
+            open_writer(self.store)
+
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)

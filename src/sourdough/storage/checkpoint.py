@@ -155,8 +155,9 @@ def compute_logical_watermark(
     ).fetchone()
     if row is None or str(row[0]) != company_id:
         raise CheckpointRefused("Store does not match the expected company")
-    schema_version = int(row[1])
-    if schema_version == RETIRED_SCHEMA_REVISION:
+    raw_schema_version = int(row[1])
+    schema_version = raw_schema_version
+    if raw_schema_version == RETIRED_SCHEMA_REVISION:
         retirement = read_retirement(connection)
         if retirement is None:
             raise CheckpointRefused("Retired store is missing retirement metadata")
@@ -197,6 +198,19 @@ def compute_logical_watermark(
             for col in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
         ]
         raw_rows = connection.execute(f'SELECT * FROM "{table}"').fetchall()
+        if (
+            table == "company"
+            and raw_schema_version == RETIRED_SCHEMA_REVISION
+            and "schema_revision" in columns
+        ):
+            rev_index = columns.index("schema_revision")
+            raw_rows = [
+                tuple(
+                    schema_version if idx == rev_index else cell
+                    for idx, cell in enumerate(record)
+                )
+                for record in raw_rows
+            ]
         serialized_rows = sorted(
             json.dumps(
                 [_normalize_cell(cell) for cell in record],
@@ -685,6 +699,190 @@ def _copy_desk_tree(source_root: Path, dest_root: Path) -> None:
     _stage_pinned_desk(source_root, dest_root, fsync_files=True)
 
 
+def _restore_request_revision(
+    company_id: str,
+    store_key: tuple[int, int],
+    manifest: CheckpointManifest,
+    target: Path,
+) -> str:
+    terms = [
+        company_id,
+        list(store_key),
+        manifest.captured_ns,
+        manifest.sha256,
+        manifest.watermark.domain_digest,
+        str(target),
+    ]
+    return sha256(json.dumps(terms, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _staged_restore_paths(
+    target: Path, desk_target: Path | None, request_revision: str, has_desk: bool
+) -> tuple[Path, Path | None]:
+    db_stage = target.with_name(f".sourdough-restore-{request_revision[:16]}.sqlite")
+    desk_stage = (
+        desk_target.with_name(f".sourdough-desk-stage-{request_revision[:16]}")
+        if desk_target is not None and has_desk
+        else None
+    )
+    return db_stage, desk_stage
+
+
+def _verify_staged_replacement(
+    candidate: Path,
+    company_id: str,
+    request_revision: str,
+    manifest: CheckpointManifest,
+) -> None:
+    """Verify a staged or published replacement DB matches this restore request."""
+    try:
+        fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise CheckpointRefused(
+            "Staged replacement database is missing or unsafe"
+        ) from error
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise CheckpointRefused(
+                "Staged replacement database must be a regular file"
+            )
+    finally:
+        os.close(fd)
+    try:
+        verify_no_wal_sidecars(candidate)
+        with closing(open_reader(candidate)) as reader, read_tx(reader):
+            mode = str(reader.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            if mode != "delete":
+                raise CheckpointRefused(
+                    f"Staged replacement must be in DELETE mode, got {mode}"
+                )
+            if reader.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise CheckpointRefused("Staged replacement failed quick_check")
+            if reader.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise CheckpointRefused("Staged replacement failed foreign_key_check")
+            company_row = reader.execute(
+                "SELECT id FROM company WHERE singleton = 1"
+            ).fetchone()
+            if company_row is None or str(company_row[0]) != company_id:
+                raise CheckpointRefused("Staged replacement company mismatch")
+            _verify_trusted_schema_objects(reader, manifest.schema_version)
+            row = reader.execute(
+                """SELECT checkpoint_sha256, watermark_json
+                   FROM company_restore_receipt
+                   WHERE request_revision = ?""",
+                (request_revision,),
+            ).fetchone()
+    except (StorageRefused, sqlite3.Error) as error:
+        raise CheckpointRefused(
+            f"Staged replacement verification failed: {error}"
+        ) from error
+    expected_wm = json.dumps(asdict(manifest.watermark), sort_keys=True)
+    if row is None or row[0] != manifest.sha256 or row[1] != expected_wm:
+        raise CheckpointRefused(
+            "Staged replacement receipt does not match this restore request"
+        )
+
+
+def _verify_staged_desk_snapshot(
+    staged_desk_dir: Path, manifest: CheckpointManifest
+) -> None:
+    """Verify a durable staged Desk directory matches the authenticated manifest digest."""
+    with TemporaryDirectory(prefix="sd-desk-verify-") as check_dir:
+        verify_root = Path(check_dir) / "desk"
+        files = _stage_pinned_desk(staged_desk_dir, verify_root)
+        digest = _compute_desk_digest(
+            (
+                rel,
+                _hash_file(
+                    verify_root.joinpath(*_validate_desk_relative_path(rel).parts)
+                ),
+            )
+            for rel in files
+        )
+    if files != manifest.desk_files or digest != manifest.desk_digest:
+        raise CheckpointRefused(
+            "Staged Desk snapshot does not match authenticated checkpoint digest"
+        )
+
+
+def _resume_retired_restore(
+    store: Path,
+    store_key: tuple[int, int],
+    company_id: str,
+    archive: Path,
+    target: Path,
+    desk_target: Path | None,
+    retirement_revision: str,
+) -> CoreRestoreReceipt:
+    """Finish publishing an interrupted restore without re-enabling the retired original."""
+    manifest = inspect_checkpoint(archive, company_id)
+    if manifest.desk_files and desk_target is None:
+        raise CheckpointRefused(
+            "Checkpoint archive bundles Desk files; desk_destination is required"
+        )
+    with closing(open_reader(store)) as original, read_tx(original):
+        live_watermark = compute_logical_watermark(original, company_id)
+    if live_watermark != manifest.watermark:
+        raise CheckpointRefused(
+            "Retired store logical watermark does not match the checkpoint cut"
+        )
+    request_revision = _restore_request_revision(
+        company_id, store_key, manifest, target
+    )
+    if retirement_revision != request_revision:
+        raise CheckpointRefused(
+            "Original store is already retired by a different restore request"
+        )
+    staged_db_sibling, staged_desk_sibling = _staged_restore_paths(
+        target, desk_target, request_revision, bool(manifest.desk_files)
+    )
+    has_pending_db = not os.path.lexists(target)
+    has_pending_desk = (
+        staged_desk_sibling is not None
+        and desk_target is not None
+        and not os.path.lexists(desk_target)
+    )
+    if not has_pending_db and not has_pending_desk:
+        if os.path.lexists(staged_db_sibling):
+            _verify_staged_replacement(target, company_id, request_revision, manifest)
+            os.unlink(staged_db_sibling)
+            _fsync_dir(target.parent)
+            return CoreRestoreReceipt(
+                company_id=company_id,
+                request_revision=request_revision,
+                checkpoint_sha256=manifest.sha256,
+                watermark=manifest.watermark,
+            )
+        raise CheckpointRefused("Replacement destination already exists")
+
+    if has_pending_db:
+        _verify_staged_replacement(
+            staged_db_sibling, company_id, request_revision, manifest
+        )
+        _publish_file(staged_db_sibling, target)
+        verify_no_wal_sidecars(target)
+    else:
+        _verify_staged_replacement(target, company_id, request_revision, manifest)
+
+    if has_pending_desk and staged_desk_sibling is not None and desk_target is not None:
+        if not os.path.lexists(staged_desk_sibling):
+            raise CheckpointRefused("Staged Desk recovery snapshot is missing")
+        _verify_staged_desk_snapshot(staged_desk_sibling, manifest)
+        os.rename(staged_desk_sibling, desk_target)
+        _fsync_dir(desk_target.parent)
+
+    if os.path.lexists(staged_db_sibling):
+        os.unlink(staged_db_sibling)
+        _fsync_dir(target.parent)
+
+    return CoreRestoreReceipt(
+        company_id=company_id,
+        request_revision=request_revision,
+        checkpoint_sha256=manifest.sha256,
+        watermark=manifest.watermark,
+    )
+
+
 def restore_store(
     store: Path,
     company_id: str,
@@ -699,20 +897,51 @@ def restore_store(
 
     Staging, optional reconciliation, and restore receipt persistence all execute
     in DELETE journal mode with verified zero -wal/-shm sidecars before atomic
-    publication, preventing silent WAL drop on file move/link.
+    publication, preventing silent WAL drop on file move/link. Durable staged
+    artifacts are preserved across post-retirement publication failures so a
+    matching retry can finish publication without re-enabling the retired store.
     """
     from ..writer_lease import hold_company_writer
 
     target = destination.parent.resolve(strict=True) / destination.name
-    if os.path.lexists(target):
-        raise CheckpointRefused("Replacement destination already exists")
     desk_target: Path | None = None
     if desk_destination is not None:
         desk_target = (
             desk_destination.parent.resolve(strict=True) / desk_destination.name
         )
-        if os.path.lexists(desk_target):
-            raise CheckpointRefused("Desk restore destination already exists")
+
+    # Check whether the original store was already retired by an interrupted publication
+    # of this exact restore request; if so, finish publication read-only without
+    # re-enabling the original writer.
+    try:
+        store_fd = os.open(store, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise CheckpointRefused("Original company store could not be opened") from error
+    try:
+        store_info = os.fstat(store_fd)
+        if not stat.S_ISREG(store_info.st_mode):
+            raise CheckpointRefused("Original company store must be a regular file")
+        store_key = (store_info.st_dev, store_info.st_ino)
+    finally:
+        os.close(store_fd)
+
+    with closing(open_reader(store)) as probe, read_tx(probe):
+        existing_retirement = read_retirement(probe)
+    if existing_retirement is not None:
+        return _resume_retired_restore(
+            store,
+            store_key,
+            company_id,
+            archive,
+            target,
+            desk_target,
+            existing_retirement.request_revision,
+        )
+
+    if os.path.lexists(target):
+        raise CheckpointRefused("Replacement destination already exists")
+    if desk_target is not None and os.path.lexists(desk_target):
+        raise CheckpointRefused("Desk restore destination already exists")
 
     with (
         hold_company_writer(
@@ -743,17 +972,9 @@ def restore_store(
                 "Original store logical watermark does not match the checkpoint cut"
             )
 
-        terms = [
-            company_id,
-            list(lease.store_key),
-            manifest.captured_ns,
-            manifest.sha256,
-            manifest.watermark.domain_digest,
-            str(target),
-        ]
-        request_revision = sha256(
-            json.dumps(terms, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        request_revision = _restore_request_revision(
+            company_id, lease.store_key, manifest, target
+        )
 
         if reconcile is not None:
             reconcile(shadow)
@@ -787,18 +1008,29 @@ def restore_store(
             )
         _normalize_database_to_delete_mode(shadow)
 
-        # Stage Desk snapshot on the destination filesystem BEFORE retiring original store
-        staged_desk_sibling: Path | None = None
-        if desk_target is not None and manifest.desk_files:
-            if os.path.lexists(desk_target):
-                raise CheckpointRefused("Desk restore destination already exists")
-            staged_desk_sibling = desk_target.with_name(
-                f".sourdough-desk-stage-{request_revision[:16]}-{time_ns()}"
-            )
-            _copy_desk_tree(staged_desk, staged_desk_sibling)
+        # Persist durable staged artifacts on destination filesystems BEFORE retiring
+        # the original store so any post-retirement publication I/O error is resumable.
+        staged_db_sibling, staged_desk_sibling = _staged_restore_paths(
+            target, desk_target, request_revision, bool(manifest.desk_files)
+        )
+        if os.path.lexists(staged_db_sibling):
+            raise CheckpointRefused("Staged replacement path already exists")
+        if staged_desk_sibling is not None and os.path.lexists(staged_desk_sibling):
+            raise CheckpointRefused("Staged Desk recovery path already exists")
 
+        retired = False
+        db_staged = False
+        desk_staged = False
         try:
-            # Fence and retire the original store only after all candidates are staged.
+            _publish_file(shadow, staged_db_sibling)
+            db_staged = True
+            if staged_desk_sibling is not None and desk_target is not None:
+                if os.path.lexists(desk_target):
+                    raise CheckpointRefused("Desk restore destination already exists")
+                _copy_desk_tree(staged_desk, staged_desk_sibling)
+                desk_staged = True
+
+            # Fence and retire the original store only after all durable candidates are staged.
             # Re-verify retirement state, logical watermark, and unoccupied targets
             # inside the BEGIN IMMEDIATE transaction so any intervening write (even
             # from a caller that did not acquire WriterLease) refuses restore cleanly.
@@ -843,17 +1075,29 @@ def restore_store(
                     "UPDATE company SET schema_revision = ? WHERE singleton = 1",
                     (RETIRED_SCHEMA_REVISION,),
                 )
+            retired = True
 
-            _publish_file(shadow, target)
+            _publish_file(staged_db_sibling, target)
             verify_no_wal_sidecars(target)
 
             if staged_desk_sibling is not None and desk_target is not None:
                 os.rename(staged_desk_sibling, desk_target)
                 _fsync_dir(desk_target.parent)
-                staged_desk_sibling = None
+                desk_staged = False
+
+            os.unlink(staged_db_sibling)
+            _fsync_dir(target.parent)
+            db_staged = False
         finally:
-            if staged_desk_sibling is not None and os.path.lexists(staged_desk_sibling):
-                shutil.rmtree(staged_desk_sibling, ignore_errors=True)
+            if not retired:
+                if db_staged and os.path.lexists(staged_db_sibling):
+                    os.unlink(staged_db_sibling)
+                if (
+                    desk_staged
+                    and staged_desk_sibling is not None
+                    and os.path.lexists(staged_desk_sibling)
+                ):
+                    shutil.rmtree(staged_desk_sibling, ignore_errors=True)
 
         return CoreRestoreReceipt(
             company_id=company_id,
