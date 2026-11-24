@@ -336,6 +336,34 @@ class WorkKernel(unittest.TestCase):
             self.assertTrue(replayed2)
             self.assertEqual(req, req_replay)
 
+            # Claim recipient's response duty, fence a stale run, and verify only the
+            # active fenced recipient run can answer or decline
+            with write_tx(conn):
+                stale_resp_run = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=req.response_work_item_id,
+                    lease_owner="stale-peer-worker",
+                    lease_ttl_ns=500,
+                    now_ns=2_200,
+                )
+                reclaim_expired_runs(conn, self.company_id, now_ns=2_800)
+
+            # Stale fenced recipient run cannot answer
+            with self.assertRaises(RunFenced):
+                with write_tx(conn):
+                    resolve_peer_request(
+                        conn,
+                        company_id=self.company_id,
+                        request_id="req-1",
+                        actor_id=self.peer_id,
+                        resolution_state="answered",
+                        response_payload={"choice": "stale"},
+                        response_run_id=stale_resp_run.run_id,
+                        response_fencing_token=stale_resp_run.fencing_token,
+                        now_ns=2_900,
+                    )
+
             # Requester cannot answer its own request
             with self.assertRaisesRegex(WorkKernelRefused, "named recipient"):
                 with write_tx(conn):
@@ -346,10 +374,37 @@ class WorkKernel(unittest.TestCase):
                         actor_id=self.founder_id,
                         resolution_state="answered",
                         response_payload={"choice": "A"},
+                        response_run_id=stale_resp_run.run_id,
+                        response_fencing_token=stale_resp_run.fencing_token,
                         now_ns=3_000,
                     )
 
-            # Recipient answers -> wakes requester work item once; late answer ignored
+            # Arm a peer_response condition and verify it does NOT fire while open
+            with write_tx(conn):
+                peer_cond = set_condition(
+                    conn,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    work_item_id=item.work_item_id,
+                    trigger_kind="peer_response",
+                    source_identity="peer_response:req-1",
+                    expected_revision="answered",
+                    now_ns=3_050,
+                )
+                self.assertEqual(
+                    evaluate_conditions(conn, self.company_id, now_ns=3_100), ()
+                )
+                active_resp_run = claim_work_run(
+                    conn,
+                    company_id=self.company_id,
+                    work_item_id=req.response_work_item_id,
+                    lease_owner="active-peer-worker",
+                    lease_ttl_ns=60_000,
+                    now_ns=3_200,
+                )
+                self.assertEqual(active_resp_run.fencing_token, 2)
+
+            # Recipient answers with active fenced run -> wakes requester once; late answer ignored
             with write_tx(conn):
                 resolved, changed = resolve_peer_request(
                     conn,
@@ -358,6 +413,8 @@ class WorkKernel(unittest.TestCase):
                     actor_id=self.peer_id,
                     resolution_state="answered",
                     response_payload={"choice": "A"},
+                    response_run_id=active_resp_run.run_id,
+                    response_fencing_token=active_resp_run.fencing_token,
                     now_ns=3_500,
                 )
                 late, changed_late = resolve_peer_request(
@@ -367,8 +424,27 @@ class WorkKernel(unittest.TestCase):
                     actor_id=self.peer_id,
                     resolution_state="declined",
                     response_payload={"choice": "B"},
+                    response_run_id=active_resp_run.run_id,
+                    response_fencing_token=active_resp_run.fencing_token,
                     now_ns=4_000,
                 )
+                # Armed peer_response condition now admits follow-up once and deduplicates on replay
+                admitted_from_peer = evaluate_conditions(
+                    conn,
+                    self.company_id,
+                    now_ns=4_100,
+                    triggering_actor_id=self.peer_id,
+                )
+                admitted_replay = evaluate_conditions(
+                    conn,
+                    self.company_id,
+                    now_ns=4_200,
+                    triggering_actor_id=self.peer_id,
+                )
+            self.assertEqual(len(admitted_from_peer), 1)
+            self.assertEqual(admitted_from_peer[0].source_id, peer_cond.condition_id)
+            self.assertEqual(admitted_from_peer[0].duty_kind, "work.assessment")
+            self.assertEqual(admitted_replay, ())
             self.assertTrue(changed)
             self.assertFalse(changed_late)
             self.assertEqual(resolved.state, "answered")

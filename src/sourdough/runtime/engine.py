@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from ..company import upgrade_work_schema
+from ..duty_run import has_turn_capacity
 from ..paper_execution import PaperExecution
 from ..storage.db import open_writer, wal_checkpoint, write_tx
 from ..writer_lease import WriterLease, hold_company_writer
@@ -257,6 +258,9 @@ class CompanyRuntime:
             for row in rows:
                 item = WorkItem(*row)
                 if item.work_item_id in blocked:
+                    continue
+                if not has_turn_capacity(conn, item.owner_agent_id):
+                    blocked.append(item.work_item_id)
                     continue
                 descriptor = self._registry.get(item.duty_kind)
                 if descriptor.precondition is not None:

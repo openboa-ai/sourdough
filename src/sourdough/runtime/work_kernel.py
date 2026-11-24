@@ -7,6 +7,7 @@ from time import time_ns
 from typing import Any
 from uuid import uuid4
 
+from ..duty_run import has_turn_capacity
 from ..storage.kernel import append_audit_event
 
 
@@ -274,6 +275,8 @@ def claim_work_run(
     _, _, agent_id, duty_kind, state = item_row
     if state != "due":
         raise WorkKernelRefused(f"Work item is not claimable in state {state}")
+    if not has_turn_capacity(connection, agent_id):
+        raise WorkKernelRefused("Agent has no remaining turn allocation")
     if dedupe_key is not None:
         dup_run = connection.execute(
             "SELECT 1 FROM work_runs WHERE dedupe_key = ?", (dedupe_key,)
@@ -1040,6 +1043,23 @@ def evaluate_conditions(
             if expected_revision is None or observed_rev == expected_revision:
                 eligible = True
                 matched_revision = observed_rev
+        elif trigger_kind == "peer_response" and source_identity:
+            req_id = str(source_identity).removeprefix("peer_response:")
+            peer_row = connection.execute(
+                """SELECT state FROM work_peer_requests
+                   WHERE company_id = ? AND request_id = ?""",
+                (company_id, req_id),
+            ).fetchone()
+            if peer_row is not None and str(peer_row[0]) != "open":
+                res_state = str(peer_row[0])
+                if (
+                    res_state in ("answered", "declined")
+                    and triggering_actor_id == owner_agent_id
+                ):
+                    continue  # anti-self-wake
+                if expected_revision is None or res_state == expected_revision:
+                    eligible = True
+                    matched_revision = res_state
 
         if not eligible:
             continue
@@ -1250,6 +1270,8 @@ def resolve_peer_request(
     actor_id: str,
     resolution_state: str,
     response_payload: dict[str, Any],
+    response_run_id: str | None = None,
+    response_fencing_token: int | None = None,
     now_ns: int | None = None,
 ) -> tuple[PeerRequest, bool]:
     """Answer, decline, or expire an open peer request and wake the requester once."""
@@ -1277,6 +1299,21 @@ def resolve_peer_request(
         if actor_id != prior.recipient_agent_id:
             raise WorkKernelRefused(
                 "Only the named recipient Agent may answer or decline a peer request"
+            )
+        if not response_run_id or response_fencing_token is None:
+            raise WorkKernelRefused(
+                "Peer response requires an active response_run_id and response_fencing_token"
+            )
+        resp_run = assert_run_fencing(
+            connection, response_run_id, response_fencing_token
+        )
+        if (
+            resp_run.company_id != company_id
+            or resp_run.work_item_id != prior.response_work_item_id
+            or resp_run.agent_id != prior.recipient_agent_id
+        ):
+            raise WorkKernelRefused(
+                "Response run does not match the named recipient's response duty"
             )
     elif timestamp < prior.deadline_ns:
         raise WorkKernelRefused("Peer request has not reached its deadline")

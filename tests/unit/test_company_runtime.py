@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found
+from sourdough.duty_run import count_company_runs, has_turn_capacity
 from sourdough.paper_execution import VenueRefused
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.runtime.engine import CompanyRuntime, build_default_registry
@@ -217,6 +218,8 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                         actor_id=peer_id,
                         resolution_state="answered",
                         response_payload={"answer": "yes"},
+                        response_run_id=ctx.run.run_id,
+                        response_fencing_token=ctx.run.fencing_token,
                         now_ns=ctx.now_ns,
                     )
             return DutyOutcome(disposition="completed", result={"answered": True})
@@ -262,3 +265,89 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                 ).fetchone(),
                 ("settled",),
             )
+
+    def test_hired_agent_turn_allocation_enforced_and_counted_by_work_kernel(self):
+        from sourdough.runtime.work_kernel import WorkKernelRefused
+
+        hired_id = "hired-1-turn"
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "INSERT INTO agent VALUES (?, ?, ?)",
+                (hired_id, self.company_id, "profile-hired"),
+            )
+            conn.execute(
+                "INSERT INTO standing_grant VALUES ('g-hired', ?, 'assessment')",
+                (hired_id,),
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS hire_receipt (
+                       request_id TEXT PRIMARY KEY NOT NULL,
+                       choice_id TEXT NOT NULL UNIQUE,
+                       manager_grant_id TEXT NOT NULL,
+                       agent_id TEXT NOT NULL UNIQUE REFERENCES agent(id),
+                       grant_id TEXT NOT NULL UNIQUE REFERENCES standing_grant(id),
+                       allocated_turns INTEGER NOT NULL CHECK (allocated_turns > 0),
+                       terms TEXT NOT NULL,
+                       hired_at INTEGER NOT NULL
+                   )"""
+            )
+            conn.execute(
+                """INSERT INTO hire_receipt VALUES (
+                       'req-h1', 'ch-h1', ?, ?, 'g-hired', 1, '{}', 100
+                   )""",
+                (self.receipt.grant_id, hired_id),
+            )
+            item1, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=hired_id,
+                duty_kind="work.task",
+                source_kind="manual",
+                source_id="t1",
+                now_ns=1_000,
+            )
+            item2, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=hired_id,
+                duty_kind="work.task",
+                source_kind="manual",
+                source_id="t2",
+                now_ns=1_001,
+            )
+
+        ran: list[str] = []
+        runtime = CompanyRuntime(
+            self.store,
+            self.company_id,
+            build_default_registry(
+                {
+                    "work.task": lambda ctx: (
+                        ran.append(ctx.work_item.work_item_id)
+                        or DutyOutcome("completed", {"done": True})
+                    )
+                }
+            ),
+            lease_directory=self.leases,
+        )
+        before_runs = count_company_runs(self.store, self.company_id)
+        summary = runtime.step(max_dispatches=4, now_ns=2_000)
+        self.assertEqual(ran, [item1.work_item_id])
+        self.assertEqual(summary.blocked_items, (item2.work_item_id,))
+        self.assertEqual(
+            count_company_runs(self.store, self.company_id), before_runs + 1
+        )
+
+        # Direct claim_work_run and has_turn_capacity must also refuse item2
+        with closing(open_writer(self.store)) as conn:
+            self.assertFalse(has_turn_capacity(conn, hired_id))
+            with self.assertRaisesRegex(WorkKernelRefused, "remaining turn allocation"):
+                with write_tx(conn):
+                    claim_work_run(
+                        conn,
+                        company_id=self.company_id,
+                        work_item_id=item2.work_item_id,
+                        lease_owner="direct-worker",
+                        lease_ttl_ns=10_000,
+                        now_ns=2_500,
+                    )
