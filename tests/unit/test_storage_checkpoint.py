@@ -1062,6 +1062,85 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                 (MAX_SCHEMA_VERSION,),
             )
 
+    def test_crash_after_final_link_recovers_orphaned_pub_link_and_permissions(self):
+        import stat
+        from unittest.mock import patch
+
+        from sourdough.writer_lease import hold_company_writer
+
+        archive = self.root / "checkpoint-post-link-crash.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "recovered-post-link.sqlite"
+
+        # Simulate a process crash immediately after os.link creates replacement
+        # and BEFORE fchmod(0o600) and unlink(private_copy) run!
+        real_fchmod = os.fchmod
+
+        def crash_before_restore_writable(fd, mode):
+            if mode == 0o600 and replacement.exists():
+                raise RuntimeError("simulated crash after final os.link")
+            return real_fchmod(fd, mode)
+
+        with patch(
+            "sourdough.storage.checkpoint.os.fchmod",
+            side_effect=crash_before_restore_writable,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "simulated crash after final os.link"
+            ):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    lease_directory=self.leases,
+                )
+
+        # Immediately after the crash, replacement has st_nlink == 2 and mode 0o400,
+        # and deterministic .sourdough-pub-* still holds the extra hard link.
+        self.assertTrue(replacement.exists())
+        crashed_st = replacement.stat(follow_symlinks=False)
+        self.assertEqual(crashed_st.st_nlink, 2)
+        self.assertEqual(stat.S_IMODE(crashed_st.st_mode), 0o400)
+        self.assertEqual(len(list(self.root.glob(".sourdough-pub-*"))), 1)
+
+        # Matching retry recovers the orphaned pub link, restores 0o600, verifies
+        # st_nlink == 1, and yields a store accepted by WriterLease and open_writer.
+        receipt = restore_store(
+            self.store,
+            self.company_id,
+            archive,
+            replacement,
+            lease_directory=self.leases,
+        )
+        self.assertEqual(receipt.company_id, self.company_id)
+        final_st = replacement.stat(follow_symlinks=False)
+        self.assertEqual(final_st.st_nlink, 1)
+        self.assertEqual(stat.S_IMODE(final_st.st_mode), 0o600)
+        self.assertEqual(list(self.root.glob(".sourdough-pub-*")), [])
+        self.assertEqual(list(self.root.glob(".sourdough-restore-*")), [])
+        with hold_company_writer(
+            replacement, self.company_id, lease_directory=self.leases
+        ) as active_lease:
+            active_lease.verify()
+            with closing(open_writer(replacement, lease=active_lease)) as writer:
+                with write_tx(writer):
+                    append_audit_event(
+                        writer,
+                        company_id=self.company_id,
+                        domain="ops",
+                        entity_type="restore",
+                        entity_id="recovered-post-link",
+                        event_type="restore.post_crash_write_ok",
+                        actor_id="operator",
+                        payload={"ok": True},
+                    )
+
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)

@@ -890,6 +890,97 @@ def _verify_staged_replacement(
             os.close(check_dir_fd)
 
 
+def _pub_dir_path(target: Path, request_revision: str) -> Path:
+    return target.with_name(f".sourdough-pub-{request_revision[:16]}")
+
+
+def _finalize_published_replacement(
+    target: Path,
+    company_id: str,
+    request_revision: str,
+    manifest: CheckpointManifest,
+    *,
+    expected_sha256: str,
+) -> None:
+    """Verify an already-published replacement, recover orphaned pub links/mode, and assert st_nlink == 1."""
+    _verify_staged_replacement(
+        target,
+        company_id,
+        request_revision,
+        manifest,
+        expected_sha256=expected_sha256,
+    )
+    parent_fd = _open_private_parent_dir(target.parent)
+    try:
+        try:
+            pub_fd = os.open(
+                target.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            raise CheckpointRefused(
+                "Published replacement database is missing or unsafe"
+            ) from error
+        try:
+            pub_st = os.fstat(pub_fd)
+            if not stat.S_ISREG(pub_st.st_mode):
+                raise CheckpointRefused(
+                    "Published replacement database must be a regular file"
+                )
+            target_key = (pub_st.st_dev, pub_st.st_ino)
+            pub_dir = _pub_dir_path(target, request_revision)
+            try:
+                pub_dir_fd = os.open(
+                    pub_dir.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                pub_dir_fd = None
+            except OSError as error:
+                raise CheckpointRefused(
+                    "Restore publication directory is unsafe"
+                ) from error
+            if pub_dir_fd is not None:
+                try:
+                    dir_st = os.fstat(pub_dir_fd)
+                    if dir_st.st_uid != os.geteuid() or (dir_st.st_mode & 0o077) != 0:
+                        raise CheckpointRefused(
+                            "Restore publication directory must be owner-only (0o700)"
+                        )
+                    try:
+                        link_st = os.lstat("replacement.sqlite", dir_fd=pub_dir_fd)
+                    except FileNotFoundError:
+                        link_st = None
+                    if link_st is not None:
+                        if (
+                            not stat.S_ISREG(link_st.st_mode)
+                            or (link_st.st_dev, link_st.st_ino) != target_key
+                        ):
+                            raise CheckpointRefused(
+                                "Unexpected artifact inside restore publication directory"
+                            )
+                        os.unlink("replacement.sqlite", dir_fd=pub_dir_fd)
+                        os.fsync(pub_dir_fd)
+                finally:
+                    os.close(pub_dir_fd)
+                os.rmdir(pub_dir.name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+
+            os.fchmod(pub_fd, 0o600)
+            os.fsync(pub_fd)
+            if os.fstat(pub_fd).st_nlink != 1:
+                raise CheckpointRefused(
+                    "Published replacement has unexpected hard-link aliases"
+                )
+        finally:
+            os.close(pub_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _publish_authenticated_replacement(
     staged_db_sibling: Path,
     target: Path,
@@ -901,16 +992,43 @@ def _publish_authenticated_replacement(
 ) -> None:
     """Verify staged DB via a pinned fd in an owner-only parent and verify post-link inode/digest."""
     parent_fd = _open_private_parent_dir(target.parent)
+    pub_dir = _pub_dir_path(target, request_revision)
+    published_verified = False
     try:
-        with TemporaryDirectory(
-            dir=target.parent, prefix=".sourdough-pub-"
-        ) as private_dir:
-            private_dir_path = Path(private_dir)
+        # Discard any incomplete deterministic publication dir from an earlier crash
+        # before os.link (target does not exist here).
+        try:
+            old_dir_fd = os.open(
+                pub_dir.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            old_dir_fd = None
+        except OSError as error:
+            raise CheckpointRefused("Restore publication path is unsafe") from error
+        if old_dir_fd is not None:
+            try:
+                old_st = os.fstat(old_dir_fd)
+                if old_st.st_uid != os.geteuid() or (old_st.st_mode & 0o077) != 0:
+                    raise CheckpointRefused(
+                        "Restore publication directory must be owner-only (0o700)"
+                    )
+            finally:
+                os.close(old_dir_fd)
+            shutil.rmtree(pub_dir)
+            os.fsync(parent_fd)
+
+        os.mkdir(pub_dir.name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        try:
             private_dir_fd = os.open(
-                private_dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                pub_dir.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
             )
             try:
-                private_copy = private_dir_path / "replacement.sqlite"
+                private_copy = pub_dir / "replacement.sqlite"
                 pinned_fd, verified_key = _copy_and_verify_replacement(
                     staged_db_sibling,
                     private_dir_fd,
@@ -955,6 +1073,7 @@ def _publish_authenticated_replacement(
                         except OSError:
                             pass
                         raise
+                    published_verified = True
                     os.fchmod(pinned_fd, 0o600)
                     os.fsync(pinned_fd)
                     os.fsync(parent_fd)
@@ -964,6 +1083,16 @@ def _publish_authenticated_replacement(
                     os.close(pinned_fd)
             finally:
                 os.close(private_dir_fd)
+            os.rmdir(pub_dir.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except BaseException:
+            if not published_verified and os.path.lexists(pub_dir):
+                shutil.rmtree(pub_dir, ignore_errors=True)
+                try:
+                    os.fsync(parent_fd)
+                except OSError:
+                    pass
+            raise
     finally:
         os.close(parent_fd)
     verify_no_wal_sidecars(target)
@@ -1128,7 +1257,7 @@ def _resume_retired_restore(
             has_pending_desk = True
 
     if not has_pending_db and not has_pending_desk:
-        _verify_staged_replacement(
+        _finalize_published_replacement(
             target,
             company_id,
             request_revision,
@@ -1160,7 +1289,7 @@ def _resume_retired_restore(
             expected_sha256=retirement.replacement_sha256,
         )
     else:
-        _verify_staged_replacement(
+        _finalize_published_replacement(
             target,
             company_id,
             request_revision,
