@@ -741,42 +741,53 @@ def _staged_restore_paths(
     return db_stage, desk_stage
 
 
-def _verify_staged_replacement(
+def _copy_and_verify_replacement(
     candidate: Path,
+    private_copy: Path,
     company_id: str,
     request_revision: str,
     manifest: CheckpointManifest,
     *,
     expected_sha256: str | None,
 ) -> None:
-    """Verify a staged or published replacement DB matches this restore request."""
+    """Stream candidate from a pinned O_NOFOLLOW fd into a private file and verify it."""
+    if expected_sha256 is not None and (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in expected_sha256)
+    ):
+        raise CheckpointRefused(
+            "Retired store is missing authenticated replacement digest"
+        )
+    try:
+        verify_no_wal_sidecars(candidate)
+    except StorageRefused as error:
+        raise CheckpointRefused(str(error)) from error
     try:
         fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as error:
         raise CheckpointRefused(
             "Staged replacement database is missing or unsafe"
         ) from error
+    hasher = sha256()
     with os.fdopen(fd, "rb") as pinned:
         if not stat.S_ISREG(os.fstat(pinned.fileno()).st_mode):
             raise CheckpointRefused(
                 "Staged replacement database must be a regular file"
             )
-        if expected_sha256 is not None:
-            if (
-                not isinstance(expected_sha256, str)
-                or len(expected_sha256) != 64
-                or any(ch not in "0123456789abcdef" for ch in expected_sha256)
-            ):
-                raise CheckpointRefused(
-                    "Retired store is missing authenticated replacement digest"
-                )
-            if file_digest(pinned, "sha256").hexdigest() != expected_sha256:
-                raise CheckpointRefused(
-                    "Staged replacement database digest does not match retired store record"
-                )
+        with private_copy.open("xb") as out:
+            os.fchmod(out.fileno(), 0o600)
+            while chunk := pinned.read(131_072):
+                hasher.update(chunk)
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+    if expected_sha256 is not None and hasher.hexdigest() != expected_sha256:
+        raise CheckpointRefused(
+            "Staged replacement database digest does not match retired store record"
+        )
     try:
-        verify_no_wal_sidecars(candidate)
-        with closing(open_reader(candidate)) as reader, read_tx(reader):
+        with closing(open_reader(private_copy)) as reader, read_tx(reader):
             mode = str(reader.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             if mode != "delete":
                 raise CheckpointRefused(
@@ -807,6 +818,84 @@ def _verify_staged_replacement(
         raise CheckpointRefused(
             "Staged replacement receipt does not match this restore request"
         )
+
+
+def _verify_staged_replacement(
+    candidate: Path,
+    company_id: str,
+    request_revision: str,
+    manifest: CheckpointManifest,
+    *,
+    expected_sha256: str | None,
+) -> None:
+    """Verify a staged or published replacement DB via a private pinned copy."""
+    with TemporaryDirectory(prefix="sd-db-verify-") as check_dir:
+        _copy_and_verify_replacement(
+            candidate,
+            Path(check_dir) / "replacement.sqlite",
+            company_id,
+            request_revision,
+            manifest,
+            expected_sha256=expected_sha256,
+        )
+
+
+def _publish_authenticated_replacement(
+    staged_db_sibling: Path,
+    target: Path,
+    company_id: str,
+    request_revision: str,
+    manifest: CheckpointManifest,
+    *,
+    expected_sha256: str,
+) -> None:
+    """Verify staged DB from a pinned fd into a private 0o700 copy and publish it."""
+    with TemporaryDirectory(dir=target.parent, prefix=".sourdough-pub-") as private_dir:
+        private_copy = Path(private_dir) / "replacement.sqlite"
+        _copy_and_verify_replacement(
+            staged_db_sibling,
+            private_copy,
+            company_id,
+            request_revision,
+            manifest,
+            expected_sha256=expected_sha256,
+        )
+        _publish_file(private_copy, target)
+        os.unlink(private_copy)
+        _fsync_dir(private_copy.parent)
+    verify_no_wal_sidecars(target)
+
+
+def _publish_authenticated_desk(
+    staged_desk_sibling: Path,
+    desk_target: Path,
+    manifest: CheckpointManifest,
+) -> None:
+    """Pin, verify, and atomically publish a staged Desk tree from a private 0o700 dir."""
+    with TemporaryDirectory(
+        dir=desk_target.parent, prefix=".sourdough-desk-pub-"
+    ) as private_dir:
+        private_desk = Path(private_dir) / "desk"
+        files = _stage_pinned_desk(staged_desk_sibling, private_desk, fsync_files=True)
+        digest = _compute_desk_digest(
+            (
+                rel,
+                _hash_file(
+                    private_desk.joinpath(*_validate_desk_relative_path(rel).parts)
+                ),
+            )
+            for rel in files
+        )
+        if files != manifest.desk_files or digest != manifest.desk_digest:
+            raise CheckpointRefused(
+                "Staged Desk snapshot does not match authenticated checkpoint digest"
+            )
+        if os.path.lexists(desk_target):
+            raise CheckpointRefused("Desk restore destination already exists")
+        os.rename(private_desk, desk_target)
+    _fsync_dir(desk_target.parent)
+    shutil.rmtree(staged_desk_sibling, ignore_errors=True)
+    _fsync_dir(staged_desk_sibling.parent)
 
 
 def _verify_staged_desk_snapshot(
@@ -866,7 +955,7 @@ def _resume_retired_restore(
     has_pending_desk = False
     if staged_desk_sibling is not None and desk_target is not None:
         if os.path.lexists(desk_target):
-            if os.path.lexists(staged_desk_sibling):
+            if has_pending_db and os.path.lexists(staged_desk_sibling):
                 raise CheckpointRefused(
                     "Desk restore destination already exists while staged Desk is unpublished"
                 )
@@ -885,6 +974,9 @@ def _resume_retired_restore(
             manifest,
             expected_sha256=retirement.replacement_sha256,
         )
+        if staged_desk_sibling is not None and os.path.lexists(staged_desk_sibling):
+            shutil.rmtree(staged_desk_sibling, ignore_errors=True)
+            _fsync_dir(staged_desk_sibling.parent)
         if os.path.lexists(staged_db_sibling):
             os.unlink(staged_db_sibling)
         _fsync_dir(target.parent)
@@ -898,15 +990,14 @@ def _resume_retired_restore(
         )
 
     if has_pending_db:
-        _verify_staged_replacement(
+        _publish_authenticated_replacement(
             staged_db_sibling,
+            target,
             company_id,
             request_revision,
             manifest,
             expected_sha256=retirement.replacement_sha256,
         )
-        _publish_file(staged_db_sibling, target)
-        verify_no_wal_sidecars(target)
     else:
         _verify_staged_replacement(
             target,
@@ -917,8 +1008,7 @@ def _resume_retired_restore(
         )
 
     if has_pending_desk and staged_desk_sibling is not None and desk_target is not None:
-        os.rename(staged_desk_sibling, desk_target)
-        _fsync_dir(desk_target.parent)
+        _publish_authenticated_desk(staged_desk_sibling, desk_target, manifest)
 
     if os.path.lexists(staged_db_sibling):
         os.unlink(staged_db_sibling)
@@ -1083,10 +1173,11 @@ def restore_store(
         db_staged = False
         desk_staged = False
         try:
-            # Publish durable DB stage atomically, record ownership immediately on link
-            # creation, and unlink temporary shadow so staged_db_sibling keeps
-            # st_nlink == 1 across process crashes.
+            # Hash the finalized private shadow before exposing it, publish durable DB
+            # stage atomically, record ownership immediately on link creation, and
+            # unlink temporary shadow so staged_db_sibling keeps st_nlink == 1 across crashes.
             _fsync_file(shadow)
+            replacement_sha256 = _hash_file(shadow)
             try:
                 os.link(shadow, staged_db_sibling)
             except FileExistsError as error:
@@ -1097,7 +1188,6 @@ def restore_store(
             _fsync_dir(staged_db_sibling.parent)
             os.unlink(shadow)
             _fsync_dir(shadow.parent)
-            replacement_sha256 = _hash_file(staged_db_sibling)
             if staged_desk_sibling is not None and desk_target is not None:
                 if os.path.lexists(desk_target):
                     raise CheckpointRefused("Desk restore destination already exists")
@@ -1167,12 +1257,17 @@ def restore_store(
                 )
             retired = True
 
-            _publish_file(staged_db_sibling, target)
-            verify_no_wal_sidecars(target)
+            _publish_authenticated_replacement(
+                staged_db_sibling,
+                target,
+                company_id,
+                request_revision,
+                manifest,
+                expected_sha256=replacement_sha256,
+            )
 
             if staged_desk_sibling is not None and desk_target is not None:
-                os.rename(staged_desk_sibling, desk_target)
-                _fsync_dir(desk_target.parent)
+                _publish_authenticated_desk(staged_desk_sibling, desk_target, manifest)
                 desk_staged = False
 
             os.unlink(staged_db_sibling)

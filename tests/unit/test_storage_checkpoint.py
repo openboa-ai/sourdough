@@ -880,6 +880,84 @@ class StorageCheckpointAndRestore(unittest.TestCase):
                 lease_directory=self.leases,
             )
 
+    def test_swapping_staged_database_after_verification_cannot_publish_tampered_db(
+        self,
+    ):
+        from unittest.mock import patch
+
+        from sourdough.storage import checkpoint as cp_mod
+
+        archive = self.root / "checkpoint-swap-stage.zip"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            archive,
+            lease_directory=self.leases,
+        )
+        replacement = self.root / "recovered-swap.sqlite"
+        real_link = os.link
+
+        def fail_final_publish(src, dst, *args, **kwargs):
+            if Path(dst) == replacement.resolve(strict=False):
+                raise OSError("simulated publish I/O error")
+            return real_link(src, dst, *args, **kwargs)
+
+        with patch(
+            "sourdough.storage.checkpoint.os.link", side_effect=fail_final_publish
+        ):
+            with self.assertRaisesRegex(OSError, "simulated publish I/O error"):
+                restore_store(
+                    self.store,
+                    self.company_id,
+                    archive,
+                    replacement,
+                    lease_directory=self.leases,
+                )
+
+        staged_dbs = list(self.root.glob(".sourdough-restore-*.sqlite"))
+        self.assertEqual(len(staged_dbs), 1)
+        staged_db = staged_dbs[0]
+
+        # Prepare a tampered DB with escalated standing_grant.scope
+        tampered = self.root / "tampered-swap.sqlite"
+        tampered.write_bytes(staged_db.read_bytes())
+        with closing(
+            open_writer(tampered, create=False, journal_mode="DELETE")
+        ) as conn:
+            with write_tx(conn):
+                conn.execute("UPDATE standing_grant SET scope = 'escalated'")
+
+        # Simulate a local attacker swapping staged_db immediately after
+        # _copy_and_verify_replacement completes and before _publish_file links target.
+        real_copy_and_verify = cp_mod._copy_and_verify_replacement
+
+        def swap_stage_right_after_verify(*args, **kwargs):
+            real_copy_and_verify(*args, **kwargs)
+            os.replace(tampered, staged_db)
+
+        with patch(
+            "sourdough.storage.checkpoint._copy_and_verify_replacement",
+            side_effect=swap_stage_right_after_verify,
+        ):
+            receipt = restore_store(
+                self.store,
+                self.company_id,
+                archive,
+                replacement,
+                lease_directory=self.leases,
+            )
+
+        self.assertEqual(receipt.company_id, self.company_id)
+        self.assertEqual(replacement.stat(follow_symlinks=False).st_nlink, 1)
+        # Published replacement MUST come from the private verified copy, NOT tampered!
+        with closing(open_reader(replacement)) as reader, read_tx(reader):
+            scopes = [
+                str(row[0])
+                for row in reader.execute("SELECT scope FROM standing_grant").fetchall()
+            ]
+        self.assertNotIn("escalated", scopes)
+        self.assertIn("manage", scopes)
+
     def test_logical_watermark_ignores_wal_physical_layout(self):
         with closing(open_reader(self.store)) as reader, read_tx(reader):
             wm1 = compute_logical_watermark(reader, self.company_id)
