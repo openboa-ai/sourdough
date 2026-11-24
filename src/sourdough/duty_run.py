@@ -49,14 +49,44 @@ def has_turn_capacity(connection: sqlite3.Connection, agent_id: str) -> bool:
         "SELECT 1 FROM sqlite_schema WHERE name = 'hire_receipt' AND type = 'table'"
     ).fetchone():
         return True
-    row = connection.execute(
-        """SELECT h.allocated_turns > (
-               SELECT count(*) FROM duty owned JOIN duty_run spent ON spent.duty_id=owned.id
-               WHERE owned.agent_id=h.agent_id
-           ) FROM hire_receipt h WHERE h.agent_id=?""",
-        (agent_id,),
-    ).fetchone()
+    has_work_runs = (
+        connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'work_runs' AND type = 'table'"
+        ).fetchone()
+        is not None
+    )
+    if has_work_runs:
+        row = connection.execute(
+            """SELECT h.allocated_turns > (
+                   (SELECT count(*) FROM duty owned JOIN duty_run spent ON spent.duty_id=owned.id
+                    WHERE owned.agent_id=h.agent_id)
+                   + (SELECT count(*) FROM work_runs wr WHERE wr.agent_id=h.agent_id)
+               ) FROM hire_receipt h WHERE h.agent_id=?""",
+            (agent_id,),
+        ).fetchone()
+    else:
+        row = connection.execute(
+            """SELECT h.allocated_turns > (
+                   SELECT count(*) FROM duty owned JOIN duty_run spent ON spent.duty_id=owned.id
+                   WHERE owned.agent_id=h.agent_id
+               ) FROM hire_receipt h WHERE h.agent_id=?""",
+            (agent_id,),
+        ).fetchone()
     return row != (0,)
+
+
+def has_active_work_run(connection: sqlite3.Connection, agent_id: str) -> bool:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name = 'work_runs' AND type = 'table'"
+    ).fetchone():
+        return False
+    return (
+        connection.execute(
+            "SELECT 1 FROM work_runs WHERE agent_id = ? AND status = 'running' LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        is not None
+    )
 
 
 def start_run(
@@ -70,6 +100,8 @@ def start_run(
     purpose: str,
     grant_scope: str,
 ) -> DutyClaim:
+    if has_active_work_run(connection, founder_id):
+        raise DutyRefused("Agent already has an active running execution")
     if not has_turn_capacity(connection, founder_id):
         raise DutyRefused("Agent has no remaining turn allocation")
     claim = DutyClaim(
@@ -125,15 +157,20 @@ def count_company_runs(store: Path, company_id: str) -> int:
                 "SELECT name FROM sqlite_schema WHERE type = 'table'"
             )
         }
-        if "duty_run" in tables:
-            return connection.execute("SELECT count(*) FROM duty_run").fetchone()[0]
         total = 0
-        if "first_duty_claim" in tables:
+        if "duty_run" in tables:
+            total += connection.execute("SELECT count(*) FROM duty_run").fetchone()[0]
+        else:
+            if "first_duty_claim" in tables:
+                total += connection.execute(
+                    "SELECT count(*) FROM first_duty_claim"
+                ).fetchone()[0]
+            if "work_follow_up" in tables:
+                total += connection.execute(
+                    "SELECT count(*) FROM work_follow_up WHERE run_id IS NOT NULL"
+                ).fetchone()[0]
+        if "work_runs" in tables:
             total += connection.execute(
-                "SELECT count(*) FROM first_duty_claim"
-            ).fetchone()[0]
-        if "work_follow_up" in tables:
-            total += connection.execute(
-                "SELECT count(*) FROM work_follow_up WHERE run_id IS NOT NULL"
+                "SELECT count(*) FROM work_runs WHERE company_id = ?", (company_id,)
             ).fetchone()[0]
         return total

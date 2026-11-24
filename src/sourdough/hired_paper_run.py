@@ -40,13 +40,15 @@ from .paper_research import (
     recoverable_hired_research,
     reopen_research_decision,
 )
+from .runtime.engine import CompanyRuntime, build_default_registry
+from .runtime.registry import DutyOutcome
 from .work import (
     ResultReference,
     claim_bound_position_review,
     finish_first_duty,
     owed_hired_follow_up_owner,
 )
-from .writer_lease import WriterLease, hold_company_writer
+from .writer_lease import WriterLease
 
 
 @dataclass(frozen=True)
@@ -188,93 +190,120 @@ def run_hired_paper_company(
 ) -> HiredPaperRun:
     if not 3 <= turn_budget <= 8 or not 0 <= idle_seconds <= 300:
         raise DutyRefused("Invalid hired-paper activation limits")
-    venue.require_independent_from(store)
-    with hold_company_writer(store, company_id, expected_store_key=store_key) as writer:
-        upgrade_work_schema(store, company_id)
-        reconciled, blocked = _recover(writer, venue, POSITION_REVIEW)
-        requeue_uncommitted_work(writer, purpose=POSITION_REVIEW, hired_only=True)
-        on_ready(writer)
-        deadline = monotonic() + idle_seconds
-        if reconciled.next_query_at is not None:
-            reconciled, blocked = _retry_reconciliation(
-                writer, venue, POSITION_REVIEW, reconciled, blocked, deadline
-            )
-        used = count_company_runs(store, company_id) - budget_from
-        if used < 0:
-            raise DutyRefused(
-                "Company run history is behind the hired paper activation"
-            )
-        remaining = max(0, turn_budget - used)
-        if reconciled.unresolved or blocked:
-            return HiredPaperRun(None, None, reconciled, None, blocked)
-        with closing(_connect(store, "ro")) as connection:
-            switching = has_pending_binding_change(connection)
-        opening = (
-            None if switching else resume_opening_research(writer, venue, hired=True)
+    registry = build_default_registry(
+        {"paper.hired_operation": lambda _ctx: DutyOutcome("completed")}
+    )
+    company_runtime = CompanyRuntime(
+        store, company_id, registry, expected_store_key=store_key
+    )
+    return company_runtime.run_bound_handler(
+        "paper.hired_operation",
+        lambda writer: _run_hired_paper(
+            writer,
+            store,
+            company_id,
+            venue,
+            runtime,
+            turn_budget=turn_budget,
+            idle_seconds=idle_seconds,
+            budget_from=budget_from,
+            on_ready=on_ready,
+        ),
+        venue=venue,
+    )
+
+
+def _run_hired_paper(
+    writer: WriterLease,
+    store: Path,
+    company_id: str,
+    venue: PaperExecution,
+    runtime: Callable[[], EmployeeProcess],
+    *,
+    turn_budget: int,
+    idle_seconds: int,
+    budget_from: int,
+    on_ready: Callable[[WriterLease], None],
+) -> HiredPaperRun:
+    upgrade_work_schema(store, company_id)
+    reconciled, blocked = _recover(writer, venue, POSITION_REVIEW)
+    requeue_uncommitted_work(writer, purpose=POSITION_REVIEW, hired_only=True)
+    on_ready(writer)
+    deadline = monotonic() + idle_seconds
+    if reconciled.next_query_at is not None:
+        reconciled, blocked = _retry_reconciliation(
+            writer, venue, POSITION_REVIEW, reconciled, blocked, deadline
         )
-        research = opening.research if opening is not None else None
-        if opening is not None and research is not None:
-            posting = opening.order.posting if opening.order is not None else None
-            order_id = opening.order.order_id if opening.order is not None else None
-            settled = _settle_opening(
-                writer, opening.claim, research, venue, posting, order_id
+    used = count_company_runs(store, company_id) - budget_from
+    if used < 0:
+        raise DutyRefused("Company run history is behind the hired paper activation")
+    remaining = max(0, turn_budget - used)
+    if reconciled.unresolved or blocked:
+        return HiredPaperRun(None, None, reconciled, None, blocked)
+    with closing(_connect(store, "ro")) as connection:
+        switching = has_pending_binding_change(connection)
+    opening = None if switching else resume_opening_research(writer, venue, hired=True)
+    research = opening.research if opening is not None else None
+    if opening is not None and research is not None:
+        posting = opening.order.posting if opening.order is not None else None
+        order_id = opening.order.order_id if opening.order is not None else None
+        settled = _settle_opening(
+            writer, opening.claim, research, venue, posting, order_id
+        )
+        if order_id is not None and not settled:
+            reconciled, blocked = _recover_hired_submission(
+                writer, venue, reconciled, deadline
             )
-            if order_id is not None and not settled:
-                reconciled, blocked = _recover_hired_submission(
-                    writer, venue, reconciled, deadline
-                )
-                if reconciled.unresolved or blocked:
-                    return HiredPaperRun(None, research, reconciled, None, blocked)
-        if not remaining:
+            if reconciled.unresolved or blocked:
+                return HiredPaperRun(None, research, reconciled, None, blocked)
+    if not remaining:
+        return HiredPaperRun(None, research, reconciled, None)
+    employee = runtime()
+    agent_id = owed_hired_follow_up_owner(
+        store, company_id, employee.profile, POSITION_REVIEW
+    )
+    hiring = None
+    if opening is None and agent_id is None:
+        if switching:
             return HiredPaperRun(None, research, reconciled, None)
-        employee = runtime()
+        hiring = prepare_hiring(
+            writer,
+            employee,
+            first_purpose=PAPER_EXECUTION,
+            allow_staffing=remaining >= 2,
+            resume_work=recoverable_hired_research,
+        )
+        claim = hiring.hire_claim
+        if claim is None:
+            return HiredPaperRun(hiring, None, reconciled, None)
+        research, pending = _hired_research(writer, claim, venue, employee)
+        hiring = replace(hiring, accepted=True)
+        if pending:
+            reconciled, blocked = _recover_hired_submission(
+                writer, venue, reconciled, deadline
+            )
+            if reconciled.unresolved or blocked:
+                return HiredPaperRun(hiring, research, reconciled, None, blocked)
         agent_id = owed_hired_follow_up_owner(
             store, company_id, employee.profile, POSITION_REVIEW
         )
-        hiring = None
-        if opening is None and agent_id is None:
-            if switching:
-                return HiredPaperRun(None, research, reconciled, None)
-            hiring = prepare_hiring(
-                writer,
-                employee,
-                first_purpose=PAPER_EXECUTION,
-                allow_staffing=remaining >= 2,
-                resume_work=recoverable_hired_research,
-            )
-            claim = hiring.hire_claim
-            if claim is None:
-                return HiredPaperRun(hiring, None, reconciled, None)
-            research, pending = _hired_research(writer, claim, venue, employee)
-            hiring = replace(hiring, accepted=True)
-            if pending:
-                reconciled, blocked = _recover_hired_submission(
-                    writer, venue, reconciled, deadline
-                )
-                if reconciled.unresolved or blocked:
-                    return HiredPaperRun(hiring, research, reconciled, None, blocked)
-            agent_id = owed_hired_follow_up_owner(
-                store, company_id, employee.profile, POSITION_REVIEW
-            )
-            remaining = turn_budget - (
-                count_company_runs(store, company_id) - budget_from
-            )
-        if agent_id is None or not remaining:
-            return HiredPaperRun(hiring, research, reconciled, None)
-        while True:
-            writer.verify()
-            work = claim_bound_position_review(
-                store, company_id, agent_id, employee.profile, now=int(time())
-            )
-            if work is not None:
-                return HiredPaperRun(
-                    hiring,
-                    research,
-                    reconciled,
-                    _review(writer, work, venue, employee, POSITION_REVIEW),
-                )
-            available = deadline - monotonic()
-            if available <= 0:
-                break
-            sleep(min(available, 0.5))
+        remaining = turn_budget - (count_company_runs(store, company_id) - budget_from)
+    if agent_id is None or not remaining:
         return HiredPaperRun(hiring, research, reconciled, None)
+    while True:
+        writer.verify()
+        work = claim_bound_position_review(
+            store, company_id, agent_id, employee.profile, now=int(time())
+        )
+        if work is not None:
+            return HiredPaperRun(
+                hiring,
+                research,
+                reconciled,
+                _review(writer, work, venue, employee, POSITION_REVIEW),
+            )
+        available = deadline - monotonic()
+        if available <= 0:
+            break
+        sleep(min(available, 0.5))
+    return HiredPaperRun(hiring, research, reconciled, None)

@@ -25,6 +25,12 @@ TABLES = (
     "external_actions",
     "company_restore_receipt",
     "company_store_retired",
+    "work_items",
+    "work_runs",
+    "work_responsibilities",
+    "work_conditions",
+    "work_condition_occurrences",
+    "work_peer_requests",
 )
 
 

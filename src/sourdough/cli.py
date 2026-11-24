@@ -32,7 +32,10 @@ from sourdough.paper_execution import VenueRefused
 from sourdough.paper_order import OrderRefused
 from sourdough.paper_research import stage_research_inputs
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.runtime.registry import RuntimeRefused
+from sourdough.runtime.work_kernel import WorkKernelRefused
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
+from sourdough.storage.db import StorageRefused
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.trading_engine import EngineRefused, prepare_engine
 from sourdough.writer_lease import WriterRefused, hold_company_writer
@@ -469,8 +472,7 @@ def main() -> int:
                 EmployeeProcess(args.employee),
             )
             if args.command == "first-duty":
-                with hold_company_writer(args.store, args.company_id) as writer:
-                    result = run_first_trade(*inputs, writer=writer)
+                result = run_first_trade(*inputs)
             elif args.command == "_paper-worker":
                 result = run_paper_company(
                     *inputs,
@@ -497,7 +499,10 @@ def main() -> int:
         MarketRefused,
         OrderRefused,
         PostingRefused,
+        RuntimeRefused,
+        StorageRefused,
         VenueRefused,
+        WorkKernelRefused,
         SupervisionRefused,
         WriterRefused,
         sqlite3.Error,
