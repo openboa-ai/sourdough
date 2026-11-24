@@ -694,9 +694,23 @@ class WorkKernel(unittest.TestCase):
                     company_id=self.company_id,
                     work_item_id=req.response_work_item_id,
                     lease_owner="peer-worker",
-                    lease_ttl_ns=60_000,
+                    lease_ttl_ns=5_000,
                     now_ns=1_350,
                 )
+                # Submitting an answer at or after deadline_ns must fail closed even
+                # while the recipient's response run is still active
+                with self.assertRaisesRegex(WorkKernelRefused, "deadline has elapsed"):
+                    resolve_peer_request(
+                        conn,
+                        company_id=self.company_id,
+                        request_id="req-auth-ok",
+                        actor_id=self.peer_id,
+                        resolution_state="answered",
+                        response_payload={"choice": "late"},
+                        response_run_id=claimed_resp.run_id,
+                        response_fencing_token=claimed_resp.fencing_token,
+                        now_ns=50_000,
+                    )
                 revoke_responsibility(
                     conn,
                     self.company_id,
@@ -717,8 +731,8 @@ class WorkKernel(unittest.TestCase):
                         response_fencing_token=claimed_resp.fencing_token,
                         now_ns=1_450,
                     )
-                # Reclaiming the expired run and attempting a fresh claim must also fail
-                reclaim_expired_runs(conn, self.company_id, now_ns=70_000)
+                # Reclaiming the expired run before deadline and attempting a fresh claim must fail
+                reclaim_expired_runs(conn, self.company_id, now_ns=7_000)
                 with self.assertRaisesRegex(
                     WorkKernelRefused, "no active peer_response responsibility"
                 ):
@@ -727,6 +741,16 @@ class WorkKernel(unittest.TestCase):
                         company_id=self.company_id,
                         work_item_id=req.response_work_item_id,
                         lease_owner="peer-worker-2",
-                        lease_ttl_ns=60_000,
-                        now_ns=70_100,
+                        lease_ttl_ns=5_000,
+                        now_ns=7_100,
+                    )
+                # Claiming after deadline must also fail closed
+                with self.assertRaisesRegex(WorkKernelRefused, "deadline has elapsed"):
+                    claim_work_run(
+                        conn,
+                        company_id=self.company_id,
+                        work_item_id=req.response_work_item_id,
+                        lease_owner="peer-worker-3",
+                        lease_ttl_ns=5_000,
+                        now_ns=50_100,
                     )

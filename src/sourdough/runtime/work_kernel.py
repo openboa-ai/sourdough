@@ -419,14 +419,26 @@ def cancel_closed_peer_response_item(
     *,
     now_ns: int,
 ) -> bool:
-    """Cancel a pending peer_response work item if its linked peer request is closed."""
-    req_state = connection.execute(
-        """SELECT state FROM work_peer_requests
+    """Cancel a pending peer_response work item if its linked peer request is closed or past deadline."""
+    req_row = connection.execute(
+        """SELECT request_id, state, deadline_ns FROM work_peer_requests
            WHERE company_id = ? AND response_work_item_id = ?""",
         (company_id, work_item_id),
     ).fetchone()
-    if req_state is None or str(req_state[0]) == "open":
+    if req_row is None:
         return False
+    req_id, state, deadline_ns = req_row
+    if str(state) == "open":
+        if now_ns < int(deadline_ns):
+            return False
+        connection.execute(
+            """UPDATE work_peer_requests
+               SET state = 'expired',
+                   response_json = COALESCE(response_json, '{"reason":"deadline_elapsed"}'),
+                   resolved_at_ns = ?
+               WHERE company_id = ? AND request_id = ? AND state = 'open'""",
+            (now_ns, company_id, str(req_id)),
+        )
     connection.execute(
         """UPDATE work_items
            SET state = 'cancelled', updated_at_ns = ?
@@ -476,17 +488,21 @@ def claim_work_run(
         is not None
     ):
         raise WorkKernelRefused("Agent already has an active running execution")
+    timestamp = time_ns() if now_ns is None else now_ns
     if duty_kind == "work.peer_response":
         req_row = connection.execute(
-            """SELECT requester_agent_id, recipient_agent_id, evidence_refs_json, state
+            """SELECT requester_agent_id, recipient_agent_id, evidence_refs_json,
+                      state, deadline_ns
                FROM work_peer_requests
                WHERE company_id = ? AND response_work_item_id = ?""",
             (company_id, work_item_id),
         ).fetchone()
         if req_row is not None:
-            requester_id, recipient_id, evidence_json, req_state = req_row
+            requester_id, recipient_id, evidence_json, req_state, req_deadline = req_row
             if str(req_state) != "open":
                 raise WorkKernelRefused("Linked peer request is no longer open")
+            if timestamp >= int(req_deadline):
+                raise WorkKernelRefused("Linked peer request deadline has elapsed")
             refs = json.loads(str(evidence_json))
             _authorize_peer_route(
                 connection,
@@ -517,7 +533,6 @@ def claim_work_run(
     )
     fencing_token = max_token + 1
     run_id = uuid4().hex
-    timestamp = time_ns() if now_ns is None else now_ns
     expires_at = timestamp + lease_ttl_ns
 
     try:
@@ -1585,6 +1600,8 @@ def resolve_peer_request(
             raise WorkKernelRefused(
                 "Only the named recipient Agent may answer or decline a peer request"
             )
+        if timestamp >= prior.deadline_ns:
+            raise WorkKernelRefused("Peer request deadline has elapsed")
         if not response_run_id or response_fencing_token is None:
             raise WorkKernelRefused(
                 "Peer response requires an active response_run_id and response_fencing_token"
@@ -1592,6 +1609,11 @@ def resolve_peer_request(
         resp_run = assert_run_fencing(
             connection, response_run_id, response_fencing_token
         )
+        if (
+            resp_run.lease_expires_at_ns is not None
+            and timestamp >= resp_run.lease_expires_at_ns
+        ):
+            raise RunFenced("Response run lease has expired")
         if (
             resp_run.company_id != company_id
             or resp_run.work_item_id != prior.response_work_item_id
