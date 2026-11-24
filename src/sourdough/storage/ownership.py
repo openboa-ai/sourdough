@@ -54,7 +54,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Core company & staffing tables
     "company": frozenset({"company.py", "storage/checkpoint.py"}),
     "agent": frozenset({"company.py", "staffing.py"}),
-    "standing_grant": frozenset({"company.py", "staffing.py"}),
+    "standing_grant": frozenset({"company.py", "staffing.py", "retirement.py"}),
     "founding_receipt": frozenset({"company.py"}),
     "staffing_authority": frozenset({"staffing.py"}),
     "staffing_read": frozenset({"staffing.py"}),
@@ -66,7 +66,15 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "hire_onboarding": frozenset({"onboarding.py"}),
     "onboarding_read": frozenset({"onboarding.py"}),
     "onboarding_acceptance": frozenset({"onboarding.py"}),
-    "private_desk": frozenset({"onboarding.py"}),
+    "private_desk": frozenset({"onboarding.py", "agent_desk.py"}),
+    # Collaboration, custody, handoff & retirement tables
+    "shared_project": frozenset({"company_assets.py"}),
+    "shared_publication": frozenset({"company_assets.py"}),
+    "project_review_brief": frozenset({"company_assets.py"}),
+    "project_message": frozenset({"conversations.py"}),
+    "project_delivery": frozenset({"conversation_delivery.py"}),
+    "agent_archive": frozenset({"retirement.py"}),
+    "work_handoff": frozenset({"work_handoff.py"}),
     # Work & assessment tables
     "duty": frozenset(
         {
@@ -79,6 +87,9 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
             "staffing.py",
             "paper_research.py",
             "company_assessment.py",
+            "retirement.py",
+            "work_handoff.py",
+            "work_peer_response.py",
         }
     ),
     "duty_run": frozenset(
@@ -88,9 +99,12 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
             "abandoned_work.py",
             "onboarding.py",
             "staffing.py",
+            "retirement.py",
+            "work_handoff.py",
+            "work_peer_response.py",
         }
     ),
-    "work_follow_up": frozenset({"work.py", "abandoned_work.py"}),
+    "work_follow_up": frozenset({"work.py", "abandoned_work.py", "work_handoff.py"}),
     "work_result_read": frozenset({"work.py"}),
     "work_review_decision": frozenset({"work.py"}),
     "assessment_source": frozenset({"company_assessment.py"}),

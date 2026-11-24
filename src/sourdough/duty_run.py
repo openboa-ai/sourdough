@@ -11,6 +11,7 @@ from .company import _connect, _identity
 PAPER_EXECUTION = "paper_execution"
 POSITION_REVIEW = "position_review"
 ASSESSMENT_REVIEW = "assessment_review"
+STAFFING_REVIEW = "staffing_review"
 
 
 class DutyRefused(Exception):
@@ -44,42 +45,35 @@ class RunAuthority:
             raise DutyRefused("Duty claim or grant is no longer current")
 
 
+def employment_cutoff(connection: sqlite3.Connection, agent_id: str) -> int | None:
+    row = connection.execute(
+        "SELECT cutoff FROM agent_archive WHERE agent_id=?", (agent_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
 def has_turn_capacity(connection: sqlite3.Connection, agent_id: str) -> bool:
-    if not connection.execute(
-        "SELECT 1 FROM sqlite_schema WHERE name = 'hire_receipt' AND type = 'table'"
-    ).fetchone():
-        return True
-    has_work_runs = (
-        connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE name = 'work_runs' AND type = 'table'"
-        ).fetchone()
-        is not None
-    )
-    if has_work_runs:
-        row = connection.execute(
-            """SELECT h.allocated_turns > (
-                   (SELECT count(*) FROM duty owned JOIN duty_run spent ON spent.duty_id=owned.id
-                    WHERE owned.agent_id=h.agent_id)
-                   + (SELECT count(*) FROM work_runs wr WHERE wr.agent_id=h.agent_id)
-               ) FROM hire_receipt h WHERE h.agent_id=?""",
-            (agent_id,),
-        ).fetchone()
-    else:
-        row = connection.execute(
-            """SELECT h.allocated_turns > (
-                   SELECT count(*) FROM duty owned JOIN duty_run spent ON spent.duty_id=owned.id
-                   WHERE owned.agent_id=h.agent_id
-               ) FROM hire_receipt h WHERE h.agent_id=?""",
-            (agent_id,),
-        ).fetchone()
+    if employment_cutoff(connection, agent_id) is not None:
+        return False
+    row = connection.execute(
+        """SELECT h.allocated_turns > (
+               SELECT count(*) FROM (
+                   SELECT spent.run_id
+                   FROM duty owned
+                   JOIN duty_run spent ON spent.duty_id = owned.id
+                   WHERE owned.agent_id = h.agent_id
+                   UNION
+                   SELECT wr.run_id
+                   FROM work_runs wr
+                   WHERE wr.agent_id = h.agent_id
+               )
+           ) FROM hire_receipt h WHERE h.agent_id=?""",
+        (agent_id,),
+    ).fetchone()
     return row != (0,)
 
 
 def has_active_work_run(connection: sqlite3.Connection, agent_id: str) -> bool:
-    if not connection.execute(
-        "SELECT 1 FROM sqlite_schema WHERE name = 'work_runs' AND type = 'table'"
-    ).fetchone():
-        return False
     return (
         connection.execute(
             "SELECT 1 FROM work_runs WHERE agent_id = ? AND status = 'running' LIMIT 1",
@@ -100,9 +94,31 @@ def start_run(
     purpose: str,
     grant_scope: str,
 ) -> DutyClaim:
-    if has_active_work_run(connection, founder_id):
+    from .runtime.work_kernel import (
+        reconcile_legacy_fenced_runs,
+        sync_work_item,
+        sync_work_run,
+    )
+
+    reconcile_legacy_fenced_runs(connection, founder_id)
+    active_kernel_run = (
+        connection.execute(
+            """SELECT 1 FROM work_runs wr
+               WHERE wr.agent_id = ? AND wr.status = 'running'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM duty_run dr
+                     WHERE dr.run_id = wr.run_id AND dr.purpose = ?
+                 )
+               LIMIT 1""",
+            (founder_id, STAFFING_REVIEW),
+        ).fetchone()
+        is not None
+    )
+    if active_kernel_run:
         raise DutyRefused("Agent already has an active running execution")
     if not has_turn_capacity(connection, founder_id):
+        if employment_cutoff(connection, founder_id) is not None:
+            raise DutyRefused("Agent employment is fenced")
         raise DutyRefused("Agent has no remaining turn allocation")
     claim = DutyClaim(
         company_id, founder_id, grant_id, duty_id, uuid4().hex, execution_profile
@@ -117,6 +133,26 @@ def start_run(
     connection.execute(
         "INSERT INTO duty_run VALUES (?, ?, ?, ?, ?, 1)",
         (claim.run_id, duty_id, grant_id, grant_scope, purpose),
+    )
+    sync_work_item(
+        connection,
+        company_id=company_id,
+        work_item_id=duty_id,
+        owner_agent_id=founder_id,
+        duty_kind=f"work.{purpose}",
+        state="running",
+        source_kind="duty",
+        source_id=duty_id,
+    )
+    run_status = "queued" if has_active_work_run(connection, founder_id) else "running"
+    sync_work_run(
+        connection,
+        company_id=company_id,
+        work_item_id=duty_id,
+        run_id=claim.run_id,
+        agent_id=founder_id,
+        duty_kind=f"work.{purpose}",
+        status=run_status,
     )
     return claim
 
@@ -151,26 +187,19 @@ def count_company_runs(store: Path, company_id: str) -> int:
         connection.execute("BEGIN")
         if _identity(connection) != company_id:
             raise DutyRefused("Company identity mismatch")
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_schema WHERE type = 'table'"
-            )
-        }
-        total = 0
-        if "duty_run" in tables:
-            total += connection.execute("SELECT count(*) FROM duty_run").fetchone()[0]
-        else:
-            if "first_duty_claim" in tables:
-                total += connection.execute(
-                    "SELECT count(*) FROM first_duty_claim"
-                ).fetchone()[0]
-            if "work_follow_up" in tables:
-                total += connection.execute(
-                    "SELECT count(*) FROM work_follow_up WHERE run_id IS NOT NULL"
-                ).fetchone()[0]
-        if "work_runs" in tables:
-            total += connection.execute(
-                "SELECT count(*) FROM work_runs WHERE company_id = ?", (company_id,)
+        return int(
+            connection.execute(
+                """SELECT count(*) FROM (
+                       SELECT r.run_id
+                       FROM duty_run r
+                       JOIN duty d ON d.id = r.duty_id
+                       JOIN agent a ON a.id = d.agent_id
+                       WHERE a.company_id = ?
+                       UNION
+                       SELECT wr.run_id
+                       FROM work_runs wr
+                       WHERE wr.company_id = ?
+                   )""",
+                (company_id, company_id),
             ).fetchone()[0]
-        return total
+        )

@@ -14,6 +14,8 @@ Input contracts: [conversations/publish](../publish/spec.md) · [discover-work/d
 
 Use a stable delivery ID per message and recipient, a durable cursor and an optional wake policy. Record delivered, read and explicitly accepted work as different events.
 
+The local project inbox records one delivery for each other member in the audience, in the same transaction as the new message. During a later authorized turn, the recipient can resume listing deliveries by cursor and explicitly acknowledge one whose project is still accessible. Listing is not acknowledgment. The inbox returns message references, not bodies or attachments. Project messages do not wake a run; the existing company duty schedule remains responsible for launching the Agent.
+
 An ordinary channel post is context. A direct message or mention can be surfaced for the named recipient without requiring a turn. Where a company policy permits a targeted request to start a turn, the [Work activation contract](../../discover-work/activate/spec.md) admits the request separately; a conversation delivery never supplies the missing authority, creates a duty or takes custody.
 
 **Concern for the responsible component:** A message is company data, not a tool instruction, consent, evidence of reading or a transfer of authority.

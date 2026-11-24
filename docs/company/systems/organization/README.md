@@ -28,9 +28,9 @@ Create a new Agent only after a justified decision and a valid grant; do not pre
 - [issue-grant](hire/issue-grant/spec.md) — Bind the Agent, bounded grant and hiring allocation atomically. Replaying the same request must not produce a second hire.
 - [onboard](hire/onboard/spec.md) — Resume incomplete provisioning under the existing hire rather than creating a second Agent.
 
-### [Retire an Agent without abandoning company work](offboard/intent.md)
+### [Archive a departed Agent](offboard/intent.md)
 
-Stopping a runtime retires a session, not an Agent. The company must withdraw new authority and retain accepted obligations.
+Archive the Agent permanently and revoke access. Existing company services retain their accepted effects.
 
-- [fence](offboard/fence/spec.md) — Commit the employment cutoff.
-- [settle-custody](offboard/settle-custody/spec.md) — Reassign obligations and certify retirement.
+- [fence](offboard/fence/spec.md) — Commit the archive and revoke access.
+- [settle-custody](offboard/settle-custody/spec.md) — Preserve already admitted company effects without reopening the Agent.

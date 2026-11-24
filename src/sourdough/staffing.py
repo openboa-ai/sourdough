@@ -9,6 +9,8 @@ from time import time
 from uuid import uuid4
 
 from .company import _connect
+from .company_assets import require_project_onboarding_authority
+from .runtime.work_kernel import sync_duty_terminal
 from .duty_run import (
     DutyClaim,
     DutyRefused,
@@ -66,11 +68,13 @@ class StaffingNeed:
     available_capacity: int
     assigned_capacity: int
     available_at: int
+    project_id: str | None = None
 
     def __post_init__(self) -> None:
         if (
             not _label(self.duty_id, 128)
             or not _label(self.summary)
+            or (self.project_id is not None and not _label(self.project_id, 128))
             or any(
                 type(value) is not int or not 0 <= value < 2**63
                 for value in (
@@ -109,7 +113,19 @@ def stage_staffing(
         ).fetchone()
         if existing != terms:
             raise DutyRefused("Staffing authority conflicts with the sealed envelope")
-        body = _canonical(asdict(need))
+        facts = asdict(need)
+        if need.project_id is None:
+            facts.pop("project_id")
+        else:
+            if authority.allowed_scope != "assessment":
+                raise DutyRefused("Project onboarding is scoped to company assessment")
+            require_project_onboarding_authority(
+                connection,
+                writer.company_id,
+                authority.manager_grant_id,
+                need.project_id,
+            )
+        body = _canonical(facts)
         revision = sha256(body.encode()).hexdigest()
         assignment = (
             need.duty_id,
@@ -180,6 +196,9 @@ def claim_staffing(
                 (row[2],),
             )
             connection.execute("UPDATE duty SET state='due' WHERE id=?", (row[2],))
+            sync_duty_terminal(
+                connection, row[2], item_state="due", run_status="fenced"
+            )
         return start_run(
             connection,
             writer.company_id,
@@ -286,38 +305,42 @@ def record_choice(writer: WriterLease, claim: DutyClaim, choice: StaffingChoice)
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        evidence, _, authority = _staffing_run(connection, claim)
-        observed = connection.execute(
-            "SELECT revision FROM staffing_read WHERE run_id = ?",
-            (claim.run_id,),
-        ).fetchone()
-        if (choice.evidence_revision,) != observed:
-            raise DutyRefused("Staffing choice requires an authorized evidence read")
-        body = _canonical(asdict(choice))
-        prior = connection.execute(
-            "SELECT run_id, choice_id, terms FROM staffing_choice WHERE duty_id = ?",
-            (claim.duty_id,),
-        ).fetchone()
-        if prior is not None:
-            if prior[0] != claim.run_id or prior[2] != body:
-                raise DutyRefused(
-                    "Staffing choice conflicts with the original judgment"
-                )
-            return prior[1]
-        authority.require_current(STAFFING_REVIEW)
-        if authority.duty_state != "running":
-            raise DutyRefused("Staffing decision requires an active assigned manager")
-        choice_id = uuid4().hex
-        decided_at = int(time())
-        connection.execute(
-            "INSERT INTO staffing_choice VALUES (?, ?, ?, ?, ?)",
-            (claim.duty_id, claim.run_id, choice_id, body, decided_at),
+        return _record_choice(connection, claim, choice)
+
+
+def _record_choice(
+    connection: Connection, claim: DutyClaim, choice: StaffingChoice
+) -> str:
+    evidence, _, authority = _staffing_run(connection, claim)
+    observed = connection.execute(
+        "SELECT revision FROM staffing_read WHERE run_id = ?",
+        (claim.run_id,),
+    ).fetchone()
+    if (choice.evidence_revision,) != observed:
+        raise DutyRefused("Staffing choice requires an authorized evidence read")
+    body = _canonical(asdict(choice))
+    prior = connection.execute(
+        "SELECT run_id, choice_id, terms FROM staffing_choice WHERE duty_id = ?",
+        (claim.duty_id,),
+    ).fetchone()
+    if prior is not None:
+        if prior[0] != claim.run_id or prior[2] != body:
+            raise DutyRefused("Staffing choice conflicts with the original judgment")
+        return prior[1]
+    authority.require_current(STAFFING_REVIEW)
+    if authority.duty_state != "running":
+        raise DutyRefused("Staffing decision requires an active assigned manager")
+    choice_id = uuid4().hex
+    decided_at = int(time())
+    connection.execute(
+        "INSERT INTO staffing_choice VALUES (?, ?, ?, ?, ?)",
+        (claim.duty_id, claim.run_id, choice_id, body, decided_at),
+    )
+    if choice.action != "hire":
+        _schedule_staffing_review(
+            connection, claim, evidence, decided_at + choice.next_check_seconds
         )
-        if choice.action != "hire":
-            _schedule_staffing_review(
-                connection, claim, evidence, decided_at + choice.next_check_seconds
-            )
-        return choice_id
+    return choice_id
 
 
 def _schedule_staffing_review(
@@ -343,6 +366,9 @@ def _schedule_staffing_review(
     )
     connection.execute(
         "UPDATE duty SET state = 'settled' WHERE id = ?", (claim.duty_id,)
+    )
+    sync_duty_terminal(
+        connection, claim.duty_id, item_state="settled", run_status="completed"
     )
 
 
@@ -430,70 +456,116 @@ def admit_hire(
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        _staffing_run(connection, claim)
-        choice = connection.execute(
-            """SELECT c.terms FROM staffing_choice c
-               JOIN duty_run original ON original.run_id=c.run_id AND original.grant_id=?
-               WHERE c.choice_id=? AND c.duty_id=?""",
-            (claim.grant_id, request.choice_id, claim.duty_id),
-        ).fetchone()
-        if choice is None or json.loads(choice[0])["action"] != "hire":
-            raise DutyRefused("An admitted staffing choice to hire is required")
-        terms = _canonical(asdict(request))
-        old = connection.execute(
-            """SELECT request_id, agent_id, grant_id, allocated_turns, terms
-               FROM hire_receipt WHERE request_id = ? OR choice_id = ?""",
-            (request.request_id, request.choice_id),
-        ).fetchone()
-        if old is not None:
-            if old[0] != request.request_id or old[-1] != terms:
-                raise DutyRefused("Hire replay conflicts with the original request")
-            return HireReceipt(*old[1:-1])
-        _assignment(connection, claim)
-        if not connection.execute(
-            "SELECT 1 FROM staffing_read WHERE run_id=?", (claim.run_id,)
-        ).fetchone():
-            raise DutyRefused(
-                "Hire authorization requires a current staffing need read"
-            )
-        scope = connection.execute(
-            "SELECT execution_profile, allowed_scope FROM staffing_authority WHERE grant_id = ?",
+        return _admit_hire(connection, claim, request)
+
+
+def _admit_hire(
+    connection: Connection, claim: DutyClaim, request: HireRequest
+) -> HireReceipt:
+    _staffing_run(connection, claim)
+    choice = connection.execute(
+        """SELECT c.terms FROM staffing_choice c
+           JOIN duty_run original ON original.run_id=c.run_id AND original.grant_id=?
+           WHERE c.choice_id=? AND c.duty_id=?""",
+        (claim.grant_id, request.choice_id, claim.duty_id),
+    ).fetchone()
+    if choice is None or json.loads(choice[0])["action"] != "hire":
+        raise DutyRefused("An admitted staffing choice to hire is required")
+    terms = _canonical(asdict(request))
+    old = connection.execute(
+        """SELECT request_id, agent_id, grant_id, allocated_turns, terms
+           FROM hire_receipt WHERE request_id = ? OR choice_id = ?""",
+        (request.request_id, request.choice_id),
+    ).fetchone()
+    if old is not None:
+        if old[0] != request.request_id or old[-1] != terms:
+            raise DutyRefused("Hire replay conflicts with the original request")
+        return HireReceipt(*old[1:-1])
+    _assignment(connection, claim)
+    if not connection.execute(
+        "SELECT 1 FROM staffing_read WHERE run_id=?", (claim.run_id,)
+    ).fetchone():
+        raise DutyRefused("Hire authorization requires a current staffing need read")
+    scope = connection.execute(
+        "SELECT execution_profile, allowed_scope FROM staffing_authority WHERE grant_id = ?",
+        (claim.grant_id,),
+    ).fetchone()
+    slots, turns = _remaining(connection, claim.grant_id)
+    if (
+        scope != (request.execution_profile, request.scope)
+        or slots < 1
+        or request.turns > turns
+    ):
+        raise DutyRefused("Hire exceeds delegated scope or allocation")
+    agent_id, grant_id = uuid4().hex, uuid4().hex
+    connection.execute(
+        "INSERT INTO agent VALUES (?, ?, ?)",
+        (agent_id, claim.company_id, request.execution_profile),
+    )
+    connection.execute(
+        "INSERT INTO standing_grant VALUES (?, ?, ?)",
+        (grant_id, agent_id, request.scope),
+    )
+    connection.execute(
+        "INSERT INTO hire_receipt VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            request.request_id,
+            request.choice_id,
+            claim.grant_id,
+            agent_id,
+            grant_id,
+            request.turns,
+            terms,
+            int(time()),
+        ),
+    )
+    connection.execute(
+        "UPDATE duty SET state = 'settled' WHERE id = ?", (claim.duty_id,)
+    )
+    sync_duty_terminal(
+        connection, claim.duty_id, item_state="settled", run_status="completed"
+    )
+    connection.execute(
+        "INSERT INTO hire_admission_run VALUES (?, ?)",
+        (request.request_id, claim.run_id),
+    )
+    return HireReceipt(agent_id, grant_id, request.turns)
+
+
+@dataclass(frozen=True)
+class HireCommitment:
+    request_id: str
+    role: str
+    turns: int
+
+
+def submit_staffing_decision(
+    writer: WriterLease,
+    claim: DutyClaim,
+    choice: StaffingChoice,
+    commitment: HireCommitment | None,
+) -> tuple[str, HireReceipt | None]:
+    if (commitment is not None) != (choice.action == "hire"):
+        raise DutyRefused(
+            "An explicit hire request is required only for a hire decision"
+        )
+    writer.verify_for(writer.store, claim.company_id)
+    with closing(_connect(writer.store, "rw")) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _staffing_run(connection, claim)[2].require_current(STAFFING_REVIEW)
+        choice_id = _record_choice(connection, claim, choice)
+        if commitment is None:
+            return choice_id, None
+        profile, scope = connection.execute(
+            "SELECT execution_profile, allowed_scope FROM staffing_authority WHERE grant_id=?",
             (claim.grant_id,),
         ).fetchone()
-        slots, turns = _remaining(connection, claim.grant_id)
-        if (
-            scope != (request.execution_profile, request.scope)
-            or slots < 1
-            or request.turns > turns
-        ):
-            raise DutyRefused("Hire exceeds delegated scope or allocation")
-        agent_id, grant_id = uuid4().hex, uuid4().hex
-        connection.execute(
-            "INSERT INTO agent VALUES (?, ?, ?)",
-            (agent_id, claim.company_id, request.execution_profile),
+        request = HireRequest(
+            commitment.request_id,
+            choice_id,
+            commitment.role,
+            profile,
+            scope,
+            commitment.turns,
         )
-        connection.execute(
-            "INSERT INTO standing_grant VALUES (?, ?, ?)",
-            (grant_id, agent_id, request.scope),
-        )
-        connection.execute(
-            "INSERT INTO hire_receipt VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                request.request_id,
-                request.choice_id,
-                claim.grant_id,
-                agent_id,
-                grant_id,
-                request.turns,
-                terms,
-                int(time()),
-            ),
-        )
-        connection.execute(
-            "UPDATE duty SET state = 'settled' WHERE id = ?", (claim.duty_id,)
-        )
-        connection.execute(
-            "INSERT INTO hire_admission_run VALUES (?, ?)",
-            (request.request_id, claim.run_id),
-        )
-        return HireReceipt(agent_id, grant_id, request.turns)
+        return choice_id, _admit_hire(connection, claim, request)

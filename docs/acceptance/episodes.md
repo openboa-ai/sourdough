@@ -81,25 +81,21 @@ flowchart TD
 
 Business situation: [Ending employment and settling obligations](../capabilities.md#departure).
 
-**Owner:** Company organization · [Cutoff and custody settlement](../company/systems/organization/offboard/intent.md). Core case: an in-flight document publication; quant overlay: an already admitted simulated order. The core must not import an order schema.
+**Owner:** Company organization · [Permanent Agent archive](../company/systems/organization/offboard/intent.md). Core case: an admitted document publication; quant overlay: an already admitted simulated order. The core must not import an order schema.
 
 ```mermaid
 flowchart TD
-    M[Authorized manager, reason and effective revision] --> F[Retiring: fence claims, runs and new effects]
-    F --> Late[Reject stale callbacks]
-    F --> Inventory[Inventory work, budgets, assets and profile duties]
-    Inventory --> S{Authorized successor accepts?}
-    S -->|Yes| Transfer[Transfer scoped custody, not private access wholesale]
-    S -->|No| Service[Contain and assign a standing recovery duty]
-    Transfer --> Verify{Every duty owned and old access fenced?}
-    Service --> Verify
-    Verify -->|No| Pending[Retirement pending; no new dependent effects]
-    Verify -->|Yes| Done[Retired; history and follow-up retained]
+    M[Authorized manager] --> A[Archive Agent and revoke access]
+    A --> N[Reject later calls and duties]
+    A --> H[Preserve company records]
+    H --> R[Existing service reconciles prior effects]
 ```
 
 - **Setup and stimulus:** An authorized manager retires an Agent with work, a private desk, a shared asset and an action accepted just before cutoff. Log the admission sequence. Separately try a caller with only a hiring grant and the last accountable officer with no chartered coverage: both must be denied.
-- **Fault:** Interrupt after fencing but before custody has settled. Deliver a late old-generation tool call, a valid receipt for the earlier action, and duplicate transfer events. For the quant overlay also keep a program under the Agent's supervision and an uncertain order.
-- **Pass:** Zero new effects admitted under the former Agent after cutoff. One successor or company recovery owner per outstanding obligation, no duplicate disposal or silent cancellation. The old order is still queried and any fill booked once; an unsupervised program cannot add risk. An unreachable successor with no authorized fallback leaves retirement pending. Independently compare roster, admissions, destination evidence and final inventory.
+- **Fault:** Restart the company after the archive commits. Deliver a late callback and replay a valid receipt for the earlier action. For the quant overlay, keep an uncertain order and a program without independent authority.
+- **Pass:** No new duty, run, or effect under the archived Agent. Existing receipts and shared assets retain their original attribution. The old order is queried by the existing service and any fill is booked once. No successor or retirement-specific queue is needed; an unknown effect remains unresolved separately.
+
+The Flow 10 connected CI suite runs the installed supervisor with deterministic employees. It checks separate authorship, delivery, acceptance, and successor review with the Client closed. The core O1 case interrupts the original worker after publication commit but before the tool reply, archives the author, refuses its stale callback, and reopens the same company so an authorized peer can read the original publication. A separate quant case checks booking the original paper effect after archive. These checks do not replace W1 with a real Agent, native isolation observations, or the managed-runtime variant of O1.
 
 ## P1 Total return
 

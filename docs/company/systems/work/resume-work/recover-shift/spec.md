@@ -35,6 +35,8 @@ Keep a renewable monotonic claim generation (`fencing_token` in `work_runs`) ins
 
 For a next duty that needs the result of an outstanding effect, the due timer makes it eligible but does not satisfy its data dependency. Retain the due occurrence until the owning domain supplies its durable disposition and result revision; admit the dependent decision once, against that revision or later. Test both arrival orders and a redelivery. Other eligible work continues. Work handles opaque result references, not order or fill schemas.
 
+When a company review turn ends without a committed decision, retain the same duty and Desk as incomplete. Its old turn can no longer mutate the review, and the scheduler runs independent due reviews within the original activation limits before reporting the interruption. A later bounded worker start can reclaim that incomplete review under a new generation. Do not retry it in the same worker, infer a decision or apply this path to an unsettled external effect. If the decision already committed, recognize that effect instead of reopening the duty.
+
 ## Operations and change review
 
 Observe oldest due work and stale claims. Back off restarts on repeated failure while keeping unresolved work visible.

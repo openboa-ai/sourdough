@@ -14,9 +14,11 @@ from threading import Thread
 
 from .first_duty import DutyRefused
 from .first_trade import OrderTool, TradeRefused, TradingContext
+from .harness import ScopedRun, run_in_desk_sandbox
 from .writer_lease import WriterRefused
 
 MAX_TOOL_REQUEST_BYTES = 64 * 1024
+LOCAL_MACOS_SANDBOX = "local-macos"
 
 
 class _ReadWorkResult(socketserver.BaseRequestHandler):
@@ -62,14 +64,29 @@ class _ToolEndpoint(socketserver.UnixStreamServer):
 class EmployeeProcess:
     def __init__(self, executable: Path):
         self.executable = executable.resolve()
-        self.profile = self._profile()
+        selection = self._identify()
+        self.sandbox_backend = selection.get("sandbox_backend")
+        self.profile = self._profile(selection)
 
-    def _profile(self) -> str:
+    def _identify(self) -> dict:
         selection = self._exchange({"operation": "identify"})
-        if set(selection) != {"provider", "model", "revision"} or not all(
+        runtime_fields = {"provider", "model", "revision"}
+        if set(selection) not in (runtime_fields, runtime_fields | {"sandbox_backend"}):
+            raise TradeRefused("Employee runtime binding is unresolved")
+        if not all(
             isinstance(value, str) and value.strip() for value in selection.values()
         ):
-            raise TradeRefused("Employee model binding is unresolved")
+            raise TradeRefused("Employee runtime binding is unresolved")
+        if (
+            "sandbox_backend" in selection
+            and selection["sandbox_backend"] != LOCAL_MACOS_SANDBOX
+        ):
+            raise TradeRefused("Employee sandbox backend is not qualified")
+        return selection
+
+    def _profile(self, selection: dict | None = None) -> str:
+        if selection is None:
+            selection = self._identify()
         with self.executable.open("rb") as stream:
             executable = file_digest(stream, "sha256").hexdigest()
         terms = json.dumps([executable, selection], sort_keys=True).encode()
@@ -140,19 +157,75 @@ class EmployeeProcess:
     def onboarding(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("onboarding_duty", _ToolEndpoint, invoke)
 
-    def assess(self, invoke: Callable[[str, dict], dict]) -> dict:
-        return self._scoped_exchange("assessment_duty", _ToolEndpoint, invoke)
+    def run_scoped(self, operation: str, run: ScopedRun) -> dict:
+        if run.claim.execution_profile != self.profile:
+            raise TradeRefused("Scoped run belongs to another execution profile")
+        return self._scoped_exchange(
+            operation, _ToolEndpoint, run.call, harness=run.manifest()
+        )
+
+    def run_sandboxed_scoped(
+        self, operation: str, run: ScopedRun, *, store: Path
+    ) -> dict:
+        """Run a scoped employee process inside the macOS Desk sandbox connected to the Outer Broker."""
+        if run.claim.execution_profile != self.profile:
+            raise TradeRefused("Scoped run belongs to another execution profile")
+        if self._profile() != self.profile:
+            raise TradeRefused("Employee model binding changed")
+        manifest = run.manifest()
+        with TemporaryDirectory(prefix="sd-sb-") as directory:
+            scratch = Path(directory).resolve()
+            address = scratch / "broker.sock"
+            with _ToolEndpoint(str(address), run.call) as endpoint:
+                thread = Thread(
+                    target=endpoint.serve_forever, kwargs={"poll_interval": 0.05}
+                )
+                thread.start()
+                try:
+                    request = {
+                        "operation": operation,
+                        "read_endpoint": str(address),
+                        "harness": manifest,
+                        "desk_path": str(run.session.desk_path),
+                    }
+                    result = run_in_desk_sandbox(
+                        run.session,
+                        [str(self.executable)],
+                        store=store,
+                        broker_socket=address,
+                        scratch_dir=scratch,
+                        extra_read_files=(self.executable,),
+                        input_data=json.dumps(request),
+                        timeout=100
+                        if operation
+                        in ("research_duty", "assessment_duty", "hired_research_duty")
+                        else 60,
+                    )
+                    if result.returncode != 0:
+                        raise TradeRefused(
+                            "Sandboxed employee process did not complete its exchange"
+                        )
+                    response = json.loads(result.stdout)
+                except (OSError, subprocess.SubprocessError, ValueError) as error:
+                    raise TradeRefused(
+                        "Sandboxed employee process did not complete its exchange"
+                    ) from error
+                finally:
+                    endpoint.shutdown()
+                    thread.join()
+        if not isinstance(response, dict):
+            raise TradeRefused("Invalid employee response")
+        return response
 
     def research_hired(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("hired_research_duty", _ToolEndpoint, invoke)
 
-    def review_assessment(self, read_result: Callable[[], dict]) -> dict:
-        return self._follow_up("assessment_review", read_result)
-
     def _follow_up(self, operation: str, read_result: Callable[[], dict]) -> dict:
         return self._scoped_exchange(operation, _ResultEndpoint, read_result)
 
-    def _scoped_exchange(self, operation: str, endpoint_type, callback) -> dict:
+    def _scoped_exchange(
+        self, operation: str, endpoint_type, callback, *, harness: dict | None = None
+    ) -> dict:
         if self._profile() != self.profile:
             raise TradeRefused("Employee model binding changed")
         with TemporaryDirectory(prefix="sd-") as directory:
@@ -163,9 +236,10 @@ class EmployeeProcess:
                 )
                 thread.start()
                 try:
-                    return self._exchange(
-                        {"operation": operation, "read_endpoint": address}
-                    )
+                    request = {"operation": operation, "read_endpoint": address}
+                    if harness is not None:
+                        request["harness"] = harness
+                    return self._exchange(request)
                 finally:
                     endpoint.shutdown()
                     thread.join()
