@@ -9,7 +9,9 @@ from sqlite3 import Connection
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
+from .agent_desk import ensure_private_desk
 from .company import _connect
+from .company_assets import enroll_project_participant
 from .duty_run import (
     PAPER_EXECUTION,
     DutyClaim,
@@ -143,6 +145,23 @@ def probe_desk_scratch() -> bool:
         return False
 
 
+def _join_designated_project(
+    connection: Connection, company_id: str, agent_id: str
+) -> None:
+    designation = connection.execute(
+        """SELECT h.manager_grant_id, json_extract(a.evidence, '$.project_id')
+           FROM hire_receipt h JOIN staffing_choice c ON c.choice_id=h.choice_id
+           JOIN staffing_assignment a ON a.duty_id=c.duty_id
+           WHERE h.agent_id=? AND json_extract(a.evidence, '$.project_id') IS NOT NULL""",
+        (agent_id,),
+    ).fetchone()
+    if designation is not None:
+        manager_grant, project_id = designation
+        enroll_project_participant(
+            connection, company_id, manager_grant, project_id, agent_id
+        )
+
+
 def provision_hire(
     writer: WriterLease,
     agent_id: str,
@@ -200,6 +219,11 @@ def provision_hire(
             ).fetchone()
             if attempts >= MAX_PROVISIONING_ATTEMPTS:
                 return current
+            if unavailable is None:
+                try:
+                    _join_designated_project(connection, writer.company_id, agent_id)
+                except DutyRefused:
+                    unavailable = "project_access_unavailable"
             if unavailable is not None:
                 connection.execute(
                     """UPDATE hire_onboarding SET state = 'blocked', attempts = ?,
@@ -214,12 +238,7 @@ def provision_hire(
                     ),
                 )
             else:
-                revision = sha256(
-                    f"{writer.company_id}:{agent_id}:{profile}".encode()
-                ).hexdigest()
-                connection.execute(
-                    "INSERT INTO private_desk VALUES (?, ?)", (agent_id, revision)
-                )
+                ensure_private_desk(connection, writer.company_id, agent_id, profile)
                 duty_id = uuid4().hex
                 connection.execute(
                     "INSERT INTO duty VALUES (?, ?, 'due')", (duty_id, agent_id)
@@ -271,11 +290,16 @@ def claim_hired_first(
         ):
             return None
         if state == "running" and resume:
+            from .runtime.work_kernel import sync_duty_terminal
+
             connection.execute(
                 "UPDATE duty_run SET is_current = 0 WHERE duty_id = ? AND is_current = 1",
                 (duty_id,),
             )
             connection.execute("UPDATE duty SET state = 'due' WHERE id = ?", (duty_id,))
+            sync_duty_terminal(
+                connection, duty_id, item_state="due", run_status="fenced"
+            )
         elif state != "due":
             return None
         return start_run(

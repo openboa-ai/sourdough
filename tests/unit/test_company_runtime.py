@@ -22,6 +22,7 @@ from sourdough.runtime.work_kernel import (
     claim_work_run,
     create_work_item,
     open_peer_request,
+    record_peer_request_read,
     register_responsibility,
     resolve_peer_request,
     set_condition,
@@ -239,6 +240,15 @@ class UnifiedCompanyRuntime(unittest.TestCase):
         def peer_handler(ctx: DutyContext) -> DutyOutcome:
             with closing(open_writer(self.store, lease=ctx.writer)) as conn:
                 with write_tx(conn):
+                    record_peer_request_read(
+                        conn,
+                        company_id=ctx.company_id,
+                        request_id="req-in-step",
+                        actor_id=peer_id,
+                        response_run_id=ctx.run.run_id,
+                        response_fencing_token=ctx.run.fencing_token,
+                        now_ns=ctx.now_ns,
+                    )
                     resolve_peer_request(
                         conn,
                         company_id=ctx.company_id,

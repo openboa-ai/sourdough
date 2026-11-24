@@ -21,6 +21,6 @@ Accept an authenticated requester, intended user, asset or capability, purpose, 
 | --- | --- |
 | Scoped provision | An Agent requests an already permitted read-only source. With Client closed, inspect the grant, reservation, inventory and successful read; an attempted write is denied. |
 | Denial and race | Exhaust budget or revoke access before commit; no new usable binding or duplicate charge appears on retry. |
-| Retirement | Retire the Agent while a resource duty remains; personal access is fenced, company custody remains and the authorized successor can continue the duty. |
+| Departure | Archive the Agent while a resource remains; personal access ends and the resource remains in company custody. The archived Agent receives no further duty. |
 
 **Oracle:** Compare authority, finance, asset inventory, connector receipt and actual access outcomes, not a request acknowledgement. All cases are unrun.

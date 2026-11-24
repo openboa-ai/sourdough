@@ -15,6 +15,7 @@ from .duty_run import (
     DutyClaim,
     DutyRefused,
     count_company_runs,
+    employment_cutoff,
 )
 from .employee_process import EmployeeProcess
 from .first_duty import founding_duty_due
@@ -326,10 +327,18 @@ def _recover(
             for order in recovery.recovered
             if is_hired_first_duty(connection, order.original_claim)
         }
+        archived = {
+            order.original_claim.founder_id
+            for order in recovery.recovered
+            if employment_cutoff(connection, order.original_claim.founder_id)
+            is not None
+        }
     blocked = []
     for original in recovery.recovered:
         writer.verify()
         claim = original.original_claim
+        if claim.founder_id in archived:
+            continue
         try:
             if original.posting is not None:
                 result = _book_reference(store, company_id, original.posting, venue)

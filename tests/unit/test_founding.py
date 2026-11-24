@@ -46,6 +46,13 @@ TABLES = (
     "assessment_source",
     "assessment_read",
     "assessment_publication",
+    "shared_project",
+    "shared_publication",
+    "project_review_brief",
+    "project_message",
+    "project_delivery",
+    "agent_archive",
+    "work_handoff",
 )
 
 

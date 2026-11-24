@@ -19,6 +19,7 @@ Create identity, debit its authorized allocation and bind its initial scope in o
 ## Functional and quality requirements
 
 - **FR.** Verify hiring authority and delegation ceiling at commit. Record a new agent_id, immutable profile reference, initial role and grants atomically. Two hires may select the same model; they never share an Agent ID.
+- **Combined request.** An explicit hire submitted with its staffing choice commits both records in the same local transaction. The choice and hiring checks still run separately; denied admission leaves neither record from that combined request. Bind the profile and scope from the active delegation, not from model-supplied values. A confirmed replay returns the same separate receipts and consumes no additional allocation.
 - **NFR.** Exact retries return the same Agent. Changing the runtime/model under the original request conflicts without a second allocation. Title changes, self-grants and changes outside the ceiling cannot increase authority.
 
 ## Acceptance and independent evidence

@@ -3,11 +3,12 @@
 import json
 import sqlite3
 from dataclasses import dataclass
+from hashlib import sha256
 from time import time_ns
 from typing import Any
 from uuid import uuid4
 
-from ..duty_run import has_turn_capacity
+from ..duty_run import employment_cutoff, has_turn_capacity
 from ..storage.kernel import append_audit_event
 
 
@@ -103,6 +104,18 @@ class PeerRequest:
     response_json: str | None
     resolved_at_ns: int | None
     created_at_ns: int
+    request_key: str | None = None
+    project_id: str | None = None
+    read_run_id: str | None = None
+    answered_run_id: str | None = None
+    resumed_run_id: str | None = None
+
+
+_PEER_REQUEST_COLUMNS = """request_id, company_id, requester_work_item_id, requester_run_id,
+    requester_agent_id, recipient_agent_id, response_work_item_id,
+    question, expected_decision, evidence_refs_json, deadline_ns,
+    state, response_json, resolved_at_ns, created_at_ns,
+    request_key, project_id, read_run_id, answered_run_id, resumed_run_id"""
 
 
 def _canonical_json(value: Any) -> str:
@@ -133,7 +146,9 @@ def has_active_grant(
     *,
     required_scope: str | None = None,
 ) -> bool:
-    """Return True iff the Agent holds a current non-revoked standing grant in this company."""
+    """Return True iff the Agent is unarchived and holds a current non-revoked standing grant."""
+    if employment_cutoff(connection, agent_id) is not None:
+        return False
     if required_scope is not None:
         row = connection.execute(
             """SELECT 1
@@ -153,6 +168,311 @@ def has_active_grant(
             (company_id, agent_id),
         ).fetchone()
     return row is not None
+
+
+def sync_work_item(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    work_item_id: str,
+    owner_agent_id: str,
+    duty_kind: str,
+    state: str,
+    source_kind: str = "duty",
+    source_id: str | None = None,
+    now_ns: int | None = None,
+) -> None:
+    """Ensure a canonical work_items row exists for a company duty."""
+    timestamp = time_ns() if now_ns is None else now_ns
+    mapped_state = (
+        state
+        if state
+        in (
+            "due",
+            "scheduled",
+            "running",
+            "waiting",
+            "settled",
+            "cancelled",
+            "blocked",
+        )
+        else "cancelled"
+    )
+    connection.execute(
+        """INSERT INTO work_items (
+               work_item_id, company_id, owner_agent_id, duty_kind, state,
+               source_kind, source_id, parent_work_item_id, dedupe_key,
+               payload_json, created_at_ns, updated_at_ns
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, '{}', ?, ?)
+           ON CONFLICT(work_item_id) DO UPDATE SET
+               state = excluded.state,
+               updated_at_ns = excluded.updated_at_ns""",
+        (
+            work_item_id,
+            company_id,
+            owner_agent_id,
+            duty_kind,
+            mapped_state,
+            source_kind,
+            source_id or work_item_id,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def sync_work_run(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    work_item_id: str,
+    run_id: str,
+    agent_id: str,
+    duty_kind: str,
+    status: str,
+    now_ns: int | None = None,
+) -> int:
+    """Ensure a canonical work_runs row exists for an execution run and return its fencing_token."""
+    timestamp = time_ns() if now_ns is None else now_ns
+    existing = connection.execute(
+        "SELECT fencing_token FROM work_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if existing is not None:
+        connection.execute(
+            "UPDATE work_runs SET status = ?, updated_at_ns = ? WHERE run_id = ?",
+            (status, timestamp, run_id),
+        )
+        return int(existing[0])
+    max_token = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(fencing_token), 0) FROM work_runs WHERE work_item_id = ?",
+            (work_item_id,),
+        ).fetchone()[0]
+    )
+    token = max_token + 1
+    connection.execute(
+        """INSERT INTO work_runs (
+               run_id, company_id, work_item_id, agent_id, duty_kind,
+               status, fencing_token, lease_owner, lease_expires_at_ns,
+               wait_until_ns, wait_event_key, budget_ceiling_minor,
+               dedupe_key, outcome_json, created_at_ns, updated_at_ns
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, NULL, NULL, ?, ?)""",
+        (
+            run_id,
+            company_id,
+            work_item_id,
+            agent_id,
+            duty_kind,
+            status,
+            token,
+            timestamp,
+            timestamp,
+        ),
+    )
+    return token
+
+
+def reconcile_legacy_fenced_runs(connection: sqlite3.Connection, agent_id: str) -> None:
+    """Fence any work_runs row whose legacy duty_run was fenced directly."""
+    connection.execute(
+        """UPDATE work_runs
+           SET status = 'fenced', lease_owner = NULL, lease_expires_at_ns = NULL
+           WHERE agent_id = ? AND status = 'running'
+             AND EXISTS (
+                 SELECT 1 FROM duty_run dr
+                 WHERE dr.run_id = work_runs.run_id AND dr.is_current = 0
+             )""",
+        (agent_id,),
+    )
+
+
+def sync_duty_terminal(
+    connection: sqlite3.Connection,
+    work_item_id: str,
+    *,
+    item_state: str = "settled",
+    run_status: str = "completed",
+    now_ns: int | None = None,
+) -> None:
+    """Release active work_runs and update work_items state when a duty transitions."""
+    timestamp = time_ns() if now_ns is None else now_ns
+    connection.execute(
+        """UPDATE work_runs
+           SET status = ?, lease_owner = NULL, lease_expires_at_ns = NULL,
+               updated_at_ns = ?
+           WHERE work_item_id = ? AND status = 'running'""",
+        (run_status, timestamp, work_item_id),
+    )
+    connection.execute(
+        """UPDATE work_items
+           SET state = ?, updated_at_ns = ?
+           WHERE work_item_id = ?""",
+        (item_state, timestamp, work_item_id),
+    )
+
+
+def upsert_project_peer_responsibility(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    owner_agent_id: str,
+    project_id: str,
+    allowed_requesters: list[str],
+    now_ns: int | None = None,
+) -> str:
+    """Maintain a standing work.peer_response responsibility scoped to a shared project."""
+    timestamp = time_ns() if now_ns is None else now_ns
+    responsibility_id = f"project-peer:{company_id}:{project_id}:{owner_agent_id}"
+    scope_json = _canonical_json(
+        {
+            "project_id": project_id,
+            "allowed_requesters": sorted(set(allowed_requesters)),
+            "evidence_prefixes": ["shared_publication:"],
+        }
+    )
+    status = "active" if allowed_requesters else "revoked"
+    existing = connection.execute(
+        "SELECT 1 FROM work_responsibilities WHERE responsibility_id = ?",
+        (responsibility_id,),
+    ).fetchone()
+    if existing is None:
+        connection.execute(
+            """INSERT INTO work_responsibilities (
+                   responsibility_id, company_id, owner_agent_id, duty_kind, remit,
+                   readable_scope_json, status, created_at_ns, updated_at_ns
+               ) VALUES (?, ?, ?, 'work.peer_response', ?, ?, ?, ?, ?)""",
+            (
+                responsibility_id,
+                company_id,
+                owner_agent_id,
+                f"Respond to project {project_id} peer requests",
+                scope_json,
+                status,
+                timestamp,
+                timestamp,
+            ),
+        )
+    else:
+        connection.execute(
+            """UPDATE work_responsibilities
+               SET readable_scope_json = ?, status = ?, updated_at_ns = ?
+               WHERE responsibility_id = ?""",
+            (scope_json, status, timestamp, responsibility_id),
+        )
+    return responsibility_id
+
+
+def retire_agent_work(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    agent_id: str,
+    actor_id: str,
+    now_ns: int | None = None,
+) -> None:
+    """Atomically fence all Work kernel state for a retired Agent inside the retirement write_tx."""
+    timestamp = time_ns() if now_ns is None else now_ns
+    connection.execute(
+        """UPDATE work_runs
+           SET status = 'fenced', lease_owner = NULL, lease_expires_at_ns = NULL,
+               updated_at_ns = ?
+           WHERE company_id = ? AND agent_id = ? AND status = 'running'""",
+        (timestamp, company_id, agent_id),
+    )
+    connection.execute(
+        """UPDATE work_runs
+           SET status = 'cancelled', wait_until_ns = NULL, wait_event_key = NULL,
+               updated_at_ns = ?
+           WHERE company_id = ? AND agent_id = ? AND status = 'waiting'""",
+        (timestamp, company_id, agent_id),
+    )
+    connection.execute(
+        """UPDATE work_items
+           SET state = 'cancelled', updated_at_ns = ?
+           WHERE company_id = ? AND owner_agent_id = ?
+             AND state IN ('due', 'scheduled', 'running', 'waiting')""",
+        (timestamp, company_id, agent_id),
+    )
+    connection.execute(
+        """UPDATE work_responsibilities
+           SET status = 'revoked', updated_at_ns = ?
+           WHERE company_id = ? AND owner_agent_id = ? AND status != 'revoked'""",
+        (timestamp, company_id, agent_id),
+    )
+    connection.execute(
+        """UPDATE work_conditions
+           SET status = 'cancelled', updated_at_ns = ?
+           WHERE company_id = ? AND owner_agent_id = ? AND status = 'armed'""",
+        (timestamp, company_id, agent_id),
+    )
+    # Expire open peer requests authored by the retired requester and cancel open response items.
+    authored = connection.execute(
+        """SELECT request_id, response_work_item_id
+           FROM work_peer_requests
+           WHERE company_id = ? AND requester_agent_id = ? AND state = 'open'""",
+        (company_id, agent_id),
+    ).fetchall()
+    for req_id, resp_item_id in authored:
+        connection.execute(
+            """UPDATE work_peer_requests
+               SET state = 'expired',
+                   response_json = '{"reason":"requester_retired"}',
+                   resolved_at_ns = ?
+               WHERE company_id = ? AND request_id = ? AND state = 'open'""",
+            (timestamp, company_id, str(req_id)),
+        )
+        connection.execute(
+            """UPDATE work_items
+               SET state = 'cancelled', updated_at_ns = ?
+               WHERE company_id = ? AND work_item_id = ?
+                 AND state IN ('due', 'scheduled')""",
+            (timestamp, company_id, str(resp_item_id)),
+        )
+    # Decline open peer requests addressed to the retired recipient and wake non-retired requesters.
+    assigned = connection.execute(
+        """SELECT request_id, requester_agent_id, response_work_item_id
+           FROM work_peer_requests
+           WHERE company_id = ? AND recipient_agent_id = ? AND state = 'open'""",
+        (company_id, agent_id),
+    ).fetchall()
+    for req_id, req_agent_id, resp_item_id in assigned:
+        connection.execute(
+            """UPDATE work_peer_requests
+               SET state = 'declined',
+                   response_json = '{"reason":"recipient_retired"}',
+                   resolved_at_ns = ?
+               WHERE company_id = ? AND request_id = ? AND state = 'open'""",
+            (timestamp, company_id, str(req_id)),
+        )
+        connection.execute(
+            """UPDATE work_items
+               SET state = 'cancelled', updated_at_ns = ?
+               WHERE company_id = ? AND work_item_id = ?
+                 AND state IN ('due', 'scheduled', 'running')""",
+            (timestamp, company_id, str(resp_item_id)),
+        )
+        if (
+            str(req_agent_id) != agent_id
+            and employment_cutoff(connection, str(req_agent_id)) is None
+        ):
+            wake_waiting_runs(
+                connection,
+                company_id,
+                now_ns=timestamp,
+                event_key=f"peer_response:{req_id}",
+                triggering_actor_id=actor_id,
+            )
+    append_audit_event(
+        connection,
+        company_id=company_id,
+        domain="work",
+        entity_type="agent",
+        entity_id=agent_id,
+        event_type="work.agent_retired",
+        actor_id=actor_id,
+        payload={"agent_id": agent_id},
+        recorded_at_ns=timestamp,
+    )
 
 
 def create_work_item(
@@ -278,6 +598,52 @@ def create_work_item(
 MAX_PEER_EVIDENCE_REFS = 32
 
 
+def _verify_project_peer_scope(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    project_id: str,
+    requester_agent_id: str,
+    recipient_agent_id: str,
+    evidence_refs: list[str],
+) -> None:
+    row = connection.execute(
+        "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
+        (company_id, project_id),
+    ).fetchone()
+    if row is None:
+        raise WorkKernelRefused("Peer project scope is unavailable")
+    members = set(json.loads(str(row[0])))
+    if requester_agent_id not in members or recipient_agent_id not in members:
+        raise WorkKernelRefused(
+            "Requester and recipient must both be active project members"
+        )
+    for ref in evidence_refs:
+        if ref.startswith("shared_publication:"):
+            spec = ref.removeprefix("shared_publication:")
+            if "@" not in spec:
+                raise WorkKernelRefused(
+                    "Peer evidence reference requires asset SHA-256"
+                )
+            asset_id, expected_digest = spec.split("@", 1)
+            pub = connection.execute(
+                """SELECT project_id, audience, content
+                   FROM shared_publication
+                   WHERE company_id = ? AND asset_id = ?""",
+                (company_id, asset_id),
+            ).fetchone()
+            if pub is None or str(pub[0]) != project_id:
+                raise WorkKernelRefused("Shared asset is unavailable")
+            audience = set(json.loads(str(pub[1])))
+            if requester_agent_id not in audience or recipient_agent_id not in audience:
+                raise WorkKernelRefused("Shared asset is unavailable")
+            actual_digest = sha256(str(pub[2]).encode("utf-8")).hexdigest()
+            if actual_digest != expected_digest:
+                raise WorkKernelRefused(
+                    "Peer evidence is outside the admitted revision"
+                )
+
+
 def _authorize_peer_route(
     connection: sqlite3.Connection,
     *,
@@ -285,6 +651,7 @@ def _authorize_peer_route(
     requester_agent_id: str,
     recipient_agent_id: str,
     evidence_refs: list[str],
+    project_id: str | None = None,
     check_open_quota: bool = False,
     check_turn_capacity: bool = True,
 ) -> None:
@@ -293,8 +660,11 @@ def _authorize_peer_route(
         raise WorkKernelRefused("Requester Agent has no active standing grant")
     if not has_active_grant(connection, company_id, recipient_agent_id):
         raise WorkKernelRefused("Recipient Agent has no active standing grant")
-    if check_turn_capacity and not has_turn_capacity(connection, recipient_agent_id):
-        raise WorkKernelRefused("Recipient Agent has no remaining turn allocation")
+    if check_turn_capacity:
+        if not has_turn_capacity(connection, requester_agent_id):
+            raise WorkKernelRefused("Requester Agent has no remaining turn allocation")
+        if not has_turn_capacity(connection, recipient_agent_id):
+            raise WorkKernelRefused("Recipient Agent has no remaining turn allocation")
     if (
         not isinstance(evidence_refs, list)
         or len(evidence_refs) > MAX_PEER_EVIDENCE_REFS
@@ -308,6 +678,15 @@ def _authorize_peer_route(
             or any(ord(ch) < 32 for ch in ref)
         ):
             raise WorkKernelRefused("Invalid peer request evidence reference")
+    if project_id is not None:
+        _verify_project_peer_scope(
+            connection,
+            company_id=company_id,
+            project_id=project_id,
+            requester_agent_id=requester_agent_id,
+            recipient_agent_id=recipient_agent_id,
+            evidence_refs=evidence_refs,
+        )
 
     rows = connection.execute(
         """SELECT readable_scope_json FROM work_responsibilities
@@ -329,6 +708,18 @@ def _authorize_peer_route(
             continue
         if not isinstance(scope, dict):
             continue
+        scoped_project = scope.get("project_id")
+        if project_id is not None and scoped_project != project_id:
+            continue
+        if project_id is None and scoped_project is not None:
+            _verify_project_peer_scope(
+                connection,
+                company_id=company_id,
+                project_id=str(scoped_project),
+                requester_agent_id=requester_agent_id,
+                recipient_agent_id=recipient_agent_id,
+                evidence_refs=evidence_refs,
+            )
         requesters = scope.get("allowed_requesters")
         if (
             not isinstance(requesters, list)
@@ -384,14 +775,15 @@ def has_authorized_peer_response_item(
 ) -> bool:
     """Verify a peer_response work item's linked request is open and currently authorized."""
     row = connection.execute(
-        """SELECT requester_agent_id, recipient_agent_id, evidence_refs_json, state
+        """SELECT requester_agent_id, recipient_agent_id, evidence_refs_json,
+                  project_id, state
            FROM work_peer_requests
            WHERE company_id = ? AND response_work_item_id = ?""",
         (company_id, work_item_id),
     ).fetchone()
     if row is None:
         return True
-    requester_id, recipient_id, evidence_json, state = row
+    requester_id, recipient_id, evidence_json, project_id, state = row
     if str(state) != "open":
         return False
     try:
@@ -405,7 +797,9 @@ def has_authorized_peer_response_item(
             requester_agent_id=str(requester_id),
             recipient_agent_id=str(recipient_id),
             evidence_refs=refs if isinstance(refs, list) else [],
+            project_id=None if project_id is None else str(project_id),
             check_open_quota=False,
+            check_turn_capacity=False,
         )
     except WorkKernelRefused:
         return False
@@ -492,13 +886,20 @@ def claim_work_run(
     if duty_kind == "work.peer_response":
         req_row = connection.execute(
             """SELECT requester_agent_id, recipient_agent_id, evidence_refs_json,
-                      state, deadline_ns
+                      project_id, state, deadline_ns
                FROM work_peer_requests
                WHERE company_id = ? AND response_work_item_id = ?""",
             (company_id, work_item_id),
         ).fetchone()
         if req_row is not None:
-            requester_id, recipient_id, evidence_json, req_state, req_deadline = req_row
+            (
+                requester_id,
+                recipient_id,
+                evidence_json,
+                project_id,
+                req_state,
+                req_deadline,
+            ) = req_row
             if str(req_state) != "open":
                 raise WorkKernelRefused("Linked peer request is no longer open")
             if timestamp >= int(req_deadline):
@@ -510,7 +911,9 @@ def claim_work_run(
                 requester_agent_id=str(requester_id),
                 recipient_agent_id=str(recipient_id),
                 evidence_refs=refs if isinstance(refs, list) else [],
+                project_id=None if project_id is None else str(project_id),
                 check_open_quota=False,
+                check_turn_capacity=False,
             )
     if not has_active_grant(
         connection, company_id, agent_id, required_scope=required_scope
@@ -636,6 +1039,8 @@ def assert_run_fencing(
     effective_now = time_ns() if now_ns is None else now_ns
     if run.lease_expires_at_ns is not None and effective_now >= run.lease_expires_at_ns:
         raise RunFenced(f"Run {run_id} lease has expired")
+    if employment_cutoff(connection, run.agent_id) is not None:
+        raise RunFenced(f"Agent {run.agent_id} employment has been retired")
     return run
 
 
@@ -654,6 +1059,8 @@ def yield_run_to_wait(
         raise WorkKernelRefused("Durable wait requires wait_until_ns or wait_event_key")
     timestamp = time_ns() if now_ns is None else now_ns
     run = assert_run_fencing(connection, run_id, fencing_token, now_ns=timestamp)
+    if not has_active_grant(connection, run.company_id, run.agent_id):
+        raise RunFenced(f"Agent {run.agent_id} no longer holds an active grant")
     outcome_json = _canonical_json({"disposition": "waiting", "reason": reason})
     changed = connection.execute(
         """UPDATE work_runs
@@ -954,6 +1361,8 @@ def complete_work_run(
         raise WorkKernelRefused(f"Unsupported terminal item state: {item_state}")
     timestamp = time_ns() if now_ns is None else now_ns
     run = assert_run_fencing(connection, run_id, fencing_token, now_ns=timestamp)
+    if not has_active_grant(connection, run.company_id, run.agent_id):
+        raise RunFenced(f"Agent {run.agent_id} no longer holds an active grant")
     outcome_json = _canonical_json(outcome)
     changed = connection.execute(
         """UPDATE work_runs
@@ -1503,6 +1912,8 @@ def open_peer_request(
     evidence_refs: list[str],
     deadline_ns: int,
     request_id: str,
+    request_key: str | None = None,
+    project_id: str | None = None,
     now_ns: int | None = None,
 ) -> tuple[PeerRequest, bool]:
     """Record a blocking peer request, yield requester run to zero-compute wait, and create recipient duty."""
@@ -1513,29 +1924,41 @@ def open_peer_request(
         (expected_decision, "expected_decision"),
     ):
         _require_nonempty(value, label)
+    if request_key is not None:
+        _require_nonempty(request_key, "request_key")
+    if project_id is not None:
+        _require_nonempty(project_id, "project_id")
     _require_agent(connection, company_id, recipient_agent_id)
     evidence_json = _canonical_json(sorted(evidence_refs))
 
-    existing = connection.execute(
-        """SELECT request_id, company_id, requester_work_item_id, requester_run_id,
-                  requester_agent_id, recipient_agent_id, response_work_item_id,
-                  question, expected_decision, evidence_refs_json, deadline_ns,
-                  state, response_json, resolved_at_ns, created_at_ns
-           FROM work_peer_requests WHERE request_id = ?""",
-        (request_id,),
-    ).fetchone()
+    existing = None
+    if request_key is not None:
+        existing = connection.execute(
+            f"""SELECT {_PEER_REQUEST_COLUMNS}
+                FROM work_peer_requests
+                WHERE requester_work_item_id = ? AND request_key = ?""",
+            (requester_work_item_id, request_key),
+        ).fetchone()
+    if existing is None:
+        existing = connection.execute(
+            f"SELECT {_PEER_REQUEST_COLUMNS} FROM work_peer_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
     if existing is not None:
         prior = PeerRequest(*existing)
         if (
             prior.company_id != company_id
             or prior.requester_work_item_id != requester_work_item_id
+            or prior.requester_run_id != requester_run_id
             or prior.recipient_agent_id != recipient_agent_id
             or prior.question != question
             or prior.expected_decision != expected_decision
             or prior.evidence_refs_json != evidence_json
             or prior.deadline_ns != deadline_ns
+            or prior.project_id != project_id
+            or (request_key is not None and prior.request_key != request_key)
         ):
-            raise WorkKernelRefused("Peer request ID reused with conflicting terms")
+            raise WorkKernelRefused("Peer request conflicts with the original receipt")
         return prior, True
 
     timestamp = time_ns() if now_ns is None else now_ns
@@ -1556,7 +1979,9 @@ def open_peer_request(
         requester_agent_id=run.agent_id,
         recipient_agent_id=recipient_agent_id,
         evidence_refs=evidence_refs,
+        project_id=project_id,
         check_open_quota=True,
+        check_turn_capacity=True,
     )
 
     response_item, _ = create_work_item(
@@ -1570,6 +1995,8 @@ def open_peer_request(
         dedupe_key=f"peer-response:{request_id}",
         payload={
             "request_id": request_id,
+            "request_key": request_key,
+            "project_id": project_id,
             "requester_agent_id": run.agent_id,
             "question": question,
             "expected_decision": expected_decision,
@@ -1584,9 +2011,11 @@ def open_peer_request(
             """INSERT INTO work_peer_requests (
                    request_id, company_id, requester_work_item_id, requester_run_id,
                    requester_agent_id, recipient_agent_id, response_work_item_id,
-                   question, expected_decision, evidence_refs_json, deadline_ns,
-                   state, response_json, resolved_at_ns, created_at_ns
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, ?)""",
+                   request_key, project_id, question, expected_decision,
+                   evidence_refs_json, deadline_ns, state, read_run_id,
+                   answered_run_id, resumed_run_id, response_json, resolved_at_ns,
+                   created_at_ns
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, NULL, NULL, ?)""",
             (
                 request_id,
                 company_id,
@@ -1595,6 +2024,8 @@ def open_peer_request(
                 run.agent_id,
                 recipient_agent_id,
                 response_item.work_item_id,
+                request_key,
+                project_id,
                 question,
                 expected_decision,
                 evidence_json,
@@ -1633,8 +2064,91 @@ def open_peer_request(
             None,
             None,
             timestamp,
+            request_key=request_key,
+            project_id=project_id,
         ),
         False,
+    )
+
+
+def record_peer_request_read(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    request_id: str,
+    actor_id: str,
+    response_run_id: str,
+    response_fencing_token: int,
+    now_ns: int | None = None,
+) -> PeerRequest:
+    """Record that the named recipient read an open peer request during the active response run."""
+    row = connection.execute(
+        f"""SELECT {_PEER_REQUEST_COLUMNS}
+            FROM work_peer_requests
+            WHERE company_id = ? AND request_id = ?""",
+        (company_id, request_id),
+    ).fetchone()
+    if row is None:
+        raise WorkKernelRefused("Peer request not found")
+    prior = PeerRequest(*row)
+    if prior.state != "open":
+        raise WorkKernelRefused("Peer question is not open for this run")
+    if actor_id != prior.recipient_agent_id:
+        raise WorkKernelRefused(
+            "Only the named recipient Agent may read a peer request"
+        )
+    timestamp = time_ns() if now_ns is None else now_ns
+    if timestamp >= prior.deadline_ns:
+        raise WorkKernelRefused("Peer request deadline has elapsed")
+    resp_run = assert_run_fencing(
+        connection, response_run_id, response_fencing_token, now_ns=timestamp
+    )
+    if (
+        resp_run.company_id != company_id
+        or resp_run.work_item_id != prior.response_work_item_id
+        or resp_run.agent_id != prior.recipient_agent_id
+    ):
+        raise WorkKernelRefused(
+            "Response run does not match the named recipient's response duty"
+        )
+    refs = json.loads(prior.evidence_refs_json)
+    _authorize_peer_route(
+        connection,
+        company_id=company_id,
+        requester_agent_id=prior.requester_agent_id,
+        recipient_agent_id=prior.recipient_agent_id,
+        evidence_refs=refs if isinstance(refs, list) else [],
+        project_id=prior.project_id,
+        check_open_quota=False,
+        check_turn_capacity=False,
+    )
+    connection.execute(
+        """UPDATE work_peer_requests
+           SET read_run_id = ?
+           WHERE company_id = ? AND request_id = ? AND state = 'open'""",
+        (response_run_id, company_id, request_id),
+    )
+    return PeerRequest(
+        prior.request_id,
+        prior.company_id,
+        prior.requester_work_item_id,
+        prior.requester_run_id,
+        prior.requester_agent_id,
+        prior.recipient_agent_id,
+        prior.response_work_item_id,
+        prior.question,
+        prior.expected_decision,
+        prior.evidence_refs_json,
+        prior.deadline_ns,
+        prior.state,
+        prior.response_json,
+        prior.resolved_at_ns,
+        prior.created_at_ns,
+        request_key=prior.request_key,
+        project_id=prior.project_id,
+        read_run_id=response_run_id,
+        answered_run_id=prior.answered_run_id,
+        resumed_run_id=prior.resumed_run_id,
     )
 
 
@@ -1656,12 +2170,9 @@ def resolve_peer_request(
             f"Unsupported peer resolution state: {resolution_state}"
         )
     row = connection.execute(
-        """SELECT request_id, company_id, requester_work_item_id, requester_run_id,
-                  requester_agent_id, recipient_agent_id, response_work_item_id,
-                  question, expected_decision, evidence_refs_json, deadline_ns,
-                  state, response_json, resolved_at_ns, created_at_ns
-           FROM work_peer_requests
-           WHERE company_id = ? AND request_id = ?""",
+        f"""SELECT {_PEER_REQUEST_COLUMNS}
+            FROM work_peer_requests
+            WHERE company_id = ? AND request_id = ?""",
         (company_id, request_id),
     ).fetchone()
     if row is None:
@@ -1698,6 +2209,10 @@ def resolve_peer_request(
             raise WorkKernelRefused(
                 "Response run does not match the named recipient's response duty"
             )
+        if prior.read_run_id != response_run_id:
+            raise WorkKernelRefused(
+                "Peer outcome requires a current read before answering"
+            )
         try:
             refs = json.loads(prior.evidence_refs_json)
         except json.JSONDecodeError as error:
@@ -1708,6 +2223,7 @@ def resolve_peer_request(
             requester_agent_id=prior.requester_agent_id,
             recipient_agent_id=prior.recipient_agent_id,
             evidence_refs=refs if isinstance(refs, list) else [],
+            project_id=prior.project_id,
             check_open_quota=False,
             check_turn_capacity=False,
         )
@@ -1715,11 +2231,21 @@ def resolve_peer_request(
         raise WorkKernelRefused("Peer request has not reached its deadline")
 
     response_json = _canonical_json(response_payload)
+    answered_run = (
+        response_run_id if resolution_state in ("answered", "declined") else None
+    )
     changed = connection.execute(
         """UPDATE work_peer_requests
-           SET state = ?, response_json = ?, resolved_at_ns = ?
+           SET state = ?, answered_run_id = ?, response_json = ?, resolved_at_ns = ?
            WHERE company_id = ? AND request_id = ? AND state = 'open'""",
-        (resolution_state, response_json, timestamp, company_id, request_id),
+        (
+            resolution_state,
+            answered_run,
+            response_json,
+            timestamp,
+            company_id,
+            request_id,
+        ),
     )
     if changed.rowcount != 1:
         return prior, False
@@ -1771,6 +2297,71 @@ def resolve_peer_request(
             response_json,
             timestamp,
             prior.created_at_ns,
+            request_key=prior.request_key,
+            project_id=prior.project_id,
+            read_run_id=prior.read_run_id,
+            answered_run_id=answered_run,
+            resumed_run_id=prior.resumed_run_id,
         ),
         True,
     )
+
+
+def mark_peer_request_resumed(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    request_id: str,
+    resumed_run_id: str,
+) -> None:
+    """Bind the resumed requester run to its resolved peer request."""
+    changed = connection.execute(
+        """UPDATE work_peer_requests
+           SET resumed_run_id = ?
+           WHERE company_id = ? AND request_id = ?
+             AND state != 'open' AND resumed_run_id IS NULL""",
+        (resumed_run_id, company_id, request_id),
+    )
+    if changed.rowcount != 1:
+        raise WorkKernelRefused("Peer request is not eligible for resume binding")
+
+
+def read_peer_request_outcome(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    requester_work_item_id: str,
+    actor_id: str,
+) -> dict[str, Any] | None:
+    """Read the resolved peer outcome for a resumed requester, guarding project removal."""
+    row = connection.execute(
+        """SELECT request_key, request_id, state, response_json, project_id
+           FROM work_peer_requests
+           WHERE company_id = ? AND requester_work_item_id = ?
+             AND resumed_run_id IS NOT NULL
+           ORDER BY rowid DESC LIMIT 1""",
+        (company_id, requester_work_item_id),
+    ).fetchone()
+    if row is None:
+        return None
+    request_key, request_id, state, response_json, project_id = row
+    label = str(request_key) if request_key is not None else str(request_id)
+    if project_id is not None:
+        proj = connection.execute(
+            "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
+            (company_id, str(project_id)),
+        ).fetchone()
+        members = set(json.loads(str(proj[0]))) if proj is not None else set()
+        if actor_id not in members:
+            return {
+                "request_key": label,
+                "outcome": "unavailable",
+                "answer": None,
+            }
+    payload = json.loads(str(response_json)) if response_json is not None else {}
+    answer = payload.get("answer") if isinstance(payload, dict) else None
+    return {
+        "request_key": label,
+        "outcome": str(state),
+        "answer": answer,
+    }

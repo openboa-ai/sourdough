@@ -106,11 +106,16 @@ CREATE TABLE work_peer_requests (
     requester_agent_id TEXT NOT NULL REFERENCES agent(id),
     recipient_agent_id TEXT NOT NULL REFERENCES agent(id),
     response_work_item_id TEXT NOT NULL UNIQUE REFERENCES work_items(work_item_id),
+    request_key TEXT,
+    project_id TEXT,
     question TEXT NOT NULL,
     expected_decision TEXT NOT NULL,
     evidence_refs_json TEXT NOT NULL,
     deadline_ns INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('open', 'answered', 'declined', 'expired')),
+    read_run_id TEXT REFERENCES work_runs(run_id),
+    answered_run_id TEXT REFERENCES work_runs(run_id),
+    resumed_run_id TEXT UNIQUE REFERENCES work_runs(run_id),
     response_json TEXT,
     resolved_at_ns INTEGER,
     created_at_ns INTEGER NOT NULL
@@ -118,3 +123,7 @@ CREATE TABLE work_peer_requests (
 
 CREATE UNIQUE INDEX ux_work_peer_requests_open_duty
     ON work_peer_requests(requester_work_item_id) WHERE state = 'open';
+
+CREATE UNIQUE INDEX ux_work_peer_requests_duty_key
+    ON work_peer_requests(requester_work_item_id, request_key)
+    WHERE request_key IS NOT NULL;

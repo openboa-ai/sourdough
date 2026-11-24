@@ -25,6 +25,7 @@ from sourdough.runtime.work_kernel import (
     claim_work_run,
     create_work_item,
     open_peer_request,
+    record_peer_request_read,
     register_responsibility,
     replace_condition,
     resolve_peer_request,
@@ -555,6 +556,15 @@ class ConnectedFlow(unittest.TestCase):
             trace.append(("peer", ctx.run.fencing_token))
             with closing(open_writer(store, lease=ctx.writer)) as conn:
                 with write_tx(conn):
+                    record_peer_request_read(
+                        conn,
+                        company_id=ctx.company_id,
+                        request_id="req-e2e",
+                        actor_id=colleague_id,
+                        response_run_id=ctx.run.run_id,
+                        response_fencing_token=ctx.run.fencing_token,
+                        now_ns=ctx.now_ns,
+                    )
                     resolve_peer_request(
                         conn,
                         company_id=ctx.company_id,

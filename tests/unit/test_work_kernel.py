@@ -1,9 +1,17 @@
+import json
 import unittest
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found
+from sourdough.retirement import (
+    TERMINATION_SCOPE,
+    Retirement,
+    employment_revision,
+    retire_agent,
+)
 from sourdough.runtime.work_kernel import (
     RunFenced,
     WorkKernelRefused,
@@ -14,18 +22,24 @@ from sourdough.runtime.work_kernel import (
     create_work_item,
     evaluate_conditions,
     fail_work_run,
+    has_active_grant,
     list_conditions,
+    mark_peer_request_resumed,
     open_peer_request,
+    read_peer_request_outcome,
     reclaim_expired_runs,
+    record_peer_request_read,
     register_responsibility,
     replace_condition,
     resolve_peer_request,
     revoke_responsibility,
     set_condition,
+    upsert_project_peer_responsibility,
     wake_waiting_runs,
     yield_run_to_wait,
 )
 from sourdough.storage.db import open_writer, write_tx
+from sourdough.writer_lease import hold_company_writer
 
 
 class WorkKernel(unittest.TestCase):
@@ -455,8 +469,17 @@ class WorkKernel(unittest.TestCase):
                 )
                 self.assertEqual(active_resp_run.fencing_token, 2)
 
-            # Recipient answers with active fenced run -> wakes requester once; late answer ignored
+            # Recipient reads and answers with active fenced run -> wakes requester once; late answer ignored
             with write_tx(conn):
+                record_peer_request_read(
+                    conn,
+                    company_id=self.company_id,
+                    request_id="req-1",
+                    actor_id=self.peer_id,
+                    response_run_id=active_resp_run.run_id,
+                    response_fencing_token=active_resp_run.fencing_token,
+                    now_ns=3_400,
+                )
                 resolved, changed = resolve_peer_request(
                     conn,
                     company_id=self.company_id,
@@ -735,6 +758,15 @@ class WorkKernel(unittest.TestCase):
                         response_fencing_token=claimed_resp.fencing_token,
                         now_ns=50_000,
                     )
+                record_peer_request_read(
+                    conn,
+                    company_id=self.company_id,
+                    request_id="req-auth-ok",
+                    actor_id=self.peer_id,
+                    response_run_id=claimed_resp.run_id,
+                    response_fencing_token=claimed_resp.fencing_token,
+                    now_ns=1_375,
+                )
                 revoke_responsibility(
                     conn,
                     self.company_id,
@@ -904,3 +936,410 @@ class WorkKernel(unittest.TestCase):
                 self.assertEqual(cond3.condition_revision, 5)
                 occ3 = evaluate_conditions(conn, self.company_id, now_ns=20_000)
                 self.assertEqual(len(occ3), 1)
+
+    def test_open_peer_request_refuses_when_requester_lacks_turn_capacity(self):
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "INSERT INTO agent VALUES ('limited', ?, 'profile-v1')",
+                (self.company_id,),
+            )
+            conn.execute(
+                "INSERT INTO standing_grant VALUES ('limited-grant', 'limited', 'assessment')"
+            )
+            conn.execute(
+                "INSERT INTO staffing_authority VALUES (?, 'profile-v1', 'assessment', 1, 1, 'manage')",
+                (self.receipt.grant_id,),
+            )
+            conn.execute(
+                "INSERT INTO duty VALUES ('staff-duty', ?, 'settled')",
+                (self.founder_id,),
+            )
+            conn.execute(
+                "INSERT INTO duty_run VALUES ('staff-run', 'staff-duty', ?, 'manage', 'staffing', 0)",
+                (self.receipt.grant_id,),
+            )
+            conn.execute(
+                "INSERT INTO staffing_assignment VALUES ('staff-duty', ?, '{}', 'rev', 1)",
+                (self.receipt.grant_id,),
+            )
+            conn.execute(
+                "INSERT INTO staffing_read VALUES ('staff-run', '{}', 'rev', 1)"
+            )
+            conn.execute(
+                "INSERT INTO staffing_choice VALUES ('staff-duty', 'staff-run', 'choice-1', '{}', 1)"
+            )
+            # Allocate only 1 turn to 'limited'
+            conn.execute(
+                "INSERT INTO hire_receipt VALUES ('hire-1', 'choice-1', ?, 'limited', 'limited-grant', 1, '{}', 1)",
+                (self.receipt.grant_id,),
+            )
+            register_responsibility(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.peer_id,
+                duty_kind="work.peer_response",
+                remit="Answer limited agent",
+                readable_scope={"allowed_requesters": ["limited"]},
+                now_ns=500,
+            )
+            item, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id="limited",
+                duty_kind="work.assessment",
+                source_kind="test",
+                source_id="limited-1",
+                now_ns=900,
+            )
+            # Consumes the 1st and only turn
+            run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=item.work_item_id,
+                lease_owner="worker-1",
+                lease_ttl_ns=60_000,
+                now_ns=1_000,
+            )
+            with self.assertRaisesRegex(
+                WorkKernelRefused, "Requester Agent has no remaining turn allocation"
+            ):
+                open_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    requester_run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    recipient_agent_id=self.peer_id,
+                    question="Will I ever resume?",
+                    expected_decision="answer",
+                    evidence_refs=[],
+                    deadline_ns=9_000,
+                    request_id="req-no-cap",
+                    now_ns=1_100,
+                )
+
+    def test_retire_agent_atomically_fences_kernel_runs_conditions_and_wakes_waiting_requester(
+        self,
+    ):
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "INSERT INTO agent VALUES ('hr-manager', ?, 'profile-v1')",
+                (self.company_id,),
+            )
+            conn.execute(
+                "INSERT INTO standing_grant VALUES ('hr-grant', 'hr-manager', ?)",
+                (TERMINATION_SCOPE,),
+            )
+            item, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.assessment",
+                source_kind="test",
+                source_id="founder-wait",
+                now_ns=1_000,
+            )
+            founder_run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=item.work_item_id,
+                lease_owner="worker-1",
+                lease_ttl_ns=60_000,
+                now_ns=1_100,
+            )
+            req, _ = open_peer_request(
+                conn,
+                company_id=self.company_id,
+                requester_work_item_id=item.work_item_id,
+                requester_run_id=founder_run.run_id,
+                fencing_token=founder_run.fencing_token,
+                recipient_agent_id=self.peer_id,
+                question="Decision before retirement?",
+                expected_decision="yes_or_no",
+                evidence_refs=[],
+                deadline_ns=90_000,
+                request_id="req-retire",
+                now_ns=1_200,
+            )
+            peer_run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=req.response_work_item_id,
+                lease_owner="peer-worker",
+                lease_ttl_ns=60_000,
+                now_ns=1_300,
+            )
+            armed_cond = set_condition(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.peer_id,
+                responsibility_id=self.peer_responsibility.responsibility_id,
+                trigger_kind="timer",
+                due_at_ns=50_000,
+                now_ns=1_350,
+            )
+
+        with hold_company_writer(self.store, self.company_id) as writer:
+            rev = employment_revision(writer, "hr-manager", "hr-grant", self.peer_id)
+            retire_agent(
+                writer,
+                "hr-manager",
+                "hr-grant",
+                Retirement("retire-peer", self.peer_id, rev, "Offboard peer."),
+            )
+
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            self.assertFalse(has_active_grant(conn, self.company_id, self.peer_id))
+            self.assertEqual(
+                conn.execute(
+                    "SELECT status FROM work_runs WHERE run_id = ?",
+                    (peer_run.run_id,),
+                ).fetchone(),
+                ("fenced",),
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT status FROM work_responsibilities WHERE responsibility_id = ?",
+                    (self.peer_responsibility.responsibility_id,),
+                ).fetchone(),
+                ("revoked",),
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT status FROM work_conditions WHERE condition_id = ?",
+                    (armed_cond.condition_id,),
+                ).fetchone(),
+                ("cancelled",),
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT state FROM work_peer_requests WHERE request_id = 'req-retire'"
+                ).fetchone(),
+                ("declined",),
+            )
+            # Non-retired waiting founder was immediately woken to 'due'
+            self.assertEqual(
+                conn.execute(
+                    "SELECT state FROM work_items WHERE work_item_id = ?",
+                    (item.work_item_id,),
+                ).fetchone(),
+                ("due",),
+            )
+            with self.assertRaises(RunFenced):
+                assert_run_fencing(conn, peer_run.run_id, peer_run.fencing_token)
+            with self.assertRaises(RunFenced):
+                complete_work_run(
+                    conn,
+                    peer_run.run_id,
+                    peer_run.fencing_token,
+                    outcome={"late": True},
+                    now_ns=2_000,
+                )
+
+    def test_peer_request_key_idempotency_read_precheck_project_sha256_and_removal_guard(
+        self,
+    ):
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            item, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.assessment",
+                source_kind="test",
+                source_id="proj-peer",
+                now_ns=1_000,
+            )
+            run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=item.work_item_id,
+                lease_owner="worker-1",
+                lease_ttl_ns=60_000,
+                now_ns=1_100,
+            )
+            conn.execute(
+                "INSERT INTO shared_project VALUES ('proj-1', ?, 'rev-1', ?, ?)",
+                (
+                    self.company_id,
+                    json.dumps([self.founder_id, self.peer_id]),
+                    json.dumps([self.founder_id]),
+                ),
+            )
+            content = "Verified balance sheet excerpt."
+            digest = sha256(content.encode("utf-8")).hexdigest()
+            conn.execute(
+                """INSERT INTO shared_publication
+                   (asset_id, company_id, project_id, author_id, work_item_id,
+                    request_id, request_digest, audience, content)
+                   VALUES ('asset-1', ?, 'proj-1', ?, ?, 'pub-1', 'd1', ?, ?)""",
+                (
+                    self.company_id,
+                    self.founder_id,
+                    item.work_item_id,
+                    json.dumps([self.founder_id, self.peer_id]),
+                    content,
+                ),
+            )
+            upsert_project_peer_responsibility(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.peer_id,
+                project_id="proj-1",
+                allowed_requesters=[self.founder_id],
+                now_ns=1_150,
+            )
+            # Wrong SHA-256 fails closed
+            with self.assertRaisesRegex(
+                WorkKernelRefused, "outside the admitted revision"
+            ):
+                open_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    requester_run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    recipient_agent_id=self.peer_id,
+                    question="Approve?",
+                    expected_decision="yes_no",
+                    evidence_refs=["shared_publication:asset-1@wrongdigest"],
+                    deadline_ns=90_000,
+                    request_id="req-bad-sha",
+                    request_key="key-1",
+                    project_id="proj-1",
+                    now_ns=1_200,
+                )
+            req, replayed = open_peer_request(
+                conn,
+                company_id=self.company_id,
+                requester_work_item_id=item.work_item_id,
+                requester_run_id=run.run_id,
+                fencing_token=run.fencing_token,
+                recipient_agent_id=self.peer_id,
+                question="Approve?",
+                expected_decision="yes_no",
+                evidence_refs=[f"shared_publication:asset-1@{digest}"],
+                deadline_ns=90_000,
+                request_id="req-good-1",
+                request_key="key-1",
+                project_id="proj-1",
+                now_ns=1_200,
+            )
+            self.assertFalse(replayed)
+            # Same request_key replays idempotently even with a fresh request_id
+            req_replay, is_replay = open_peer_request(
+                conn,
+                company_id=self.company_id,
+                requester_work_item_id=item.work_item_id,
+                requester_run_id=run.run_id,
+                fencing_token=run.fencing_token,
+                recipient_agent_id=self.peer_id,
+                question="Approve?",
+                expected_decision="yes_no",
+                evidence_refs=[f"shared_publication:asset-1@{digest}"],
+                deadline_ns=90_000,
+                request_id="req-good-duplicate",
+                request_key="key-1",
+                project_id="proj-1",
+                now_ns=1_210,
+            )
+            self.assertTrue(is_replay)
+            self.assertEqual(req_replay.request_id, req.request_id)
+            # Conflicting terms on same request_key fail closed
+            with self.assertRaisesRegex(WorkKernelRefused, "original receipt"):
+                open_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    requester_run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    recipient_agent_id=self.peer_id,
+                    question="Changed question?",
+                    expected_decision="yes_no",
+                    evidence_refs=[f"shared_publication:asset-1@{digest}"],
+                    deadline_ns=90_000,
+                    request_id="req-conflict",
+                    request_key="key-1",
+                    project_id="proj-1",
+                    now_ns=1_220,
+                )
+            resp_run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=req.response_work_item_id,
+                lease_owner="peer-worker",
+                lease_ttl_ns=60_000,
+                now_ns=1_300,
+            )
+            # Answering without prior read_run_id fails closed
+            with self.assertRaisesRegex(
+                WorkKernelRefused, "requires a current read before answering"
+            ):
+                resolve_peer_request(
+                    conn,
+                    company_id=self.company_id,
+                    request_id=req.request_id,
+                    actor_id=self.peer_id,
+                    resolution_state="answered",
+                    response_payload={"answer": "Approved."},
+                    response_run_id=resp_run.run_id,
+                    response_fencing_token=resp_run.fencing_token,
+                    now_ns=1_400,
+                )
+            record_peer_request_read(
+                conn,
+                company_id=self.company_id,
+                request_id=req.request_id,
+                actor_id=self.peer_id,
+                response_run_id=resp_run.run_id,
+                response_fencing_token=resp_run.fencing_token,
+                now_ns=1_350,
+            )
+            resolve_peer_request(
+                conn,
+                company_id=self.company_id,
+                request_id=req.request_id,
+                actor_id=self.peer_id,
+                resolution_state="answered",
+                response_payload={"answer": "Approved."},
+                response_run_id=resp_run.run_id,
+                response_fencing_token=resp_run.fencing_token,
+                now_ns=1_400,
+            )
+            resumed_run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=item.work_item_id,
+                lease_owner="worker-2",
+                lease_ttl_ns=60_000,
+                now_ns=1_500,
+            )
+            mark_peer_request_resumed(
+                conn,
+                company_id=self.company_id,
+                request_id=req.request_id,
+                resumed_run_id=resumed_run.run_id,
+            )
+            # While requester is still a project member, outcome is visible
+            self.assertEqual(
+                read_peer_request_outcome(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    actor_id=self.founder_id,
+                ),
+                {"request_key": "key-1", "outcome": "answered", "answer": "Approved."},
+            )
+            # Removing requester from project masks the outcome as unavailable
+            conn.execute(
+                "UPDATE shared_project SET members = ? WHERE project_id = 'proj-1'",
+                (json.dumps([self.peer_id]),),
+            )
+            self.assertEqual(
+                read_peer_request_outcome(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    actor_id=self.founder_id,
+                ),
+                {"request_key": "key-1", "outcome": "unavailable", "answer": None},
+            )

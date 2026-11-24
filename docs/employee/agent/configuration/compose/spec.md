@@ -30,3 +30,5 @@ Return an immutable profile reference for the explicit runtime implementation, a
 ## Operations and change review
 
 Deprecation blocks new launches under the withdrawn profile; it does not rewrite past evidence. Block the affected Agent and retain company recovery duties. When a successor is needed, use an authorized hire or existing eligible Agent, fresh authority and a recorded work handoff.
+
+For local Codex setup, require an explicit `employee-profile --sandbox local-macos` selection that matches the adapter declaration. Include it in the profile identity and check that identity before a bound run. The local executable adapter cannot declare a hosted backend for admission until that backend is qualified. Existing process fixtures without a sandbox declaration retain their previous profile identity for deterministic regressions; they do not qualify an operating sandbox.

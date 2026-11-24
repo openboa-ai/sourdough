@@ -14,6 +14,8 @@ Keep SQLite `private_desk` as the authoritative store for Desk metadata, revisio
 
 Bundle consistent per-Agent Desk filesystem snapshots alongside SQLite `private_desk` revisions inside verified company checkpoints ([restore contract](../../../../company/systems/operations/restore-company/restore/spec.md)) and clone permitted Desk snapshots into isolated arm namespaces for paired operating-revision and offline learning comparisons so trial arms cannot mutate the live company Desk or read another arm's state.
 
+The local workspace service retains versioned private drafts in company custody. The scoped run receives only its own permitted notes, materialized as plain files in a fresh native working directory. Do not mount the source database or local account home. These notes are data, not instructions or grants. The initial read-only view does not yet accept native edits or authorize publication.
+
 **Concern for the responsible component:** Private means limited visibility inside company custody, not Agent ownership or automatic visibility to every colleague.
 
 ## Functional and quality requirements
