@@ -107,8 +107,11 @@ Each spec has one primary verification owner. Earlier steps implement only the p
 
 - [client/commands/submit](../client/commands/submit/spec.md)
 - [client/inspect/investment-panel](../client/inspect/investment-panel/spec.md)
+- [client/inspect/office-floor-map](../client/inspect/office-floor-map/spec.md)
 - [client/inspect/screens](../client/inspect/screens/spec.md)
 - [client/inspect/flow-observability](../client/inspect/flow-observability/spec.md)
+- [client/governance/ceo-direct-line](../client/governance/ceo-direct-line/spec.md)
+- [client/governance/approvals-and-custody](../client/governance/approvals-and-custody/spec.md)
 - [client/control-plane/bridge-and-auth](../client/control-plane/bridge-and-auth/spec.md)
 - [client/control-plane/projections](../client/control-plane/projections/spec.md)
 - [client/control-plane/commands-and-events](../client/control-plane/commands-and-events/spec.md)

@@ -131,7 +131,7 @@ The Board Client is optional for autonomous operation but is the only human inte
 
 | Owner | Authoritative output | Decision boundary | Intents / specs |
 | --- | --- | --- | ---: |
-| [U1 · Board Client](client/README.md) | Local view state, command submission, receipt display, local control-plane contracts, and client design-system alignment | Presents permitted projections; only the server can accept commands or repair the books. | 4 / 11 |
+| [U1 · Board Client](client/README.md) | Local view state, command submission, receipt display, local control-plane contracts, Executive IA (Live Trading, Office Floor, CEO Direct Line, Company, quiet System), and client design-system alignment | Presents permitted projections and strict Board-vs-CEO governance; only the server can accept commands or repair the books. | 5 / 14 |
 
 Every feature has one system parent. Follow the parent page for the complete list and the responsibilities of each development unit. Paths follow their owning domain; links across systems express dependencies, not multiple ownership. See the [composition contract](architecture.md) for runtime and connector ports, accounting boundaries, and the two proof environments. [SDLC](engineering/lifecycle.md) is how changes are delivered, not another product system.
 
