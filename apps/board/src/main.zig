@@ -55,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
     app.model.scope = .{
         .executable = init.environ_map.get("SOURDOUGH_SERVICE") orelse "",
         .store = init.environ_map.get("SOURDOUGH_STORE") orelse "",
+        .socket = init.environ_map.get("SOURDOUGH_SOCKET") orelse "",
         .company = init.environ_map.get("SOURDOUGH_COMPANY") orelse "",
         .store_key = init.environ_map.get("SOURDOUGH_STORE_KEY") orelse "",
         .pending_dir = pending_dir,

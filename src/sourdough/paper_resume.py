@@ -75,6 +75,8 @@ def resume_managed_paper_risk(
     command: PaperSuspension,
     engine: Path,
     authorize: AuthorizeBoard | None,
+    *,
+    peer_pid: int | None = None,
 ) -> PaperRiskReceipt:
     def observe():
         with closing(open_reader(writer.store)) as connection, read_tx(connection):
@@ -108,4 +110,4 @@ def resume_managed_paper_risk(
 
         return verify_local
 
-    return _resume_with_evidence(writer, command, authorize, observe)
+    return _resume_with_evidence(writer, command, authorize, observe, peer_pid=peer_pid)

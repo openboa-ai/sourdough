@@ -2,11 +2,14 @@
 
 import argparse
 import json
+import os
+import signal
 import sqlite3
+import stat
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from time import time_ns
+from time import sleep, time_ns
 
 from sourdough.accounting_close import CloseRefused
 from sourdough.assessment_run import run_assessment_company
@@ -26,6 +29,7 @@ from sourdough.fund_returns import ReturnRefused
 from sourdough.general_ledger import JournalRefused
 from sourdough.hired_paper_run import run_hired_paper_company
 from sourdough.hiring_run import run_hiring
+from sourdough.ipc import CompanyDaemon, ControlPlaneClient, IpcRefused
 from sourdough.market_runtime import observe_market
 from sourdough.market_worker import MarketRefused
 from sourdough.nautilus_runtime import bind_paper as bind_nautilus_paper
@@ -242,6 +246,42 @@ def main() -> int:
     receipt_read.add_argument(
         "--operation", choices=("suspend_new_risk", "resume_new_risk")
     )
+    daemon_cmd = commands.add_parser(
+        "serve-company-daemon",
+        help="Run the resident single-writer CompanyDaemon over a local Unix socket",
+    )
+    daemon_cmd.add_argument("store", type=Path)
+    daemon_cmd.add_argument("--company-id", required=True)
+    daemon_cmd.add_argument("--socket-dir", type=Path)
+    daemon_cmd.add_argument("--socket", type=Path)
+    daemon_cmd.add_argument("--lease-dir", type=Path)
+    daemon_cmd.add_argument("--engine-dir", type=Path)
+    daemon_cmd.add_argument("--store-key", type=_store_key)
+    daemon_cmd.add_argument("--ready-fd", type=int)
+
+    bridge_cmd = commands.add_parser(
+        "client-bridge",
+        help="Talk to the local CompanyDaemon over its UDS control plane",
+    )
+    bridge_cmd.add_argument("--socket", required=True, type=Path)
+    bridge_cmd.add_argument("--timeout-seconds", type=float, default=10.0)
+    bridge_ops = bridge_cmd.add_subparsers(dest="bridge_command", required=True)
+    bridge_ops.add_parser("meta")
+    bridge_work = bridge_ops.add_parser("inspect-work")
+    bridge_work.add_argument("--company-id", required=True)
+    bridge_work.add_argument("--contract-revision", default=WORK_TIMELINE_REVISION)
+    bridge_work.add_argument("--if-none-match")
+    bridge_receipt = bridge_ops.add_parser("read-command-receipt")
+    bridge_receipt.add_argument("--company-id", required=True)
+    bridge_receipt.add_argument("--command-id", required=True)
+    bridge_receipt.add_argument(
+        "--operation", choices=("suspend_new_risk", "resume_new_risk")
+    )
+    bridge_events = bridge_ops.add_parser("events")
+    bridge_events.add_argument("--company-id")
+    bridge_events.add_argument("--after-seq", type=int, default=0)
+    bridge_events.add_argument("--limit", type=int, default=100)
+    bridge_events.add_argument("--wait-ms", type=int, default=0)
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
     profile.add_argument("--sandbox", help="User-selected sandbox backend")
@@ -433,6 +473,102 @@ def main() -> int:
                 )
             )
             return 0
+        elif args.command == "serve-company-daemon":
+            if args.ready_fd is not None:
+                if args.ready_fd < 3:
+                    raise IpcRefused("ready-fd must be an inherited descriptor >= 3")
+                try:
+                    fd_info = os.fstat(args.ready_fd)
+                except OSError as error:
+                    raise IpcRefused(
+                        "ready-fd is not an open file descriptor"
+                    ) from error
+                if not (
+                    stat.S_ISFIFO(fd_info.st_mode) or stat.S_ISREG(fd_info.st_mode)
+                ):
+                    raise IpcRefused("ready-fd must refer to a pipe or regular file")
+
+            stop_requested = False
+
+            def _request_stop(_signum, _frame):
+                nonlocal stop_requested
+                stop_requested = True
+
+            previous_sigint = signal.signal(signal.SIGINT, _request_stop)
+            previous_sigterm = signal.signal(signal.SIGTERM, _request_stop)
+            previous_sighup = signal.signal(signal.SIGHUP, _request_stop)
+            try:
+                with CompanyDaemon(
+                    args.store,
+                    args.company_id,
+                    socket_dir=args.socket_dir,
+                    socket_path=args.socket,
+                    lease_directory=args.lease_dir,
+                    expected_store_key=args.store_key,
+                    engine_directory=args.engine_dir,
+                ) as daemon:
+                    announcement = json.dumps(asdict(daemon.info), sort_keys=True)
+                    if args.ready_fd is not None:
+                        with os.fdopen(args.ready_fd, "w", encoding="utf-8") as ready:
+                            ready.write(announcement + "\n")
+                            ready.flush()
+                    else:
+                        print(announcement, flush=True)
+                    while not stop_requested:
+                        sleep(0.25)
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint)
+                signal.signal(signal.SIGTERM, previous_sigterm)
+                signal.signal(signal.SIGHUP, previous_sighup)
+            return 0
+        elif args.command == "client-bridge":
+            client = ControlPlaneClient(
+                args.socket, timeout_seconds=args.timeout_seconds
+            )
+            if args.bridge_command == "meta":
+                print(json.dumps(client.meta()))
+                return 0
+            if args.bridge_command == "inspect-work":
+                status_code, etag, payload = client.work_timeline(
+                    contract_revision=args.contract_revision,
+                    if_none_match=args.if_none_match,
+                    expected_company_id=args.company_id,
+                )
+                if status_code == 304:
+                    print(
+                        json.dumps(
+                            {
+                                "not_modified": True,
+                                "company_id": args.company_id,
+                                "etag": etag,
+                            }
+                        )
+                    )
+                    return 0
+                assert payload is not None
+                print(json.dumps(payload))
+                return 0
+            if args.bridge_command == "read-command-receipt":
+                payload = client.command_receipt(
+                    args.command_id, operation=args.operation
+                )
+                if payload.get("company_id") != args.company_id:
+                    raise IpcRefused(
+                        "HTTP 403: Control plane company identity mismatch"
+                    )
+                print(json.dumps(payload))
+                return 0
+            if args.bridge_command == "events":
+                events = client.events(
+                    after_seq=args.after_seq,
+                    limit=args.limit,
+                    wait_ms=args.wait_ms,
+                    expected_company_id=args.company_id,
+                )
+                for event in events:
+                    print(json.dumps(event, sort_keys=True))
+                return 0
+            raise IpcRefused("Unsupported client-bridge operation")
         elif args.command == "run-paper-window":
             result = _run_paper_window(args)
             print(json.dumps(asdict(result)))
@@ -715,6 +851,7 @@ def main() -> int:
         FoundingRefused,
         BindingRefused,
         DutyRefused,
+        IpcRefused,
         JournalRefused,
         TradeRefused,
         EngineRefused,

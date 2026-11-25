@@ -312,7 +312,11 @@ def _append_control(
     control: _AuthorizedControl,
     *,
     applied: bool,
+    peer_pid: int | None = None,
 ) -> PaperRiskReceipt:
+    if peer_pid is not None and (type(peer_pid) is not int or peer_pid <= 0):
+        raise PaperRiskRefused("Invalid peer process identifier")
+    effective_peer_pid = os.getpid() if peer_pid is None else peer_pid
     now_ns = time_ns()
     next_revision = control.current_revision + int(applied)
     disposition = "applied" if applied else "conflicting_revision"
@@ -345,6 +349,7 @@ def _append_control(
             payload={
                 "operation": control.operation,
                 "effective_revision": next_revision,
+                "peer_pid": effective_peer_pid,
             },
             recorded_at_ns=now_ns,
         )
@@ -354,7 +359,7 @@ def _append_control(
             company_id=company_id,
             command_id=control.command.request_id,
             actor_id=control.principal,
-            peer_pid=os.getpid(),
+            peer_pid=effective_peer_pid,
             command_type=control.operation,
             contract_version=control.command.contract_revision,
             payload_sha256=control.payload_sha256,
@@ -400,6 +405,8 @@ def suspend_paper_risk(
     writer: WriterLease,
     command: PaperSuspension,
     authorize: AuthorizeBoard | None,
+    *,
+    peer_pid: int | None = None,
 ) -> PaperRiskReceipt:
     writer.verify()
     with (
@@ -410,7 +417,11 @@ def suspend_paper_risk(
             connection, writer, command, SUSPEND_NEW_RISK, authorize
         )
         return control.prior or _append_control(
-            connection, writer.company_id, control, applied=control.eligible
+            connection,
+            writer.company_id,
+            control,
+            applied=control.eligible,
+            peer_pid=peer_pid,
         )
 
 
@@ -419,6 +430,8 @@ def _resume_with_evidence(
     command: PaperSuspension,
     authorize: AuthorizeBoard | None,
     observe: Callable[[], Callable[[Connection], None]],
+    *,
+    peer_pid: int | None = None,
 ) -> PaperRiskReceipt:
     writer.verify()
     with closing(open_reader(writer.store)) as connection, read_tx(connection):
@@ -454,7 +467,13 @@ def _resume_with_evidence(
         applied = current.eligible and verify_local is not None
         if applied:
             verify_local(connection)
-        return _append_control(connection, writer.company_id, current, applied=applied)
+        return _append_control(
+            connection,
+            writer.company_id,
+            current,
+            applied=applied,
+            peer_pid=peer_pid,
+        )
 
 
 def read_paper_risk_receipt(
