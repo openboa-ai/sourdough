@@ -14,6 +14,7 @@ from .paper_account import has_pending_binding_change, reopen_binding
 from .paper_decision import has_matching_paper_decision
 from .paper_execution import PaperDestination, PaperIntent, VenueRefused
 from .paper_research import allows_hired_research_order, allows_research_order
+from .paper_risk import effective_paper_risk
 from .storage.schema import is_domain_installed, require_domain
 from .writer_lease import WriterLease
 
@@ -98,6 +99,8 @@ def submit_paper_order(
         if receipt is not None:
             return receipt
         require_paper_authority(connection, claim)
+        if effective_paper_risk(connection).suspended:
+            raise OrderRefused("New paper risk is suspended")
         if has_pending_binding_change(connection):
             raise OrderRefused("Paper binding change is pending; new sends are fenced")
         if reopen_binding(store, claim.company_id) != observed_binding:

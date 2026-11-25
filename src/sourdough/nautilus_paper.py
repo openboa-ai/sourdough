@@ -119,6 +119,22 @@ class SandboxBalance:
     cash_atoms: int
 
 
+@dataclass(frozen=True)
+class SandboxRestoreCut:
+    balance: SandboxBalance
+    order_ids: tuple[str, ...]
+    fills: tuple[tuple[str, str, int, int, int], ...]
+
+
+@dataclass(frozen=True)
+class SandboxRiskCut:
+    account: PaperAccount
+    settled: SandboxRestoreCut
+    generation: str
+    observed_ns: int
+    expires_ns: int
+
+
 class NautilusPaperVenue:
     def __init__(self, journal: Path):
         self.journal = journal.resolve()
@@ -397,6 +413,65 @@ class NautilusPaperVenue:
             connection.commit()
             _, plan = self._configuration(connection)
             return self._checkpoint(connection, plan)
+
+    def read_restore_cut(self, account_id: str) -> SandboxRestoreCut:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            self._account(connection, account_id)
+            return self._settled_cut(connection)
+
+    def _settled_cut(self, connection: sqlite3.Connection) -> SandboxRestoreCut:
+        _, plan = self._configuration(connection)
+        if (
+            plan.tape_revision is not None
+            or connection.execute(
+                "SELECT 1 FROM sandbox_order WHERE state='queued' LIMIT 1"
+            ).fetchone()
+        ):
+            raise VenueRefused("Expected settled original paper orders")
+        return SandboxRestoreCut(
+            self._checkpoint(connection, plan),
+            tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT order_id FROM sandbox_order ORDER BY order_id"
+                )
+            ),
+            tuple(
+                connection.execute(
+                    """SELECT fill_id,order_id,quantity,price_atoms,fee_atoms
+                       FROM sandbox_fill_observation ORDER BY fill_id"""
+                )
+            ),
+        )
+
+    def read_current_risk_cut(self, account_id: str) -> SandboxRiskCut:
+        with self._connect("ro") as connection:
+            connection.execute("BEGIN")
+            account = self._account(connection, account_id)
+            if account.connector_revision != CONNECTOR:
+                raise VenueRefused(
+                    "Risk resumption requires current paper market evidence"
+                )
+            self._quote_observation(connection)
+            generation, event, trade = connection.execute(
+                "SELECT generation,event_ns,exchange_trade_ns FROM sandbox_quote"
+            ).fetchone()
+            if not connection.execute(
+                """SELECT 1 FROM sandbox_activation
+                   WHERE generation=? AND venue_account_id='BINANCE-001'""",
+                (generation,),
+            ).fetchone():
+                raise VenueRefused(
+                    "Current quote generation has no witnessed SDK account"
+                )
+            return SandboxRiskCut(
+                account,
+                self._settled_cut(connection),
+                generation,
+                time_ns(),
+                min(event, trade) + _STALE_NS,
+            )
 
     def prove_account(
         self,

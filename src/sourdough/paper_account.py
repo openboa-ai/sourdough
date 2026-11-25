@@ -369,17 +369,21 @@ def change_paper_binding(
     return BindingChange(previous_revision, next_mandate.revision, requested, effective)
 
 
+def read_current_binding(connection, expected_company_id: str) -> PaperMandate:
+    if _identity(connection) != expected_company_id:
+        raise BindingRefused("Company identity mismatch")
+    if not is_domain_installed(connection, "paper"):
+        raise BindingRefused("Paper binding is absent")
+    row = connection.execute(_SELECT_BINDING).fetchone()
+    charter = connection.execute(
+        "SELECT charter_revision FROM company WHERE singleton = 1"
+    ).fetchone()
+    if row is None or row[1] != expected_company_id or (row[2],) != charter:
+        raise BindingRefused("No paper binding for the current company charter")
+    return PaperMandate(*row[:3], PaperAccount(*row[4:]), row[3])
+
+
 def reopen_binding(store: Path, expected_company_id: str) -> PaperMandate:
     with closing(_connect(store, "ro")) as connection, connection:
         connection.execute("BEGIN")
-        if _identity(connection) != expected_company_id:
-            raise BindingRefused("Company identity mismatch")
-        if not is_domain_installed(connection, "paper"):
-            raise BindingRefused("Paper binding is absent")
-        row = connection.execute(_SELECT_BINDING).fetchone()
-        charter = connection.execute(
-            "SELECT charter_revision FROM company WHERE singleton = 1"
-        ).fetchone()
-        if row is None or row[1] != expected_company_id or (row[2],) != charter:
-            raise BindingRefused("No paper binding for the current company charter")
-        return PaperMandate(*row[:3], PaperAccount(*row[4:]), row[3])
+        return read_current_binding(connection, expected_company_id)

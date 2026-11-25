@@ -138,3 +138,13 @@ CREATE TABLE hired_research_order_request (
     run_id TEXT NOT NULL REFERENCES duty_run(run_id),
     decision_id TEXT NOT NULL UNIQUE REFERENCES paper_research_decision(decision_id)
 ) STRICT;
+
+CREATE TABLE paper_risk_state (
+    company_id TEXT PRIMARY KEY NOT NULL REFERENCES company(id),
+    suspended INTEGER NOT NULL CHECK (suspended IN (0, 1)),
+    effective_revision INTEGER NOT NULL CHECK (effective_revision >= 0),
+    last_command_id TEXT,
+    updated_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (company_id, last_command_id)
+        REFERENCES command_receipt(company_id, command_id)
+) STRICT;

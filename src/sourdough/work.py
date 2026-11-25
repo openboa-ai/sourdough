@@ -112,7 +112,8 @@ class ReviewDecision:
 
 
 def _check_store(connection: sqlite3.Connection, company_id: str) -> None:
-    if _company_version(connection) != (company_id, SCHEMA_REVISION):
+    identity, revision = _company_version(connection)
+    if identity != company_id or revision != SCHEMA_REVISION:
         raise DutyRefused("Expected current company work store")
 
 
@@ -470,6 +471,7 @@ def settle_review(
     successor_purpose: str = POSITION_REVIEW,
     successor_result: ResultReference | None = None,
     historical_paper: bool = False,
+    paper_review_only: bool = False,
     eligible_result: ResultEligibility | None = None,
 ) -> FollowUp:
     _time(now)
@@ -477,10 +479,12 @@ def settle_review(
     result = successor_result or follow_up.result
     claim = follow_up.claim
     transition = (
-        historical_paper
+        (paper_review_only or historical_paper)
         and follow_up.purpose == PAPER_EXECUTION
-        and successor_purpose == PAPER_EXECUTION
-        and successor_result is not None
+        and (
+            (successor_purpose == PAPER_EXECUTION and successor_result is not None)
+            or (successor_purpose == POSITION_REVIEW and successor_result is None)
+        )
     )
     if not transition and (
         follow_up.purpose not in (POSITION_REVIEW, ASSESSMENT_REVIEW)

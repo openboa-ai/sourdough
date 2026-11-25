@@ -77,6 +77,7 @@ def supervise_worker(
     emit: Callable[[dict], None],
     environment: Mapping[str, str] | None = None,
     expected_store_key: tuple[int, int] | None = None,
+    inherited_fds: tuple[int, ...] = (),
 ) -> SupervisionResult:
     if (
         not 0 <= max_restarts <= 4
@@ -108,7 +109,7 @@ def supervise_worker(
                         "--store-key",
                         f"{key[0]}:{key[1]}",
                     ],
-                    pass_fds=(write_end,),
+                    pass_fds=(write_end, *inherited_fds),
                     env=environment,
                 )
             finally:
