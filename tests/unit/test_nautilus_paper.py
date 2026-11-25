@@ -70,6 +70,8 @@ class NautilusPaperPort(unittest.TestCase):
         with self.assertRaisesRegex(VenueRefused, "sealed availability cut"):
             self.venue.observe_quote("paper")
         self.venue.publish_replay_cut("offline", 50_000_000, 90, 101)
+        with self.assertRaisesRegex(VenueRefused, "not a current valuation"):
+            self.venue.observe_valuation_cut("paper")
         with patch("sourdough.nautilus_paper.time_ns", return_value=time_ns() + 10**12):
             price, cut = self.venue.observe_research_quote("paper")
         self.assertEqual((price, cut.tape_revision), (50_000_000, revision))
@@ -316,6 +318,16 @@ class NautilusPaperPort(unittest.TestCase):
         first_price = price - 10
         cash_after = self.plan.starting_atoms - 8 * first_price - 12 * price
         self.venue.publish_quote("current", price, stamp, stamp)
+        with self.assertRaisesRegex(VenueRefused, "requires an observed bid"):
+            self.venue.observe_valuation_cut("paper")
+        self.venue.publish_quote(
+            "current", price, stamp, stamp, bid_atoms_per_lot=first_price
+        )
+        before = self.venue.observe_valuation_cut("paper")
+        self.assertEqual(
+            (before.balance, before.bid_atoms_per_lot, before.ask_atoms_per_lot),
+            (opening, first_price, price),
+        )
         account = self.venue.observe_account("paper")
         self.assertEqual(account.destination_id, destination)
         intent = PaperIntent("action", self.terms.revision, 20, price)
@@ -366,6 +378,8 @@ class NautilusPaperPort(unittest.TestCase):
             sender.read_fills(account.account_id, "order", account_sync=True), ()
         )
         with self.assertRaisesRegex(VenueRefused, "missing a corroborated"):
+            sender.observe_valuation_cut(account.account_id)
+        with self.assertRaisesRegex(VenueRefused, "missing a corroborated"):
             sender.start_generation()
         with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
             sender.observe_quote(account.account_id)
@@ -385,6 +399,20 @@ class NautilusPaperPort(unittest.TestCase):
             sender.prove_account("replacement", "BINANCE-001", "USDT", opening)
         sender.prove_account("replacement", "BINANCE-001", "USDT", checkpoint)
         self.assertEqual(sender.observe_account("paper"), account)
+        stamp = time_ns()
+        sender.publish_quote(
+            "replacement", price, stamp, stamp, bid_atoms_per_lot=first_price
+        )
+        after = sender.observe_valuation_cut("paper")
+        self.assertEqual(
+            (after.balance.position_lots, after.balance.cash_atoms), (20, cash_after)
+        )
+        self.assertEqual(
+            (after.quote_event_ns, after.quote_received_ns), (stamp, stamp)
+        )
+        with patch("sourdough.nautilus_paper.time_ns", return_value=stamp + 16 * 10**9):
+            with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
+                sender.observe_valuation_cut(account.account_id)
         with closing(sqlite3.connect(sender.journal)) as database:
             self.assertEqual(
                 database.execute("SELECT count(*) FROM sandbox_order").fetchone(), (1,)

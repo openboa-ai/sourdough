@@ -12,6 +12,12 @@ Before close, pin company/account, reporting currency, period, inclusive boundar
 
 **NFR:** All comparisons use exact currency units and unrounded amounts; each source is posted once even across restart or delayed acknowledgments. Retain source revisions and superseded close receipts.
 
+The first operating-cost join binds the company, window ID, currency, dated cut, operating chart and declared cost-source identities into the sealed inventory revision. Later actual amounts and evidence revisions are not part of that inventory hash. Read the exact company accounting close and require a matching, nonempty inventory, the window currency and precisely matching coverage, assessed after the window closes. A dated accounting close proves only complete UTC accounting days; sub-day windows need a finer-cut accounting source. Paper fill fees already reflected in venue cash do not belong to this operating-cost inventory. A missing or incompatible close supplies no verified amount, and a matching incomplete close retains accounting's responsible owners and recheck evidence. This join does not assert valuation, FX, or total-return coverage.
+
+For costs joined to a valuation amount, the sealed inventory also binds the accounting scale. Convert covered amounts only to an exact integral count in the requested scale of the same currency. Unknown scale, nonintegral conversion, and different currencies are unavailable, not zero or an assumed exchange rate.
+
+For the managed buy-only cash-spot sandbox, freeze a count and digest of the original venue fill prefix in the same read snapshot as the balance and quote. Between two ordered, eligible cuts for the same sealed window, read those original prefixes again from the bound venue, excluding later entries. Match source IDs and exact signed cash and lot movements, including each fee once. Reject altered prefixes, missing event times, fills outside the cut interval, or unexplained movements. The scope has no venue funding or capital-movement route after provisioning; this contract does not impute zero for other environments. Retain both cut revisions and original fill identities. A reconciled interval is not full-window coverage and does not establish company-net return without the other sources.
+
 ## Independent cases
 
 | Case | Evidence and expected result |

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from .company import _connect, _identity
+from .company import _identity
 
 PAPER_EXECUTION = "paper_execution"
 POSITION_REVIEW = "position_review"
@@ -182,24 +182,29 @@ def resolve_run(connection: sqlite3.Connection, claim: DutyClaim) -> RunAuthorit
     return RunAuthority(purpose, issued_scope, current_scope, state, bool(is_current))
 
 
+def count_company_runs_in_tx(connection: sqlite3.Connection, company_id: str) -> int:
+    if _identity(connection) != company_id:
+        raise DutyRefused("Company identity mismatch")
+    return int(
+        connection.execute(
+            """SELECT count(*) FROM (
+                   SELECT r.run_id
+                   FROM duty_run r
+                   JOIN duty d ON d.id = r.duty_id
+                   JOIN agent a ON a.id = d.agent_id
+                   WHERE a.company_id = ?
+                   UNION
+                   SELECT wr.run_id
+                   FROM work_runs wr
+                   WHERE wr.company_id = ?
+               )""",
+            (company_id, company_id),
+        ).fetchone()[0]
+    )
+
+
 def count_company_runs(store: Path, company_id: str) -> int:
-    with closing(_connect(store, "ro")) as connection:
-        connection.execute("BEGIN")
-        if _identity(connection) != company_id:
-            raise DutyRefused("Company identity mismatch")
-        return int(
-            connection.execute(
-                """SELECT count(*) FROM (
-                       SELECT r.run_id
-                       FROM duty_run r
-                       JOIN duty d ON d.id = r.duty_id
-                       JOIN agent a ON a.id = d.agent_id
-                       WHERE a.company_id = ?
-                       UNION
-                       SELECT wr.run_id
-                       FROM work_runs wr
-                       WHERE wr.company_id = ?
-                   )""",
-                (company_id, company_id),
-            ).fetchone()[0]
-        )
+    from .storage.db import open_reader, read_tx
+
+    with closing(open_reader(store)) as connection, read_tx(connection):
+        return count_company_runs_in_tx(connection, company_id)

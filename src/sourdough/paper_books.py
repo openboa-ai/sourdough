@@ -8,15 +8,17 @@ from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
-from time import time
+from time import time, time_ns
 from typing import TYPE_CHECKING
 
 from .company import _connect, _identity
-from .paper_account import read_applied_binding, reopen_binding
+from .paper_account import read_applied_binding, read_current_binding, reopen_binding
 from .paper_execution import TERMINAL_OUTCOMES, observe_bound_position
+from .storage.db import open_reader, open_writer, read_tx, write_tx
 from .storage.schema import is_domain_installed, require_domain
 
 if TYPE_CHECKING:
+    from .paper_account import PaperAccount
     from .paper_execution import (
         PaperExecution,
         TerminalOutcome,
@@ -38,6 +40,19 @@ class Posting:
     quantity: int
     price_minor_units: int
     fee_minor_units: int = 0
+
+
+@dataclass(frozen=True)
+class FillAccountingSource:
+    destination_id: str
+    account_id: str
+    fill_id: str
+    order_id: str
+    binding_revision: str
+    currency: str
+    mapping_revision: str
+    recorded_at_ns: int
+    fee_minor_units: int
 
 
 @dataclass(frozen=True)
@@ -108,7 +123,12 @@ FILLED_QUANTITY = (
 )
 
 
-def _post_fill(db: sqlite3.Connection, order_id: str, observed: VenueExecution) -> None:
+def _post_fill(
+    db: sqlite3.Connection,
+    account: PaperAccount,
+    order_id: str,
+    observed: VenueExecution,
+) -> None:
     if not isinstance(observed.fill_id, str) or not observed.fill_id:
         raise PostingRefused("Invalid fill identity")
     price = observed.fill_price_minor_units
@@ -154,6 +174,16 @@ def _post_fill(db: sqlite3.Connection, order_id: str, observed: VenueExecution) 
         raise PostingRefused("Cumulative fills exceed the admitted order")
     db.execute("INSERT INTO paper_fill VALUES (?, ?, ?, ?)", terms)
     db.execute("INSERT INTO paper_fill_fee VALUES (?, ?)", (observed.fill_id, fee))
+    db.execute(
+        "INSERT INTO paper_fill_accounting_source VALUES (?, ?, ?, ?, ?)",
+        (
+            observed.fill_id,
+            account.destination_id,
+            account.currency,
+            "paper-quote-fee-v1",
+            time_ns(),
+        ),
+    )
     db.execute(
         "UPDATE paper_order SET reserved_minor_units = ? WHERE order_id = ?",
         (spent + filled * price + remaining * observed.limit_minor_units, order_id),
@@ -319,11 +349,13 @@ def post_confirmed_fill(
         and position is None
     ):
         cancellation = None
-    with closing(_connect(store, "rw")) as db, db:
-        db.execute("BEGIN IMMEDIATE")
+    with closing(open_writer(store, lease=writer)) as db, write_tx(db):
         if writer is not None:
             writer.verify_for(store, company_id)
-        if _identity(db) != company_id or reopen_binding(store, company_id) != binding:
+        if (
+            _identity(db) != company_id
+            or read_current_binding(db, company_id) != binding
+        ):
             raise PostingRefused("Company binding changed")
         require_domain(db, "paper")
         order = db.execute(
@@ -343,9 +375,36 @@ def post_confirmed_fill(
                 observed.limit_minor_units,
             ):
                 raise PostingRefused("Fill does not match admitted order")
-            _post_fill(db, order_id, observed)
+            _post_fill(db, binding.account, order_id, observed)
         _apply_cancellation(db, order_id, order, cancellation, position)
         return _completed_posting(db, order_id)
+
+
+def read_fill_accounting_source_in_tx(
+    db: sqlite3.Connection, company_id: str, fill_id: str
+) -> FillAccountingSource | None:
+    if _identity(db) != company_id:
+        raise PostingRefused("Company identity mismatch")
+    if not is_domain_installed(db, "paper"):
+        return None
+    row = db.execute(
+        """SELECT s.destination_id,o.account_id,s.fill_id,o.order_id,o.mandate_revision,
+                  s.currency,s.mapping_revision,s.recorded_at_ns,fee.fee_minor_units
+           FROM paper_fill_accounting_source s
+           JOIN paper_fill_fee fee USING(fill_id)
+           JOIN paper_fill f USING(fill_id)
+           JOIN paper_order o USING(order_id)
+           WHERE s.fill_id=?""",
+        (fill_id,),
+    ).fetchone()
+    return FillAccountingSource(*row) if row else None
+
+
+def read_fill_accounting_source(
+    store: Path, company_id: str, fill_id: str
+) -> FillAccountingSource | None:
+    with closing(open_reader(store)) as db, read_tx(db):
+        return read_fill_accounting_source_in_tx(db, company_id, fill_id)
 
 
 def position_quantity(store: Path, company_id: str) -> int:

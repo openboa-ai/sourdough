@@ -113,12 +113,21 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Evidence review qualification and activation tables
     "review_qualification": frozenset({"review_qualification_store.py"}),
     "review_tool_activation": frozenset({"review_tool_activation.py"}),
+    # Core general ledger and accounting close tables
+    "journal_entry": frozenset({"general_ledger.py"}),
+    "journal_line": frozenset({"general_ledger.py"}),
+    "accounting_close": frozenset({"accounting_close.py"}),
     # Opt-in paper domain tables (company store)
     "paper_binding": frozenset({"paper_account.py"}),
     "paper_binding_change": frozenset({"paper_account.py"}),
     "paper_order": frozenset({"paper_order.py", "paper_books.py"}),
     "paper_fill": frozenset({"paper_books.py"}),
     "paper_fill_fee": frozenset({"paper_books.py"}),
+    "paper_fill_accounting_source": frozenset({"paper_books.py"}),
+    "paper_fee_delivery": frozenset({"paper_fee_bridge.py"}),
+    "paper_valuation": frozenset({"paper_valuation.py"}),
+    "paper_operating_window": frozenset({"paper_window.py"}),
+    "paper_statement": frozenset({"paper_statement_store.py"}),
     "paper_cancellation": frozenset({"paper_reconcile.py", "paper_books.py"}),
     "paper_reconciliation": frozenset({"paper_reconcile.py"}),
     "paper_position_observation": frozenset({"paper_decision.py", "paper_books.py"}),
@@ -147,6 +156,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "sandbox_quote": frozenset({"nautilus_paper.py"}),
     "sandbox_order": frozenset({"nautilus_paper.py"}),
     "sandbox_fill_observation": frozenset({"nautilus_paper.py"}),
+    "sandbox_fill_time": frozenset({"nautilus_paper.py"}),
     "sandbox_cancellation": frozenset({"nautilus_paper.py"}),
     "sandbox_account_observation": frozenset({"nautilus_paper.py"}),
 }
