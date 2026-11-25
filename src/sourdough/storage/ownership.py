@@ -139,6 +139,11 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "paper_research_decision": frozenset({"paper_research.py"}),
     "hired_research_order_request": frozenset({"paper_research.py"}),
     "paper_risk_state": frozenset({"paper_risk.py"}),
+    "paper_pit_catalog_manifest": frozenset({"strategy_comparison.py"}),
+    "paper_strategy_release": frozenset({"strategy_comparison.py"}),
+    "paper_funding_settlement": frozenset({"paper_funding.py"}),
+    "paper_challenger_trial": frozenset({"strategy_comparison.py"}),
+    "paper_strategy_deployment": frozenset({"strategy_comparison.py"}),
     # Separate venue / market SQLite databases (outside company store)
     "replay_decision_cut": frozenset({"nautilus_paper.py"}),
     "venue_account": frozenset({"paper_venue.py"}),
