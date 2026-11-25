@@ -37,3 +37,7 @@ Research owns the complete [operating-revision comparison record](../../company/
 - **Sanity case, not market evidence:** on 1,000 opening capital and no external flows, gross gain 12 less 4 trading costs and 10 operating costs gives the candidate a company loss of 2 and TWR −0.2%. Against the incumbent earning +0.1% net, the candidate trails by 0.3 percentage points; a green trading book is not company profit. Remove the model-cost receipt: trading return remains measurable, company-net verdict becomes unavailable.
 
 At review retain the cash reference, the registered revisions' statements and all failed or aborted windows. If the change is unsupported or inconclusive, keep the incumbent within its mandate or suspend risk if required. Rejecting a change is not a verdict against Agent-run operation.
+
+## Connected CI case
+
+On a controlled clock, seal a managed paper window before observation, capture scheduled marks on both sides of an original venue fill, and close through the CLI. Reconstruct the marked trading loss from the independent venue records. Without the expected operating receipt, only trading is measurable; supplying that receipt permits a distinct corrected company-net result. Reopen both revisions after detaching the test venue and verify exact close redelivery. Controlled venue inputs and illustrative costs qualify this path, not public-feed operation, a business verdict, or P1's Client observations.

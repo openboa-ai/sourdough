@@ -1,11 +1,11 @@
 """Run the paper company without the Client."""
 
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from sqlite3 import Connection
-from time import monotonic, sleep, time
+from time import monotonic, sleep, time, time_ns
 
 from .abandoned_work import requeue_uncommitted_work
 from .company import _connect
@@ -57,8 +57,10 @@ from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
 from .paper_research import read_research_result, reopen_research_decision
 from .paper_review import bind_review_quote, observe_review_quote
 from .paper_risk import effective_paper_risk
+from .paper_window import RegisteredWindow
 from .runtime.engine import CompanyRuntime, build_default_registry
 from .runtime.registry import DutyOutcome
+from .window_sampler import WindowSampler
 from .writer_lease import WriterLease
 from .work import (
     FollowUp,
@@ -115,9 +117,17 @@ def run_paper_company(
     expected_store_key: tuple[int, int] | None = None,
     budget_from: int | None = None,
     on_ready: Callable[[WriterLease], None] | None = None,
+    sampler: WindowSampler | None = None,
+    start_work_before_ns: int | None = None,
 ) -> CompanyRun:
     if not 1 <= turn_budget <= 8 or not 0 <= idle_seconds <= 900:
         raise TradeRefused("Invalid company turn or idle budget")
+    if start_work_before_ns is not None and (
+        sampler is None
+        or sampler.observe_through_ns is None
+        or not 0 < start_work_before_ns <= sampler.observe_through_ns
+    ):
+        raise TradeRefused("Work cutoff requires a bounded observation segment")
     registry = build_default_registry(
         {"paper.company_operation": lambda _ctx: DutyOutcome("completed")}
     )
@@ -127,18 +137,28 @@ def run_paper_company(
         registry,
         expected_store_key=expected_store_key,
     )
+
+    def _run_with_sampler(writer: WriterLease) -> CompanyRun:
+        sampling = (
+            sampler.activate(writer, venue) if sampler is not None else nullcontext()
+        )
+        with sampling as window:
+            return _operate(
+                writer,
+                venue,
+                runtime,
+                repeat_paper,
+                turn_budget,
+                idle_seconds,
+                budget_from,
+                on_ready,
+                window,
+                start_work_before_ns,
+            )
+
     return company_runtime.run_bound_handler(
         "paper.company_operation",
-        lambda writer: _operate(
-            writer,
-            venue,
-            runtime,
-            repeat_paper,
-            turn_budget,
-            idle_seconds,
-            budget_from,
-            on_ready,
-        ),
+        _run_with_sampler,
         venue=venue,
     )
 
@@ -152,16 +172,28 @@ def _operate(
     idle_seconds: int,
     budget_from: int | None,
     on_ready: Callable[[WriterLease], None] | None,
+    window: RegisteredWindow | None,
+    start_work_before_ns: int | None,
 ) -> CompanyRun:
     store, company_id = writer.store, writer.company_id
     writer.verify()
-    if budget_from is not None:
-        consumed = count_company_runs(store, company_id) - budget_from
-        if consumed < 0:
-            raise TradeRefused(
-                "Company run history is behind the activation budget baseline"
-            )
-        turn_budget = max(0, turn_budget - consumed)
+    window_limit = window.plan.agent_turn_limit if window is not None else None
+    if budget_from is not None or window_limit is not None:
+        current = count_company_runs(store, company_id)
+        if budget_from is not None:
+            if current < budget_from:
+                raise TradeRefused(
+                    "Company run history is behind the activation budget baseline"
+                )
+            turn_budget -= current - budget_from
+        if window_limit is not None:
+            sealed_count = window.run_count_at_seal
+            if sealed_count is None or current < sealed_count:
+                raise TradeRefused(
+                    "Company run history is behind the sealed window baseline"
+                )
+            turn_budget = min(turn_budget, window_limit - (current - sealed_count))
+        turn_budget = max(0, turn_budget)
     idle_deadline = monotonic() + idle_seconds
     binding = reopen_binding(store, company_id)
     active_scope = (binding.account.account_id, binding.account.instrument_rules_digest)
@@ -179,9 +211,14 @@ def _operate(
         if reconciliation.unresolved or switching or suspended
         else resume_opening_research(writer, venue)
     )
+
+    def may_start_work():
+        return start_work_before_ns is None or time_ns() < start_work_before_ns
+
     if (
         first is None
         and turn_budget
+        and may_start_work()
         and not reconciliation.unresolved
         and not switching
         and not suspended
@@ -254,6 +291,8 @@ def _operate(
         )
 
     while turn_budget or reconciliation.next_query_at is not None:
+        if not may_start_work():
+            turn_budget = 0
         if (
             reconciliation.next_query_at is not None
             and reconciliation.next_query_at <= int(time())
@@ -321,7 +360,7 @@ def _recover(
     )
     if not recovery.recovered:
         return recovery, ()
-    with closing(_connect(store, "ro")) as connection:
+    with closing(open_reader(store)) as connection, read_tx(connection):
         (first_duty_id,) = connection.execute(
             "SELECT due_work_id FROM founding_receipt WHERE company_id = ?",
             (company_id,),
@@ -502,7 +541,7 @@ def _review(
         )
         if purpose == PAPER_EXECUTION:
             binding = reopen_binding(store, writer.company_id)
-            with closing(_connect(store, "ro")) as connection:
+            with closing(open_reader(store)) as connection, read_tx(connection):
                 prior = _read_paper_observation(
                     connection, follow_up.result, writer.company_id
                 )

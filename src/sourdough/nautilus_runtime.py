@@ -1,16 +1,18 @@
 """Prepare, start, and bind an independently supervised Nautilus paper venue."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from .market_worker import SpotInstrumentTerms, read_spot_terms, reopen
-from .nautilus_paper import NautilusPaperVenue, SandboxPlan
+from .nautilus_paper import NautilusPaperVenue, SandboxPlan, SandboxValuationCut
 from .paper_account import (
     BindingChange,
     PaperAccount,
     PaperMandate,
     bind,
     change_paper_binding,
+    reopen_binding,
 )
 from .paper_execution import VenueRefused
 from .paper_sender_lease import hold_sender_lease, verify_sender_lease
@@ -24,6 +26,16 @@ _WORKER = """import importlib, sys
 sys.path.insert(0, sys.argv.pop(1))
 importlib.import_module(sys.argv.pop(1)).main()
 """
+VALUATION_SOURCE_REVISION = "binance-public-spot-quote-v1"
+PAPER_READY_SECONDS = 32
+PAPER_ACTIVATION_LIMIT_SECONDS = 600
+
+
+@dataclass(frozen=True)
+class BoundValuationCut:
+    binding_revision: str
+    observation: SandboxValuationCut
+    source_revision: str
 
 
 def paper_venue(
@@ -35,6 +47,22 @@ def paper_venue(
     )
     venue.require_independent_from(store)
     return venue
+
+
+def observe_bound_valuation(
+    store: Path, company_id: str, directory: Path
+) -> BoundValuationCut:
+    binding = reopen_binding(store, company_id)
+    venue = paper_venue(store, directory)
+    _, plan = venue.configuration()
+    cut = venue.observe_valuation_cut(binding.account.account_id)
+    if (
+        plan.company_id != company_id
+        or cut.account != binding.account
+        or reopen_binding(store, company_id) != binding
+    ):
+        raise VenueRefused("Valuation cut does not match the current company binding")
+    return BoundValuationCut(binding.revision, cut, VALUATION_SOURCE_REVISION)
 
 
 def _prepared(
@@ -153,8 +181,9 @@ def supervise_paper(
     seconds: int,
     emit: Callable[[dict], None],
     tape_path: Path | None = None,
+    max_restarts: int = 1,
 ) -> SupervisionResult:
-    if type(seconds) is not int or not 1 <= seconds <= 600:
+    if type(seconds) is not int or not 1 <= seconds <= PAPER_ACTIVATION_LIMIT_SECONDS:
         raise VenueRefused("Sandbox activation must be bounded to one to 600 seconds")
     journal = paper_venue(store, directory, replay=tape_path is not None).journal
     with hold_sender_lease(journal) as (descriptor, key):
@@ -199,8 +228,8 @@ def supervise_paper(
             ],
             journal,
             company_id,
-            max_restarts=1,
-            startup_seconds=32,
+            max_restarts=max_restarts,
+            startup_seconds=PAPER_READY_SECONDS,
             max_seconds=seconds + 80,
             emit=emit,
             environment=_environment(engine / "home"),

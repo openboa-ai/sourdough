@@ -55,6 +55,9 @@ TABLES = (
     "work_handoff",
     "review_qualification",
     "review_tool_activation",
+    "journal_entry",
+    "journal_line",
+    "accounting_close",
 )
 
 

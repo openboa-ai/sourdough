@@ -14,6 +14,14 @@ Compare opening balances plus movements with independent statement and usage evi
 
 **Concern for the responsible component:** Closing does not authorize a payment, order or edit to historical entries.
 
+The initial close operates on the existing journal's inclusive accounting dates, one cash account, one currency and one fixed chart revision. It compares an independently supplied opening/closing balance pair and a declared operating-cost inventory with the journal in a single transaction; it does not import statements, add entries or convert currencies. Each expected cost names its original source, expense account and responsible owner. A verified zero must have an explicit source receipt; absence does not mean zero. Any operating expense in a declared account but outside the inventory is unresolved.
+
+An immutable close receipt preserves the independent statement revision, the journal entries used, discrepancies, and the input evidence. Replaying the same request returns its original close. A changed close must explicitly supersede the latest revision; it may add sources but cannot remove an expected source or change the chart or expense accounts within the same period. Posting a late actual and issuing a corrected close do not rewrite the previous close or any journal lines. This accounting receipt is an input to the fund statement, not a claim that trading P&L or a prospective return was verified.
+
+Trusted consumers reopen the original request and its receipt by company and exact close ID, with the service time sampled before assessing that journal snapshot. They do not substitute the latest receipt, rerun reconciliation, or read journal tables as a second accounting interface. A pre-existing receipt without a recorded assessment time remains readable but cannot prove an as-of cutoff.
+
+An explicitly scaled close compares only like units. A relevant posting with absent or differing units is unresolved, not a number to add to the statement. A corrected close preserves its original scale. Legacy unscaled closes retain their original scope and receipt semantics, but cannot attest to conversion into another unit.
+
 ## Functional and quality requirements
 
 - **FR.** Return a clean close at the declared cutoff or discrepancies with evidence and owners. Preserve locked history.
