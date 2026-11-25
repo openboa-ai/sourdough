@@ -9,8 +9,13 @@ from pathlib import Path
 from sqlite3 import Connection
 from time import time_ns
 
-from .company import FoundingRefused, _connect, _identity
+from .company import FoundingRefused, _identity
+from .paper_risk import PaperRiskRefused, effective_paper_risk
+from .storage.db import open_reader, read_tx
 from .storage.schema import is_domain_installed
+
+
+WORK_TIMELINE_REVISION = "work-timeline-v1"
 
 
 def _rows(connection: Connection, sql: str) -> list[dict]:
@@ -19,15 +24,21 @@ def _rows(connection: Connection, sql: str) -> list[dict]:
     return [dict(zip(labels, row, strict=True)) for row in cursor]
 
 
-def read_local_board_timeline(store: Path, company_id: str) -> dict:
+def read_local_board_timeline(
+    store: Path,
+    company_id: str,
+    *,
+    contract_revision: str = WORK_TIMELINE_REVISION,
+) -> dict:
+    if contract_revision != WORK_TIMELINE_REVISION:
+        raise FoundingRefused("Unsupported work timeline contract")
     initial = store.stat(follow_symlinks=False)
     if not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.geteuid():
         raise FoundingRefused(
             "Only the local company store owner can inspect this timeline"
         )
 
-    with closing(_connect(store, "ro")) as connection:
-        connection.execute("BEGIN")
+    with closing(open_reader(store)) as connection, read_tx(connection):
         if _identity(connection) != company_id:
             raise FoundingRefused("Company identity mismatch")
         as_of_ns = time_ns()
@@ -52,6 +63,7 @@ def read_local_board_timeline(store: Path, company_id: str) -> dict:
             "access": "local_store_owner",
             "duties": duties,
             "paper": _paper_projection(connection, has_paper),
+            "risk_control": _risk_control(connection, company_id, has_paper),
         }
         current = store.stat(follow_symlinks=False)
         if (initial.st_dev, initial.st_ino, initial.st_uid) != (
@@ -61,7 +73,66 @@ def read_local_board_timeline(store: Path, company_id: str) -> dict:
         ):
             raise FoundingRefused("Company store changed while inspecting its timeline")
     revision = sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
-    return body | {"revision": revision, "as_of_ns": as_of_ns}
+    return body | {
+        "contract_revision": WORK_TIMELINE_REVISION,
+        "revision": revision,
+        "as_of_ns": as_of_ns,
+    }
+
+
+def _risk_control(
+    connection: Connection, company_id: str, has_paper: bool
+) -> dict | None:
+    has_risk_receipt = (
+        connection.execute(
+            """SELECT 1 FROM command_receipt
+               WHERE company_id = ?
+                 AND command_type IN ('suspend_new_risk', 'resume_new_risk')
+                 AND (? = 1 OR state = 'applied')
+               LIMIT 1""",
+            (company_id, int(has_paper)),
+        ).fetchone()
+        is not None
+    )
+    if not has_paper and not has_risk_receipt:
+        return None
+    has_paper_binding = (
+        has_paper
+        and connection.execute("SELECT 1 FROM paper_binding LIMIT 1").fetchone()
+        is not None
+    )
+    has_risk_state = (
+        has_paper
+        and connection.execute(
+            "SELECT 1 FROM paper_risk_state WHERE company_id = ? LIMIT 1",
+            (company_id,),
+        ).fetchone()
+        is not None
+    )
+    if not (has_paper_binding or has_risk_state or has_risk_receipt):
+        return None
+    try:
+        current = effective_paper_risk(connection)
+    except PaperRiskRefused:
+        return {
+            "state": "unavailable",
+            "effective_revision": None,
+            "last_applied": None,
+        }
+    applied = current.applied
+    return {
+        "state": "suspended" if current.suspended else "not_suspended",
+        "effective_revision": current.revision,
+        "last_applied": (
+            {
+                "request_id": applied.request_id,
+                "operation": applied.operation,
+                "recorded_at_ns": applied.recorded_at_ns,
+            }
+            if applied is not None
+            else None
+        ),
+    }
 
 
 def _decisions(connection: Connection, has_paper: bool) -> dict:

@@ -12,6 +12,10 @@ Input contracts: founded company, current work state and [authorize-actor/check]
 
 Project company, work, decision, allowed evidence, owner, next condition and as-of time via ACL-filtered on-demand indexed queries on `open_reader()` (`mode=ro`, `PRAGMA query_only=ON`) exposed through `/v1/projections/{name}` on the local UDS Control Plane. Preserve the `work-timeline-v1` content-hash `revision` contract for existing consumers while exposing `ETag` and monotonic `event_seq` on `work-timeline-v2` (supporting `If-None-Match` conditional reads). Optional profile links do not introduce mandatory quant fields.
 
+The local Client uses the read-only service entry point `inspect-work`, specifying the company and the supported `work-timeline-v1` contract revision. The response reports that contract separately from the content revision and observation time. A request for an unsupported contract rejects before accessing the store. The local store-owner check remains in the service; the Client gets neither database access nor operational authority through this query.
+
+An optional `risk_control` observation reports the effective paper risk revision, suspension state and last applied request reference, operation and time from the [risk control owner](../../../../profiles/quant/trading/board-control/apply-control/spec.md). No paper profile yields no observation; a controlled store with incomplete evidence returns unavailable, not unsuspended. A conflicting request never becomes the last applied receipt. Unsuspended does not imply a current grant or permission to submit an order. Earlier compatible Clients may ignore the observation.
+
 **Concern for the responsible component:** Authorize every read at current access scope. Do not expose restricted evidence through titles, aggregates or stale cached projections.
 
 ## Functional and quality requirements

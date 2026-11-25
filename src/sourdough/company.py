@@ -7,10 +7,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from .storage.db import (
+    RETIRED_SCHEMA_REVISION,
     SCHEMA_VERSION,
     StorageRefused,
+    StoreRetirement,
     open_reader,
     open_writer,
+    read_retirement,
     read_tx,
     write_tx,
 )
@@ -19,6 +22,7 @@ from .storage.schema import apply_core_v1, has_user_schema_objects
 
 
 SCHEMA_REVISION = SCHEMA_VERSION
+_RETIRED_SCHEMA_REVISION = RETIRED_SCHEMA_REVISION
 
 
 class FoundingRefused(Exception):
@@ -59,13 +63,30 @@ class OpenCompany:
     due_work_ids: tuple[str, ...]
 
 
+def _retired_store(connection: sqlite3.Connection) -> StoreRetirement | None:
+    try:
+        return read_retirement(connection)
+    except StorageRefused as error:
+        raise FoundingRefused(str(error)) from error
+
+
+def _require_writable_store(connection: sqlite3.Connection) -> None:
+    if _retired_store(connection) is not None:
+        raise FoundingRefused("The original company store is retired")
+
+
 def _connect(store: Path, mode: str, *, initialize: bool = False) -> sqlite3.Connection:
-    if mode == "ro":
-        return open_reader(store)
-    if mode == "rw":
-        return open_writer(store, create=False)
-    if mode == "rwc":
-        return open_writer(store, create=True, initialize=initialize)
+    try:
+        if mode == "ro":
+            return open_reader(store)
+        if mode == "rw":
+            return open_writer(store, create=False)
+        if mode == "rwc":
+            return open_writer(store, create=True, initialize=initialize)
+    except StorageRefused as error:
+        if "retired" in str(error).lower():
+            raise FoundingRefused("The original company store is retired") from error
+        raise
     raise FoundingRefused(f"Unsupported SQLite open mode: {mode}")
 
 
@@ -73,9 +94,18 @@ def _company_version(connection: sqlite3.Connection) -> tuple[str, int]:
     row = connection.execute(
         "SELECT id, schema_revision FROM company WHERE singleton = 1"
     ).fetchone()
-    if row is None or int(row[1]) != SCHEMA_REVISION:
+    if row is None:
         raise FoundingRefused("Unsupported company store schema")
-    return str(row[0]), int(row[1])
+    company_id = str(row[0])
+    schema = int(row[1])
+    if schema == _RETIRED_SCHEMA_REVISION:
+        retirement = _retired_store(connection)
+        if retirement is None:
+            raise FoundingRefused("Company store retirement receipt is missing")
+        schema = retirement.original_schema
+    if schema != SCHEMA_REVISION:
+        raise FoundingRefused("Unsupported company store schema")
+    return company_id, schema
 
 
 def _identity(connection: sqlite3.Connection) -> str:
