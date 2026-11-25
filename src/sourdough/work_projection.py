@@ -12,6 +12,7 @@ from time import time_ns
 from .company import FoundingRefused, _identity
 from .paper_risk import PaperRiskRefused, effective_paper_risk
 from .storage.db import open_reader, read_tx
+from .storage.kernel import max_event_seq
 from .storage.schema import is_domain_installed
 
 
@@ -24,12 +25,13 @@ def _rows(connection: Connection, sql: str) -> list[dict]:
     return [dict(zip(labels, row, strict=True)) for row in cursor]
 
 
-def read_local_board_timeline(
+def read_local_board_timeline_with_seq(
     store: Path,
     company_id: str,
     *,
     contract_revision: str = WORK_TIMELINE_REVISION,
-) -> dict:
+) -> tuple[dict, int]:
+    """Read the local board timeline and matching committed event_seq in one snapshot."""
     if contract_revision != WORK_TIMELINE_REVISION:
         raise FoundingRefused("Unsupported work timeline contract")
     initial = store.stat(follow_symlinks=False)
@@ -42,6 +44,7 @@ def read_local_board_timeline(
         if _identity(connection) != company_id:
             raise FoundingRefused("Company identity mismatch")
         as_of_ns = time_ns()
+        event_seq = max_event_seq(connection, company_id)
         has_paper = is_domain_installed(connection, "paper")
         duties = _rows(
             connection,
@@ -73,11 +76,27 @@ def read_local_board_timeline(
         ):
             raise FoundingRefused("Company store changed while inspecting its timeline")
     revision = sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
-    return body | {
-        "contract_revision": WORK_TIMELINE_REVISION,
-        "revision": revision,
-        "as_of_ns": as_of_ns,
-    }
+    return (
+        body
+        | {
+            "contract_revision": WORK_TIMELINE_REVISION,
+            "revision": revision,
+            "as_of_ns": as_of_ns,
+        },
+        event_seq,
+    )
+
+
+def read_local_board_timeline(
+    store: Path,
+    company_id: str,
+    *,
+    contract_revision: str = WORK_TIMELINE_REVISION,
+) -> dict:
+    timeline, _ = read_local_board_timeline_with_seq(
+        store, company_id, contract_revision=contract_revision
+    )
+    return timeline
 
 
 def _risk_control(

@@ -8,9 +8,20 @@ const revision_label = "work-timeline-v1";
 pub const Scope = struct {
     executable: []const u8 = "",
     store: []const u8 = "",
+    socket: []const u8 = "",
     company: []const u8 = "",
     store_key: []const u8 = "",
     pending_dir: []const u8 = "",
+
+    pub fn hasValidTransport(self: Scope) bool {
+        if (!std.fs.path.isAbsolute(self.executable) or self.company.len == 0) {
+            return false;
+        }
+        if (self.socket.len > 0) {
+            return std.fs.path.isAbsolute(self.socket);
+        }
+        return std.fs.path.isAbsolute(self.store);
+    }
 };
 
 pub const LinkState = enum {
@@ -49,20 +60,35 @@ const Duty = struct {
     decision: []const u8,
 };
 
-/// Narrow transport boundary hiding the Wave B CLI bridge behind typed queries.
-/// Wave B-post/C swaps only this adapter to the UDS daemon client-bridge.
+/// Narrow transport boundary routing through the UDS daemon client-bridge when a
+/// daemon socket is configured, with local CLI fallback when no socket is set.
 pub const Transport = struct {
     pub fn inspectWork(scope: Scope, key: u64, fx: *Effects) void {
-        const argv = [_][]const u8{
-            scope.executable,
-            "inspect-work",
-            scope.store,
-            "--company-id",
-            scope.company,
-            "--contract-revision",
-            revision_label,
-        };
-        fx.spawn(.{ .key = key, .argv = &argv, .output = .collect, .on_exit = Effects.exitMsg(.reply) });
+        if (scope.socket.len > 0) {
+            const argv = [_][]const u8{
+                scope.executable,
+                "client-bridge",
+                "--socket",
+                scope.socket,
+                "inspect-work",
+                "--company-id",
+                scope.company,
+                "--contract-revision",
+                revision_label,
+            };
+            fx.spawn(.{ .key = key, .argv = &argv, .output = .collect, .on_exit = Effects.exitMsg(.reply) });
+        } else {
+            const argv = [_][]const u8{
+                scope.executable,
+                "inspect-work",
+                scope.store,
+                "--company-id",
+                scope.company,
+                "--contract-revision",
+                revision_label,
+            };
+            fx.spawn(.{ .key = key, .argv = &argv, .output = .collect, .on_exit = Effects.exitMsg(.reply) });
+        }
         fx.startTimer(.{ .key = key, .interval_ms = 5000, .on_fire = Effects.timerMsg(.deadline) });
     }
 
@@ -73,18 +99,35 @@ pub const Transport = struct {
         key: u64,
         fx: *Effects,
     ) void {
-        const argv = [_][]const u8{
-            scope.executable,
-            "read-command-receipt",
-            scope.store,
-            "--company-id",
-            scope.company,
-            "--command-id",
-            command_id,
-            "--operation",
-            operation,
-        };
-        fx.spawn(.{ .key = key, .argv = &argv, .output = .collect, .on_exit = Effects.exitMsg(.receipt_reply) });
+        if (scope.socket.len > 0) {
+            const argv = [_][]const u8{
+                scope.executable,
+                "client-bridge",
+                "--socket",
+                scope.socket,
+                "read-command-receipt",
+                "--company-id",
+                scope.company,
+                "--command-id",
+                command_id,
+                "--operation",
+                operation,
+            };
+            fx.spawn(.{ .key = key, .argv = &argv, .output = .collect, .on_exit = Effects.exitMsg(.receipt_reply) });
+        } else {
+            const argv = [_][]const u8{
+                scope.executable,
+                "read-command-receipt",
+                scope.store,
+                "--company-id",
+                scope.company,
+                "--command-id",
+                command_id,
+                "--operation",
+                operation,
+            };
+            fx.spawn(.{ .key = key, .argv = &argv, .output = .collect, .on_exit = Effects.exitMsg(.receipt_reply) });
+        }
         fx.startTimer(.{ .key = key, .interval_ms = 5000, .on_fire = Effects.timerMsg(.receipt_deadline) });
     }
 };
@@ -104,12 +147,16 @@ pub const Model = struct {
     scope: Scope = .{},
     storage: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     command_storage: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    request_scope_storage: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     next_effect_key: u64 = 0,
     request: u64 = 0,
     receipt_request: u64 = 0,
     pending: bool = false,
     receipt_pending: bool = false,
     pending_recovered: bool = false,
+    request_company_id: []const u8 = "",
+    request_store_key: []const u8 = "",
+    request_socket: []const u8 = "",
 
     // Separated Link State (never blank-wipes verified Data State on transient loss).
     link_state: LinkState = .disconnected,
@@ -118,10 +165,11 @@ pub const Model = struct {
     show_stale_banner: bool = false,
     stale_banner: []const u8 = "",
 
-    // Verified Data State stamped with (company_id, store_key, revision, as_of_ns).
+    // Verified Data State stamped with (company_id, store_key, socket, revision, as_of_ns).
     available: bool = false,
     data_company_id: []const u8 = "",
     data_store_key: []const u8 = "",
+    data_socket: []const u8 = "",
     data_as_of_ns: i64 = 0,
     status: []const u8 = "Company work unavailable.",
     observed: []const u8 = "",
@@ -141,17 +189,22 @@ pub const Model = struct {
         "scope",
         "storage",
         "command_storage",
+        "request_scope_storage",
         "next_effect_key",
         "request",
         "receipt_request",
         "pending",
         "receipt_pending",
         "pending_recovered",
+        "request_company_id",
+        "request_store_key",
+        "request_socket",
         "link_state",
         "stale",
         "controls_locked",
         "data_company_id",
         "data_store_key",
+        "data_socket",
         "data_as_of_ns",
         "command_state",
         "pending_command",
@@ -160,6 +213,7 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         self.storage.deinit();
         self.command_storage.deinit();
+        self.request_scope_storage.deinit();
     }
 
     fn nextKey(self: *Model) u64 {
@@ -168,13 +222,31 @@ pub const Model = struct {
     }
 
     fn effectiveStoreKey(scope: Scope) []const u8 {
-        return if (scope.store_key.len > 0) scope.store_key else scope.store;
+        if (scope.store_key.len > 0) return scope.store_key;
+        if (scope.socket.len > 0) return scope.socket;
+        return scope.store;
     }
 
     fn scopeMatchesData(self: *const Model) bool {
         if (!self.available) return false;
         return std.mem.eql(u8, self.data_company_id, self.scope.company) and
-            std.mem.eql(u8, self.data_store_key, effectiveStoreKey(self.scope));
+            std.mem.eql(u8, self.data_store_key, effectiveStoreKey(self.scope)) and
+            std.mem.eql(u8, self.data_socket, self.scope.socket);
+    }
+
+    fn scopeMatchesInFlight(self: *const Model) bool {
+        if (self.request_company_id.len == 0) return true;
+        return std.mem.eql(u8, self.request_company_id, self.scope.company) and
+            std.mem.eql(u8, self.request_store_key, effectiveStoreKey(self.scope)) and
+            std.mem.eql(u8, self.request_socket, self.scope.socket);
+    }
+
+    fn stampInFlightScope(self: *Model) void {
+        _ = self.request_scope_storage.reset(.free_all);
+        const alloc = self.request_scope_storage.allocator();
+        self.request_company_id = alloc.dupe(u8, self.scope.company) catch "";
+        self.request_store_key = alloc.dupe(u8, effectiveStoreKey(self.scope)) catch "";
+        self.request_socket = alloc.dupe(u8, self.scope.socket) catch "";
     }
 
     fn clearInMemoryCommandState(self: *Model) void {
@@ -207,6 +279,7 @@ pub const Model = struct {
         self.stale_banner = "";
         self.data_company_id = "";
         self.data_store_key = "";
+        self.data_socket = "";
         self.data_as_of_ns = 0;
         self.status = status;
         self.observed = "";
@@ -271,6 +344,7 @@ pub const Model = struct {
             "";
         const stamped_company = try alloc.dupe(u8, incoming.company_id);
         const stamped_store = try alloc.dupe(u8, effectiveStoreKey(self.scope));
+        const stamped_socket = try alloc.dupe(u8, self.scope.socket);
 
         // Commit new Data State atomically without blanking prior state on parse error.
         self.storage.deinit();
@@ -278,6 +352,7 @@ pub const Model = struct {
 
         self.data_company_id = stamped_company;
         self.data_store_key = stamped_store;
+        self.data_socket = stamped_socket;
         self.data_as_of_ns = incoming.as_of_ns;
         self.observed = observed_text;
         self.revision = incoming.revision;
@@ -341,7 +416,7 @@ pub const Model = struct {
         self.controls_locked = true;
         self.show_command_status = true;
         self.command_status = "Command outcome unknown; checking saved receipt without reissuing.";
-        if (std.fs.path.isAbsolute(self.scope.executable) and std.fs.path.isAbsolute(self.scope.store)) {
+        if (self.scope.hasValidTransport()) {
             if (self.receipt_pending) {
                 fx.cancel(self.receipt_request);
                 fx.cancelTimer(self.receipt_request);
@@ -494,8 +569,10 @@ pub const Model = struct {
 };
 
 fn isAccessDenialOutput(text: []const u8) bool {
-    return std.mem.indexOf(u8, text, "401") != null or
-        std.mem.indexOf(u8, text, "403") != null or
+    return std.mem.indexOf(u8, text, "HTTP 401") != null or
+        std.mem.indexOf(u8, text, "HTTP 403") != null or
+        std.mem.indexOf(u8, text, "401 Unauthorized") != null or
+        std.mem.indexOf(u8, text, "403 Forbidden") != null or
         std.mem.indexOf(u8, text, "Unauthorized") != null or
         std.mem.indexOf(u8, text, "Forbidden") != null or
         std.mem.indexOf(u8, text, "Access denied") != null or
@@ -529,9 +606,7 @@ fn clockText(alloc: std.mem.Allocator, unix: i64) ![]const u8 {
 
 pub fn read(model: *Model, fx: *Effects) void {
     const scope = model.scope;
-    if (!std.fs.path.isAbsolute(scope.executable) or
-        !std.fs.path.isAbsolute(scope.store) or scope.company.len == 0)
-    {
+    if (!scope.hasValidTransport()) {
         if (model.pending) {
             fx.cancel(model.request);
             fx.cancelTimer(model.request);
@@ -545,9 +620,11 @@ pub fn read(model: *Model, fx: *Effects) void {
         return;
     }
 
-    // Company or store switch ALWAYS wipes prior Data State & in-memory pending state immediately,
-    // even if a previous refresh was in flight.
-    if (model.available and !model.scopeMatchesData()) {
+    // Company, store, or socket switch ALWAYS wipes prior Data State & cancels in-flight
+    // requests immediately, even before initial data has loaded.
+    const scope_changed = (model.available and !model.scopeMatchesData()) or
+        ((model.pending or model.receipt_pending or model.pending_command != null) and !model.scopeMatchesInFlight());
+    if (scope_changed) {
         if (model.pending) {
             fx.cancel(model.request);
             fx.cancelTimer(model.request);
@@ -570,6 +647,8 @@ pub fn read(model: *Model, fx: *Effects) void {
         model.controls_locked = true;
         model.status = "Checking current access…";
     }
+
+    model.stampInFlightScope();
 
     // Cold-start / post-switch recovery: reload any persisted pending command for this company
     // before unlocking controls.
@@ -596,8 +675,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.pending = false;
             fx.cancelTimer(result.key);
             if (result.reason != .exited or result.code != 0 or result.output_truncated) {
-                if (result.reason == .exited and result.code != 0 and !result.output_truncated and
-                    isAccessDenialOutput(result.output))
+                if (result.reason == .exited and result.code != 0 and
+                    (isAccessDenialOutput(result.stderr_tail) or isAccessDenialOutput(result.output)))
                 {
                     if (model.receipt_pending) {
                         fx.cancel(model.receipt_request);
@@ -757,7 +836,15 @@ test "access denial clears cached private data and in-memory pending state immed
     defer fx_arena.deinit();
     var fx: Effects = .{ .allocator = fx_arena.allocator() };
     read(&model, &fx);
-    update(&model, .{ .reply = .{ .key = model.request, .code = 1, .output = "403 Forbidden" } }, &fx);
+    // Transient stderr containing numeric digits like "4031" must NOT false-wipe Data State.
+    update(&model, .{ .reply = .{ .key = model.request, .code = 1, .stderr_tail = "transient disconnect on pid 4031" } }, &fx);
+    try std.testing.expect(model.available);
+    try std.testing.expect(model.stale);
+    try std.testing.expect(model.controls_locked);
+
+    // Real CLI stderr access denial ("HTTP 403") immediately wipes cached private data & pending state.
+    read(&model, &fx);
+    update(&model, .{ .reply = .{ .key = model.request, .code = 1, .stderr_tail = "Company command refused: HTTP 403: Control plane company identity mismatch" } }, &fx);
     try std.testing.expect(!model.available);
     try std.testing.expectEqual(LinkState.incompatible, model.link_state);
     try std.testing.expectEqual(@as(usize, 0), model.duties.len);
@@ -849,4 +936,48 @@ test "an old or incomplete reply cannot restore company work" {
     try std.testing.expect(model.pending and !model.available);
     update(&model, .{ .reply = .{ .key = 2, .code = 0, .output_truncated = true } }, &fx);
     try std.testing.expect(!model.pending and !model.available and model.duties.len == 0);
+}
+
+test "uds socket transport works without a direct sqlite store path and clears on socket switch" {
+    var model = Model{
+        .scope = .{
+            .executable = "/usr/bin/true",
+            .socket = "/tmp/sourdough-a.sock",
+            .company = "company-1",
+        },
+    };
+    defer model.deinit();
+    try std.testing.expect(model.scope.hasValidTransport());
+
+    var fx_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer fx_arena.deinit();
+    var fx: Effects = .{ .allocator = fx_arena.allocator() };
+    read(&model, &fx);
+    try std.testing.expect(model.pending);
+    try std.testing.expectEqual(LinkState.connecting, model.link_state);
+
+    const body =
+        \\{"contract_revision":"work-timeline-v1","company_id":"company-1","revision":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","as_of_ns":1700000000000000000,"duties":[],"paper":null}
+    ;
+    update(&model, .{ .reply = .{ .key = model.request, .code = 0, .output = body } }, &fx);
+    try std.testing.expect(model.available);
+    try std.testing.expectEqual(LinkState.connected, model.link_state);
+    try std.testing.expect(!model.controls_locked);
+
+    // Switching daemon socket clears cached Data State immediately even if store_key matches.
+    model.scope.store_key = "1:2";
+    try model.present(body);
+    model.scope.socket = "/tmp/sourdough-b.sock";
+    read(&model, &fx);
+    try std.testing.expect(!model.available);
+    try std.testing.expect(model.controls_locked);
+    try std.testing.expectEqual(LinkState.connecting, model.link_state);
+
+    // Switching daemon socket while request is still in flight (available == false)
+    // cancels the old request key and dispatches a fresh one.
+    const old_key = model.request;
+    model.scope.socket = "/tmp/sourdough-c.sock";
+    read(&model, &fx);
+    try std.testing.expect(model.pending);
+    try std.testing.expect(model.request != old_key);
 }
