@@ -31,6 +31,7 @@ SEPARATE_DB_MODULES: frozenset[str] = frozenset(
         "paper_venue.py",
         "market_worker.py",
         "nautilus_paper.py",
+        "trial_registry.py",
     }
 )
 
@@ -164,6 +165,13 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "sandbox_fill_time": frozenset({"nautilus_paper.py"}),
     "sandbox_cancellation": frozenset({"nautilus_paper.py"}),
     "sandbox_account_observation": frozenset({"nautilus_paper.py"}),
+    # Separate offline evaluator SQLite database (strictly outside company store)
+    "trial_suite": frozenset({"trial_registry.py"}),
+    "trial_reservation": frozenset({"trial_registry.py"}),
+    "trial_observation": frozenset({"trial_registry.py"}),
+    "trial_invalidation": frozenset({"trial_registry.py"}),
+    "trial_grade": frozenset({"trial_registry.py"}),
+    "trial_pairwise_grade": frozenset({"trial_registry.py"}),
 }
 
 
