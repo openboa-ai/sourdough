@@ -16,8 +16,11 @@ Start with **what has changed for the company or its employees**, not an API, de
 - Company → systems: [Authenticate and authorize](company/systems/authority/authorize-actor/intent.md).
 - Company → systems: [Withdraw an existing grant](company/systems/authority/revoke-access/intent.md).
 - Quant specialization: [Suspend new investment risk](company/profiles/quant/trading/board-control/intent.md).
-- optional client: [Present an authorized projection](client/inspect/intent.md).
-- optional client: [Submit an explicit command](client/commands/intent.md).
+- optional client: [Inspect authorized company state](client/inspect/intent.md).
+- optional client: [Request a governance change](client/commands/intent.md).
+- optional client: [Govern through CEO Direct Line and Board approvals](client/governance/intent.md).
+- optional client: [Serve the local control plane](client/control-plane/intent.md).
+- optional client: [Align Client presentation with the Yogurt design system](client/design-system/intent.md).
 
 <a id="staffing"></a>
 
