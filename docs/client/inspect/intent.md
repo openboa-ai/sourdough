@@ -20,3 +20,5 @@ Select, format and navigate. Do not create records of fact, promote a method, wa
 
 - [Present a work projection](present/spec.md)
 - [Present investment evidence](investment-panel/spec.md)
+- [Present client screens and navigation](screens/spec.md)
+- [Observe all company and paper-fund flows](flow-observability/spec.md)
