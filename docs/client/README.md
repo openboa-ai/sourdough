@@ -33,3 +33,10 @@ The Board Client is the optional presentation and control-plane UI for Sourdough
 - [projections](control-plane/projections/spec.md) — `GET /v1/meta` capability negotiation and all 29 concrete `GET /v1/projections/*` read contracts (including `work_projection.py` upgrade, Desk opacity, missing-data honesty, and Flow 13 `offline-trial-registry-v1`).
 - [commands-and-events](control-plane/commands-and-events/spec.md) — `GET /v1/events` redacted NDJSON stream, `CompanyRuntime` post-commit wakeups and `audit_event` emissions across the 15 silent domain/runtime areas, and generalized `POST /v1/commands` / `GET /v1/commands/{command_id}?operation=...` contracts.
 - [paper-boundary](control-plane/paper-boundary/spec.md) — Strict `environment == "paper"` boundary behind `PaperDestination` / `PaperExecution`, `paper_sender_lease`, `BoundedVenueCoordinator`, and `paper_binding_change` drain preconditions.
+
+## Design system and component alignment
+
+### [Align Client presentation with the Yogurt design system](design-system/intent.md)
+
+- [tokens-and-layout](design-system/tokens-and-layout/spec.md) — `@openboa/yogurt` (`0.2.0-local.1`) CSS `@layer` cascade, `21 x 11` palette, `#175174` commitment-CTA reservation, `Rethink Sans` typography, `{4,6,8,12,16,20,999}px` radii, `@container` layout grammar, 5-state surface contracts, and domain derivation rules.
+- [yogurt-components](design-system/yogurt-components/spec.md) — Complete verified primitive bindings across all four global shells and 33 UI routes, the eight custom `@ui-sdk/react` (`0.1.0-beta.13`) + `@openboa/yogurt` domain compositions, `ControlledConfirmDialog` and `createYogurtAgent` / WebMCP safety boundaries, and `Chart` high-baseline / `null`-gap honesty.

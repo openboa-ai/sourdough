@@ -2,17 +2,17 @@
 
 Design draft · Verification **UNRUN** · Responsible component: Board Client
 
-[Feature intent](../intent.md) · [Client architecture](../../architecture.md) · [Flow observability](../flow-observability/spec.md) · [System map](../../../README.md) · [Development lifecycle](../../../engineering/lifecycle.md)
+[Feature intent](../intent.md) · [Client architecture](../../architecture.md) · [Flow observability](../flow-observability/spec.md) · [Yogurt component bindings](../../design-system/yogurt-components/spec.md) · [Tokens and layout](../../design-system/tokens-and-layout/spec.md) · [System map](../../../README.md) · [Development lifecycle](../../../engineering/lifecycle.md)
 
 ## Boundary and dependencies
 
-Define the complete screen inventory, route hierarchy, role visibility gates, freshness/redaction rules, and required UI states across the seven domain-derived Information Architecture areas. All screens consume authorized UDS projections (`GET /v1/meta`, `GET /v1/projections/*`, `GET /v1/events`) and route every mutation through [Command submission](../../commands/submit/spec.md).
+Define the complete screen inventory, route hierarchy, role visibility gates, freshness/redaction rules, and required UI states across the seven domain-derived Information Architecture areas. All screens consume authorized UDS projections (`GET /v1/meta`, `GET /v1/projections/*`, `GET /v1/events`), bind every shell and route to verified `@openboa/yogurt` (`0.2.0-local.1`) and `@ui-sdk/react` (`0.1.0-beta.13`) primitives per [Yogurt component bindings](../../design-system/yogurt-components/spec.md), and route every mutation through [Command submission](../../commands/submit/spec.md).
 
-Input contracts: [Base presentation](../present/spec.md) · [Investment evidence](../investment-panel/spec.md) · [Command submission](../../commands/submit/spec.md) · [Client architecture](../../architecture.md). These are public service contracts, not imports of service implementations.
+Input contracts: [Base presentation](../present/spec.md) · [Investment evidence](../investment-panel/spec.md) · [Command submission](../../commands/submit/spec.md) · [Client architecture](../../architecture.md) · [Yogurt component bindings](../../design-system/yogurt-components/spec.md). These are public service and client contracts, not imports of service implementations.
 
 ## Design decision and review
 
-Organize navigation inside `SidebarLayout` across seven domain areas grounded directly in Sourdough's 13 flows, anchored by a persistent Global Status & Safety Bar and an always-visible `CommandOutboxPanel` whenever `command_state !== "idle"`. Every route below separates `[Live origin/main]` data/commands from `[M3 Extension]` endpoints and schemas.
+Organize navigation inside `SidebarLayout` across seven domain areas grounded directly in Sourdough's 13 flows, anchored by a persistent Global Status & Safety Bar and an always-visible `CommandOutboxPanel` whenever `command_state !== "idle"`. Every route below separates `[Live origin/main]` data/commands from `[M3 Extension]` endpoints and schemas, and resolves its complete `@openboa/yogurt` / `@ui-sdk/react` primitive and domain-composition bindings in [Yogurt component bindings](../../design-system/yogurt-components/spec.md).
 
 ### Global chrome, outbox, and confirmation shells
 
@@ -101,8 +101,8 @@ Every route above must implement all five standard states consistently without l
 
 ## Functional and quality requirements
 
-- **FR.** Provide a deterministic route ID, role gate, projection source, confirmation boundary, and 5-state specification for every screen across all 7 IA areas.
-- **NFR.** Enforce keyboard navigability across `SidebarLayout`, `DataTable`, `ControlledConfirmDialog`, and `CommandOutboxPanel`, preserve `@openboa/yogurt` visual contrast and `#175174` commitment-CTA discipline, and conceal protected DOM immediately on `clearData()` or `host_locked`.
+- **FR.** Provide a deterministic route ID, role gate, projection source, confirmation boundary, and 5-state specification for every screen across all 7 IA areas, bound to verified primitives in [Yogurt component bindings](../../design-system/yogurt-components/spec.md).
+- **NFR.** Enforce keyboard navigability across `SidebarLayout`, `DataTable`, `ControlledConfirmDialog`, and `CommandOutboxPanel` (verifying raw-HTML composites omitted from `createYogurtAgent.snapshot()` independently), preserve `@openboa/yogurt` visual contrast and `#175174` commitment-CTA discipline per [Tokens and layout](../../design-system/tokens-and-layout/spec.md), and conceal protected DOM immediately on `clearData()` or `host_locked`.
 
 ## Acceptance and independent evidence
 
@@ -112,7 +112,7 @@ Every route above must implement all five standard states consistently without l
 | Five-state coverage | Exercise `empty`, `loading`, `error`, `stale`, and `locked` (`controls_locked` and `host_locked`) on `/overview` and `/paper/performance`. Confirm zero blank-wipes on `stale`, instant DOM clearance on `403`, and non-mutated `as_of_ns` under `host_locked`. |
 | Agent confirm guard | Trigger a `ControlledConfirmDialog` action with synthetic `details.source = "agent"`. Confirm the `SDKButton` guard rejects execution and logs no `POST /v1/commands`. |
 
-**Oracle:** Compare screen route map, DOM visibility across roles/locks, and keyboard navigation trace against [Flow observability](../flow-observability/spec.md) and [Usage scenarios](../../scenarios.md).
+**Oracle:** Compare screen route map, DOM visibility across roles/locks, and keyboard navigation trace against [Flow observability](../flow-observability/spec.md), [Yogurt component bindings](../../design-system/yogurt-components/spec.md), and [Usage scenarios](../../scenarios.md).
 
 ## Operations and change review
 
