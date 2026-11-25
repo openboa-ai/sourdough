@@ -53,6 +53,8 @@ TABLES = (
     "project_delivery",
     "agent_archive",
     "work_handoff",
+    "review_qualification",
+    "review_tool_activation",
 )
 
 
