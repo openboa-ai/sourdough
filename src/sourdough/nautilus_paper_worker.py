@@ -143,11 +143,12 @@ async def serve(
         def on_start(self):
             try:
                 instrument = self.cache.instrument(instrument_id)
+                expected_fee = Decimal(plan.fee_bps) / Decimal(10_000)
                 if (
                     not isinstance(instrument, CurrencyPair)
                     or describe_spot_instrument(instrument) != plan.terms
-                    or instrument.maker_fee != 0
-                    or instrument.taker_fee != 0
+                    or instrument.maker_fee != expected_fee
+                    or instrument.taker_fee != expected_fee
                 ):
                     raise VenueRefused(
                         "Sandbox instrument or fee policy differs from the registered plan"
