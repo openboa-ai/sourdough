@@ -1,20 +1,29 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ActivityIsland } from "@openboa/yogurt/motion-activity-island";
+import { StorageMeter } from "@openboa/yogurt/motion-storage-meter";
 import {
   Badge,
   Button,
   Card,
   DataTable,
   DisclosureRow,
+  EmptyResult,
+  FilterBar,
   Inline,
+  List,
   Notice,
   PageHeader,
+  RecordFacts,
   Result,
+  SegmentedControl,
   Skeleton,
   Stack,
   Status,
   Text,
+  WorkEvent,
   type DataColumn,
   type DataRow,
+  type Fact,
 } from "@openboa/yogurt";
 import {
   fetchProjection,
@@ -23,9 +32,47 @@ import {
   formatRelativeNs,
   formatSignedPct,
 } from "../api/client";
-import type { LiveTradingProjection } from "../api/types";
+import type { LiveTradingProjection, ReturnPoint } from "../api/types";
 import { PortfolioChart } from "../components/PortfolioChart";
 import { useApp } from "../state/store";
+
+function MiniSparkline({ points }: { points: ReturnPoint[] }) {
+  const valid = points
+    .map((p, idx) => ({ idx, val: p.return_pct }))
+    .filter((item): item is { idx: number; val: number } => item.val !== null);
+  if (valid.length < 2) return null;
+  const min = Math.min(0, ...valid.map((v) => v.val));
+  const max = Math.max(0, ...valid.map((v) => v.val));
+  const span = Math.max(max - min, 0.2);
+  const w = 180;
+  const h = 32;
+  const xAt = (idx: number) => 4 + (idx / Math.max(1, points.length - 1)) * (w - 8);
+  const yAt = (v: number) => 4 + ((max - v) / span) * (h - 8);
+  const zeroY = yAt(0);
+
+  const segments: string[] = [];
+  let seg: string[] = [];
+  points.forEach((p, idx) => {
+    if (p.return_pct === null) {
+      if (seg.length > 0) {
+        segments.push(seg.join(" "));
+        seg = [];
+      }
+    } else {
+      seg.push(`${seg.length === 0 ? "M" : "L"} ${xAt(idx).toFixed(1)} ${yAt(p.return_pct).toFixed(1)}`);
+    }
+  });
+  if (seg.length > 0) segments.push(seg.join(" "));
+
+  return (
+    <svg className="sd-kpi-spark" viewBox={`0 0 ${w} ${h}`} aria-hidden="true">
+      <line x1={4} y1={zeroY} x2={w - 4} y2={zeroY} className="sd-kpi-spark-zero" />
+      {segments.map((d, i) => (
+        <path key={i} d={d} className="sd-kpi-spark-line" />
+      ))}
+    </svg>
+  );
+}
 
 export function LiveTradingView() {
   const { navigate, refreshSeq, linkState, reportApiError } = useApp();
@@ -33,8 +80,13 @@ export function LiveTradingView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [freshOrderIds, setFreshOrderIds] = useState<Set<string>>(() => new Set());
+  const [kpiPulsing, setKpiPulsing] = useState(false);
+  const [tapeQuery, setTapeQuery] = useState("");
+  const [tapeFilter, setTapeFilter] = useState<"all" | "working" | "filled" | "cancelled">("all");
+  const [tapePresentation, setTapePresentation] = useState<"table" | "feed">("table");
   const etagRef = useRef<string | undefined>(undefined);
   const seenOrdersRef = useRef<Set<string>>(new Set());
+  const prevSeqRef = useRef<number | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -54,9 +106,14 @@ export function LiveTradingView() {
             }
             if (newlyArrived.size > 0) {
               setFreshOrderIds(newlyArrived);
-              window.setTimeout(() => setFreshOrderIds(new Set()), 1400);
+              window.setTimeout(() => setFreshOrderIds(new Set()), 1800);
             }
           }
+          if (prevSeqRef.current !== null && res.data.event_seq !== prevSeqRef.current) {
+            setKpiPulsing(true);
+            window.setTimeout(() => setKpiPulsing(false), 600);
+          }
+          prevSeqRef.current = res.data.event_seq;
           seenOrdersRef.current = incoming;
           setData(res.data);
         }
@@ -72,6 +129,26 @@ export function LiveTradingView() {
     })();
     return () => controller.abort();
   }, [refreshSeq, reportApiError]);
+
+  const filteredTape = useMemo(() => {
+    const list = data?.execution_tape ?? [];
+    const q = tapeQuery.trim().toLowerCase();
+    return list.filter((o) => {
+      if (tapeFilter === "working" && o.status !== "working" && o.status !== "partial_fill") {
+        return false;
+      }
+      if (tapeFilter === "filled" && o.status !== "filled") {
+        return false;
+      }
+      if (tapeFilter === "cancelled" && !o.cancel_not_flat && o.status !== "cancelled_flat") {
+        return false;
+      }
+      if (!q) return true;
+      return `${o.order_id} ${o.instrument} ${o.agent_name} ${o.agent_role} ${o.action}`
+        .toLowerCase()
+        .includes(q);
+    });
+  }, [data?.execution_tape, tapeQuery, tapeFilter]);
 
   if (loading && !data) {
     return (
@@ -126,8 +203,58 @@ export function LiveTradingView() {
   const opex = data.kpis.agent_llm_opex;
   const net = data.kpis.company_net_pnl;
 
+  const exposureLimitMajor =
+    data.adapter_status?.exposure_limit_minor_units != null
+      ? Math.round(data.adapter_status.exposure_limit_minor_units / 100)
+      : null;
+
+  const exposureCategories = data.open_positions.map((pos) => {
+    const notionalMajor = Math.max(
+      1,
+      Math.round((Math.abs(pos.quantity) * pos.avg_entry_minor_units) / 100)
+    );
+    return {
+      id: pos.instrument,
+      label: pos.instrument,
+      amount: notionalMajor,
+      detail: `${pos.quantity} qty @ ${formatMinorCurrency(pos.avg_entry_minor_units, currency)} · Author: ${pos.agent_name}`,
+    };
+  });
+
+  const exposureUsedMajor = exposureCategories.reduce((acc, c) => acc + c.amount, 0);
+
+  const reconciliationFacts: Fact[] = data.pnl_reconciliation_bridge.map((step) => ({
+    id: step.step,
+    label: step.label,
+    value: (
+      <Text
+        variant="body"
+        className={`sd-tabular ${
+          step.status === "unavailable"
+            ? "sd-tone-muted"
+            : (step.amount_minor ?? 0) > 0
+              ? "sd-tone-pos"
+              : (step.amount_minor ?? 0) < 0
+                ? "sd-tone-neg"
+                : ""
+        }`}
+      >
+        {step.status === "unavailable"
+          ? "Unavailable"
+          : formatMinorCurrency(step.amount_minor, currency, {
+              signed: step.step !== "agent_llm_opex" && step.step !== "trading_fees",
+            })}
+      </Text>
+    ),
+  }));
+
   const tapeColumns: DataColumn[] = [
-    { id: "order", label: "Order & Instrument", kind: "identity" },
+    {
+      id: "order",
+      label: "Order & Instrument",
+      kind: "identity",
+      sortValue: (row) => row.id,
+    },
     { id: "author", label: "Authoring Agent", kind: "role" },
     { id: "qty", label: "Ordered / Filled / Rem", kind: "numeric", align: "end" },
     { id: "price", label: "Limit / Avg / Fees", kind: "numeric", align: "end" },
@@ -135,7 +262,7 @@ export function LiveTradingView() {
     { id: "trace", label: "Why?", kind: "actions", align: "end" },
   ];
 
-  const tapeRows: DataRow[] = data.execution_tape.map((o) => {
+  const tapeRows: DataRow[] = filteredTape.map((o) => {
     const isFresh = freshOrderIds.has(o.order_id);
     const statusBadge = o.cancel_not_flat ? (
       <Stack gap={2}>
@@ -167,9 +294,9 @@ export function LiveTradingView() {
       cells: {
         order: (
           <Stack gap={2} className={isFresh ? "sd-live-enter sd-live-flash" : undefined}>
-            <Inline gap={6} align="center">
-              <Text variant="body">{o.action.toUpperCase()} {o.instrument}</Text>
-            </Inline>
+            <Text variant="body">
+              {o.action.toUpperCase()} {o.instrument}
+            </Text>
             <Text variant="meta" className="sd-mono">
               {o.order_id}
             </Text>
@@ -260,10 +387,27 @@ export function LiveTradingView() {
         title="Live Trading & Portfolio"
         detail={asOfLabel}
         action={
-          <Inline gap={8} align="center">
-            <Badge tone="brand" variant="soft" dot={false}>
-              Paper Environment
-            </Badge>
+          <Inline gap={8} align="center" wrap>
+            <ActivityIsland
+              label={linkState === "live" ? "Live Tape" : "Snapshot"}
+              summary={`${data.execution_tape.length} orders · #${data.event_seq}`}
+            >
+              <Stack gap={8}>
+                <Text variant="meta">
+                  Recent daemon stream · {data.since_last_visit.new_event_count} events since last visit
+                </Text>
+                {data.since_last_visit.highlights.slice(0, 4).map((ev) => (
+                  <Inline key={ev.event_seq} justify="between" align="center" gap={8}>
+                    <Text variant="help">
+                      {ev.domain}.{ev.event_type}
+                    </Text>
+                    <Text variant="meta" className="sd-tabular">
+                      #{ev.event_seq}
+                    </Text>
+                  </Inline>
+                ))}
+              </Stack>
+            </ActivityIsland>
             <Status tone={data.risk_gate.suspended ? "warning" : "success"}>
               {data.risk_gate.suspended ? "New Orders Paused" : "Risk Gate Open"}
             </Status>
@@ -271,90 +415,81 @@ export function LiveTradingView() {
         }
       />
 
-      {/* 4-KPI 3-Second Executive Band */}
       <div className="sd-kpi-grid">
-        <Card variant="outlined" density="compact">
-          <Stack gap={6}>
-            <Inline justify="between" align="center">
-              <Text variant="meta">Paper Portfolio Value</Text>
-              <Badge tone="neutral" variant="outline" dot={false}>
-                Paper
-              </Badge>
-            </Inline>
-            <Text className="sd-kpi-value">
-              {formatMinorCurrency(port.value_minor, currency)}
-            </Text>
-            <Inline justify="between" align="center">
-              <Text
-                variant="meta"
-                className={
-                  port.return_pct === null
-                    ? "sd-kpi-delta-muted sd-tabular"
-                    : port.return_pct >= 0
-                      ? "sd-kpi-delta-pos sd-tabular"
-                      : "sd-kpi-delta-neg sd-tabular"
-                }
-              >
-                {formatSignedPct(port.return_pct)}
-              </Text>
-              <Text variant="meta">{port.source}</Text>
-            </Inline>
-          </Stack>
-        </Card>
-
-        <Card variant="outlined" density="compact">
-          <Stack gap={6}>
-            <Text variant="meta">Trading BOR P&L</Text>
+        <section className="sd-kpi-card" data-pulse={kpiPulsing ? "true" : "false"}>
+          <Inline justify="between" align="center">
+            <Text variant="meta">Paper Portfolio Value</Text>
+            <Badge tone="neutral" variant="outline" dot={false}>
+              Paper
+            </Badge>
+          </Inline>
+          <Text className="sd-kpi-value">
+            {formatMinorCurrency(port.value_minor, currency)}
+          </Text>
+          <MiniSparkline points={data.cumulative_return_series} />
+          <Inline justify="between" align="center">
             <Text
-              className={`sd-kpi-value ${
-                bor.value_minor === null
-                  ? "sd-kpi-delta-muted"
-                  : bor.value_minor >= 0
-                    ? "sd-kpi-delta-pos"
-                    : "sd-kpi-delta-neg"
+              variant="meta"
+              className={`sd-tabular ${
+                port.return_pct === null
+                  ? "sd-tone-muted"
+                  : port.return_pct >= 0
+                    ? "sd-tone-pos"
+                    : "sd-tone-neg"
               }`}
             >
-              {formatMinorCurrency(bor.value_minor, currency, { signed: true })}
+              {formatSignedPct(port.return_pct)}
             </Text>
-            <Text variant="meta">{bor.source}</Text>
-          </Stack>
-        </Card>
+            <Text variant="meta">{port.source}</Text>
+          </Inline>
+        </section>
 
-        <Card variant="outlined" density="compact">
-          <Stack gap={6}>
-            <Text variant="meta">Agent LLM & Compute Opex</Text>
-            <Text className="sd-kpi-value">
-              {formatMinorCurrency(opex.value_minor, currency)}
-            </Text>
-            <Text variant="meta">{opex.source}</Text>
-          </Stack>
-        </Card>
+        <section className="sd-kpi-card" data-pulse={kpiPulsing ? "true" : "false"}>
+          <Text variant="meta">Trading BOR P&amp;L</Text>
+          <Text
+            className={`sd-kpi-value ${
+              bor.value_minor === null
+                ? "sd-tone-muted"
+                : bor.value_minor >= 0
+                  ? "sd-tone-pos"
+                  : "sd-tone-neg"
+            }`}
+          >
+            {formatMinorCurrency(bor.value_minor, currency, { signed: true })}
+          </Text>
+          <Text variant="meta">{bor.source}</Text>
+        </section>
 
-        <Card variant="outlined" density="compact">
-          <Stack gap={6}>
-            <Inline justify="between" align="center">
-              <Text variant="meta">Company Net P&L</Text>
-              <Status tone={data.risk_gate.suspended ? "warning" : "success"}>
-                {data.risk_gate.suspended ? "Paused" : "Active"}
-              </Status>
-            </Inline>
-            <Text
-              className={`sd-kpi-value ${
-                net.value_minor === null
-                  ? "sd-kpi-delta-muted"
-                  : net.value_minor >= 0
-                    ? "sd-kpi-delta-pos"
-                    : "sd-kpi-delta-neg"
-              }`}
-            >
-              {formatMinorCurrency(net.value_minor, currency, { signed: true })}
-            </Text>
-            <Text variant="meta">{net.source}</Text>
-          </Stack>
-        </Card>
+        <section className="sd-kpi-card" data-pulse={kpiPulsing ? "true" : "false"}>
+          <Text variant="meta">Agent LLM &amp; Compute Opex</Text>
+          <Text className="sd-kpi-value">
+            {formatMinorCurrency(opex.value_minor, currency)}
+          </Text>
+          <Text variant="meta">{opex.source}</Text>
+        </section>
+
+        <section className="sd-kpi-card" data-pulse={kpiPulsing ? "true" : "false"}>
+          <Inline justify="between" align="center">
+            <Text variant="meta">Company Net P&amp;L</Text>
+            <Status tone={data.risk_gate.suspended ? "warning" : "success"}>
+              {data.risk_gate.suspended ? "Paused" : "Active"}
+            </Status>
+          </Inline>
+          <Text
+            className={`sd-kpi-value ${
+              net.value_minor === null
+                ? "sd-tone-muted"
+                : net.value_minor >= 0
+                  ? "sd-tone-pos"
+                  : "sd-tone-neg"
+            }`}
+          >
+            {formatMinorCurrency(net.value_minor, currency, { signed: true })}
+          </Text>
+          <Text variant="meta">{net.source}</Text>
+        </section>
       </div>
 
-      {/* Single Collapsible Since Last Visit Brief (no redundant sidebar links) */}
       <DisclosureRow
         label={`Since Last Visit · ${data.since_last_visit.new_event_count} recorded events`}
         initiallyOpen={false}
@@ -363,27 +498,25 @@ export function LiveTradingView() {
           {data.since_last_visit.highlights.length === 0 ? (
             <Text variant="help">No new company events since your previous visit.</Text>
           ) : (
-            data.since_last_visit.highlights.map((ev) => (
-              <Inline key={ev.event_seq} justify="between" align="center" wrap>
-                <Inline gap={8} align="center">
-                  <Badge tone="neutral" variant="outline" dot={false}>
-                    {ev.domain}
-                  </Badge>
-                  <Text variant="body">{ev.event_type}</Text>
-                  <Text variant="meta" className="sd-mono">
-                    {ev.entity_id}
-                  </Text>
-                </Inline>
-                <Text variant="meta" className="sd-tabular">
-                  {formatRelativeNs(ev.recorded_at_ns)} · seq #{ev.event_seq}
-                </Text>
-              </Inline>
-            ))
+            <List label="Recent company events" divided>
+              {data.since_last_visit.highlights.map((ev) => (
+                <WorkEvent
+                  key={ev.event_seq}
+                  event={{
+                    id: String(ev.event_seq),
+                    kind: ev.domain === "paper" ? "task" : ev.domain === "ops" ? "routine" : "review",
+                    title: `${ev.domain} · ${ev.event_type}`,
+                    detail: ev.entity_id,
+                    time: `${formatRelativeNs(ev.recorded_at_ns)} · seq #${ev.event_seq}`,
+                    state: "done",
+                  }}
+                />
+              ))}
+            </List>
           )}
         </Stack>
       </DisclosureRow>
 
-      {/* Performance Chart + 5-Step Two-Layer P&L Reconciliation Bridge */}
       <div className="sd-two-col">
         <PortfolioChart
           points={data.cumulative_return_series}
@@ -391,58 +524,46 @@ export function LiveTradingView() {
           asOfLabel={asOfLabel}
         />
 
-        <Card
-          title="Two-Layer P&L Reconciliation"
-          description="Trading books of record vs Company operating costs"
-          variant="outlined"
-        >
-          <Stack gap={8}>
-            {data.pnl_reconciliation_bridge.map((step) => (
-              <div key={step.step} className="sd-bridge-row">
-                <Text variant="body">{step.label}</Text>
-                <Text
-                  variant="body"
-                  className={`sd-tabular ${
-                    step.status === "unavailable"
-                      ? "sd-kpi-delta-muted"
-                      : (step.amount_minor ?? 0) > 0
-                        ? "sd-kpi-delta-pos"
-                        : (step.amount_minor ?? 0) < 0
-                          ? "sd-kpi-delta-neg"
-                          : ""
-                  }`}
-                >
-                  {step.status === "unavailable"
-                    ? "Unavailable"
-                    : formatMinorCurrency(step.amount_minor, currency, {
-                        signed: step.step !== "agent_llm_opex" && step.step !== "trading_fees",
-                      })}
-                </Text>
-              </div>
-            ))}
+        <Stack gap={16}>
+          <Card
+            title="Two-Layer P&L Reconciliation"
+            description="Trading books of record vs Company operating costs"
+            variant="raised"
+          >
+            <Stack gap={12}>
+              <RecordFacts
+                source={
+                  data.adapter_status
+                    ? `${data.adapter_status.connector_revision} · ${data.adapter_status.account_id}`
+                    : "paper_valuation + general_ledger"
+                }
+                asOf={`seq #${data.event_seq}`}
+                facts={reconciliationFacts}
+              />
 
-            {data.open_close_issues && data.open_close_issues.length > 0 ? (
-              <Notice title="Open accounting close issue" tone="warning">
-                Company Net P&L remains Unavailable until all missing cost records are closed —
-                never coerced to $0.00.
-              </Notice>
-            ) : null}
+              {data.open_close_issues && data.open_close_issues.length > 0 ? (
+                <Notice title="Open accounting close issue" tone="warning">
+                  Company Net P&amp;L remains Unavailable until all missing cost records are closed —
+                  never coerced to $0.00.
+                </Notice>
+              ) : null}
+            </Stack>
+          </Card>
 
-            {data.adapter_status ? (
-              <Text variant="meta">
-                Adapter: {data.adapter_status.connector_revision} · Account{" "}
-                {data.adapter_status.account_id} · Exposure cap{" "}
-                {formatMinorCurrency(
-                  data.adapter_status.exposure_limit_minor_units,
-                  currency
-                )}
-              </Text>
-            ) : null}
-          </Stack>
-        </Card>
+          {exposureLimitMajor && exposureLimitMajor > 0 ? (
+            <Card variant="raised" density="compact">
+              <StorageMeter
+                label="Paper Exposure Cap Utilization"
+                used={exposureUsedMajor}
+                capacity={exposureLimitMajor}
+                unit={currency}
+                categories={exposureCategories}
+              />
+            </Card>
+          ) : null}
+        </Stack>
       </div>
 
-      {/* Live Execution Tape (6-column cancel != flat honesty) */}
       <Card
         title="Live Paper Execution Tape"
         description={
@@ -450,24 +571,111 @@ export function LiveTradingView() {
             ? "Coalesced live stream · Grouped causal Order → Fills → Fees → Cancellation → Position"
             : "Snapshot paused while reconnecting"
         }
-        variant="outlined"
-      >
-        {data.execution_tape.length === 0 ? (
-          <Text variant="help">No paper orders recorded yet for this company.</Text>
-        ) : (
-          <DataTable
-            caption="Paper execution tape"
-            columns={tapeColumns}
-            rows={tapeRows}
+        headerAction={
+          <SegmentedControl
+            label="Execution tape layout"
+            value={tapePresentation}
+            onValueChange={(next) => setTapePresentation(next as "table" | "feed")}
+            options={[
+              { id: "table", label: "Table" },
+              { id: "feed", label: "Causal Feed" },
+            ]}
           />
-        )}
+        }
+        variant="raised"
+      >
+        <Stack gap={12}>
+          <FilterBar
+            label="Filter execution tape"
+            hiddenLabel
+            placeholder="Filter by order ID, instrument, or agent..."
+            size="compact"
+            query={tapeQuery}
+            onQueryChange={setTapeQuery}
+          >
+            <SegmentedControl
+              label="Filter by order status"
+              value={tapeFilter}
+              onValueChange={(next) =>
+                setTapeFilter(next as "all" | "working" | "filled" | "cancelled")
+              }
+              options={[
+                { id: "all", label: `All (${data.execution_tape.length})` },
+                { id: "working", label: "Working" },
+                { id: "filled", label: "Filled" },
+                { id: "cancelled", label: "Cancelled" },
+              ]}
+            />
+          </FilterBar>
+
+          {data.execution_tape.length === 0 ? (
+            <Text variant="help">No paper orders recorded yet for this company.</Text>
+          ) : filteredTape.length === 0 ? (
+            <EmptyResult
+              query={tapeQuery || tapeFilter}
+              onClear={() => {
+                setTapeQuery("");
+                setTapeFilter("all");
+              }}
+            />
+          ) : tapePresentation === "table" ? (
+            <DataTable
+              caption="Paper execution tape"
+              columns={tapeColumns}
+              rows={tapeRows}
+            />
+          ) : (
+            <List label="Live execution causal feed" divided>
+              {filteredTape.map((o) => (
+                <WorkEvent
+                  key={o.order_id}
+                  event={{
+                    id: o.order_id,
+                    kind: o.cancel_not_flat ? "review" : "task",
+                    title: `${o.action.toUpperCase()} ${o.instrument} (${o.filled_qty}/${o.ordered_qty})`,
+                    detail: `${o.agent_name} · Avg ${formatMinorCurrency(
+                      o.avg_fill_minor_units ?? o.limit_minor_units,
+                      currency
+                    )} · Fee ${formatMinorCurrency(o.total_fee_minor_units, currency)}${
+                      o.cancel_not_flat
+                        ? ` · Residual open ${o.residual_position_qty} (cancel did not flatten)`
+                        : ""
+                    }`,
+                    state: o.cancel_not_flat
+                      ? "waiting"
+                      : o.status === "filled"
+                        ? "ready"
+                        : "running",
+                  }}
+                  inlineMeta={
+                    <Badge
+                      tone={
+                        o.cancel_not_flat
+                          ? "warning"
+                          : o.status === "filled"
+                            ? "success"
+                            : "brand"
+                      }
+                      dot={false}
+                    >
+                      {o.cancel_not_flat
+                        ? `Cancelled · Open ${o.residual_position_qty}`
+                        : o.status}
+                    </Badge>
+                  }
+                  hideStateBadge
+                  onOpen={() => navigate(`/orders/${encodeURIComponent(o.order_id)}`)}
+                />
+              ))}
+            </List>
+          )}
+        </Stack>
       </Card>
 
-      {/* Open Paper Positions */}
       <Card
         title="Open Paper Positions"
         description="Current observed paper exposure across instruments"
-        variant="outlined"
+        variant="raised"
       >
         {data.open_positions.length === 0 ? (
           <Text variant="help">No open paper positions (flat).</Text>

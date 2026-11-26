@@ -2,12 +2,12 @@ import { useEffect, useState } from "react";
 import {
   Badge,
   Button,
-  ButtonGroup,
   Card,
   DataTable,
   Inline,
   PageHeader,
   Result,
+  SegmentedControl,
   Skeleton,
   Stack,
   Text,
@@ -23,11 +23,6 @@ import type { ApprovalQuestionItem, ApprovalsProjection } from "../api/types";
 import { ControlledInlineConfirm } from "../components/ControlledInlineConfirm";
 import { useApp } from "../state/store";
 
-/**
- * Board Approvals (/company/approvals):
- * ZERO dimmed popup modals and ZERO right slide-over drawers.
- * Clicking any pending item expands an inline confirmation panel right inside the card.
- */
 export function ApprovalsView() {
   const { navigate, refreshSeq, meta, canWrite, dispatchCommand, reportApiError } = useApp();
   const [data, setData] = useState<ApprovalsProjection | null>(null);
@@ -44,7 +39,6 @@ export function ApprovalsView() {
         });
         if (res.data) {
           setData(res.data);
-          // Auto-expand first pending approval if none selected and user has pending work.
           if (res.data.pending.length === 1 && expandedId === null) {
             setExpandedId(res.data.pending[0].question_id);
           }
@@ -128,7 +122,7 @@ export function ApprovalsView() {
       />
 
       {data.pending.length === 0 ? (
-        <Card variant="outlined">
+        <Card variant="raised">
           <Result title="No pending Board approvals">
             All governance requests have been resolved. New proposals from Founder · CEO will appear
             here and increment the sidebar badge automatically.
@@ -143,7 +137,7 @@ export function ApprovalsView() {
             return (
               <Card
                 key={item.question_id}
-                variant="outlined"
+                variant="raised"
                 title={item.title}
                 description={`Requested by ${item.created_by_name} (${item.created_by_role}) · ${formatRelativeNs(item.created_at_ns)}`}
                 headerAction={
@@ -171,36 +165,22 @@ export function ApprovalsView() {
                   {isOpen ? (
                     <Stack gap={12}>
                       <Inline justify="between" align="center" wrap>
-                        <ButtonGroup label="Select decision stance">
-                          <Button
-                            emphasis={!isDecline ? "filled" : "soft"}
-                            tone={!isDecline ? "brand" : "neutral"}
-                            size="compact"
-                            shape="pill"
-                            onClick={() =>
+                        <div className="sd-intrinsic">
+                          <SegmentedControl
+                            label="Select decision stance"
+                            value={choice}
+                            onValueChange={(next) =>
                               setSelectedChoice((prev) => ({
                                 ...prev,
-                                [item.question_id]: "approve",
+                                [item.question_id]: next,
                               }))
                             }
-                          >
-                            Approve Path
-                          </Button>
-                          <Button
-                            emphasis={isDecline ? "filled" : "soft"}
-                            tone={isDecline ? "danger" : "neutral"}
-                            size="compact"
-                            shape="pill"
-                            onClick={() =>
-                              setSelectedChoice((prev) => ({
-                                ...prev,
-                                [item.question_id]: "decline",
-                              }))
-                            }
-                          >
-                            Decline Path
-                          </Button>
-                        </ButtonGroup>
+                            options={[
+                              { id: "approve", label: "Approve Path" },
+                              { id: "decline", label: "Decline Path" },
+                            ]}
+                          />
+                        </div>
 
                         <Button
                           emphasis="quiet"
@@ -274,11 +254,10 @@ export function ApprovalsView() {
         </Stack>
       )}
 
-      {/* Resolution & Delivery Ledger */}
       <Card
         title="Decision Resolution & Delivery Ledger"
         description="Tracks accepted Board choice, application status, and delivery status separately"
-        variant="outlined"
+        variant="raised"
       >
         {historyRows.length === 0 ? (
           <Text variant="help">No resolved Board decisions recorded yet.</Text>

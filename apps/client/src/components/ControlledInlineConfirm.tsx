@@ -3,12 +3,12 @@ import { Button as SDKButton } from "@ui-sdk/react/button";
 import {
   Button,
   ButtonGroup,
+  Card,
   DisclosureRow,
-  Heading,
-  Inline,
   Notice,
   RecordFacts,
   Stack,
+  Surface,
   Text,
   Textarea,
   type Fact,
@@ -40,15 +40,6 @@ interface ControlledInlineConfirmProps {
   onConfirm: (latched: { id: string; revision: string; reason: string }) => void;
 }
 
-/**
- * Universal Inline Human-Language Confirmation surface (zero popup modals, zero right drawers).
- * Enforces all five safety invariants:
- *   1. Revision latch on expand (openedRef)
- *   2. Mid-review change detection + disable + inline warning
- *   3. One-shot submit guard (sentRef) + SDKButton details.source !== "agent" check
- *   4. Specific consequence-verb CTA (#175174 brand or danger tone)
- *   5. data-agent-confirm strictly on the confirm SDKButton
- */
 export function ControlledInlineConfirm({
   open,
   decision,
@@ -110,78 +101,14 @@ export function ControlledInlineConfirm({
   }));
 
   return (
-    <div
-      className="sd-inline-confirm"
-      data-destructive={decision.destructive ? "true" : "false"}
-      role="region"
-      aria-label={`Confirm ${decision.title}`}
-    >
-      <Stack gap={12}>
-        <Inline justify="between" align="center" wrap>
-          <Heading level={3}>{decision.title}</Heading>
-          {decision.secondaryAction}
-        </Inline>
-
-        <Text variant="body">{decision.consequence}</Text>
-
-        {changed ? (
-          <Text className="yg-error" role="status">
-            This decision changed while open. Collapse and review it again before confirming.
-          </Text>
-        ) : null}
-
-        {agentBlockedMsg ? (
-          <Notice title="Human confirmation required" tone="warning" urgent>
-            {agentBlockedMsg}
-          </Notice>
-        ) : null}
-
-        <div className="sd-impact-grid">
-          <div className="sd-impact-well">
-            <RecordFacts
-              title="What changes"
-              facts={changesFacts}
-              source="Board review"
-              asOf="On confirmation"
-            />
-          </div>
-          <div className="sd-impact-well">
-            <RecordFacts
-              title="What stays untouched"
-              facts={untouchedFacts}
-              source="Preserved scope"
-              asOf="Unchanged"
-            />
-          </div>
-        </div>
-
-        {decision.extraPreview}
-
-        {decision.requireReason ? (
-          <Textarea
-            label="Decision reason"
-            value={reason}
-            onChange={(event) => {
-              userEditedReasonRef.current = true;
-              setReason(event.target.value);
-            }}
-            placeholder={
-              decision.reasonPlaceholder ??
-              "Explain why you are taking this action (recorded in audit trail)..."
-            }
-            rows={2}
-            help="Required (1 to 2,000 characters). Included in the command digest."
-          />
-        ) : null}
-
-        <DisclosureRow label="Technical details" initiallyOpen={false}>
-          <RecordFacts
-            facts={techFacts}
-            source="Optimistic preconditions"
-            asOf="Latched on expand"
-          />
-        </DisclosureRow>
-
+    <Card
+      className="yg-decision-card sd-live-enter"
+      data-state={decision.destructive ? "destructive" : "pending"}
+      variant="raised"
+      title={decision.title}
+      description={decision.consequence}
+      headerAction={decision.secondaryAction}
+      action={
         <ButtonGroup label="Decision" justify="end">
           <Button emphasis="quiet" shape="pill" onClick={onCancel} disabled={pending}>
             Cancel
@@ -224,7 +151,67 @@ export function ControlledInlineConfirm({
             {decision.confirmLabel}
           </SDKButton>
         </ButtonGroup>
+      }
+    >
+      <Stack gap={12}>
+        {changed ? (
+          <Notice title="Decision changed during review" tone="warning" urgent>
+            This decision changed while open. Collapse and review it again before confirming.
+          </Notice>
+        ) : null}
+
+        {agentBlockedMsg ? (
+          <Notice title="Human confirmation required" tone="warning" urgent>
+            {agentBlockedMsg}
+          </Notice>
+        ) : null}
+
+        <div className="sd-split-equal">
+          <Surface variant="surface" density="compact">
+            <RecordFacts
+              title="What changes"
+              facts={changesFacts}
+              source="Board review"
+              asOf="On confirmation"
+            />
+          </Surface>
+          <Surface variant="surface" density="compact">
+            <RecordFacts
+              title="What stays untouched"
+              facts={untouchedFacts}
+              source="Preserved scope"
+              asOf="Unchanged"
+            />
+          </Surface>
+        </div>
+
+        {decision.extraPreview}
+
+        {decision.requireReason ? (
+          <Textarea
+            label="Decision reason"
+            value={reason}
+            onChange={(event) => {
+              userEditedReasonRef.current = true;
+              setReason(event.target.value);
+            }}
+            placeholder={
+              decision.reasonPlaceholder ??
+              "Explain why you are taking this action (recorded in audit trail)..."
+            }
+            rows={2}
+            help="Required (1 to 2,000 characters). Included in the command digest."
+          />
+        ) : null}
+
+        <DisclosureRow label="Technical details" initiallyOpen={false}>
+          <RecordFacts
+            facts={techFacts}
+            source="Optimistic preconditions"
+            asOf="Latched on expand"
+          />
+        </DisclosureRow>
       </Stack>
-    </div>
+    </Card>
   );
 }

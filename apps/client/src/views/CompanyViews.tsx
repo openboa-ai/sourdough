@@ -1,20 +1,22 @@
 import { useEffect, useState } from "react";
 import {
-  AgentAvatar,
+  AgentRow,
   Badge,
   Button,
   Card,
   DataTable,
   DisclosureRow,
-  Inline,
+  List,
   Notice,
   PageHeader,
   RecordFacts,
+  ResourceRow,
   Result,
   Skeleton,
   Stack,
   Tabs,
   Text,
+  WorkEvent,
   type DataColumn,
   type DataRow,
 } from "@openboa/yogurt";
@@ -228,7 +230,7 @@ export function StrategiesView() {
             id: "active",
             label: "Active Deployment",
             panel: (
-              <Card variant="outlined" title="Active Paper Strategy Deployment">
+              <Card variant="raised" title="Active Paper Strategy Deployment">
                 {data.active_deployment ? (
                   <RecordFacts
                     source="paper_strategy_deployment"
@@ -266,7 +268,7 @@ export function StrategiesView() {
             id: "trials",
             label: `Challenger Trials (${data.trials.length})`,
             panel: (
-              <Card variant="outlined" title="Paired Incumbent vs Challenger Trials">
+              <Card variant="raised" title="Paired Incumbent vs Challenger Trials">
                 {trialRows.length === 0 ? (
                   <Text variant="help">No challenger trials registered yet.</Text>
                 ) : (
@@ -279,7 +281,7 @@ export function StrategiesView() {
             id: "adapter",
             label: "PaperExecution Adapter",
             panel: (
-              <Card variant="outlined" title="Swappable PaperExecution Connector">
+              <Card variant="raised" title="Swappable PaperExecution Connector">
                 {data.adapter ? (
                   <RecordFacts
                     source="paper_binding"
@@ -377,13 +379,13 @@ export function FinanceView() {
 
       {data.open_close_issues.length > 0 ? (
         <Notice title="Accounting close contains open issues" tone="warning" urgent>
-          {data.open_close_issues.length} unresolved cost or valuation item(s). Company Net P&L
+          {data.open_close_issues.length} unresolved cost or valuation item(s). Company Net P&amp;L
           stays explicitly Unavailable until closed cleanly.
         </Notice>
       ) : null}
 
       <div className="sd-split-equal">
-        <Card title="General Ledger Account Balances" variant="outlined">
+        <Card title="General Ledger Account Balances" variant="raised">
           {balRows.length === 0 ? (
             <Text variant="help">No journal entries posted yet.</Text>
           ) : (
@@ -391,7 +393,7 @@ export function FinanceView() {
           )}
         </Card>
 
-        <Card title="Period Accounting Closes" variant="outlined">
+        <Card title="Period Accounting Closes" variant="raised">
           {closeRows.length === 0 ? (
             <Text variant="help">No accounting closes recorded yet.</Text>
           ) : (
@@ -407,28 +409,23 @@ export function FinanceView() {
         {data.funding_settlements.length === 0 ? (
           <Text variant="help">No funding intervals recorded.</Text>
         ) : (
-          <Stack gap={8}>
+          <List label="8h funding settlements" divided>
             {data.funding_settlements.map((f) => (
-              <Inline key={f.settlement_id} justify="between" align="center" wrap>
-                <Text variant="body">
-                  {f.instrument_id} · pos {f.signed_position_lots}
-                </Text>
-                <Inline gap={8} align="center">
-                  <Badge
-                    tone={f.status === "unavailable" ? "warning" : "neutral"}
-                    dot={false}
-                  >
-                    {f.status}
-                  </Badge>
-                  <Text className="sd-tabular">
-                    {f.status === "unavailable"
+              <WorkEvent
+                key={f.settlement_id}
+                event={{
+                  id: f.settlement_id,
+                  kind: "routine",
+                  title: `${f.instrument_id} · pos ${f.signed_position_lots}`,
+                  detail:
+                    f.status === "unavailable"
                       ? `Unavailable (${f.unavailable_reason ?? "missing"})`
-                      : formatMinorCurrency(f.funding_cashflow_atoms)}
-                  </Text>
-                </Inline>
-              </Inline>
+                      : formatMinorCurrency(f.funding_cashflow_atoms),
+                  state: f.status === "unavailable" ? "waiting" : "done",
+                }}
+              />
             ))}
-          </Stack>
+          </List>
         )}
       </DisclosureRow>
     </Stack>
@@ -494,89 +491,60 @@ export function OrgReportsView() {
             id: "roster",
             label: `Roster (${data.roster.length})`,
             panel: (
-              <Stack gap={12}>
-                {data.roster.map((agent) => (
-                  <Card key={agent.agent_id} variant="outlined" density="compact">
-                    <Inline justify="between" align="center" wrap>
-                      <Inline gap={12} align="center">
-                        <AgentAvatar
-                          agent={agent.avatar_variant}
-                          state={agent.avatar_state}
-                          animated={false}
-                          size={34}
-                          label={agent.display_name}
-                        />
-                        <Stack gap={2}>
-                          <Inline gap={8} align="center">
-                            <Text variant="body">{agent.display_name}</Text>
-                            <Badge
-                              tone={agent.is_ceo ? "brand" : "neutral"}
-                              dot={false}
-                            >
-                              {agent.role_label}
-                            </Badge>
-                          </Inline>
-                          <Text variant="meta">
-                            {agent.grant_scope} · {agent.private_draft_count} private drafts
-                          </Text>
-                        </Stack>
-                      </Inline>
-                      <Button
-                        emphasis="soft"
-                        size="compact"
-                        shape="pill"
-                        onClick={() =>
-                          navigate(`/office/agents/${encodeURIComponent(agent.agent_id)}`)
-                        }
-                      >
-                        Open Agent Detail
-                      </Button>
-                    </Inline>
-                  </Card>
-                ))}
-              </Stack>
+              <Card title="Active Company Roster" variant="raised">
+                <List label="Company agents" divided>
+                  {data.roster.map((agent) => (
+                    <AgentRow
+                      key={agent.agent_id}
+                      agent={{
+                        id: agent.agent_id,
+                        name: agent.display_name,
+                        role: agent.role_label,
+                        state: agent.avatar_state,
+                        art: agent.avatar_variant,
+                        preview: `${agent.grant_scope} · ${agent.private_draft_count} private drafts`,
+                      }}
+                      onSelect={() =>
+                        navigate(`/office/agents/${encodeURIComponent(agent.agent_id)}`)
+                      }
+                    />
+                  ))}
+                </List>
+              </Card>
             ),
           },
           {
             id: "reports",
             label: `Published Reports (${data.publications.length})`,
             panel: (
-              <Stack gap={12}>
+              <Card title="Selective Company Publications" variant="raised">
                 {data.publications.length === 0 ? (
-                  <Card variant="outlined">
-                    <Text variant="help">No published company reports yet.</Text>
-                  </Card>
+                  <Text variant="help">No published company reports yet.</Text>
                 ) : (
-                  data.publications.map((p) => (
-                    <Card
-                      key={p.asset_id}
-                      variant="outlined"
-                      title={`Report ${p.asset_id}`}
-                      description={`${p.author_name} (${p.author_role}) · #${p.project_id}`}
-                      headerAction={
-                        <Button
-                          emphasis="quiet"
-                          size="compact"
-                          shape="pill"
-                          onClick={() =>
-                            navigate("/messages", {
-                              contextRef: {
-                                kind: "shared_publication",
-                                id: p.asset_id,
-                                label: `Report ${p.asset_id} by ${p.author_name}`,
-                              },
-                            })
-                          }
-                        >
-                          Ask CEO →
-                        </Button>
-                      }
-                    >
-                      <Text variant="body">{p.content}</Text>
-                    </Card>
-                  ))
+                  <List label="Published company reports" divided>
+                    {data.publications.map((p) => (
+                      <ResourceRow
+                        key={p.asset_id}
+                        resource={{
+                          id: p.asset_id,
+                          kind: "output",
+                          title: `Report ${p.asset_id} · ${p.author_name} (${p.author_role})`,
+                          detail: `#${p.project_id} · ${p.content}`,
+                        }}
+                        onOpen={() =>
+                          navigate("/messages", {
+                            contextRef: {
+                              kind: "shared_publication",
+                              id: p.asset_id,
+                              label: `Report ${p.asset_id} by ${p.author_name}`,
+                            },
+                          })
+                        }
+                      />
+                    ))}
+                  </List>
                 )}
-              </Stack>
+              </Card>
             ),
           },
           {
@@ -584,13 +552,12 @@ export function OrgReportsView() {
             label: `Delegated HR Custody (${custodyRows.length})`,
             panel: (
               <Stack gap={12}>
-                {/* Strictly read-only: ZERO Board retire_employee write buttons! */}
                 <Notice title={data.delegated_hr_custody.policy_notice} tone="neutral">
                   Routine employee hiring and retirement are delegated to Founder · CEO under
                   standing authority. Board members inspect offboarding custody transfers here
                   read-only.
                 </Notice>
-                <Card title="Archived Employees & Custody Ledger" variant="outlined">
+                <Card title="Archived Employees & Custody Ledger" variant="raised">
                   {custodyRows.length === 0 ? (
                     <Text variant="help">No retired employees recorded.</Text>
                   ) : (
@@ -710,7 +677,7 @@ export function RestrictionsView() {
       ) : null}
 
       {data.paper_risk ? (
-        <Card title="Paper Risk Gate Readiness (Non-Binding Telemetry)" variant="outlined">
+        <Card title="Paper Risk Gate Readiness (Non-Binding Telemetry)" variant="raised">
           <Stack gap={8}>
             <RecordFacts
               source="paper_risk_state + paper_order"
@@ -743,7 +710,7 @@ export function RestrictionsView() {
         </Card>
       ) : null}
 
-      <Card title={`Active Restriction Causes (${data.active_causes.length})`} variant="outlined">
+      <Card title={`Active Restriction Causes (${data.active_causes.length})`} variant="raised">
         {data.active_causes.length === 0 ? (
           <Text variant="help">No active operational restriction causes.</Text>
         ) : (

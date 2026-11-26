@@ -1,3 +1,4 @@
+import { Yogurt } from "@openboa/yogurt/yogurt";
 import { AppShell } from "./components/AppShell";
 import { AppProvider, useApp } from "./state/store";
 import { AgentDetailView } from "./views/AgentDetailView";
@@ -23,11 +24,7 @@ function RouteSwitch() {
   const { route, meta } = useApp();
   const path = route.includes("?") ? route.slice(0, route.indexOf("?")) : route;
 
-  if (meta?.board_access.bootstrap_locked) {
-    return <BootstrapView />;
-  }
-
-  if (path === "/bootstrap") {
+  if (meta?.board_access.bootstrap_locked || path === "/bootstrap") {
     return <BootstrapView />;
   }
   if (path === "/" || path === "/performance") {
@@ -74,12 +71,21 @@ function RouteSwitch() {
   return <LiveTradingView />;
 }
 
-export function App() {
+function YogurtStage() {
+  const { appearance, material } = useApp();
   return (
-    <AppProvider>
+    <Yogurt appearance={appearance} material={material} className="sd-stage">
       <AppShell>
         <RouteSwitch />
       </AppShell>
+    </Yogurt>
+  );
+}
+
+export function App() {
+  return (
+    <AppProvider>
+      <YogurtStage />
     </AppProvider>
   );
 }

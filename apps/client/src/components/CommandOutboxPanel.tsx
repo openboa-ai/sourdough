@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { CopyButton } from "@openboa/yogurt/motion-copy-button";
 import {
   Button,
   ButtonGroup,
@@ -12,15 +13,6 @@ import {
 } from "@openboa/yogurt";
 import { useApp } from "../state/store";
 
-/**
- * Persistent inline CommandOutboxPanel mounted strictly below the 48px Top Bar.
- * Implements the exact 8-variant CommandLifecycle state machine:
- *   - submitting / accepted: Receipt state="pending" + pending_age (NO onLookup)
- *   - unknown: Receipt state="unknown" + onLookup ("Check status") ONLY here
- *   - applied: Receipt state="confirmed"
- *   - denied: Receipt state="failed" + denial_code
- *   - not_found_retry_choice: Retry same request vs Discard draft (NO onLookup)
- */
 export function CommandOutboxPanel() {
   const {
     outbox,
@@ -101,7 +93,7 @@ export function CommandOutboxPanel() {
   };
 
   return (
-    <Card variant="outlined" density="compact">
+    <Card variant="raised" density="compact" className="sd-live-enter">
       <Stack gap={8}>
         <Receipt
           record={record}
@@ -147,7 +139,12 @@ export function CommandOutboxPanel() {
         ) : null}
 
         {outbox.lifecycle === "applied" || outbox.lifecycle === "denied" ? (
-          <Inline justify="end">
+          <Inline justify="between" align="center" wrap>
+            {intent?.command_id ? (
+              <CopyButton value={intent.command_id} presentation="quiet" />
+            ) : (
+              <span />
+            )}
             <Button
               emphasis="quiet"
               size="compact"

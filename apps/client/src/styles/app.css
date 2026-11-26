@@ -1,152 +1,264 @@
 @layer yg.patterns {
-  /* Sourdough Board Client layout & domain patterns.
-     Uses @openboa/yogurt semantic tokens only: zero gradients, zero static card
-     shadows, strict even radii {4, 6, 8, 12, 16, 20, 999}px, tabular-nums. */
+  /* Sourdough Board Client — 100% Yogurt 0.2.0 token & Studio parity layout.
+     Zero literal colors, zero gradients, zero static card shadows, @container responsive. */
 
-  .sd-root {
-    min-height: 100dvh;
+  .sd-stage {
+    min-block-size: 100dvh;
     background: var(--yg-surface);
     color: var(--yg-text);
   }
 
+  .sd-stage > .yg-sidebar-layout {
+    min-block-size: 100dvh;
+    background: var(--yg-surface);
+  }
+
+  .sd-stage > .yg-sidebar-layout > .yg-sidebar-panel {
+    background: var(--yg-surface);
+    border-inline-end: 1px solid var(--yg-border-subtle);
+  }
+
+  .sd-stage > .yg-sidebar-layout > .yg-sidebar-panel > .yg-sidebar-header {
+    min-block-size: 52px;
+    padding-inline: var(--boa-space-14, 14px);
+    display: flex;
+    align-items: center;
+  }
+
+  .sd-brand-title {
+    font: var(--yg-font-card-title);
+    font-weight: 600;
+    letter-spacing: var(--yg-tracking-card-title);
+    color: var(--yg-text);
+    white-space: nowrap;
+  }
+
   .sd-topbar {
-    height: 48px;
-    padding: 0 16px;
+    min-block-size: 52px;
+    padding-inline: var(--boa-space-16);
     background: var(--yg-canvas);
-    border-bottom: 1px solid var(--yg-border);
+    border-block-end: 1px solid var(--yg-border-subtle);
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 12px;
+    gap: var(--yg-gap-inline);
   }
 
-  .sd-topbar-left,
-  .sd-topbar-right {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-width: 0;
+  .sd-main-wrap {
+    container-type: inline-size;
+    inline-size: 100%;
   }
 
   .sd-main {
-    padding: 20px 24px 40px;
-    max-width: 1360px;
-    width: 100%;
-    margin: 0 auto;
+    padding: var(--boa-space-20) var(--boa-space-24) var(--boa-space-40, 40px);
+    max-inline-size: 1380px;
+    inline-size: 100%;
+    margin-inline: auto;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: var(--yg-gap-panel);
   }
 
-  .sd-tabular {
-    font-variant-numeric: tabular-nums;
-  }
-
+  /* Responsive container grids (Yogurt AP-06: @container instead of @media) */
   .sd-kpi-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 12px;
-  }
-
-  @media (max-width: 1080px) {
-    .sd-kpi-grid {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-  }
-
-  @media (max-width: 640px) {
-    .sd-kpi-grid {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  .sd-kpi-value {
-    font-size: 26px;
-    line-height: 1.15;
-    font-weight: 540;
-    letter-spacing: -0.02em;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .sd-kpi-delta-pos {
-    color: var(--yg-signal-positive, #2f7d4d);
-  }
-
-  .sd-kpi-delta-neg {
-    color: var(--yg-signal-limit, #b83b36);
-  }
-
-  .sd-kpi-delta-muted {
-    color: var(--yg-text-muted);
+    gap: var(--boa-space-12);
   }
 
   .sd-two-col {
     display: grid;
     grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
-    gap: 16px;
+    gap: var(--yg-gap-panel);
     align-items: start;
   }
 
   .sd-split-equal {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 16px;
+    gap: var(--yg-gap-panel);
     align-items: start;
   }
 
-  @media (max-width: 960px) {
+  .sd-messages-shell {
+    display: grid;
+    grid-template-columns: 280px minmax(0, 1fr);
+    gap: var(--yg-gap-panel);
+    min-block-size: calc(100dvh - 168px);
+    align-items: stretch;
+  }
+
+  @container (width < 980px) {
+    .sd-kpi-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
     .sd-two-col,
-    .sd-split-equal {
-      grid-template-columns: 1fr;
+    .sd-split-equal,
+    .sd-messages-shell {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 
-  /* Portfolio SVG Chart (0% / $0 baseline, null-gap breaks, zero gradients) */
-  .sd-chart-frame {
-    width: 100%;
-    overflow-x: auto;
+  @container (width < 560px) {
+    .sd-kpi-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
 
-  .sd-chart-svg {
-    width: 100%;
-    height: 220px;
+  /* Executive KPI typography & motion */
+  .sd-kpi-card {
+    background: var(--yg-raised);
+    border: 1px solid var(--yg-border-subtle);
+    border-radius: var(--yg-radius-card);
+    padding: var(--yg-card-inset-regular);
+    display: flex;
+    flex-direction: column;
+    gap: var(--yg-gap-control);
+    transition: border-color var(--yg-motion-settle);
+  }
+
+  .sd-kpi-card[data-pulse="true"] {
+    border-color: var(--yg-brand-border);
+    animation: sdKpiSettle var(--yg-motion-expand) both;
+  }
+
+  .sd-kpi-value {
+    font: var(--yg-font-value);
+    letter-spacing: var(--yg-tracking-value);
+    font-variant-numeric: tabular-nums;
+    color: var(--yg-text);
+  }
+
+  .sd-kpi-spark {
+    inline-size: 100%;
+    block-size: 32px;
     display: block;
+    overflow: visible;
   }
 
-  .sd-chart-zero {
-    stroke: var(--yg-border-strong, var(--yg-border));
-    stroke-width: 1;
-    stroke-dasharray: 4 4;
-  }
-
-  .sd-chart-gridline {
-    stroke: var(--yg-border);
-    stroke-width: 1;
-    opacity: 0.65;
-  }
-
-  .sd-chart-line {
+  .sd-kpi-spark-line {
     fill: none;
-    stroke: var(--yg-brand-ink, #175174);
-    stroke-width: 2.25;
+    stroke: var(--yg-brand-ink);
+    stroke-width: 1.75;
     stroke-linecap: round;
     stroke-linejoin: round;
   }
 
+  .sd-kpi-spark-zero {
+    stroke: var(--yg-border-subtle);
+    stroke-width: 1;
+    stroke-dasharray: 2 3;
+  }
+
+  .sd-tone-pos {
+    color: var(--yg-success);
+  }
+
+  .sd-tone-neg {
+    color: var(--yg-danger);
+  }
+
+  .sd-tone-warn {
+    color: var(--yg-warning);
+  }
+
+  .sd-tone-brand {
+    color: var(--yg-brand-ink);
+  }
+
+  .sd-tone-muted {
+    color: var(--yg-muted);
+  }
+
+  /* Interactive 0% / $0 Baseline Portfolio Chart (Yogurt Chart visual parity) */
+  .sd-chart-wrap {
+    position: relative;
+    inline-size: 100%;
+    border-radius: var(--yg-radius-panel);
+  }
+
+  .sd-chart-wrap:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 1.5px var(--yg-focus-ring), 0 0 0 3.5px var(--yg-focus-halo);
+  }
+
+  .sd-chart-svg {
+    inline-size: 100%;
+    block-size: 248px;
+    display: block;
+    cursor: crosshair;
+  }
+
+  .sd-chart-gridline {
+    stroke: var(--yg-border-subtle);
+    stroke-width: 1;
+  }
+
+  .sd-chart-zero {
+    stroke: var(--yg-border-control);
+    stroke-width: 1;
+    stroke-dasharray: 4 4;
+  }
+
+  .sd-chart-crosshair {
+    stroke: var(--yg-brand-border);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+  }
+
+  .sd-chart-line {
+    fill: none;
+    stroke: var(--yg-brand-ink);
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: opacity var(--yg-motion-settle);
+  }
+
+  .sd-chart-point {
+    fill: var(--yg-brand-ink);
+    stroke: var(--yg-raised);
+    stroke-width: 2;
+    transition: r var(--yg-motion-press);
+  }
+
+  .sd-chart-point-active {
+    fill: var(--yg-brand-ink);
+    stroke: var(--yg-raised);
+    stroke-width: 2.5;
+  }
+
   .sd-chart-gap {
     fill: var(--yg-surface);
-    stroke: var(--yg-border);
+    stroke: var(--yg-border-chrome);
     stroke-dasharray: 3 3;
     stroke-width: 1;
   }
 
   .sd-chart-label {
-    fill: var(--yg-text-muted);
-    font-size: 11px;
+    fill: var(--yg-muted);
+    font: var(--yg-font-meta);
     font-variant-numeric: tabular-nums;
   }
 
-  /* Live dynamic entrance for incoming fills/events */
+  .sd-chart-hit {
+    fill: transparent;
+    cursor: pointer;
+  }
+
+  .sd-chart-readout {
+    background: var(--yg-surface);
+    border: 1px solid var(--yg-border-subtle);
+    border-radius: var(--yg-radius-panel);
+    padding: var(--boa-space-8) var(--boa-space-12);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--yg-gap-inline);
+  }
+
+  /* Live Entrance & Settle Animations (Yogurt canonical motion) */
   @keyframes sdRowEnter {
     0% {
       opacity: 0;
@@ -158,167 +270,156 @@
     }
   }
 
-  @keyframes sdLivePulse {
+  @keyframes sdKpiSettle {
     0% {
-      background-color: color-mix(in srgb, var(--yg-brand-ink, #175174) 10%, transparent);
+      transform: scale(0.992);
     }
     100% {
-      background-color: transparent;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes sdEdgeFlow {
+    to {
+      stroke-dashoffset: -28;
     }
   }
 
   .sd-live-enter {
-    animation: sdRowEnter 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation: sdRowEnter var(--yg-motion-expand) both;
   }
 
   .sd-live-flash {
-    animation: sdLivePulse 900ms ease-out both;
+    background: var(--yg-brand-soft);
+    border-radius: var(--yg-radius-small);
+    padding-inline: var(--boa-space-6);
+    margin-inline: calc(var(--boa-space-6) * -1);
+    transition: background var(--yg-motion-settle);
   }
 
-  /* Agent Interaction Graph (/office) */
+  /* Adaptive Clustered Agent Interaction Graph (/office) */
   .sd-graph-canvas {
     position: relative;
-    width: 100%;
-    min-height: 520px;
-    border-radius: 16px;
-    border: 1px solid var(--yg-border);
-    background-color: var(--yg-surface);
+    inline-size: 100%;
+    min-block-size: 560px;
+    border-radius: var(--yg-radius-card);
+    border: 1px solid var(--yg-border-subtle);
+    background: var(--yg-surface);
     overflow: hidden;
   }
 
   .sd-graph-edges-svg {
     position: absolute;
     inset: 0;
-    width: 100%;
-    height: 100%;
+    inline-size: 100%;
+    block-size: 100%;
     pointer-events: none;
   }
 
-  .sd-graph-edge-path {
-    fill: none;
-    stroke: var(--yg-border-strong, #c5c4bd);
-    stroke-width: 1.75;
-    transition: stroke 160ms ease, stroke-width 160ms ease;
+  .sd-graph-cluster-ring {
+    fill: var(--yg-canvas);
+    fill-opacity: 0.48;
+    stroke: var(--yg-border-subtle);
+    stroke-width: 1;
+    stroke-dasharray: 4 4;
   }
 
-  .sd-graph-edge-path[data-active="true"] {
-    stroke: var(--yg-brand-ink, #175174);
+  .sd-graph-cluster-label {
+    fill: var(--yg-text-subtle);
+    font: var(--yg-font-cap);
+    letter-spacing: var(--yg-tracking-cap);
+    text-transform: uppercase;
+  }
+
+  .sd-graph-edge-base {
+    fill: none;
+    stroke: var(--yg-border-chrome);
+    stroke-width: 1.5;
+    transition: stroke var(--yg-motion-settle), stroke-width var(--yg-motion-settle);
+  }
+
+  .sd-graph-edge-base[data-focused="true"] {
+    stroke: var(--yg-brand-ink);
     stroke-width: 2.25;
+  }
+
+  .sd-graph-edge-pulse {
+    fill: none;
+    stroke: var(--yg-brand-ink);
+    stroke-width: 2;
+    stroke-dasharray: 6 22;
+    stroke-linecap: round;
+    opacity: 0.72;
+    animation: sdEdgeFlow 1.8s linear infinite;
+  }
+
+  .sd-graph-edge-pulse[data-focused="true"] {
+    opacity: 1;
+    stroke-width: 2.5;
+    animation-duration: 1.1s;
   }
 
   .sd-graph-edge-pill-wrap {
     position: absolute;
     transform: translate(-50%, -50%);
-    z-index: 4;
+    z-index: 7;
   }
 
   .sd-graph-node-wrap {
     position: absolute;
-    width: 256px;
+    inline-size: 244px;
     transform: translate(-50%, -50%);
     z-index: 5;
-    transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+    transition: transform var(--yg-motion-settle);
+  }
+
+  .sd-graph-node-wrap[data-dense="true"] {
+    inline-size: 224px;
   }
 
   .sd-graph-node-card {
-    background: var(--yg-canvas);
-    border: 1px solid var(--yg-border-strong, #d0cfc8);
-    border-radius: 16px;
-    padding: 14px 16px;
+    background: var(--yg-raised);
+    border: 1px solid var(--yg-border-subtle);
+    border-radius: var(--yg-radius-card);
+    padding: var(--yg-card-inset-compact) var(--yg-card-inset-regular);
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    transition: border-color 150ms ease;
-  }
-
-  .sd-channel-btn {
-    width: 100%;
-    justify-content: space-between;
-    text-align: left;
+    gap: var(--yg-gap-row);
+    transition: border-color var(--yg-motion-settle);
   }
 
   .sd-graph-node-card:hover,
   .sd-graph-node-card[data-focused="true"] {
-    border-color: var(--yg-brand-ink, #175174);
+    border-color: var(--yg-brand-ink);
   }
 
-  /* Unified Company Messages (/messages) */
-  .sd-messages-shell {
-    display: grid;
-    grid-template-columns: 272px minmax(0, 1fr);
-    gap: 16px;
-    min-height: calc(100dvh - 148px);
-    align-items: stretch;
+  .sd-graph-node-card[data-dimmed="true"] {
+    opacity: 0.48;
   }
 
-  @media (max-width: 860px) {
-    .sd-messages-shell {
-      grid-template-columns: 1fr;
-    }
-  }
-
+  /* Messages Workspace (/messages) */
   .sd-channel-rail {
-    background: var(--yg-canvas);
-    border: 1px solid var(--yg-border);
-    border-radius: 16px;
-    padding: 12px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: var(--boa-space-12);
   }
 
   .sd-thread-pane {
-    background: var(--yg-canvas);
-    border: 1px solid var(--yg-border);
-    border-radius: 16px;
-    padding: 16px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    min-height: 520px;
+    gap: var(--boa-space-12);
+    min-block-size: 540px;
+  }
+
+  .sd-thread-pane .yg-composer {
+    inline-size: 100%;
+    max-inline-size: 100%;
   }
 
   .sd-thread-scroll {
     flex: 1 1 auto;
-    min-height: 260px;
-    max-height: 540px;
-    overflow-y: auto;
-    padding-right: 4px;
-  }
-
-  /* Inline Expandable Confirmation (Zero Popups!) */
-  .sd-inline-confirm {
-    border: 1px solid var(--yg-brand-ink, #175174);
-    border-radius: 16px;
-    background: var(--yg-canvas);
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    animation: sdRowEnter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  }
-
-  .sd-inline-confirm[data-destructive="true"] {
-    border-color: var(--yg-signal-limit, #b83b36);
-  }
-
-  .sd-impact-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
-  }
-
-  @media (max-width: 720px) {
-    .sd-impact-grid {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  .sd-impact-well {
-    border: 1px solid var(--yg-border);
-    border-radius: 12px;
-    padding: 12px;
-    background: var(--yg-surface);
+    min-block-size: 280px;
+    max-block-size: 560px;
   }
 
   /* Host-Lock Privacy Shield */
@@ -330,40 +431,35 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 24px;
+    padding: var(--boa-space-24);
   }
 
-  .sd-nav-section-label {
-    font-size: 11px;
-    font-weight: 520;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--yg-text-muted);
-    padding: 0 8px;
+  /* Toast Stack Overlay */
+  .sd-toast-corner {
+    position: fixed;
+    inset-block-end: var(--boa-space-20);
+    inset-inline-end: var(--boa-space-20);
+    z-index: 50;
+    inline-size: min(340px, calc(100vw - 32px));
   }
 
-  .sd-bridge-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 0;
-    border-bottom: 1px solid var(--yg-border);
-    gap: 12px;
-  }
-
-  .sd-bridge-row:last-child {
-    border-bottom: none;
-    padding-top: 10px;
-    font-weight: 540;
+  .sd-intrinsic {
+    inline-size: fit-content;
   }
 
   @media (prefers-reduced-motion: reduce) {
     .sd-live-enter,
-    .sd-live-flash,
-    .sd-inline-confirm,
-    .sd-graph-node-wrap,
-    .sd-graph-edge-path {
+    .sd-kpi-card[data-pulse="true"],
+    .sd-graph-edge-pulse {
       animation: none;
+    }
+    .sd-kpi-card,
+    .sd-chart-line,
+    .sd-chart-point,
+    .sd-graph-edge-base,
+    .sd-graph-node-wrap,
+    .sd-graph-node-card,
+    .sd-live-flash {
       transition: none;
     }
   }
@@ -371,16 +467,16 @@
 
 @layer yg.utilities {
   .sd-w-full {
-    width: 100%;
+    inline-size: 100%;
   }
 
-  .sd-muted {
-    color: var(--yg-text-muted);
+  .sd-tabular {
+    font-variant-numeric: tabular-nums;
   }
 
   .sd-mono {
-    font-size: 12px;
+    font-size: var(--yg-type-help-size);
     font-variant-numeric: tabular-nums;
-    letter-spacing: 0.01em;
+    letter-spacing: var(--yg-tracking-meta);
   }
 }
