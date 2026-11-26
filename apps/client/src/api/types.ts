@@ -287,6 +287,7 @@ export interface AgentDetailProjection {
     onboarding_attempts: number;
     allocated_turns: number | null;
   };
+  agent_sandbox?: AgentSandboxPortfolioDetail | null;
   desk_workspace: {
     execution_profile: string;
     desk_manifest_revision: string | null;
@@ -781,4 +782,124 @@ export interface CommandReceiptResponse {
   recorded_at_ns?: number;
   peer_pid?: number;
   result?: Record<string, unknown>;
+}
+
+export interface ExecutionTierBindingItem {
+  binding_id: string;
+  company_id: string;
+  tier: "agent_sandbox" | "company_paper" | "company_live";
+  environment: "paper" | "external_test" | "live";
+  owner_agent_id: string | null;
+  account_id: string;
+  destination_id: string;
+  connector_revision: string;
+  instrument_rules_digest: string;
+  currency: string;
+  starting_minor_units: number;
+  exposure_limit_minor_units: number;
+  fee_bps: number;
+  slippage_bps: number;
+  quote_source: string;
+  credential_handle_ref: string | null;
+  status: string;
+  created_at_ns?: number;
+  updated_at_ns?: number;
+}
+
+export interface LiveCandidateBindingItem extends ExecutionTierBindingItem {
+  matching_qualification_receipt_id: string | null;
+  promotion_payload_hash: string | null;
+}
+
+export interface AgentSandboxSummaryItem {
+  agent_id: string;
+  agent_display_name?: string;
+  agent_role_label?: string;
+  binding_id: string;
+  account_id: string;
+  currency: string;
+  fee_bps: number;
+  slippage_bps: number;
+  quote_source: string;
+  cash_minor_units: number;
+  gross_exposure_minor_units: number;
+  realized_pnl_minor_units: number;
+  total_fees_minor_units: number;
+  open_positions_count: number;
+  fill_count: number;
+}
+
+export interface AgentSandboxPortfolioDetail {
+  binding: ExecutionTierBindingItem;
+  cash_minor_units: number;
+  gross_exposure_minor_units: number;
+  exposure_limit_minor_units: number;
+  realized_pnl_minor_units: number;
+  total_fees_minor_units: number;
+  fill_count: number;
+  positions: Array<{
+    instrument_id: string;
+    quantity: number;
+    avg_entry_minor_units: number;
+    realized_pnl_minor_units: number;
+    total_fees_minor_units: number;
+    updated_at_ns: number;
+  }>;
+  orders: Array<{
+    order_id: string;
+    action_id: string;
+    instrument_id: string;
+    side: string;
+    quantity: number;
+    limit_minor_units: number;
+    status: string;
+    filled_quantity: number;
+    fill_price_minor_units: number | null;
+    fee_minor_units: number;
+    created_at_ns: number;
+  }>;
+}
+
+export interface QualificationReceiptItem {
+  receipt_id: string;
+  adapter_revision: string;
+  environment: string;
+  destination_id: string;
+  instrument_rules_digest: string;
+  core_digest: string;
+  verdict: string;
+  cases_passed: number;
+  cases_failed: number;
+  cases_unrun: number;
+  evidence_sha256: string;
+  recorded_at_ns: number;
+}
+
+export interface EnvironmentPromotionRecordItem {
+  promotion_id: string;
+  command_id: string;
+  action: string;
+  from_binding_id: string | null;
+  to_binding_id: string;
+  qualification_receipt_id: string | null;
+  payload_hash: string;
+  reason: string;
+  recorded_at_ns: number;
+}
+
+export interface ExecutionTiersProjection {
+  projection: string;
+  company_id: string;
+  charter_revision: string;
+  as_of_ns: number;
+  event_seq: number;
+  paper_domain_installed: boolean;
+  company_paper: ExecutionTierBindingItem | null;
+  company_paper_soak_ready: boolean;
+  company_live: ExecutionTierBindingItem | null;
+  live_candidates: LiveCandidateBindingItem[];
+  agent_sandboxes: AgentSandboxSummaryItem[];
+  qualification_receipts: QualificationReceiptItem[];
+  promotion_history: EnvironmentPromotionRecordItem[];
+  current_core_digest: string;
 }

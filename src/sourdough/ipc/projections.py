@@ -2387,13 +2387,36 @@ def read_execution_tiers_projection(
             raise FoundingRefused("Company identity mismatch")
         event_seq = max_event_seq(db, company_id)
         snapshot = read_execution_tiers_snapshot(db, company_id)
+        directory = _agent_directory(db, company_id)
+        charter_row = db.execute(
+            "SELECT charter_revision FROM company WHERE id = ?",
+            (company_id,),
+        ).fetchone()
+        charter_revision = (
+            str(charter_row[0])
+            if charter_row is not None
+            else str(snapshot.get("charter_revision", ""))
+        )
+        enriched_sandboxes = [
+            sbx
+            | {
+                "agent_display_name": directory.get(sbx["agent_id"], {}).get(
+                    "display_name", sbx["agent_id"]
+                ),
+                "agent_role_label": directory.get(sbx["agent_id"], {}).get(
+                    "role_label", "Agent"
+                ),
+            }
+            for sbx in snapshot.get("agent_sandboxes", [])
+        ]
         return (
             {
                 "projection": PROJECTION_EXECUTION_TIERS,
                 "company_id": company_id,
+                "charter_revision": charter_revision,
                 "as_of_ns": time_ns(),
                 "event_seq": event_seq,
-                **snapshot,
+                **(snapshot | {"agent_sandboxes": enriched_sandboxes}),
             },
             event_seq,
         )

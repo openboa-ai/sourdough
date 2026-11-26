@@ -11,6 +11,7 @@ import {
   RestrictionsView,
   StrategiesView,
 } from "./views/CompanyViews";
+import { ExecutionTiersView } from "./views/ExecutionTiersView";
 import { LiveTradingView } from "./views/LiveTradingView";
 import { MessagesView } from "./views/MessagesView";
 import { OrderTraceView } from "./views/OrderTraceView";
@@ -56,6 +57,9 @@ function RouteSwitch() {
   }
   if (path === "/company/strategy-trials") {
     return <StrategiesView />;
+  }
+  if (path === "/company/execution-tiers") {
+    return <ExecutionTiersView />;
   }
   if (path === "/company/finance") {
     return <FinanceView />;

@@ -547,6 +547,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           m: "/messages",
           p: "/company/approvals",
           s: "/company/strategy-trials",
+          e: "/company/execution-tiers",
           r: "/restrictions",
         };
         const dest = chordTargets[key];
@@ -625,6 +626,14 @@ export function AppShell({ children }: { children: ReactNode }) {
       icon: "sliders",
       shortcut: "G S",
       keywords: ["Strategy Trials", "Strategies", "Trials", "Challenger", "Releases", "Deployments"],
+    },
+    {
+      id: "nav:/company/execution-tiers",
+      label: "Execution Tiers & Live Promotion",
+      hint: "Company",
+      icon: "sliders",
+      shortcut: "G E",
+      keywords: ["Execution Tiers", "Sandbox", "Paper", "Live", "Promotion", "Binance", "Qualification"],
     },
     {
       id: "nav:/company/finance",
@@ -770,6 +779,12 @@ export function AppShell({ children }: { children: ReactNode }) {
             icon={<Icon name="sliders" />}
             active={path === "/company/strategy-trials"}
             onSelect={() => navigate("/company/strategy-trials")}
+          />
+          <SidebarItem
+            label="Execution Tiers"
+            icon={<Icon name="chart" />}
+            active={path === "/company/execution-tiers"}
+            onSelect={() => navigate("/company/execution-tiers")}
           />
           <SidebarItem
             label="Finance & Costs"

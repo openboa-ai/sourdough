@@ -945,17 +945,27 @@ export function LiveTradingView() {
               {data.risk_gate.suspended ? "New Orders Paused" : "Risk Gate Open"}
             </Status>
             {!performanceMode ? (
-              <Button
-                emphasis="quiet"
-                size="compact"
-                shape="pill"
-                data-focus-id="perf-adapter-entry"
-                onClick={() =>
-                  navigate("/performance", { focusReturnId: "perf-adapter-entry" })
-                }
-              >
-                Performance &amp; Adapter
-              </Button>
+              <Inline gap={6} align="center">
+                <Button
+                  emphasis="quiet"
+                  size="compact"
+                  shape="pill"
+                  onClick={() => navigate("/company/execution-tiers")}
+                >
+                  Execution Tiers
+                </Button>
+                <Button
+                  emphasis="quiet"
+                  size="compact"
+                  shape="pill"
+                  data-focus-id="perf-adapter-entry"
+                  onClick={() =>
+                    navigate("/performance", { focusReturnId: "perf-adapter-entry" })
+                  }
+                >
+                  Performance &amp; Adapter
+                </Button>
+              </Inline>
             ) : null}
           </Inline>
         }

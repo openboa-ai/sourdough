@@ -2198,11 +2198,74 @@ def read_execution_tiers_snapshot(db: Connection, company_id: str) -> dict[str, 
         ),
         None,
     )
-    live_candidates = [
-        asdict(b)
-        for b in bindings
-        if b.tier == TIER_COMPANY_LIVE and b.status != "active"
+    charter_row = db.execute(
+        "SELECT charter_revision FROM company WHERE id = ?",
+        (company_id,),
+    ).fetchone()
+    charter_revision = str(charter_row[0]) if charter_row is not None else ""
+    current_core = compute_trading_core_digest()
+
+    qual_receipts = [
+        {
+            "receipt_id": str(r[0]),
+            "adapter_revision": str(r[1]),
+            "environment": str(r[2]),
+            "destination_id": str(r[3]),
+            "instrument_rules_digest": str(r[4]),
+            "core_digest": str(r[5]),
+            "verdict": str(r[6]),
+            "cases_passed": int(r[7]),
+            "cases_failed": int(r[8]),
+            "cases_unrun": int(r[9]),
+            "evidence_sha256": str(r[10]),
+            "recorded_at_ns": int(r[11]),
+        }
+        for r in db.execute(
+            """SELECT receipt_id, adapter_revision, environment, destination_id,
+                      instrument_rules_digest, core_digest, verdict,
+                      cases_passed, cases_failed, cases_unrun,
+                      evidence_sha256, recorded_at_ns
+               FROM venue_qualification_receipt
+               WHERE company_id = ?
+               ORDER BY recorded_at_ns DESC LIMIT 20""",
+            (company_id,),
+        ).fetchall()
     ]
+
+    live_candidates = []
+    for b in bindings:
+        if b.tier == TIER_COMPANY_LIVE and b.status != "active":
+            matching = next(
+                (
+                    q
+                    for q in qual_receipts
+                    if q["verdict"] == "PASS"
+                    and q["cases_failed"] == 0
+                    and q["cases_unrun"] == 0
+                    and q["adapter_revision"] == b.connector_revision
+                    and q["instrument_rules_digest"] == b.instrument_rules_digest
+                    and q["core_digest"] == current_core
+                ),
+                None,
+            )
+            matching_id = str(matching["receipt_id"]) if matching is not None else None
+            promo_hash = (
+                build_promotion_payload_hash(
+                    company_id=company_id,
+                    charter_revision=charter_revision,
+                    target_binding=b,
+                    qualification_receipt_id=matching_id,
+                )
+                if matching_id is not None and charter_revision
+                else None
+            )
+            live_candidates.append(
+                asdict(b)
+                | {
+                    "matching_qualification_receipt_id": matching_id,
+                    "promotion_payload_hash": promo_hash,
+                }
+            )
     agent_sandboxes = []
     for b in bindings:
         if b.tier == TIER_AGENT_SANDBOX and b.status == "active" and b.owner_agent_id:
@@ -2234,32 +2297,6 @@ def read_execution_tiers_snapshot(db: Connection, company_id: str) -> dict[str, 
                     }
                 )
 
-    qual_receipts = [
-        {
-            "receipt_id": str(r[0]),
-            "adapter_revision": str(r[1]),
-            "environment": str(r[2]),
-            "destination_id": str(r[3]),
-            "instrument_rules_digest": str(r[4]),
-            "core_digest": str(r[5]),
-            "verdict": str(r[6]),
-            "cases_passed": int(r[7]),
-            "cases_failed": int(r[8]),
-            "cases_unrun": int(r[9]),
-            "evidence_sha256": str(r[10]),
-            "recorded_at_ns": int(r[11]),
-        }
-        for r in db.execute(
-            """SELECT receipt_id, adapter_revision, environment, destination_id,
-                      instrument_rules_digest, core_digest, verdict,
-                      cases_passed, cases_failed, cases_unrun,
-                      evidence_sha256, recorded_at_ns
-               FROM venue_qualification_receipt
-               WHERE company_id = ?
-               ORDER BY recorded_at_ns DESC LIMIT 20""",
-            (company_id,),
-        ).fetchall()
-    ]
     promotions = [
         {
             "promotion_id": str(r[0]),
@@ -2284,6 +2321,7 @@ def read_execution_tiers_snapshot(db: Connection, company_id: str) -> dict[str, 
     ]
     return {
         "paper_domain_installed": True,
+        "charter_revision": charter_revision,
         "company_paper": company_paper,
         "company_paper_soak_ready": _has_company_paper_soak_evidence(db, company_id),
         "company_live": company_live,
@@ -2291,7 +2329,7 @@ def read_execution_tiers_snapshot(db: Connection, company_id: str) -> dict[str, 
         "agent_sandboxes": agent_sandboxes,
         "qualification_receipts": qual_receipts,
         "promotion_history": promotions,
-        "current_core_digest": compute_trading_core_digest(),
+        "current_core_digest": current_core,
     }
 
 
