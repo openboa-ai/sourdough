@@ -1,9 +1,16 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  Command as SDKCommand,
+  CommandEmpty,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@ui-sdk/react/command";
 import { CopyButton } from "@openboa/yogurt/motion-copy-button";
 import {
   Badge,
   Button,
-  Command,
+  Dialog,
   Divider,
   Icon,
   IconButton,
@@ -28,16 +35,201 @@ import {
   Status,
   Text,
   ToastStack,
+  Tooltip,
+  type IconName,
   type Material,
 } from "@openboa/yogurt";
 import { newCommandId } from "../api/client";
-import { useApp } from "../state/store";
+import { splitRoute, useApp } from "../state/store";
 import { CommandOutboxPanel } from "./CommandOutboxPanel";
 import { ControlledInlineConfirm } from "./ControlledInlineConfirm";
 
-function pathnameOf(route: string): string {
-  const idx = route.indexOf("?");
-  return idx === -1 ? route : route.slice(0, idx);
+function hasOpenModalOrPopover(): boolean {
+  const matches = document.querySelectorAll(
+    'dialog[open], [role="dialog"], [role="alertdialog"], [data-slot="popover-content"][data-open]'
+  );
+  for (const el of matches) {
+    if (el.closest('[inert], [hidden], [aria-hidden="true"], [data-closed]')) {
+      continue;
+    }
+    if (el instanceof HTMLDialogElement && !el.open) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+interface SavedFocusTarget {
+  focusId: string | null;
+  ariaLabel: string | null;
+  placeholder: string | null;
+  name: string | null;
+  inputType: string | null;
+  tagName: string | null;
+  text: string | null;
+  inMain: boolean;
+}
+
+function escapeSelectorAttr(value: string): string {
+  return typeof CSS !== "undefined" && typeof CSS.escape === "function"
+    ? CSS.escape(value)
+    : value.replace(/"/g, '\\"');
+}
+
+function normalizeSeqText(text: string): string {
+  return text.replace(/#\d+/g, "#").replace(/\s+/g, " ").trim();
+}
+
+function describeFocusTarget(el: Element | null, depth = 0): SavedFocusTarget | null {
+  if (!el || el === document.body || el === document.documentElement || depth > 2) {
+    return null;
+  }
+  if (el.closest(".sd-privacy-shield")) {
+    return null;
+  }
+  const popover = el.closest('[data-slot="popover-content"], .yg-popover, .yg-anchored-panel');
+  if (popover) {
+    const popId = popover.getAttribute("id");
+    let trigger: Element | null = null;
+    if (popId) {
+      trigger = document.querySelector(`[aria-controls="${escapeSelectorAttr(popId)}"]`);
+    }
+    if (!trigger) {
+      trigger =
+        document.querySelector('header.sd-topbar button[aria-expanded="true"][aria-haspopup]') ??
+        document.querySelector('[data-focus-id="topbar-diagnostics-trigger"]');
+    }
+    if (trigger && trigger !== el) {
+      return describeFocusTarget(trigger, depth + 1);
+    }
+  }
+  const tagName = el.tagName;
+  const isField = tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT";
+  return {
+    focusId:
+      el.getAttribute("data-focus-id") ??
+      el.closest("[data-focus-id]")?.getAttribute("data-focus-id") ??
+      null,
+    ariaLabel: el.getAttribute("aria-label"),
+    placeholder: el.getAttribute("placeholder"),
+    name: el.getAttribute("name"),
+    inputType: el instanceof HTMLInputElement ? el.type : null,
+    tagName,
+    text: isField ? null : (el.textContent ?? "").trim().slice(0, 80) || null,
+    inMain: Boolean(el.closest("main")),
+  };
+}
+
+function getFocusableElements(root: HTMLElement | null): HTMLElement[] {
+  if (!root) return [];
+  const candidates = root.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]):not([disabled])'
+  );
+  return Array.from(candidates).filter((el) => {
+    if (el.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+    return el.getClientRects().length > 0;
+  });
+}
+
+function isVisibleFocusable(el: HTMLElement | null): el is HTMLElement {
+  if (!el) return false;
+  if (el.hasAttribute("disabled") || el.closest('[hidden], [inert], [aria-hidden="true"]')) {
+    return false;
+  }
+  return el.getClientRects().length > 0;
+}
+
+function findExactSavedFocusTarget(saved: SavedFocusTarget | null): HTMLElement | null {
+  if (!saved) return null;
+  const mainEl = document.querySelector<HTMLElement>("main");
+  if (saved.inMain && !mainEl) return null;
+  const scopeRoot: ParentNode = saved.inMain && mainEl ? mainEl : document;
+
+  if (saved.focusId) {
+    const byFocusId = document.querySelector<HTMLElement>(
+      `[data-focus-id="${escapeSelectorAttr(saved.focusId)}"]`
+    );
+    if (isVisibleFocusable(byFocusId)) {
+      return byFocusId;
+    }
+  }
+  if (saved.ariaLabel) {
+    const byAria = scopeRoot.querySelector<HTMLElement>(
+      `[aria-label="${escapeSelectorAttr(saved.ariaLabel)}"]`
+    );
+    if (isVisibleFocusable(byAria)) {
+      return byAria;
+    }
+  }
+
+  const candidates = getFocusableElements(
+    scopeRoot instanceof HTMLElement ? scopeRoot : document.body
+  );
+
+  if (saved.tagName === "INPUT" || saved.tagName === "TEXTAREA" || saved.tagName === "SELECT") {
+    const fieldCandidates = candidates.filter((el) => {
+      if (el.tagName !== saved.tagName) return false;
+      if (saved.inputType && el instanceof HTMLInputElement && el.type !== saved.inputType) {
+        return false;
+      }
+      return true;
+    });
+    if (saved.name) {
+      const byName = fieldCandidates.find((el) => el.getAttribute("name") === saved.name);
+      if (byName) return byName;
+    }
+    if (saved.placeholder) {
+      const byPlaceholder = fieldCandidates.find(
+        (el) => el.getAttribute("placeholder") === saved.placeholder
+      );
+      if (byPlaceholder) return byPlaceholder;
+    }
+    if (!saved.name && !saved.placeholder && fieldCandidates.length === 1) {
+      return fieldCandidates[0];
+    }
+  }
+
+  if (saved.tagName && saved.text) {
+    const exactTextMatch = candidates.find(
+      (el) => el.tagName === saved.tagName && (el.textContent ?? "").trim().slice(0, 80) === saved.text
+    );
+    if (exactTextMatch) return exactTextMatch;
+
+    if (saved.text.includes("#")) {
+      const normalizedSaved = normalizeSeqText(saved.text);
+      const seqNormalizedMatch = candidates.find(
+        (el) =>
+          el.tagName === saved.tagName &&
+          normalizeSeqText((el.textContent ?? "").trim().slice(0, 80)) === normalizedSaved
+      );
+      if (seqNormalizedMatch) return seqNormalizedMatch;
+    }
+  }
+
+  return null;
+}
+
+function isMainSkeletonActive(): boolean {
+  const mainEl = document.querySelector<HTMLElement>("main");
+  if (!mainEl) return true;
+  return Boolean(mainEl.querySelector(".yg-skeleton"));
+}
+
+function focusFallbackTarget(saved: SavedFocusTarget | null): void {
+  const mainFocusable = getFocusableElements(document.querySelector<HTMLElement>("main"))[0];
+  const topbarFocusable = getFocusableElements(
+    document.querySelector<HTMLElement>("header.sd-topbar")
+  )[0];
+  if (saved && !saved.inMain && topbarFocusable) {
+    topbarFocusable.focus();
+    return;
+  }
+  if (mainFocusable) {
+    mainFocusable.focus();
+    return;
+  }
+  topbarFocusable?.focus();
 }
 
 export function AppShell({ children }: { children: ReactNode }) {
@@ -50,7 +242,10 @@ export function AppShell({ children }: { children: ReactNode }) {
     lastEventSeq,
     hostLocked,
     setHostLocked,
+    controlsLocked,
     canWrite,
+    outbox,
+    unreadCeoReply,
     dispatchCommand,
     forceRefresh,
     appearance,
@@ -63,8 +258,18 @@ export function AppShell({ children }: { children: ReactNode }) {
   } = useApp();
 
   const [safetyStripOpen, setSafetyStripOpen] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [commandQuery, setCommandQuery] = useState("");
+  const [unlocking, setUnlocking] = useState(false);
+  const [unlockError, setUnlockError] = useState<string | null>(null);
+  const gArmedUntilRef = useRef(0);
+  const commandInputRef = useRef<HTMLInputElement | null>(null);
+  const shieldRef = useRef<HTMLDivElement | null>(null);
+  const preCommandFocusRef = useRef<SavedFocusTarget | null>(null);
+  const restoreFocusRef = useRef<SavedFocusTarget | null>(null);
+  const wasShieldActiveRef = useRef(false);
 
-  const path = pathnameOf(route);
+  const { pathname: path } = splitRoute(route);
   const paperActive = meta?.active_domains.includes("paper") ?? false;
   const paperRiskSuspended = Boolean(meta?.paper_risk_suspended);
   const activeRestrictions = meta?.active_restrictions_count ?? 0;
@@ -96,45 +301,400 @@ export function AppShell({ children }: { children: ReactNode }) {
     meta?.supported_commands?.resume_new_risk?.includes("paper-risk-command-v1")
   );
 
+  const safetyDisabledReason =
+    linkState !== "live"
+      ? "Unavailable while disconnected from local daemon"
+      : controlsLocked
+        ? "Resolve the pending command in the outbox first"
+        : meta?.board_access.role !== "board_control"
+          ? "Requires board_control role (read-only viewer)"
+          : "Control plane locked";
+
+  const resumeEngineNote =
+    "Server-side paper engine directory is required to resume trading; inspect Restrictions.";
+
+  const isShieldActive = hostLocked && linkState !== "unauthorized";
+
+  useEffect(() => {
+    if (!isShieldActive) {
+      if (wasShieldActiveRef.current) {
+        wasShieldActiveRef.current = false;
+        const saved = restoreFocusRef.current;
+        restoreFocusRef.current = null;
+
+        let cancelled = false;
+        let observer: MutationObserver | null = null;
+        let timeoutId: number | null = null;
+        let rafId: number | null = null;
+
+        const cleanup = () => {
+          cancelled = true;
+          observer?.disconnect();
+          observer = null;
+          if (timeoutId !== null) {
+            window.clearTimeout(timeoutId);
+            timeoutId = null;
+          }
+          if (rafId !== null) {
+            window.cancelAnimationFrame(rafId);
+            rafId = null;
+          }
+          window.removeEventListener("pointerdown", onUserInteract, true);
+          window.removeEventListener("keydown", onUserKeyDown, true);
+        };
+
+        const onUserInteract = () => cleanup();
+        const onUserKeyDown = (event: KeyboardEvent) => {
+          if (
+            event.key === "Tab" ||
+            event.key === "Enter" ||
+            event.key === " " ||
+            event.key.startsWith("Arrow")
+          ) {
+            cleanup();
+          }
+        };
+
+        const immediate = findExactSavedFocusTarget(saved);
+        if (immediate) {
+          immediate.focus();
+          return;
+        }
+        if (saved && !saved.inMain) {
+          focusFallbackTarget(saved);
+          return;
+        }
+        if (!isMainSkeletonActive()) {
+          const fallbackRaf = window.requestAnimationFrame(() => {
+            const retried = findExactSavedFocusTarget(saved);
+            if (retried) {
+              retried.focus();
+            } else {
+              focusFallbackTarget(saved);
+            }
+          });
+          return () => window.cancelAnimationFrame(fallbackRaf);
+        }
+
+        window.addEventListener("pointerdown", onUserInteract, true);
+        window.addEventListener("keydown", onUserKeyDown, true);
+
+        observer = new MutationObserver(() => {
+          if (cancelled) return;
+          const exact = findExactSavedFocusTarget(saved);
+          if (exact) {
+            exact.focus();
+            cleanup();
+            return;
+          }
+          if (!isMainSkeletonActive() && rafId === null) {
+            rafId = window.requestAnimationFrame(() => {
+              rafId = null;
+              if (cancelled) return;
+              const settled = findExactSavedFocusTarget(saved);
+              if (settled) {
+                settled.focus();
+              } else {
+                focusFallbackTarget(saved);
+              }
+              cleanup();
+            });
+          }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        timeoutId = window.setTimeout(() => {
+          if (cancelled) return;
+          const exact = findExactSavedFocusTarget(saved);
+          if (exact) {
+            exact.focus();
+          } else {
+            focusFallbackTarget(saved);
+          }
+          cleanup();
+        }, 4000);
+
+        return cleanup;
+      }
+      return;
+    }
+
+    if (!wasShieldActiveRef.current) {
+      wasShieldActiveRef.current = true;
+      if (!restoreFocusRef.current) {
+        restoreFocusRef.current = describeFocusTarget(document.activeElement);
+      }
+    }
+
+    const focusIntoShield = () => {
+      const shield = shieldRef.current;
+      if (!shield) return;
+      if (shield.contains(document.activeElement)) return;
+      const focusables = getFocusableElements(shield);
+      (focusables[0] ?? shield).focus();
+    };
+    focusIntoShield();
+    const raf = window.requestAnimationFrame(focusIntoShield);
+
+    const onShieldKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (event.key === "Tab") {
+        const shield = shieldRef.current;
+        if (!shield) return;
+        const focusables = getFocusableElements(shield);
+        event.preventDefault();
+        if (focusables.length === 0) {
+          shield.focus();
+          return;
+        }
+        const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        const idx = active ? focusables.indexOf(active) : -1;
+        if (idx === -1) {
+          (event.shiftKey ? focusables[focusables.length - 1] : focusables[0]).focus();
+        } else {
+          const nextIdx = event.shiftKey
+            ? (idx - 1 + focusables.length) % focusables.length
+            : (idx + 1) % focusables.length;
+          focusables[nextIdx].focus();
+        }
+      }
+    };
+
+    document.addEventListener("keydown", onShieldKeyDown, true);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      document.removeEventListener("keydown", onShieldKeyDown, true);
+    };
+  }, [isShieldActive]);
+
+  useEffect(() => {
+    if (!commandOpen) return;
+    const raf = window.requestAnimationFrame(() => {
+      const inputEl =
+        commandInputRef.current ??
+        document.querySelector<HTMLInputElement>(".yg-command-search input");
+      inputEl?.focus();
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [commandOpen]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
-      const trigger = document.querySelector<HTMLButtonElement>(".sd-command-slot button");
-      if (trigger) {
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k") {
+        if (hostLocked) {
+          event.preventDefault();
+          return;
+        }
         event.preventDefault();
-        trigger.click();
+        setCommandQuery("");
+        setCommandOpen((open) => {
+          if (!open) {
+            preCommandFocusRef.current = describeFocusTarget(document.activeElement);
+          }
+          return !open;
+        });
+        return;
+      }
+
+      if (
+        hostLocked ||
+        commandOpen ||
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.repeat ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.shiftKey
+      ) {
+        gArmedUntilRef.current = 0;
+        return;
+      }
+
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        (target.closest(
+          'input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"]'
+        ) ||
+          (target instanceof HTMLElement && target.isContentEditable))
+      ) {
+        gArmedUntilRef.current = 0;
+        return;
+      }
+
+      if (hasOpenModalOrPopover()) {
+        gArmedUntilRef.current = 0;
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      const now = Date.now();
+      if (gArmedUntilRef.current > now) {
+        gArmedUntilRef.current = 0;
+        const chordTargets: Record<string, string> = {
+          l: "/",
+          a: "/office",
+          m: "/messages",
+          p: "/company/approvals",
+          s: "/company/strategy-trials",
+          r: "/restrictions",
+        };
+        const dest = chordTargets[key];
+        if (dest) {
+          event.preventDefault();
+          navigate(dest);
+        }
+        return;
+      }
+
+      if (key === "g") {
+        gArmedUntilRef.current = now + 900;
+      } else {
+        gArmedUntilRef.current = 0;
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [commandOpen, hostLocked, navigate]);
 
-  const commandItems = [
-    { id: "nav:/", label: "Live Trading & Portfolio", hint: "Core", icon: "chart" as const, shortcut: "G L" },
-    { id: "nav:/office", label: "Agents & Activity Graph", hint: "Core", icon: "workflow" as const, shortcut: "G A" },
-    { id: "nav:/messages", label: "Company Messages (Founder · CEO)", hint: "Core", icon: "chat" as const, shortcut: "G M" },
+  const commandItems: Array<{
+    id: string;
+    label: string;
+    hint: string;
+    icon: IconName;
+    shortcut?: string;
+    keywords?: string[];
+  }> = [
+    {
+      id: "nav:/",
+      label: "Live Trading & Portfolio",
+      hint: "Core",
+      icon: "chart",
+      shortcut: "G L",
+      keywords: ["Live", "Trading", "Portfolio", "Home", "Dashboard", "Orders", "Positions"],
+    },
+    ...(paperActive
+      ? [
+          {
+            id: "nav:/performance",
+            label: "Performance & Two-Layer P&L",
+            hint: "Core",
+            icon: "chart" as const,
+            keywords: ["Performance", "PnL", "P&L", "Returns", "Two-Layer"],
+          },
+        ]
+      : []),
+    {
+      id: "nav:/office",
+      label: "Agents & Activity Graph",
+      hint: "Core",
+      icon: "workflow",
+      shortcut: "G A",
+      keywords: ["Agents", "Activity", "Office", "Graph", "Workers", "Roster"],
+    },
+    {
+      id: "nav:/messages",
+      label: "Company Messages (Founder · CEO)",
+      hint: "Core",
+      icon: "chat",
+      shortcut: "G M",
+      keywords: ["Messages", "CEO", "Founder", "Chat", "Direct", "Threads"],
+    },
     {
       id: "nav:/company/approvals",
       label: pendingApprovals > 0 ? `Board Approvals (${pendingApprovals} pending)` : "Board Approvals",
       hint: "Company",
-      icon: "check" as const,
+      icon: "check",
+      shortcut: "G P",
+      keywords: ["Approvals", "Decisions", "Questions", "Pending", "Governance"],
     },
-    { id: "nav:/company/strategy-trials", label: "Strategies & Challenger Trials", hint: "Company", icon: "sliders" as const },
-    { id: "nav:/company/finance", label: "Finance & Operating Costs", hint: "Company", icon: "bookmark" as const },
-    { id: "nav:/company/org", label: "Organization & Published Reports", hint: "Company", icon: "person" as const },
-    { id: "nav:/system/checkpoints", label: "Safety, Checkpoints & Restore", hint: "System", icon: "clock" as const },
-    { id: "nav:/system/evaluations", label: "Evaluations & Tool Lineage", hint: "System", icon: "puzzle" as const },
-    { id: "nav:/system/audit", label: "Audit Log & Diagnostics", hint: "System", icon: "folder" as const },
+    {
+      id: "nav:/company/strategy-trials",
+      label: "Strategies & Challenger Trials",
+      hint: "Company",
+      icon: "sliders",
+      shortcut: "G S",
+      keywords: ["Strategy Trials", "Strategies", "Trials", "Challenger", "Releases", "Deployments"],
+    },
+    {
+      id: "nav:/company/finance",
+      label: "Finance & Operating Costs",
+      hint: "Company",
+      icon: "bookmark",
+      keywords: ["Finance", "Costs", "Accounting", "Journals", "Statements", "Budget"],
+    },
+    {
+      id: "nav:/company/org",
+      label: "Organization & Published Reports",
+      hint: "Company",
+      icon: "person",
+      keywords: ["Org", "Organization", "Reports", "Publications", "Custody", "Team"],
+    },
+    {
+      id: "nav:/restrictions",
+      label: "Active Restrictions & Risk Gates",
+      hint: "Company",
+      icon: "info",
+      shortcut: "G R",
+      keywords: ["Restrictions", "Risk", "Stops", "Pause", "Resume", "Gates"],
+    },
+    {
+      id: "nav:/system/checkpoints",
+      label: "Safety, Checkpoints & Restore",
+      hint: "System",
+      icon: "clock",
+      keywords: ["Checkpoints", "Safety", "Restore", "Snapshot"],
+    },
+    {
+      id: "nav:/system/evaluations",
+      label: "Evaluations & Tool Lineage",
+      hint: "System",
+      icon: "puzzle",
+      keywords: ["Evaluations", "Evals", "Lineage", "Qualifications", "DAG"],
+    },
+    {
+      id: "nav:/system/audit",
+      label: "Audit Log & Diagnostics",
+      hint: "System",
+      icon: "folder",
+      keywords: ["Audit", "Log", "Diagnostics", "Events"],
+    },
+    {
+      id: "nav:/system/daemon",
+      label: "Daemon & Adapter Diagnostics",
+      hint: "System",
+      icon: "folder",
+      keywords: ["Daemon", "Adapter", "Diagnostics", "Runtime", "System"],
+    },
     {
       id: "action:theme",
       label: isDark ? "Switch to Light Appearance" : "Switch to Dark Appearance",
       hint: "Yogurt",
-      icon: (isDark ? "sun" : "moon") as "sun" | "moon",
+      icon: isDark ? "sun" : "moon",
+      keywords: ["Theme", "Appearance", "Light", "Dark"],
     },
-    { id: "action:lock", label: "Lock Board Client Screen", hint: "Privacy", icon: "close" as const },
+    {
+      id: "action:lock",
+      label: "Lock Board Client Screen",
+      hint: "Privacy",
+      icon: "close",
+      keywords: ["Lock", "Privacy", "Shield", "Screen"],
+    },
   ];
 
   const handleCommandSelect = (id: string) => {
+    const savedPreCommand = preCommandFocusRef.current;
+    preCommandFocusRef.current = null;
     if (id.startsWith("nav:")) {
       navigate(id.slice("nav:".length));
     } else if (id === "action:theme") {
@@ -142,6 +702,9 @@ export function AppShell({ children }: { children: ReactNode }) {
       setAppearance(next);
       pushToast(`Switched appearance to ${next}.`);
     } else if (id === "action:lock") {
+      restoreFocusRef.current =
+        savedPreCommand ?? describeFocusTarget(document.activeElement);
+      setUnlockError(null);
       setHostLocked(true);
     }
   };
@@ -176,6 +739,14 @@ export function AppShell({ children }: { children: ReactNode }) {
             label="Messages"
             icon={<Icon name="chat" />}
             active={path === "/messages" || path === "/ceo"}
+            badge={
+              unreadCeoReply ? (
+                <span className="sd-unread-badge" title="New CEO reply">
+                  <span className="yg-signal-dot" aria-hidden="true" />
+                  <span className="sd-sr-only">New CEO reply</span>
+                </span>
+              ) : undefined
+            }
             onSelect={() => navigate("/messages")}
           />
         </SidebarGroup>
@@ -184,7 +755,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem
             label="Approvals"
             icon={<Icon name="check" />}
-            active={path === "/company/approvals"}
+            active={path === "/company/approvals" || path.startsWith("/company/approvals/")}
             badge={
               pendingApprovals > 0 ? (
                 <Badge tone="brand" dot={false}>
@@ -209,7 +780,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem
             label="Org & Reports"
             icon={<Icon name="person" />}
-            active={path === "/company/org"}
+            active={path === "/company/org" || path.startsWith("/company/org/")}
             onSelect={() => navigate("/company/org")}
           />
         </SidebarGroup>
@@ -239,7 +810,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem
             label="Audit Log"
             icon={<Icon name="folder" />}
-            active={path === "/system/audit"}
+            active={path === "/system/audit" || path === "/system/daemon"}
             onSelect={() => navigate("/system/audit")}
           />
         </SidebarGroup>
@@ -268,8 +839,10 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <>
-      {hostLocked ? (
+      {isShieldActive ? (
         <div
+          ref={shieldRef}
+          tabIndex={-1}
           className="sd-privacy-shield"
           role="dialog"
           aria-modal="true"
@@ -283,17 +856,37 @@ export function AppShell({ children }: { children: ReactNode }) {
                 emphasis="filled"
                 tone="brand"
                 shape="pill"
-                onClick={() => {
-                  setHostLocked(false);
-                  forceRefresh();
+                pending={unlocking}
+                pendingLabel="Verifying..."
+                onClick={async () => {
+                  setUnlocking(true);
+                  setUnlockError(null);
+                  const ok = await forceRefresh();
+                  setUnlocking(false);
+                  if (ok) {
+                    setHostLocked(false);
+                  } else {
+                    setUnlockError(
+                      "Could not reach local daemon to re-verify session."
+                    );
+                  }
                 }}
               >
                 Unlock Board Client
               </Button>
             }
           >
-            Company telemetry and controls are concealed while locked. Your last observed
-            sequence (seq #{lastEventSeq}) is preserved safely.
+            <Stack gap={12}>
+              <Text variant="help">
+                Company telemetry and controls are concealed while locked. Your last observed
+                sequence (seq #{lastEventSeq}) is preserved safely.
+              </Text>
+              {unlockError ? (
+                <Notice title="Unlock verification failed" tone="danger" urgent>
+                  {unlockError}
+                </Notice>
+              ) : null}
+            </Stack>
           </Result>
         </div>
       ) : (
@@ -310,6 +903,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               <SidebarTrigger label="Toggle sidebar" size="compact" />
               <Link
                 href="/"
+                className="sd-brand-link"
                 onClick={(e) => {
                   e.preventDefault();
                   navigate("/");
@@ -326,16 +920,79 @@ export function AppShell({ children }: { children: ReactNode }) {
               ) : null}
             </Inline>
 
-            <Inline gap={8} align="center" wrap={false}>
-              <span className="sd-command-slot">
-                <Command
-                  label="⌘K"
-                  title="Board Client Command"
-                  triggerText="⌘K"
-                  items={commandItems}
-                  onSelect={handleCommandSelect}
-                />
-              </span>
+            <Inline gap={8} align="center" wrap>
+              <Button
+                emphasis="soft"
+                size="compact"
+                shape="pill"
+                aria-label="Open command palette"
+                aria-keyshortcuts="Meta+K Control+K"
+                onClick={() => {
+                  preCommandFocusRef.current = describeFocusTarget(document.activeElement);
+                  setCommandQuery("");
+                  setCommandOpen(true);
+                }}
+              >
+                ⌘K
+              </Button>
+
+              <Dialog
+                open={commandOpen}
+                onOpenChange={(open) => {
+                  setCommandOpen(open);
+                  if (!open) {
+                    setCommandQuery("");
+                    preCommandFocusRef.current = null;
+                  }
+                }}
+                title="Board Client Command"
+              >
+                {commandOpen ? (
+                  <SDKCommand
+                    query={commandQuery}
+                    onQueryChange={setCommandQuery}
+                    filter="contains"
+                    loop
+                    onAction={(id) => {
+                      setCommandOpen(false);
+                      setCommandQuery("");
+                      handleCommandSelect(id);
+                    }}
+                  >
+                    <div className="yg-command-search">
+                      <Icon name="search" />
+                      <CommandInput
+                        ref={commandInputRef}
+                        autoFocus
+                        aria-label="Find a command"
+                        placeholder="Find a command..."
+                      />
+                    </div>
+                    <CommandEmpty className="yg-help">No matching commands</CommandEmpty>
+                    <CommandList className="yg-command-list" aria-label="Commands">
+                      {commandItems.map((item) => (
+                        <CommandItem
+                          key={item.id}
+                          value={item.id}
+                          label={item.label}
+                          keywords={[item.hint, ...(item.keywords ?? [])]}
+                        >
+                          <Icon name={item.icon} />
+                          <span className="yg-command-copy">
+                            <span>{item.label}</span>
+                            <Text variant="meta"> · {item.hint}</Text>
+                          </span>
+                          {item.shortcut ? (
+                            <kbd className="sd-command-kbd" aria-hidden="true">
+                              {item.shortcut}
+                            </kbd>
+                          ) : null}
+                        </CommandItem>
+                      ))}
+                    </CommandList>
+                  </SDKCommand>
+                ) : null}
+              </Dialog>
 
               <IconButton
                 size="compact"
@@ -353,13 +1010,18 @@ export function AppShell({ children }: { children: ReactNode }) {
                 label="Control plane diagnostics"
                 align="end"
                 trigger={
-                  <Button emphasis="quiet" size="compact" shape="pill">
+                  <Button
+                    emphasis="quiet"
+                    size="compact"
+                    shape="pill"
+                    data-focus-id="topbar-diagnostics-trigger"
+                  >
                     <Status tone={statusTone}>{statusLabel}</Status>
                   </Button>
                 }
               >
                 <Stack gap={12}>
-                  <PopoverTitle>Control Plane & Surface</PopoverTitle>
+                  <PopoverTitle>Control Plane &amp; Surface</PopoverTitle>
                   <PopoverDescription>
                     Single-writer local UDS daemon telemetry and Yogurt surface controls.
                   </PopoverDescription>
@@ -413,7 +1075,20 @@ export function AppShell({ children }: { children: ReactNode }) {
                       emphasis="soft"
                       size="compact"
                       shape="pill"
-                      onClick={() => setHostLocked(true)}
+                      onClick={() => {
+                        const diagTrigger =
+                          document.querySelector<HTMLElement>(
+                            '[data-focus-id="topbar-diagnostics-trigger"]'
+                          ) ??
+                          document.querySelector<HTMLElement>(
+                            "header.sd-topbar button[aria-haspopup]"
+                          );
+                        restoreFocusRef.current = describeFocusTarget(
+                          diagTrigger ?? document.activeElement
+                        );
+                        setUnlockError(null);
+                        setHostLocked(true);
+                      }}
                     >
                       Lock Screen
                     </Button>
@@ -431,21 +1106,62 @@ export function AppShell({ children }: { children: ReactNode }) {
 
               {paperActive ? (
                 paperRiskSuspended ? (
-                  <Button
-                    emphasis="filled"
-                    tone="brand"
-                    size="compact"
-                    shape="pill"
-                    onClick={() => {
-                      if (!canResumePaper) {
-                        navigate("/restrictions");
-                        return;
-                      }
-                      setSafetyStripOpen((v) => !v);
-                    }}
-                  >
-                    Resume Trading
-                  </Button>
+                  !canWrite ? (
+                    <Tooltip label={safetyDisabledReason}>
+                      {(tipProps) => (
+                        <span
+                          className="sd-tooltip-anchor"
+                          {...tipProps}
+                          title={safetyDisabledReason}
+                        >
+                          <Button
+                            emphasis="filled"
+                            tone="brand"
+                            size="compact"
+                            shape="pill"
+                            disabled
+                            aria-label={`Resume Trading (${safetyDisabledReason})`}
+                          >
+                            Resume Trading
+                          </Button>
+                        </span>
+                      )}
+                    </Tooltip>
+                  ) : !canResumePaper ? (
+                    <Tooltip label={resumeEngineNote}>
+                      {(tipProps) => (
+                        <span
+                          className="sd-tooltip-anchor"
+                          {...tipProps}
+                          title={resumeEngineNote}
+                        >
+                          <Button
+                            emphasis="filled"
+                            tone="brand"
+                            size="compact"
+                            shape="pill"
+                            aria-label={`Resume Trading (${resumeEngineNote})`}
+                            onClick={() => {
+                              pushToast(resumeEngineNote);
+                              navigate("/restrictions");
+                            }}
+                          >
+                            Resume Trading
+                          </Button>
+                        </span>
+                      )}
+                    </Tooltip>
+                  ) : (
+                    <Button
+                      emphasis="filled"
+                      tone="brand"
+                      size="compact"
+                      shape="pill"
+                      onClick={() => setSafetyStripOpen((v) => !v)}
+                    >
+                      Resume Trading
+                    </Button>
+                  )
                 ) : activeRestrictions > 0 ? (
                   <Button
                     emphasis="soft"
@@ -456,13 +1172,33 @@ export function AppShell({ children }: { children: ReactNode }) {
                   >
                     Active Stops ({activeRestrictions})
                   </Button>
+                ) : !canWrite ? (
+                  <Tooltip label={safetyDisabledReason}>
+                    {(tipProps) => (
+                      <span
+                        className="sd-tooltip-anchor"
+                        {...tipProps}
+                        title={safetyDisabledReason}
+                      >
+                        <Button
+                          emphasis="soft"
+                          tone="danger"
+                          size="compact"
+                          shape="pill"
+                          disabled
+                          aria-label={`Pause New Orders (${safetyDisabledReason})`}
+                        >
+                          Pause New Orders
+                        </Button>
+                      </span>
+                    )}
+                  </Tooltip>
                 ) : (
                   <Button
                     emphasis="soft"
                     tone="danger"
                     size="compact"
                     shape="pill"
-                    disabled={!canWrite}
                     onClick={() => setSafetyStripOpen((v) => !v)}
                   >
                     Pause New Orders
@@ -486,6 +1222,11 @@ export function AppShell({ children }: { children: ReactNode }) {
               {paperActive && meta && linkState !== "unauthorized" ? (
                 <ControlledInlineConfirm
                   open={safetyStripOpen}
+                  pending={
+                    (outbox.lifecycle === "submitting" || outbox.lifecycle === "accepted") &&
+                    (outbox.intent?.command_type === "suspend_new_risk" ||
+                      outbox.intent?.command_type === "resume_new_risk")
+                  }
                   onCancel={() => setSafetyStripOpen(false)}
                   decision={{
                     id: paperRiskSuspended ? "resume-paper-orders" : "pause-paper-orders",
@@ -527,9 +1268,9 @@ export function AppShell({ children }: { children: ReactNode }) {
                       { label: "company_id", value: meta.company_id },
                     ],
                   }}
-                  onConfirm={({ reason }) => {
+                  onConfirm={async ({ reason }) => {
                     const cmdType = paperRiskSuspended ? "resume_new_risk" : "suspend_new_risk";
-                    void dispatchCommand({
+                    const lifecycle = await dispatchCommand({
                       company_id: meta.company_id,
                       command_id: newCommandId(paperRiskSuspended ? "resume" : "pause"),
                       command_type: cmdType,
@@ -542,6 +1283,13 @@ export function AppShell({ children }: { children: ReactNode }) {
                       label: paperRiskSuspended ? "Resume new paper orders" : "Pause new paper orders",
                       sent_ns: Date.now() * 1_000_000,
                     });
+                    if (
+                      lifecycle === "applied" ||
+                      lifecycle === "accepted" ||
+                      lifecycle === "unknown"
+                    ) {
+                      setSafetyStripOpen(false);
+                    }
                   }}
                 />
               ) : null}
@@ -552,7 +1300,14 @@ export function AppShell({ children }: { children: ReactNode }) {
                   tone="warning"
                   urgent
                   action={
-                    <Button emphasis="soft" size="compact" shape="pill" onClick={forceRefresh}>
+                    <Button
+                      emphasis="soft"
+                      size="compact"
+                      shape="pill"
+                      onClick={() => {
+                        void forceRefresh();
+                      }}
+                    >
                       Reconnect
                     </Button>
                   }
@@ -587,7 +1342,13 @@ export function AppShell({ children }: { children: ReactNode }) {
                   <Result
                     title="Session access revoked or unauthorized"
                     action={
-                      <Button emphasis="soft" shape="pill" onClick={forceRefresh}>
+                      <Button
+                        emphasis="soft"
+                        shape="pill"
+                        onClick={() => {
+                          void forceRefresh();
+                        }}
+                      >
                         Retry Session
                       </Button>
                     }
@@ -604,7 +1365,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       )}
 
       {toasts.length > 0 ? (
-        <div className="sd-toast-corner">
+        <div className="sd-toast-corner" data-agent-hidden="">
           <ToastStack
             label="Board client notifications"
             items={toasts}

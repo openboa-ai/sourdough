@@ -1,6 +1,7 @@
+import { Button, Result } from "@openboa/yogurt";
 import { Yogurt } from "@openboa/yogurt/yogurt";
 import { AppShell } from "./components/AppShell";
-import { AppProvider, useApp } from "./state/store";
+import { AppProvider, decodeSingleSegment, splitRoute, useApp } from "./state/store";
 import { AgentDetailView } from "./views/AgentDetailView";
 import { AgentsActivityView } from "./views/AgentsActivityView";
 import { ApprovalsView } from "./views/ApprovalsView";
@@ -21,30 +22,36 @@ import {
 } from "./views/SystemViews";
 
 function RouteSwitch() {
-  const { route, meta } = useApp();
-  const path = route.includes("?") ? route.slice(0, route.indexOf("?")) : route;
+  const { route, meta, navigate } = useApp();
+  const { pathname: path } = splitRoute(route);
 
-  if (meta?.board_access.bootstrap_locked || path === "/bootstrap") {
+  if (meta?.board_access.bootstrap_locked || (!meta && path === "/bootstrap")) {
     return <BootstrapView />;
+  }
+  if (path === "/bootstrap") {
+    return <LiveTradingView />;
   }
   if (path === "/" || path === "/performance") {
     return <LiveTradingView />;
   }
-  if (path.startsWith("/orders/")) {
-    const orderId = decodeURIComponent(path.slice("/orders/".length));
+  const orderId = decodeSingleSegment(path, "/orders/");
+  if (orderId) {
     return <OrderTraceView orderId={orderId} />;
   }
   if (path === "/office") {
     return <AgentsActivityView />;
   }
-  if (path.startsWith("/office/agents/")) {
-    const agentId = decodeURIComponent(path.slice("/office/agents/".length));
+  const agentId = decodeSingleSegment(path, "/office/agents/");
+  if (agentId) {
     return <AgentDetailView agentId={agentId} />;
   }
   if (path === "/messages" || path === "/ceo") {
     return <MessagesView />;
   }
-  if (path === "/company/approvals") {
+  if (
+    path === "/company/approvals" ||
+    decodeSingleSegment(path, "/company/approvals/") !== null
+  ) {
     return <ApprovalsView />;
   }
   if (path === "/company/strategy-trials") {
@@ -68,7 +75,18 @@ function RouteSwitch() {
   if (path === "/system/audit" || path === "/system/daemon") {
     return <SystemAuditView />;
   }
-  return <LiveTradingView />;
+  return (
+    <Result
+      title="Page not found"
+      action={
+        <Button emphasis="soft" shape="pill" onClick={() => navigate("/")}>
+          Back to Live Trading
+        </Button>
+      }
+    >
+      No Board Client screen matches {path}.
+    </Result>
+  );
 }
 
 function YogurtStage() {
