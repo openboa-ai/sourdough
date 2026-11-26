@@ -52,6 +52,14 @@ from ..board_control import (
     submit_decision_answer,
 )
 from ..company import FoundingRefused, _identity
+from ..execution_tiers import (
+    DEMOTE_LIVE_ENVIRONMENT,
+    EXECUTION_TIER_COMMAND,
+    PROMOTE_EXECUTION_ENVIRONMENT,
+    ExecutionTierRefused,
+    demote_live_environment,
+    promote_execution_environment,
+)
 from ..paper_account import BindingRefused
 from ..paper_execution import VenueRefused
 from ..paper_resume import resume_managed_paper_risk
@@ -77,6 +85,7 @@ from .projections import (
     read_agent_detail_projection,
     read_agents_graph_projection,
     read_approvals_projection,
+    read_execution_tiers_projection,
     read_finance_projection,
     read_live_trading_projection,
     read_messages_projection,
@@ -120,6 +129,15 @@ _RESTRICTION_PRECONDITION_KEYS = frozenset(
 )
 _CHECKPOINT_PRECONDITION_KEYS = frozenset({"charter_revision"})
 _RBAC_BOOTSTRAP_KEYS = frozenset({"bootstrap_state"})
+_PROMOTE_PRECONDITION_KEYS = frozenset(
+    {
+        "charter_revision",
+        "target_binding_id",
+        "qualification_receipt_id",
+        "expected_payload_hash",
+    }
+)
+_DEMOTE_PRECONDITION_KEYS = frozenset({"charter_revision", "target_binding_id"})
 
 
 @dataclass(frozen=True)
@@ -478,6 +496,7 @@ class CompanyDaemon:
                 except (
                     FoundingRefused,
                     BindingRefused,
+                    ExecutionTierRefused,
                     VenueRefused,
                     BoardControlRefused,
                     IpcRefused,
@@ -527,6 +546,8 @@ class CompanyDaemon:
             CANCEL_WORK: [WORK_COMMAND],
             CUT_CHECKPOINT: [CHECKPOINT_COMMAND],
             REGISTER_OWNER: [RBAC_COMMAND],
+            PROMOTE_EXECUTION_ENVIRONMENT: [EXECUTION_TIER_COMMAND],
+            DEMOTE_LIVE_ENVIRONMENT: [EXECUTION_TIER_COMMAND],
         }
         if self._engine_directory is not None:
             supported[RESUME_NEW_RISK] = [PAPER_RISK_COMMAND]
@@ -762,6 +783,13 @@ class CompanyDaemon:
 
         if suffix == "system-audit":
             payload, seq = read_system_audit_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "execution-tiers":
+            payload, seq = read_execution_tiers_projection(
+                self._store, self._company_id
+            )
             self._send_projection(conn, request, payload, seq, deadline=deadline)
             return
 
@@ -1354,6 +1382,55 @@ class CompanyDaemon:
                     challenge=payload.get("challenge"),
                     proof=payload.get("proof"),
                     expected_challenge=self._bootstrap_challenge,
+                    peer_pid=peer.pid,
+                )
+            elif (
+                contract_version == EXECUTION_TIER_COMMAND
+                and command_type == PROMOTE_EXECUTION_ENVIRONMENT
+            ):
+                if set(preconditions.keys()) != _PROMOTE_PRECONDITION_KEYS:
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                outcome = promote_execution_environment(
+                    writer,
+                    command_id=idem_key,
+                    charter_revision=preconditions.get("charter_revision"),
+                    target_binding_id=preconditions.get("target_binding_id"),
+                    qualification_receipt_id=preconditions.get(
+                        "qualification_receipt_id"
+                    ),
+                    expected_payload_hash=preconditions.get("expected_payload_hash"),
+                    reason=payload.get("reason"),
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
+                    peer_pid=peer.pid,
+                )
+            elif (
+                contract_version == EXECUTION_TIER_COMMAND
+                and command_type == DEMOTE_LIVE_ENVIRONMENT
+            ):
+                if set(preconditions.keys()) != _DEMOTE_PRECONDITION_KEYS:
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                outcome = demote_live_environment(
+                    writer,
+                    command_id=idem_key,
+                    charter_revision=preconditions.get("charter_revision"),
+                    target_binding_id=preconditions.get("target_binding_id"),
+                    action=payload.get("action"),
+                    reason=payload.get("reason"),
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
                     peer_pid=peer.pid,
                 )
             else:

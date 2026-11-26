@@ -84,6 +84,7 @@ class SandboxPlan:
     starting_atoms: int
     fee_bps: int
     tape_revision: str | None = None
+    slippage_bps: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -92,7 +93,9 @@ class SandboxPlan:
             or type(self.starting_atoms) is not int
             or not 0 < self.starting_atoms <= MAX_ATOMS
             or type(self.fee_bps) is not int
-            or self.fee_bps != 0
+            or not 0 <= self.fee_bps <= 1000
+            or type(self.slippage_bps) is not int
+            or not 0 <= self.slippage_bps <= 500
             or (
                 self.tape_revision is not None
                 and (
@@ -106,7 +109,7 @@ class SandboxPlan:
             )
         ):
             raise VenueRefused(
-                "Expected a bounded virtual cash account and zero test fee"
+                "Expected a bounded virtual cash account with valid fee/slippage policy"
             )
         SpotCashUnits(self.terms)
 

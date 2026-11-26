@@ -22,6 +22,10 @@ from typing import Any
 from ..agent_desk import _check_no_symlinks, _drafts_directory
 from ..board_control import resolve_board_access
 from ..company import FoundingRefused, _identity
+from ..execution_tiers import (
+    read_agent_sandbox_portfolio_from_db,
+    read_execution_tiers_snapshot,
+)
 from ..paper_risk import AuthorizeBoard, effective_paper_risk
 from ..storage.db import open_reader, read_tx
 from ..storage.kernel import max_event_seq
@@ -40,6 +44,7 @@ PROJECTION_RESTRICTIONS = "restrictions-v1"
 PROJECTION_SYSTEM_SAFETY = "system-safety-v1"
 PROJECTION_SYSTEM_EVALS = "system-evals-v1"
 PROJECTION_SYSTEM_AUDIT = "system-audit-v1"
+PROJECTION_EXECUTION_TIERS = "execution-tiers-v1"
 
 ALL_CLIENT_PROJECTIONS: tuple[str, ...] = (
     PROJECTION_LIVE_TRADING,
@@ -55,6 +60,7 @@ ALL_CLIENT_PROJECTIONS: tuple[str, ...] = (
     PROJECTION_SYSTEM_SAFETY,
     PROJECTION_SYSTEM_EVALS,
     PROJECTION_SYSTEM_AUDIT,
+    PROJECTION_EXECUTION_TIERS,
 )
 
 _DEFAULT_AVATAR_VARIANTS: tuple[str, ...] = (
@@ -1353,6 +1359,7 @@ def read_agent_detail_projection(
             (r for r in work_activity if r["status"] in ("running", "waiting")), None
         )
 
+        agent_sandbox = read_agent_sandbox_portfolio_from_db(db, company_id, agent_id)
         return (
             {
                 "projection": PROJECTION_AGENT_DETAIL,
@@ -1360,6 +1367,7 @@ def read_agent_detail_projection(
                 "as_of_ns": as_of_ns,
                 "event_seq": event_seq,
                 "profile": info | {"active_run": active_run},
+                "agent_sandbox": agent_sandbox,
                 "desk_workspace": {
                     "execution_profile": info["execution_profile"],
                     "desk_manifest_revision": None
@@ -2365,6 +2373,27 @@ def read_system_audit_projection(
                 "conditions": conditions,
                 "active_fences": fences,
                 "board_bindings": bindings,
+            },
+            event_seq,
+        )
+
+
+def read_execution_tiers_projection(
+    store: Path, company_id: str
+) -> tuple[dict[str, Any], int]:
+    """Read redacted three-tier execution accounts, sandboxes, and promotion history."""
+    with closing(open_reader(store)) as db, read_tx(db):
+        if _identity(db) != company_id:
+            raise FoundingRefused("Company identity mismatch")
+        event_seq = max_event_seq(db, company_id)
+        snapshot = read_execution_tiers_snapshot(db, company_id)
+        return (
+            {
+                "projection": PROJECTION_EXECUTION_TIERS,
+                "company_id": company_id,
+                "as_of_ns": time_ns(),
+                "event_seq": event_seq,
+                **snapshot,
             },
             event_seq,
         )
