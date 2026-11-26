@@ -1023,14 +1023,21 @@ def read_agents_graph_projection(
             seen_edge_keys.add(key)
             q_text = str(r[4])
             short_label = q_text if len(q_text) <= 34 else f"{q_text[:31]}..."
+            preview_text = q_text if len(q_text) <= 180 else f"{q_text[:177]}..."
+            sender_name = str(directory.get(src, {}).get("display_name", src))
+            state_str = str(r[5])
             edges.append(
                 {
                     "edge_id": f"peer-{r[0]}",
                     "source_agent_id": src,
                     "target_agent_id": dst,
                     "kind": "peer_request",
-                    "state": str(r[5]),
+                    "state": state_str,
+                    "active": state_str == "open",
                     "label": short_label,
+                    "latest_preview": preview_text,
+                    "latest_sender_name": sender_name,
+                    "message_count": 1,
                     "channel_id": str(r[3]) if r[3] else "ceo-direct",
                     "updated_at_ns": int(r[6]),
                 }
@@ -1046,14 +1053,26 @@ def read_agents_graph_projection(
             src, dst = str(r[1]), str(r[2])
             if src == dst:
                 continue
+            expected_text = str(r[3])
+            preview_text = (
+                expected_text
+                if len(expected_text) <= 180
+                else f"{expected_text[:177]}..."
+            )
+            sender_name = str(directory.get(src, {}).get("display_name", src))
+            accepted = bool(r[4])
             edges.append(
                 {
                     "edge_id": f"handoff-{r[0]}",
                     "source_agent_id": src,
                     "target_agent_id": dst,
                     "kind": "handoff",
-                    "state": "accepted" if r[4] else "offered",
-                    "label": f"Handoff · {str(r[3])[:24]}",
+                    "state": "accepted" if accepted else "offered",
+                    "active": not accepted,
+                    "label": f"Handoff · {expected_text[:24]}",
+                    "latest_preview": preview_text,
+                    "latest_sender_name": sender_name,
+                    "message_count": 1,
                     "channel_id": "ceo-direct",
                     "updated_at_ns": as_of_ns,
                 }
@@ -1080,6 +1099,12 @@ def read_agents_graph_projection(
             if not isinstance(members, list) or len(members) < 2 or msg_count == 0:
                 continue
             src = last_sender if last_sender in members else str(members[0])
+            sender_name = str(directory.get(src, {}).get("display_name", src))
+            preview_text = (
+                last_body.strip()
+                if len(last_body.strip()) <= 180
+                else f"{last_body.strip()[:177]}..."
+            )
             for member in members:
                 dst = str(member)
                 if dst == src:
@@ -1099,7 +1124,11 @@ def read_agents_graph_projection(
                         "target_agent_id": dst,
                         "kind": "channel",
                         "state": "active",
+                        "active": True,
                         "label": label,
+                        "latest_preview": preview_text,
+                        "latest_sender_name": sender_name,
+                        "message_count": msg_count,
                         "channel_id": project_id,
                         "updated_at_ns": as_of_ns,
                     }

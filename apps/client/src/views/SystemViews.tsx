@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { CopyButton } from "@openboa/yogurt/motion-copy-button";
 import { TaskList } from "@openboa/yogurt/motion-task-list";
 import {
   Badge,
@@ -6,7 +7,10 @@ import {
   Card,
   DataTable,
   DisclosureRow,
+  EmptyResult,
+  FilterBar,
   Inline,
+  List,
   Notice,
   PageHeader,
   RecordFacts,
@@ -15,6 +19,7 @@ import {
   Stack,
   Text,
   TextField,
+  WorkEvent,
   type DataColumn,
   type DataRow,
 } from "@openboa/yogurt";
@@ -156,11 +161,11 @@ export function SystemSafetyView() {
       ) : null}
 
       <div className="sd-split-equal">
-        <Card title="Safe Custody Hold (5-Step Readiness)" variant="outlined">
+        <Card title="Safe Custody Hold (5-Step Readiness)" variant="raised">
           <TaskList label="Safe Custody Hold checklist" tasks={tasks} />
         </Card>
 
-        <Card title="Verified Checkpoint Archives" variant="outlined">
+        <Card title="Verified Checkpoint Archives" variant="raised">
           {cpRows.length === 0 ? (
             <Text variant="help">No checkpoints cut yet. Cut one before major charter changes.</Text>
           ) : (
@@ -245,7 +250,7 @@ export function SystemEvalsView() {
       </Notice>
 
       <div className="sd-split-equal">
-        <Card title="Review Tool Qualifications (pass^k)" variant="outlined">
+        <Card title="Review Tool Qualifications (pass^k)" variant="raised">
           {qualRows.length === 0 ? (
             <Text variant="help">No review tool qualifications recorded yet.</Text>
           ) : (
@@ -253,7 +258,7 @@ export function SystemEvalsView() {
           )}
         </Card>
 
-        <Card title="Tool Activation DAG & Quarantine Blast Radius" variant="outlined">
+        <Card title="Tool Activation DAG & Quarantine Blast Radius" variant="raised">
           {data.activations.length === 0 ? (
             <Text variant="help">No review tool activations recorded yet.</Text>
           ) : (
@@ -296,7 +301,7 @@ export function SystemEvalsView() {
             ? "Connected read-only to external offline evaluator store"
             : "No offline evaluator store attached to this daemon"
         }
-        variant="outlined"
+        variant="raised"
       >
         {suiteRows.length === 0 ? (
           <Text variant="help">
@@ -315,6 +320,7 @@ export function SystemAuditView() {
   const { refreshSeq, meta, reportApiError } = useApp();
   const [data, setData] = useState<SystemAuditProjection | null>(null);
   const [loading, setLoading] = useState(true);
+  const [auditQuery, setAuditQuery] = useState("");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -333,6 +339,17 @@ export function SystemAuditView() {
     return () => controller.abort();
   }, [refreshSeq, reportApiError]);
 
+  const filteredEvents = useMemo(() => {
+    const events = data?.events ?? [];
+    const q = auditQuery.trim().toLowerCase();
+    if (!q) return events;
+    return events.filter((e) =>
+      `${e.event_seq} ${e.domain} ${e.event_type} ${e.entity_type} ${e.entity_id}`
+        .toLowerCase()
+        .includes(q)
+    );
+  }, [data?.events, auditQuery]);
+
   if (loading && !data) return <Skeleton label="Loading audit log and leases" lines={5} />;
   if (!data) return <Result title="Audit Log unavailable">Could not load audit trail.</Result>;
 
@@ -343,7 +360,7 @@ export function SystemAuditView() {
     { id: "entity", label: "Entity", kind: "text" },
     { id: "time", label: "Recorded", kind: "numeric", align: "end" },
   ];
-  const evRows: DataRow[] = data.events.map((e) => ({
+  const evRows: DataRow[] = filteredEvents.map((e) => ({
     id: String(e.event_seq),
     cells: {
       seq: <Text className="sd-tabular">#{e.event_seq}</Text>,
@@ -390,7 +407,11 @@ export function SystemAuditView() {
       />
 
       {meta ? (
-        <Card title="Control Plane Runtime Identity" variant="outlined">
+        <Card
+          title="Control Plane Runtime Identity"
+          variant="raised"
+          headerAction={<CopyButton value={meta.company_id} presentation="quiet" />}
+        >
           <RecordFacts
             source="GET /v1/meta"
             asOf={`seq #${data.event_seq}`}
@@ -406,7 +427,7 @@ export function SystemAuditView() {
       ) : null}
 
       <div className="sd-split-equal">
-        <Card title="Board Principal Bindings" variant="outlined">
+        <Card title="Board Principal Bindings" variant="raised">
           {bindRows.length === 0 ? (
             <Text variant="help">No principals bound (company is bootstrap-locked).</Text>
           ) : (
@@ -414,32 +435,46 @@ export function SystemAuditView() {
           )}
         </Card>
 
-        <Card title={`Active Work Leases & Fences (${data.active_fences.length})`} variant="outlined">
+        <Card title={`Active Work Leases & Fences (${data.active_fences.length})`} variant="raised">
           {data.active_fences.length === 0 ? (
             <Text variant="help">No running or waiting work runs holding active leases.</Text>
           ) : (
-            <Stack gap={8}>
+            <List label="Active work leases" divided>
               {data.active_fences.map((f) => (
-                <Inline key={f.run_id} justify="between" align="center" wrap>
-                  <Text variant="body">
-                    {f.duty_kind} · {f.agent_id}
-                  </Text>
-                  <Badge tone="brand" dot={false}>
-                    {f.status} · fence #{f.fencing_token}
-                  </Badge>
-                </Inline>
+                <WorkEvent
+                  key={f.run_id}
+                  event={{
+                    id: f.run_id,
+                    kind: "task",
+                    title: `${f.duty_kind} · ${f.agent_id}`,
+                    detail: `Fence #${f.fencing_token}`,
+                    state: f.status === "running" ? "running" : "waiting",
+                  }}
+                />
               ))}
-            </Stack>
+            </List>
           )}
         </Card>
       </div>
 
-      <Card title="Append-Only Redacted Audit Events" variant="outlined">
-        {evRows.length === 0 ? (
-          <Text variant="help">No audit events recorded yet.</Text>
-        ) : (
-          <DataTable caption="Audit events" columns={evCols} rows={evRows} />
-        )}
+      <Card title="Append-Only Redacted Audit Events" variant="raised">
+        <Stack gap={12}>
+          <FilterBar
+            label="Filter audit log"
+            hiddenLabel
+            placeholder="Filter by domain, event type, or entity..."
+            size="compact"
+            query={auditQuery}
+            onQueryChange={setAuditQuery}
+          />
+          {data.events.length === 0 ? (
+            <Text variant="help">No audit events recorded yet.</Text>
+          ) : evRows.length === 0 ? (
+            <EmptyResult query={auditQuery} onClear={() => setAuditQuery("")} />
+          ) : (
+            <DataTable caption="Audit events" columns={evCols} rows={evRows} />
+          )}
+        </Stack>
       </Card>
     </Stack>
   );
@@ -467,7 +502,13 @@ export function BootstrapView() {
         compute SHA-256(&quot;&lt;challenge&gt;:&lt;company_id&gt;&quot;) to claim board_control.
       </Notice>
 
-      <Card title="Owner Bootstrap Challenge" variant="outlined">
+      <Card
+        title="Owner Bootstrap Challenge"
+        variant="raised"
+        headerAction={
+          challenge ? <CopyButton value={challenge} presentation="quiet" /> : undefined
+        }
+      >
         <Stack gap={12}>
           <RecordFacts
             source="GET /v1/meta (bootstrap_locked)"

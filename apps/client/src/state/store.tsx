@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { createYogurtAgent } from "@openboa/yogurt/agent";
+import type { Appearance, Material } from "@openboa/yogurt";
 import {
   ApiError,
   deletePendingOutboxApi,
@@ -37,6 +38,11 @@ export interface CommandOutboxState {
   quarantineNotice: string | null;
 }
 
+export interface ToastItem {
+  id: string;
+  message: string;
+}
+
 interface AppContextValue {
   route: string;
   navigate: (path: string, opts?: { contextRef?: ContextRef | null; focusReturnId?: string }) => void;
@@ -44,6 +50,13 @@ interface AppContextValue {
   clearFocusReturnId: () => void;
   pendingAskContext: ContextRef | null;
   setPendingAskContext: (ctx: ContextRef | null) => void;
+  appearance: Appearance;
+  setAppearance: (next: Appearance) => void;
+  material: Material;
+  setMaterial: (next: Material) => void;
+  toasts: ToastItem[];
+  pushToast: (message: string) => void;
+  dismissToast: (id: string) => void;
   meta: ControlPlaneMeta | null;
   linkState: LinkState;
   lastError: string | null;
@@ -77,6 +90,55 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
   const [focusReturnId, setFocusReturnId] = useState<string | null>(null);
   const [pendingAskContext, setPendingAskContext] = useState<ContextRef | null>(null);
+  const [appearance, setAppearanceState] = useState<Appearance>(() => {
+    try {
+      const saved = window.localStorage.getItem("sd-yogurt-appearance");
+      if (saved === "light" || saved === "dark" || saved === "auto") return saved;
+    } catch {
+      // Ignore storage failures in restricted contexts.
+    }
+    return "light";
+  });
+  const [material, setMaterialState] = useState<Material>(() => {
+    try {
+      const saved = window.localStorage.getItem("sd-yogurt-material");
+      if (saved === "neutral" || saved === "paper" || saved === "mist") return saved;
+    } catch {
+      // Ignore storage failures in restricted contexts.
+    }
+    return "neutral";
+  });
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+  const setAppearance = useCallback((next: Appearance) => {
+    setAppearanceState(next);
+    try {
+      window.localStorage.setItem("sd-yogurt-appearance", next);
+    } catch {
+      // Ignore storage failures.
+    }
+  }, []);
+
+  const setMaterial = useCallback((next: Material) => {
+    setMaterialState(next);
+    try {
+      window.localStorage.setItem("sd-yogurt-material", next);
+    } catch {
+      // Ignore storage failures.
+    }
+  }, []);
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const pushToast = useCallback((message: string) => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setToasts((prev) => [...prev.slice(-3), { id, message }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((item) => item.id !== id));
+    }, 4500);
+  }, []);
 
   const [meta, setMeta] = useState<ControlPlaneMeta | null>(null);
   const [linkState, setLinkState] = useState<LinkState>("connecting");
@@ -614,6 +676,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       clearFocusReturnId,
       pendingAskContext,
       setPendingAskContext,
+      appearance,
+      setAppearance,
+      material,
+      setMaterial,
+      toasts,
+      pushToast,
+      dismissToast,
       meta,
       linkState,
       lastError,
@@ -639,6 +708,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       focusReturnId,
       clearFocusReturnId,
       pendingAskContext,
+      appearance,
+      setAppearance,
+      material,
+      setMaterial,
+      toasts,
+      pushToast,
+      dismissToast,
       meta,
       linkState,
       lastError,

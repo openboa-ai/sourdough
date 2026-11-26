@@ -247,7 +247,11 @@ export interface AgentEdgeItem {
   target_agent_id: string;
   kind: "peer_request" | "handoff" | "channel";
   state: string;
+  active?: boolean;
   label: string;
+  latest_preview?: string;
+  latest_sender_name?: string;
+  message_count?: number;
   channel_id: string;
   updated_at_ns: number;
 }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ThinkingIndicator } from "@openboa/yogurt/motion-thinking-indicator";
 import {
   AgentAvatar,
   Badge,
@@ -7,19 +8,26 @@ import {
   Card,
   DataTable,
   Inline,
+  List,
   Message,
+  Navbar,
   Notice,
   PageHeader,
   RecordFacts,
+  ResourceRow,
   Result,
+  RoutineRow,
+  RuntimePanel,
   Skeleton,
   Stack,
   Status,
   Tabs,
   Text,
   Transcript,
+  WorkEvent,
   type DataColumn,
   type DataRow,
+  type RuntimeState,
 } from "@openboa/yogurt";
 import {
   fetchProjection,
@@ -32,11 +40,6 @@ import type { AgentDetailProjection } from "../api/types";
 import { ControlledInlineConfirm } from "../components/ControlledInlineConfirm";
 import { useApp } from "../state/store";
 
-/**
- * Full-screen Agent Detail view (/office/agents/:agentId — ZERO right slide-over drawers).
- * Shows Profile Header, Desk & Workspace (opaque private draft count only),
- * Authority / Permissions / Budget, and 4 individual activity tabs.
- */
 export function AgentDetailView({ agentId }: { agentId: string }) {
   const { navigate, refreshSeq, meta, canWrite, dispatchCommand, reportApiError } = useApp();
   const [data, setData] = useState<AgentDetailProjection | null>(null);
@@ -72,7 +75,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
         title="Agent not found"
         action={
           <Button emphasis="soft" shape="pill" onClick={() => navigate("/office")}>
-            Back to Agents & Activity
+            Back to Agents &amp; Activity
           </Button>
         }
       >
@@ -84,60 +87,13 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
   const profile = data.profile;
   const activeRun = profile.active_run;
 
-  const runCols: DataColumn[] = [
-    { id: "run", label: "Work Run", kind: "identity" },
-    { id: "duty", label: "Duty Kind", kind: "text" },
-    { id: "status", label: "Status", kind: "role" },
-    { id: "fence", label: "Fence Token", kind: "numeric", align: "end" },
-    { id: "updated", label: "Updated", kind: "numeric", align: "end" },
-  ];
-
-  const runRows: DataRow[] = data.tabs.work_activity.map((run) => ({
-    id: run.run_id,
-    cells: {
-      run: <Text className="sd-mono">{run.run_id.slice(0, 14)}</Text>,
-      duty: run.duty_kind,
-      status: (
-        <Badge
-          tone={
-            run.status === "running"
-              ? "brand"
-              : run.status === "completed"
-                ? "success"
-                : run.status === "failed" || run.status === "cancelled"
-                  ? "danger"
-                  : "neutral"
-          }
-          dot={false}
-        >
-          {run.status}
-        </Badge>
-      ),
-      fence: <Text className="sd-tabular">#{run.fencing_token}</Text>,
-      updated: <Text className="sd-tabular">{formatRelativeNs(run.updated_at_ns)}</Text>,
-    },
-  }));
-
-  const condCols: DataColumn[] = [
-    { id: "id", label: "Condition", kind: "identity" },
-    { id: "kind", label: "Trigger", kind: "text" },
-    { id: "due", label: "Scheduled For", kind: "numeric", align: "end" },
-    { id: "status", label: "Status", kind: "role" },
-  ];
-
-  const condRows: DataRow[] = data.tabs.conditions.map((c) => ({
-    id: c.condition_id,
-    cells: {
-      id: <Text className="sd-mono">{c.condition_id}</Text>,
-      kind: c.trigger_kind,
-      due: c.due_at_ns ? formatNsClock(c.due_at_ns) : "Not scheduled",
-      status: (
-        <Badge tone={c.status === "armed" ? "brand" : "neutral"} dot={false}>
-          {c.status}
-        </Badge>
-      ),
-    },
-  }));
+  const runtimeState: RuntimeState = profile.archived
+    ? "offline"
+    : activeRun?.status === "running"
+      ? "working"
+      : activeRun?.status === "waiting"
+        ? "waiting"
+        : "available";
 
   const peerCols: DataColumn[] = [
     { id: "dir", label: "Direction", kind: "role" },
@@ -180,6 +136,12 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
 
   return (
     <Stack gap={16}>
+      <Navbar
+        variant="back"
+        label="Back to Agents & Activity"
+        onBack={() => navigate("/office", { focusReturnId: profile.agent_id })}
+      />
+
       <Breadcrumb
         items={[
           { id: "office", label: "Agents & Activity", href: "/office" },
@@ -244,7 +206,13 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
         }
       />
 
-      {/* Inline confirmation for interrupting an active run (zero popups!) */}
+      {activeRun?.status === "running" ? (
+        <ThinkingIndicator
+          active
+          label={`${profile.display_name} is executing ${activeRun.duty_kind} (fence #${activeRun.fencing_token})`}
+        />
+      ) : null}
+
       {activeRun && meta ? (
         <ControlledInlineConfirm
           open={stopConfirmOpen}
@@ -292,14 +260,12 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
         />
       ) : null}
 
-      {/* Side-by-side Desk & Workspace + Authority, Permissions & Budget */}
       <div className="sd-split-equal">
-        <Card
-          title="Desk & Workspace"
-          description="Isolated per-agent workspace and selective publication boundary"
-          variant="outlined"
-        >
-          <Stack gap={12}>
+        <RuntimePanel
+          state={runtimeState}
+          title="Desk & Isolated Harness"
+          detail={data.desk_workspace.private_draft_notice}
+          preview={
             <RecordFacts
               source="private_desk + shared_publication"
               asOf={`seq #${data.event_seq}`}
@@ -330,14 +296,13 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                 },
               ]}
             />
-            <Text variant="meta">{data.desk_workspace.private_draft_notice}</Text>
-          </Stack>
-        </Card>
+          }
+        />
 
         <Card
           title="Authority, Permissions & Budget"
           description="Scoped standing grants and hard operating ceilings"
-          variant="outlined"
+          variant="raised"
         >
           <Stack gap={12}>
             <RecordFacts
@@ -387,7 +352,6 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
         </Card>
       </div>
 
-      {/* 4 Individual Activity Tabs */}
       <Tabs
         label="Agent individual activity"
         presentation="pill"
@@ -399,22 +363,55 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
             label: `Work Activity (${data.tabs.work_activity.length})`,
             panel: (
               <Stack gap={12}>
-                <Card title="Recent Work Runs" variant="outlined">
-                  {runRows.length === 0 ? (
+                <Card title="Recent Work Runs" variant="raised">
+                  {data.tabs.work_activity.length === 0 ? (
                     <Text variant="help">No work runs recorded for this agent yet.</Text>
                   ) : (
-                    <DataTable caption="Agent work runs" columns={runCols} rows={runRows} />
+                    <List label="Agent work runs" divided>
+                      {data.tabs.work_activity.map((run) => (
+                        <WorkEvent
+                          key={run.run_id}
+                          event={{
+                            id: run.run_id,
+                            kind: "task",
+                            title: run.duty_kind,
+                            detail: `Run ${run.run_id.slice(0, 14)} · Fence #${run.fencing_token}`,
+                            time: formatRelativeNs(run.updated_at_ns),
+                            state:
+                              run.status === "running"
+                                ? "running"
+                                : run.status === "completed"
+                                  ? "ready"
+                                  : run.status === "waiting"
+                                    ? "waiting"
+                                    : run.status === "failed" || run.status === "cancelled"
+                                      ? "failed"
+                                      : "done",
+                          }}
+                        />
+                      ))}
+                    </List>
                   )}
                 </Card>
-                <Card title="Armed Wake Conditions" variant="outlined">
-                  {condRows.length === 0 ? (
+
+                <Card title="Armed Wake Conditions" variant="raised">
+                  {data.tabs.conditions.length === 0 ? (
                     <Text variant="help">No wake conditions armed.</Text>
                   ) : (
-                    <DataTable
-                      caption="Agent wake conditions"
-                      columns={condCols}
-                      rows={condRows}
-                    />
+                    <List label="Agent wake conditions" divided>
+                      {data.tabs.conditions.map((c) => (
+                        <RoutineRow
+                          key={c.condition_id}
+                          routine={{
+                            id: c.condition_id,
+                            title: c.trigger_kind,
+                            cadence: c.condition_id,
+                            state: c.status === "armed" ? "scheduled" : "paused",
+                            nextRun: c.due_at_ns ? formatNsClock(c.due_at_ns) : undefined,
+                          }}
+                        />
+                      ))}
+                    </List>
                   )}
                 </Card>
               </Stack>
@@ -429,7 +426,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                   Internal agent conversations do not assign or accept work on their own. To give
                   direction, send an advisory message to Founder · CEO in Company Messages.
                 </Notice>
-                <Card variant="outlined">
+                <Card variant="raised">
                   {data.tabs.interactions_and_talks.length === 0 ? (
                     <Text variant="help">No project messages involving this agent yet.</Text>
                   ) : (
@@ -458,23 +455,37 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
             panel: (
               <Stack gap={12}>
                 {data.tabs.published_reports.length === 0 ? (
-                  <Card variant="outlined">
+                  <Card variant="raised">
                     <Text variant="help">
                       No shared company reports published by this agent yet. Unpublished work stays
                       private on their Desk.
                     </Text>
                   </Card>
                 ) : (
-                  data.tabs.published_reports.map((pub) => (
-                    <Card
-                      key={pub.asset_id}
-                      title={`Asset ${pub.asset_id}`}
-                      description={`Project #${pub.project_id} · Audience: ${pub.audience.join(", ") || "company"}`}
-                      variant="outlined"
-                    >
-                      <Text variant="body">{pub.content}</Text>
-                    </Card>
-                  ))
+                  <Card title="Selective Company Publications" variant="raised">
+                    <List label="Published reports" divided>
+                      {data.tabs.published_reports.map((pub) => (
+                        <ResourceRow
+                          key={pub.asset_id}
+                          resource={{
+                            id: pub.asset_id,
+                            kind: "output",
+                            title: `Asset ${pub.asset_id}`,
+                            detail: `#${pub.project_id} · ${pub.content}`,
+                          }}
+                          onOpen={() =>
+                            navigate("/messages", {
+                              contextRef: {
+                                kind: "shared_publication",
+                                id: pub.asset_id,
+                                label: `Asset ${pub.asset_id} by ${profile.display_name}`,
+                              },
+                            })
+                          }
+                        />
+                      ))}
+                    </List>
+                  </Card>
                 )}
               </Stack>
             ),
@@ -484,29 +495,31 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
             label: `Peer Requests & Handoffs (${data.tabs.peer_requests.length + data.tabs.handoffs.length})`,
             panel: (
               <Stack gap={12}>
-                <Card title="Blocking Peer Requests" variant="outlined">
+                <Card title="Blocking Peer Requests" variant="raised">
                   {peerRows.length === 0 ? (
                     <Text variant="help">No peer requests recorded.</Text>
                   ) : (
                     <DataTable caption="Peer requests" columns={peerCols} rows={peerRows} />
                   )}
                 </Card>
-                <Card title="Work Handoff Offers" variant="outlined">
+                <Card title="Work Handoff Offers" variant="raised">
                   {data.tabs.handoffs.length === 0 ? (
                     <Text variant="help">No work handoffs recorded.</Text>
                   ) : (
-                    <Stack gap={8}>
+                    <List label="Work handoff offers" divided>
                       {data.tabs.handoffs.map((h) => (
-                        <Inline key={h.offer_id} justify="between" align="center" wrap>
-                          <Text variant="body">
-                            {h.sender_name} → {h.recipient_name} · {h.expected_result}
-                          </Text>
-                          <Badge tone={h.accepted ? "success" : "warning"} dot={false}>
-                            {h.accepted ? "Accepted" : "Offered"}
-                          </Badge>
-                        </Inline>
+                        <WorkEvent
+                          key={h.offer_id}
+                          event={{
+                            id: h.offer_id,
+                            kind: "handoff",
+                            title: `${h.sender_name} → ${h.recipient_name}`,
+                            detail: h.expected_result,
+                            state: h.accepted ? "ready" : "waiting",
+                          }}
+                        />
                       ))}
-                    </Stack>
+                    </List>
                   )}
                 </Card>
               </Stack>

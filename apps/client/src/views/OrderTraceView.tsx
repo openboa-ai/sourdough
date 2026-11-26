@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { CopyButton } from "@openboa/yogurt/motion-copy-button";
 import {
   Badge,
   Breadcrumb,
@@ -6,6 +7,7 @@ import {
   Card,
   DataTable,
   Inline,
+  Navbar,
   Notice,
   PageHeader,
   RecordFacts,
@@ -72,7 +74,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
   const order = data.order;
   const traceEvents: TraceEvent[] = data.causal_steps.map((step, idx) => ({
     id: `${step.stage}-${idx}`,
-    index: String(idx + 1),
+    index: String(idx + 1).padStart(2, "0"),
     title: `${step.stage} · ${step.id}`,
     detail: step.detail,
     state:
@@ -114,6 +116,13 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
 
   return (
     <Stack gap={16}>
+      <Navbar
+        variant="back"
+        label="Back to Live Trading"
+        onBack={() => navigate("/")}
+        action={<CopyButton value={order.order_id} presentation="quiet" />}
+      />
+
       <Breadcrumb
         items={[
           { id: "home", label: "Live Trading", href: "/" },
@@ -125,7 +134,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
         title={`Order ${order.order_id}`}
         detail={`${order.action.toUpperCase()} ${order.instrument} · Author: ${order.agent_name}`}
         action={
-          <Inline gap={8} align="center">
+          <Inline gap={8} align="center" wrap>
             {order.agent_id ? (
               <Button
                 emphasis="soft"
@@ -168,11 +177,11 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
       ) : null}
 
       <div className="sd-two-col">
-        <Card title="Causal Execution Lineage" variant="outlined">
+        <Card title="Causal Execution Lineage" variant="raised">
           <Trace label="Order execution lineage" events={traceEvents} />
         </Card>
 
-        <Card title="Order & Exposure Summary" variant="outlined">
+        <Card title="Order & Exposure Summary" variant="raised">
           <RecordFacts
             source="paper_order + paper_fill + paper_cancellation"
             asOf={`seq #${data.event_seq}`}
@@ -215,7 +224,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
         </Card>
       </div>
 
-      <Card title="Recorded Fills & Fees" variant="outlined">
+      <Card title="Recorded Fills & Fees" variant="raised">
         {order.fills.length === 0 ? (
           <Text variant="help">No fills recorded for this order.</Text>
         ) : (

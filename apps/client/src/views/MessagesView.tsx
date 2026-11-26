@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
+import { ThinkingIndicator } from "@openboa/yogurt/motion-thinking-indicator";
 import {
   AgentAvatar,
+  AgentRow,
   Badge,
   Button,
   Card,
@@ -8,13 +10,16 @@ import {
   Divider,
   Heading,
   Inline,
+  List,
   Message,
   Notice,
   PageHeader,
   Result,
+  ScrollArea,
   Skeleton,
   Stack,
   Text,
+  ThreadRow,
   Transcript,
 } from "@openboa/yogurt";
 import {
@@ -32,12 +37,6 @@ function initialChannelFromRoute(route: string): string {
   return params.get("channel") || "ceo-direct";
 }
 
-/**
- * Unified Company Messages (/messages, alias /ceo):
- *   - Top pinned DIRECT (BOARD <-> CEO) 1:1 thread is the SOLE writable thread (send_ceo_message).
- *   - Below: INTERNAL COMPANY CHANNELS (READ-ONLY) so Board observes agent discussions without
- *     bypassing the CEO boundary.
- */
 export function MessagesView() {
   const {
     route,
@@ -45,6 +44,7 @@ export function MessagesView() {
     refreshSeq,
     meta,
     canWrite,
+    outbox,
     pendingAskContext,
     setPendingAskContext,
     dispatchCommand,
@@ -91,6 +91,9 @@ export function MessagesView() {
     (ch) => ch.channel_id === selectedChannel
   );
   const isCeoThread = !activeInternal;
+  const sendingCeo =
+    outbox.intent?.command_type === "send_ceo_message" &&
+    (outbox.lifecycle === "submitting" || outbox.lifecycle === "accepted");
 
   const handleSendCeo = ({ text }: { text: string }) => {
     const body = text.trim();
@@ -125,74 +128,63 @@ export function MessagesView() {
       />
 
       <div className="sd-messages-shell">
-        {/* Left Channel Rail */}
-        <aside className="sd-channel-rail" aria-label="Company message channels">
-          <Stack gap={6}>
-            <Text className="sd-nav-section-label">DIRECT (BOARD ↔ CEO)</Text>
-            <Button
-              emphasis={isCeoThread ? "soft" : "quiet"}
-              tone={isCeoThread ? "brand" : "neutral"}
-              shape="rounded"
-              className="sd-channel-btn"
-              onClick={() => setSelectedChannel("ceo-direct")}
-            >
-              <Inline justify="between" align="center" className="sd-w-full">
-                <Inline gap={8} align="center">
-                  <AgentAvatar
-                    agent={data.ceo_thread.ceo_avatar_variant}
-                    state="ready"
-                    animated={false}
-                    size={22}
-                    label={data.ceo_thread.ceo_display_name}
-                  />
-                  <Text variant="body">{data.ceo_thread.ceo_display_name}</Text>
-                </Inline>
-                <Badge tone="brand" variant="soft" dot={false}>
-                  1:1
-                </Badge>
-              </Inline>
-            </Button>
+        <Card variant="raised" density="compact" className="sd-channel-rail">
+          <Stack gap={12}>
+            <Stack gap={6}>
+              <Text variant="cap">Direct (Board ↔ CEO)</Text>
+              <AgentRow
+                current={isCeoThread}
+                agent={{
+                  id: "ceo-direct",
+                  name: data.ceo_thread.ceo_display_name,
+                  role: "Direct 1:1",
+                  state: sendingCeo ? "working" : "ready",
+                  art: data.ceo_thread.ceo_avatar_variant,
+                  preview: `${data.ceo_thread.messages.length} messages · Writable`,
+                }}
+                onSelect={() => setSelectedChannel("ceo-direct")}
+              />
+            </Stack>
+
+            <Divider />
+
+            <Stack gap={6}>
+              <Text variant="cap">Internal Channels (Read-Only)</Text>
+              {data.internal_channels.length === 0 ? (
+                <Text variant="meta">No shared internal channels created yet.</Text>
+              ) : (
+                <List label="Internal company channels">
+                  {data.internal_channels.map((ch) => {
+                    const lastMsg = ch.messages[ch.messages.length - 1];
+                    return (
+                      <ThreadRow
+                        key={ch.channel_id}
+                        selected={selectedChannel === ch.channel_id}
+                        thread={{
+                          id: ch.channel_id,
+                          title: ch.name,
+                          preview: lastMsg
+                            ? `${lastMsg.sender_name}: ${lastMsg.body}`
+                            : `${ch.message_count} messages`,
+                        }}
+                        onOpen={() => setSelectedChannel(ch.channel_id)}
+                      />
+                    );
+                  })}
+                </List>
+              )}
+            </Stack>
           </Stack>
+        </Card>
 
-          <Divider />
-
-          <Stack gap={6}>
-            <Text className="sd-nav-section-label">INTERNAL CHANNELS (READ-ONLY)</Text>
-            {data.internal_channels.length === 0 ? (
-              <Text variant="meta">No shared internal channels created yet.</Text>
-            ) : (
-              data.internal_channels.map((ch) => {
-                const active = selectedChannel === ch.channel_id;
-                return (
-                  <Button
-                    key={ch.channel_id}
-                    emphasis={active ? "soft" : "quiet"}
-                    shape="rounded"
-                    className="sd-channel-btn"
-                    onClick={() => setSelectedChannel(ch.channel_id)}
-                  >
-                    <Inline justify="between" align="center" className="sd-w-full">
-                      <Text variant="body">{ch.name}</Text>
-                      <Badge tone="neutral" variant="outline" dot={false}>
-                        {ch.message_count}
-                      </Badge>
-                    </Inline>
-                  </Button>
-                );
-              })
-            )}
-          </Stack>
-        </aside>
-
-        {/* Right Conversation Pane */}
-        <section className="sd-thread-pane" aria-label="Selected message thread">
+        <Card variant="raised" className="sd-thread-pane">
           {isCeoThread ? (
-            <>
+            <Stack gap={12} className="sd-thread-pane">
               <Inline justify="between" align="center" wrap>
                 <Inline gap={12} align="center">
                   <AgentAvatar
                     agent={data.ceo_thread.ceo_avatar_variant}
-                    state="ready"
+                    state={sendingCeo ? "working" : "ready"}
                     size={36}
                     label={data.ceo_thread.ceo_display_name}
                   />
@@ -212,29 +204,7 @@ export function MessagesView() {
                 {data.ceo_thread.advisory_notice}
               </Notice>
 
-              {/* Contextual Ask CEO Read-Only Context Attachment Card */}
-              {pendingAskContext ? (
-                <Card
-                  variant="outlined"
-                  density="compact"
-                  title="Attached Context (Read-Only)"
-                  description={`${pendingAskContext.kind} · ${pendingAskContext.id}`}
-                  headerAction={
-                    <Button
-                      emphasis="quiet"
-                      size="compact"
-                      shape="pill"
-                      onClick={() => setPendingAskContext(null)}
-                    >
-                      Remove
-                    </Button>
-                  }
-                >
-                  <Text variant="body">{pendingAskContext.label}</Text>
-                </Card>
-              ) : null}
-
-              <div className="sd-thread-scroll">
+              <ScrollArea label="Board and CEO messages" className="sd-thread-scroll">
                 {data.ceo_thread.messages.length === 0 ? (
                   <Text variant="help">
                     No messages yet. Ask Founder · CEO about trading posture, strategy trials, or
@@ -265,7 +235,11 @@ export function MessagesView() {
                     ))}
                   </Transcript>
                 )}
-              </div>
+              </ScrollArea>
+
+              {sendingCeo ? (
+                <ThinkingIndicator active label="Delivering advisory message to Founder · CEO" />
+              ) : null}
 
               {canWrite && data.ceo_thread.writable ? (
                 <Composer
@@ -273,6 +247,21 @@ export function MessagesView() {
                   value={draft}
                   onValueChange={setDraft}
                   onSend={handleSendCeo}
+                  pending={sendingCeo}
+                  attachments={
+                    pendingAskContext
+                      ? [
+                          {
+                            id: pendingAskContext.id,
+                            name: pendingAskContext.label,
+                            detail: `${pendingAskContext.kind} (read-only ref)`,
+                          },
+                        ]
+                      : undefined
+                  }
+                  onRemoveAttachment={
+                    pendingAskContext ? () => setPendingAskContext(null) : undefined
+                  }
                   placeholder={`Message ${data.ceo_thread.ceo_display_name} (advisory only)...`}
                   shortcutHint="Cmd+Enter to send"
                 />
@@ -281,11 +270,11 @@ export function MessagesView() {
                   Board control authority is required to send advisory messages to Founder · CEO.
                 </Notice>
               )}
-            </>
+            </Stack>
           ) : (
-            <>
+            <Stack gap={12} className="sd-thread-pane">
               <Inline justify="between" align="center" wrap>
-                <Stack gap={2}>
+                <Stack gap={4}>
                   <Heading level={2}>{activeInternal.name}</Heading>
                   <Inline gap={6} align="center" wrap>
                     {activeInternal.members.map((m) => (
@@ -313,7 +302,7 @@ export function MessagesView() {
                 are strictly read-only. To give guidance, switch to Founder · CEO (Direct 1:1).
               </Notice>
 
-              <div className="sd-thread-scroll">
+              <ScrollArea label={`${activeInternal.name} messages`} className="sd-thread-scroll">
                 {activeInternal.messages.length === 0 ? (
                   <Text variant="help">No messages posted in {activeInternal.name} yet.</Text>
                 ) : (
@@ -349,10 +338,10 @@ export function MessagesView() {
                     ))}
                   </Transcript>
                 )}
-              </div>
-            </>
+              </ScrollArea>
+            </Stack>
           )}
-        </section>
+        </Card>
       </div>
     </Stack>
   );
