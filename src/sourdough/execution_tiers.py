@@ -39,6 +39,7 @@ from .board_control import (
     BoardControlConflict,
     BoardControlForbidden,
     BoardControlRefused,
+    record_decision_question,
     resolve_board_access,
 )
 from .company import _identity
@@ -1031,8 +1032,10 @@ def register_company_paper_tier(
     slippage_bps: int = 2,
     quote_source: str = "live_read_only",
     binding_id: str | None = None,
+    book_name: str | None = None,
+    strategy_release_id: str | None = None,
 ) -> ExecutionBinding:
-    """Register or idempotently verify the company's active Tier 2 company_paper binding."""
+    """Register or idempotently verify an active Tier 2 company_paper book binding."""
     writer.verify()
     _require_safe_id(account_id, "account_id")
     _require_safe_id(destination_id, "destination_id")
@@ -1048,6 +1051,14 @@ def register_company_paper_tier(
     _require_bps(fee_bps, "fee_bps", upper=1000)
     _require_bps(slippage_bps, "slippage_bps", upper=500)
     _require_text(quote_source, "quote_source", max_len=64)
+    resolved_book_name = _require_text(
+        book_name if book_name is not None else account_id, "book_name", max_len=128
+    )
+    resolved_strategy = (
+        None
+        if strategy_release_id is None
+        else _require_safe_id(strategy_release_id, "strategy_release_id")
+    )
     resolved_id = (
         f"cpap-{uuid4().hex[:16]}"
         if binding_id is None
@@ -1063,8 +1074,8 @@ def register_company_paper_tier(
         )
         existing = db.execute(
             f"""{_SELECT_BINDING_COLS}
-                WHERE company_id = ? AND tier = ? AND status = 'active'""",
-            (writer.company_id, TIER_COMPANY_PAPER),
+                WHERE company_id = ? AND tier = ? AND account_id = ? AND status = 'active'""",
+            (writer.company_id, TIER_COMPANY_PAPER, account_id),
         ).fetchone()
         if existing is not None:
             prior = _row_to_binding(existing)
@@ -1079,9 +1090,25 @@ def register_company_paper_tier(
                 and prior.fee_bps == fee_bps
                 and prior.slippage_bps == slippage_bps
             ):
+                now = time_ns()
+                db.execute(
+                    """INSERT OR IGNORE INTO company_paper_book (
+                           binding_id, company_id, book_name, strategy_release_id,
+                           role, shadow_of_live_binding_id, nominated_question_id,
+                           created_at_ns, updated_at_ns
+                       ) VALUES (?, ?, ?, ?, 'active', NULL, NULL, ?, ?)""",
+                    (
+                        prior.binding_id,
+                        writer.company_id,
+                        resolved_book_name,
+                        resolved_strategy,
+                        now,
+                        now,
+                    ),
+                )
                 return prior
             raise ExecutionTierRefused(
-                "An active company_paper tier binding already exists with different terms"
+                "An active company_paper book binding already exists for this account_id with different terms"
             )
         now = time_ns()
         db.execute(
@@ -1112,6 +1139,21 @@ def register_company_paper_tier(
                 now,
             ),
         )
+        db.execute(
+            """INSERT INTO company_paper_book (
+                   binding_id, company_id, book_name, strategy_release_id,
+                   role, shadow_of_live_binding_id, nominated_question_id,
+                   created_at_ns, updated_at_ns
+               ) VALUES (?, ?, ?, ?, 'active', NULL, NULL, ?, ?)""",
+            (
+                resolved_id,
+                writer.company_id,
+                resolved_book_name,
+                resolved_strategy,
+                now,
+                now,
+            ),
+        )
         append_audit_event(
             db,
             company_id=writer.company_id,
@@ -1123,6 +1165,8 @@ def register_company_paper_tier(
             payload={
                 "binding_id": resolved_id,
                 "account_id": account_id,
+                "book_name": resolved_book_name,
+                "strategy_release_id": resolved_strategy,
                 "destination_id": destination_id,
                 "fee_bps": fee_bps,
                 "slippage_bps": slippage_bps,
@@ -1151,6 +1195,544 @@ def register_company_paper_tier(
             created_at_ns=now,
             updated_at_ns=now,
         )
+
+
+def open_company_paper_book(
+    writer: WriterLease,
+    *,
+    account_id: str,
+    book_name: str,
+    strategy_release_id: str | None = None,
+    destination_id: str = "company-paper-sim",
+    connector_revision: str = "company-paper-sim-v1",
+    instrument_rules_digest: str = "btc-usdt-spot-v1",
+    currency: str = "USD",
+    starting_minor_units: int = 100_000_000,
+    exposure_limit_minor_units: int | None = None,
+    fee_bps: int = 4,
+    slippage_bps: int = 2,
+    quote_source: str = "live_read_only",
+    binding_id: str | None = None,
+) -> ExecutionBinding:
+    """Open an isolated concurrent Company Paper Book with its own simulated ledger."""
+    exp_limit = (
+        starting_minor_units // 2
+        if exposure_limit_minor_units is None
+        else exposure_limit_minor_units
+    )
+    return register_company_paper_tier(
+        writer,
+        account_id=account_id,
+        destination_id=destination_id,
+        connector_revision=connector_revision,
+        instrument_rules_digest=instrument_rules_digest,
+        currency=currency,
+        starting_minor_units=starting_minor_units,
+        exposure_limit_minor_units=exp_limit,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        quote_source=quote_source,
+        binding_id=binding_id,
+        book_name=book_name,
+        strategy_release_id=strategy_release_id,
+    )
+
+
+def _compute_company_paper_book_cash_and_exposure(
+    db: Connection, binding: ExecutionBinding
+) -> tuple[int, int]:
+    """Return (available_cash_minor_units, gross_exposure_minor_units) for one Company Paper Book."""
+    cash = binding.starting_minor_units
+    for side, qty, price, fee in db.execute(
+        """SELECT side, quantity, price_minor_units, fee_minor_units
+           FROM company_paper_fill
+           WHERE binding_id = ?""",
+        (binding.binding_id,),
+    ).fetchall():
+        notional = int(qty) * int(price)
+        if side == "buy":
+            cash -= notional + int(fee)
+        else:
+            cash += notional - int(fee)
+
+    gross_exposure = 0
+    for qty, avg_entry in db.execute(
+        """SELECT quantity, avg_entry_minor_units
+           FROM company_paper_position
+           WHERE binding_id = ? AND quantity != 0""",
+        (binding.binding_id,),
+    ).fetchall():
+        gross_exposure += abs(int(qty)) * int(avg_entry)
+    return cash, gross_exposure
+
+
+def submit_company_paper_book_order(
+    writer: WriterLease,
+    *,
+    binding_id: str,
+    actor_id: str,
+    action_id: str,
+    instrument_id: str,
+    side: str,
+    quantity: int,
+    limit_minor_units: int,
+    market_price_minor_units: int,
+    quote_observed_at_ns: int | None = None,
+    fill_mode: str = "immediate",
+) -> dict[str, Any]:
+    """Submit a realistic simulated order strictly inside one Company Paper Book."""
+    writer.verify()
+    _require_safe_id(binding_id, "binding_id")
+    _require_safe_id(actor_id, "actor_id")
+    _require_safe_id(action_id, "action_id")
+    _require_safe_id(instrument_id, "instrument_id")
+    if side not in ("buy", "sell"):
+        raise ExecutionTierRefused("side must be 'buy' or 'sell'")
+    _require_positive_int(quantity, "quantity")
+    _require_positive_int(limit_minor_units, "limit_minor_units")
+    _require_positive_int(market_price_minor_units, "market_price_minor_units")
+    if fill_mode not in ("immediate", "resting"):
+        raise ExecutionTierRefused("fill_mode must be 'immediate' or 'resting'")
+    observed_ns = time_ns() if quote_observed_at_ns is None else quote_observed_at_ns
+    _require_positive_int(observed_ns, "quote_observed_at_ns")
+
+    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
+        writer.verify()
+        if _identity(db) != writer.company_id:
+            raise ExecutionTierRefused("Company identity mismatch")
+        if not is_domain_installed(db, "paper"):
+            raise ExecutionTierRefused("Paper domain is not installed")
+        row = db.execute(
+            f"""{_SELECT_BINDING_COLS}
+                WHERE company_id = ? AND binding_id = ? AND tier = ? AND status = 'active'""",
+            (writer.company_id, binding_id, TIER_COMPANY_PAPER),
+        ).fetchone()
+        if row is None:
+            raise ExecutionTierRefused(
+                f"Active company_paper book binding '{binding_id}' not found"
+            )
+        binding = _row_to_binding(row)
+
+        existing = db.execute(
+            """SELECT order_id, instrument_id, side, quantity, limit_minor_units,
+                      market_price_minor_units, status, filled_quantity,
+                      fill_price_minor_units, fee_minor_units
+               FROM company_paper_order
+               WHERE binding_id = ? AND action_id = ?""",
+            (binding.binding_id, action_id),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing[1]) != instrument_id
+                or str(existing[2]) != side
+                or int(existing[3]) != quantity
+                or int(existing[4]) != limit_minor_units
+            ):
+                raise ExecutionTierRefused(
+                    "action_id already used for a different company paper order"
+                )
+            fill_row = db.execute(
+                """SELECT fill_id, realized_pnl_minor_units
+                   FROM company_paper_fill WHERE order_id = ?""",
+                (str(existing[0]),),
+            ).fetchone()
+            return {
+                "order_id": str(existing[0]),
+                "binding_id": binding.binding_id,
+                "action_id": action_id,
+                "instrument_id": instrument_id,
+                "side": side,
+                "quantity": quantity,
+                "status": str(existing[6]),
+                "filled_quantity": int(existing[7]),
+                "fill_price_minor_units": None
+                if existing[8] is None
+                else int(existing[8]),
+                "fee_minor_units": int(existing[9]),
+                "fill_id": None if fill_row is None else str(fill_row[0]),
+                "realized_pnl_minor_units": 0 if fill_row is None else int(fill_row[1]),
+                "replayed": True,
+            }
+
+        if side == "buy":
+            slipped_price = (
+                market_price_minor_units
+                + (market_price_minor_units * binding.slippage_bps + 9_999) // 10_000
+            )
+            crosses_limit = slipped_price <= limit_minor_units
+        else:
+            slipped_price = max(
+                1,
+                market_price_minor_units
+                - (market_price_minor_units * binding.slippage_bps) // 10_000,
+            )
+            crosses_limit = slipped_price >= limit_minor_units
+
+        cash_available, gross_exposure = _compute_company_paper_book_cash_and_exposure(
+            db, binding
+        )
+        pos_row = db.execute(
+            """SELECT quantity, avg_entry_minor_units, realized_pnl_minor_units, total_fees_minor_units
+               FROM company_paper_position
+               WHERE binding_id = ? AND instrument_id = ?""",
+            (binding.binding_id, instrument_id),
+        ).fetchone()
+        cur_qty = int(pos_row[0]) if pos_row else 0
+        cur_avg = int(pos_row[1]) if pos_row else 0
+        cur_realized = int(pos_row[2]) if pos_row else 0
+        cur_fees = int(pos_row[3]) if pos_row else 0
+
+        now = time_ns()
+        order_id = f"cpbo-{uuid4().hex[:16]}"
+        should_fill = fill_mode == "immediate" and crosses_limit
+
+        if should_fill:
+            notional = quantity * slipped_price
+            fee = (notional * binding.fee_bps + 5_000) // 10_000
+            delta = quantity if side == "buy" else -quantity
+            new_qty = cur_qty + delta
+            other_exposure = gross_exposure - abs(cur_qty) * cur_avg
+
+            realized_delta = 0
+            if (
+                cur_qty == 0
+                or (cur_qty > 0 and delta > 0)
+                or (cur_qty < 0 and delta < 0)
+            ):
+                total_cost = abs(cur_qty) * cur_avg + quantity * slipped_price
+                new_avg = total_cost // abs(new_qty)
+            else:
+                closing_qty = min(abs(cur_qty), quantity)
+                if cur_qty > 0:
+                    realized_delta = (slipped_price - cur_avg) * closing_qty
+                else:
+                    realized_delta = (cur_avg - slipped_price) * closing_qty
+                if new_qty == 0:
+                    new_avg = 0
+                elif (cur_qty > 0 and new_qty > 0) or (cur_qty < 0 and new_qty < 0):
+                    new_avg = cur_avg
+                else:
+                    new_avg = slipped_price
+
+            projected_exposure = other_exposure + abs(new_qty) * new_avg
+            if projected_exposure > binding.exposure_limit_minor_units:
+                raise ExecutionTierRefused(
+                    "Company paper book order exceeds exposure limit"
+                )
+            if side == "buy" and notional + fee > cash_available:
+                raise ExecutionTierRefused(
+                    "Company paper book order exceeds available virtual cash"
+                )
+            realized_net = realized_delta - fee
+            fill_id = f"cpbf-{uuid4().hex[:16]}"
+            db.execute(
+                """INSERT INTO company_paper_order (
+                       order_id, binding_id, company_id, actor_id, action_id,
+                       instrument_id, side, quantity, limit_minor_units,
+                       market_price_minor_units, quote_observed_at_ns, quote_source,
+                       fee_bps, slippage_bps, status, filled_quantity,
+                       fill_price_minor_units, fee_minor_units, created_at_ns, updated_at_ns
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'filled', ?, ?, ?, ?, ?)""",
+                (
+                    order_id,
+                    binding.binding_id,
+                    writer.company_id,
+                    actor_id,
+                    action_id,
+                    instrument_id,
+                    side,
+                    quantity,
+                    limit_minor_units,
+                    market_price_minor_units,
+                    observed_ns,
+                    binding.quote_source,
+                    binding.fee_bps,
+                    binding.slippage_bps,
+                    quantity,
+                    slipped_price,
+                    fee,
+                    now,
+                    now,
+                ),
+            )
+            db.execute(
+                """INSERT INTO company_paper_fill (
+                       fill_id, order_id, binding_id, company_id, actor_id,
+                       instrument_id, side, quantity, price_minor_units,
+                       fee_minor_units, realized_pnl_minor_units, filled_at_ns
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fill_id,
+                    order_id,
+                    binding.binding_id,
+                    writer.company_id,
+                    actor_id,
+                    instrument_id,
+                    side,
+                    quantity,
+                    slipped_price,
+                    fee,
+                    realized_net,
+                    now,
+                ),
+            )
+            db.execute(
+                """INSERT INTO company_paper_position (
+                       binding_id, company_id, instrument_id,
+                       quantity, avg_entry_minor_units, realized_pnl_minor_units,
+                       total_fees_minor_units, updated_at_ns
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (binding_id, instrument_id) DO UPDATE SET
+                       quantity = excluded.quantity,
+                       avg_entry_minor_units = excluded.avg_entry_minor_units,
+                       realized_pnl_minor_units = excluded.realized_pnl_minor_units,
+                       total_fees_minor_units = excluded.total_fees_minor_units,
+                       updated_at_ns = excluded.updated_at_ns""",
+                (
+                    binding.binding_id,
+                    writer.company_id,
+                    instrument_id,
+                    new_qty,
+                    new_avg,
+                    cur_realized + realized_net,
+                    cur_fees + fee,
+                    now,
+                ),
+            )
+            append_audit_event(
+                db,
+                company_id=writer.company_id,
+                domain="paper",
+                entity_type="company_paper_fill",
+                entity_id=fill_id,
+                event_type="company_paper.order_filled",
+                actor_id=actor_id,
+                payload={
+                    "order_id": order_id,
+                    "fill_id": fill_id,
+                    "binding_id": binding.binding_id,
+                    "instrument_id": instrument_id,
+                    "side": side,
+                    "quantity": quantity,
+                    "price_minor_units": slipped_price,
+                    "fee_minor_units": fee,
+                },
+                recorded_at_ns=now,
+            )
+            writer.verify()
+            return {
+                "order_id": order_id,
+                "binding_id": binding.binding_id,
+                "action_id": action_id,
+                "instrument_id": instrument_id,
+                "side": side,
+                "quantity": quantity,
+                "status": "filled",
+                "filled_quantity": quantity,
+                "fill_price_minor_units": slipped_price,
+                "fee_minor_units": fee,
+                "fill_id": fill_id,
+                "realized_pnl_minor_units": realized_net,
+                "replayed": False,
+            }
+
+        if side == "buy" and quantity * limit_minor_units > cash_available:
+            raise ExecutionTierRefused(
+                "Company paper book limit order exceeds available virtual cash"
+            )
+        db.execute(
+            """INSERT INTO company_paper_order (
+                   order_id, binding_id, company_id, actor_id, action_id,
+                   instrument_id, side, quantity, limit_minor_units,
+                   market_price_minor_units, quote_observed_at_ns, quote_source,
+                   fee_bps, slippage_bps, status, filled_quantity,
+                   fill_price_minor_units, fee_minor_units, created_at_ns, updated_at_ns
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', 0, NULL, 0, ?, ?)""",
+            (
+                order_id,
+                binding.binding_id,
+                writer.company_id,
+                actor_id,
+                action_id,
+                instrument_id,
+                side,
+                quantity,
+                limit_minor_units,
+                market_price_minor_units,
+                observed_ns,
+                binding.quote_source,
+                binding.fee_bps,
+                binding.slippage_bps,
+                now,
+                now,
+            ),
+        )
+        writer.verify()
+        return {
+            "order_id": order_id,
+            "binding_id": binding.binding_id,
+            "action_id": action_id,
+            "instrument_id": instrument_id,
+            "side": side,
+            "quantity": quantity,
+            "status": "open",
+            "filled_quantity": 0,
+            "fill_price_minor_units": None,
+            "fee_minor_units": 0,
+            "fill_id": None,
+            "realized_pnl_minor_units": 0,
+            "replayed": False,
+        }
+
+
+def read_company_paper_book_portfolio_from_db(
+    db: Connection, company_id: str, binding_id: str
+) -> dict[str, Any] | None:
+    """Read one Company Paper Book's independent virtual cash, exposure, fills, and soak state."""
+    if not is_domain_installed(db, "paper"):
+        return None
+    row = db.execute(
+        f"""{_SELECT_BINDING_COLS}
+            WHERE company_id = ? AND binding_id = ? AND tier = ?""",
+        (company_id, binding_id, TIER_COMPANY_PAPER),
+    ).fetchone()
+    if row is None:
+        return None
+    binding = _row_to_binding(row)
+    meta_row = db.execute(
+        """SELECT book_name, strategy_release_id, role,
+                  shadow_of_live_binding_id, nominated_question_id,
+                  created_at_ns, updated_at_ns
+           FROM company_paper_book
+           WHERE company_id = ? AND binding_id = ?""",
+        (company_id, binding_id),
+    ).fetchone()
+    book_name = str(meta_row[0]) if meta_row is not None else binding.account_id
+    strategy_release_id = (
+        None if meta_row is None or meta_row[1] is None else str(meta_row[1])
+    )
+    role = (
+        str(meta_row[2])
+        if meta_row is not None
+        else ("retired" if binding.status == "retired" else "active")
+    )
+    shadow_of_live_binding_id = (
+        None if meta_row is None or meta_row[3] is None else str(meta_row[3])
+    )
+    nominated_question_id = (
+        None if meta_row is None or meta_row[4] is None else str(meta_row[4])
+    )
+    if role == "nominated" and nominated_question_id is not None:
+        q_row = db.execute(
+            "SELECT state FROM decision_question WHERE company_id = ? AND question_id = ?",
+            (company_id, nominated_question_id),
+        ).fetchone()
+        if q_row is not None and str(q_row[0]) != "open":
+            role = "active"
+            nominated_question_id = None
+
+    cash, gross_exposure = _compute_company_paper_book_cash_and_exposure(db, binding)
+    positions = [
+        {
+            "instrument_id": str(r[0]),
+            "quantity": int(r[1]),
+            "avg_entry_minor_units": int(r[2]),
+            "realized_pnl_minor_units": int(r[3]),
+            "total_fees_minor_units": int(r[4]),
+            "updated_at_ns": int(r[5]),
+        }
+        for r in db.execute(
+            """SELECT instrument_id, quantity, avg_entry_minor_units,
+                      realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
+               FROM company_paper_position
+               WHERE binding_id = ?
+               ORDER BY instrument_id ASC""",
+            (binding.binding_id,),
+        ).fetchall()
+    ]
+    orders = [
+        {
+            "order_id": str(r[0]),
+            "action_id": str(r[1]),
+            "instrument_id": str(r[2]),
+            "side": str(r[3]),
+            "quantity": int(r[4]),
+            "limit_minor_units": int(r[5]),
+            "status": str(r[6]),
+            "filled_quantity": int(r[7]),
+            "fill_price_minor_units": None if r[8] is None else int(r[8]),
+            "fee_minor_units": int(r[9]),
+            "created_at_ns": int(r[10]),
+        }
+        for r in db.execute(
+            """SELECT order_id, action_id, instrument_id, side, quantity,
+                      limit_minor_units, status, filled_quantity,
+                      fill_price_minor_units, fee_minor_units, created_at_ns
+               FROM company_paper_order
+               WHERE binding_id = ?
+               ORDER BY created_at_ns DESC LIMIT 30""",
+            (binding.binding_id,),
+        ).fetchall()
+    ]
+    fill_count = int(
+        db.execute(
+            "SELECT COUNT(*) FROM company_paper_fill WHERE binding_id = ?",
+            (binding.binding_id,),
+        ).fetchone()[0]
+    )
+    open_orders_count = int(
+        db.execute(
+            "SELECT COUNT(*) FROM company_paper_order WHERE binding_id = ? AND status = 'open'",
+            (binding.binding_id,),
+        ).fetchone()[0]
+    )
+    realized_pnl = sum(p["realized_pnl_minor_units"] for p in positions)
+    total_fees = sum(p["total_fees_minor_units"] for p in positions)
+    open_positions_count = sum(1 for p in positions if p["quantity"] != 0)
+
+    # Book-level soak readiness: recorded fills in this book OR legacy soak evidence if mirroring legacy paper_binding.
+    soak_ready = fill_count > 0
+    if not soak_ready:
+        legacy_match = db.execute(
+            "SELECT 1 FROM paper_binding WHERE singleton = 1 AND company_id = ? AND account_id = ?",
+            (company_id, binding.account_id),
+        ).fetchone()
+        if legacy_match is not None:
+            for sql in (
+                "SELECT 1 FROM paper_fill LIMIT 1",
+                "SELECT 1 FROM paper_valuation LIMIT 1",
+                "SELECT 1 FROM paper_statement LIMIT 1",
+            ):
+                if db.execute(sql).fetchone() is not None:
+                    soak_ready = True
+                    break
+
+    return {
+        "binding_id": binding.binding_id,
+        "account_id": binding.account_id,
+        "book_name": book_name,
+        "strategy_release_id": strategy_release_id,
+        "role": role,
+        "status": binding.status,
+        "shadow_of_live_binding_id": shadow_of_live_binding_id,
+        "nominated_question_id": nominated_question_id,
+        "currency": binding.currency,
+        "starting_minor_units": binding.starting_minor_units,
+        "exposure_limit_minor_units": binding.exposure_limit_minor_units,
+        "fee_bps": binding.fee_bps,
+        "slippage_bps": binding.slippage_bps,
+        "quote_source": binding.quote_source,
+        "cash_minor_units": cash,
+        "gross_exposure_minor_units": gross_exposure,
+        "realized_pnl_minor_units": realized_pnl,
+        "total_fees_minor_units": total_fees,
+        "fill_count": fill_count,
+        "open_positions_count": open_positions_count,
+        "open_orders_count": open_orders_count,
+        "soak_ready": soak_ready,
+        "positions": positions,
+        "orders": orders,
+    }
 
 
 def sync_company_paper_from_legacy_binding(
@@ -1550,6 +2132,7 @@ def _has_company_paper_soak_evidence(db: Connection, company_id: str) -> bool:
     if not (has_tier_paper or has_legacy_paper):
         return False
     for sql in (
+        "SELECT 1 FROM company_paper_fill LIMIT 1",
         "SELECT 1 FROM paper_fill LIMIT 1",
         "SELECT 1 FROM paper_valuation LIMIT 1",
         "SELECT 1 FROM paper_statement LIMIT 1",
@@ -2061,6 +2644,13 @@ def demote_live_environment(
                WHERE binding_id = ?""",
             (next_status, now, target_id),
         )
+        if next_status == "retired":
+            db.execute(
+                """UPDATE company_paper_book
+                   SET role = 'active', shadow_of_live_binding_id = NULL, updated_at_ns = ?
+                   WHERE company_id = ? AND shadow_of_live_binding_id = ? AND role = 'shadow'""",
+                (now, writer.company_id, target_id),
+            )
         promotion_id = f"demote-{uuid4().hex[:16]}"
         result_body = {
             "promotion_id": promotion_id,
@@ -2129,18 +2719,554 @@ def demote_live_environment(
         )
 
 
+# ---------------------------------------------------------------------------
+# Safe Paper -> Live Migration Engine
+# ---------------------------------------------------------------------------
+
+VALID_MIGRATION_MODES = frozenset({"clean_start", "drain_incumbent"})
+VALID_SOURCE_PAPER_DISPOSITIONS = frozenset({"keep_shadow", "retire_source"})
+
+
+def propose_paper_to_live_migration(
+    writer: WriterLease,
+    *,
+    question_id: str,
+    source_paper_binding_id: str,
+    target_live_binding_id: str,
+    qualification_receipt_id: str,
+    created_by_agent_id: str,
+    migration_mode: str = "clean_start",
+    source_paper_disposition: str = "keep_shadow",
+    title: str | None = None,
+    summary: str | None = None,
+    respond_by_ns: int | None = None,
+    expected_core_digest: str | None = None,
+) -> dict[str, Any]:
+    """Nominate a soaked Company Paper Book for Live Trading via a Board decision_question.
+
+    The resulting decision_question surfaces identically in Paper Trading, Live Trading,
+    and the unified Approvals inbox. Approving from any surface triggers board.apply_decision
+    -> execute_paper_to_live_migration.
+    """
+    writer.verify()
+    _require_safe_id(question_id, "question_id")
+    _require_safe_id(source_paper_binding_id, "source_paper_binding_id")
+    _require_safe_id(target_live_binding_id, "target_live_binding_id")
+    _require_safe_id(qualification_receipt_id, "qualification_receipt_id")
+    _require_safe_id(created_by_agent_id, "created_by_agent_id")
+    if migration_mode not in VALID_MIGRATION_MODES:
+        raise ExecutionTierRefused(
+            "migration_mode must be 'clean_start' or 'drain_incumbent'"
+        )
+    if source_paper_disposition not in VALID_SOURCE_PAPER_DISPOSITIONS:
+        raise ExecutionTierRefused(
+            "source_paper_disposition must be 'keep_shadow' or 'retire_source'"
+        )
+
+    core_digest = (
+        compute_trading_core_digest()
+        if expected_core_digest is None
+        else expected_core_digest
+    )
+
+    with closing(open_reader(writer.store)) as db, read_tx(db):
+        if _identity(db) != writer.company_id:
+            raise ExecutionTierRefused("Company identity mismatch")
+        if not is_domain_installed(db, "paper"):
+            raise ExecutionTierRefused("Paper domain is not installed")
+        source_book = read_company_paper_book_portfolio_from_db(
+            db, writer.company_id, source_paper_binding_id
+        )
+        if source_book is None or source_book["status"] != "active":
+            raise ExecutionTierRefused(
+                "Source paper book must be an active company_paper binding"
+            )
+        if not source_book["soak_ready"]:
+            raise ExecutionTierRefused(
+                "Source paper book lacks soak evidence (recorded fills or legacy soak) required before nominating for live"
+            )
+        target_row = db.execute(
+            f"{_SELECT_BINDING_COLS} WHERE company_id = ? AND binding_id = ?",
+            (writer.company_id, target_live_binding_id),
+        ).fetchone()
+        if target_row is None:
+            raise ExecutionTierRefused("Target live candidate binding was not found")
+        target = _row_to_binding(target_row)
+        if target.tier != TIER_COMPANY_LIVE or target.environment != ENV_LIVE:
+            raise ExecutionTierRefused(
+                "Migration target must be a company_live binding"
+            )
+        if target.status not in ("registered", "suspended"):
+            raise ExecutionTierRefused(
+                f"Target live binding in status '{target.status}' cannot be nominated"
+            )
+        qual_row = db.execute(
+            """SELECT environment, instrument_rules_digest, core_digest,
+                      verdict, cases_passed, cases_failed, cases_unrun
+               FROM venue_qualification_receipt
+               WHERE company_id = ? AND receipt_id = ?""",
+            (writer.company_id, qualification_receipt_id),
+        ).fetchone()
+        if qual_row is None:
+            raise ExecutionTierRefused(
+                "Venue qualification receipt was not found for migration nomination"
+            )
+        if (
+            str(qual_row[0]) != ENV_EXTERNAL_TEST
+            or str(qual_row[3]) != "PASS"
+            or int(qual_row[4]) <= 0
+            or int(qual_row[5]) != 0
+            or int(qual_row[6]) != 0
+        ):
+            raise ExecutionTierRefused(
+                "Migration nomination requires a PASS external_test qualification receipt with zero failed/unrun cases"
+            )
+        if str(qual_row[1]) != target.instrument_rules_digest:
+            raise ExecutionTierRefused(
+                "Qualification receipt instrument_rules_digest does not match target live binding"
+            )
+        if str(qual_row[2]) != core_digest:
+            raise ExecutionTierRefused(
+                "Qualification receipt core_digest does not match current trading core"
+            )
+
+    book_name = str(source_book["book_name"])
+    resolved_title = (
+        title.strip()
+        if isinstance(title, str) and title.strip()
+        else f"Migrate Paper Book '{book_name}' to Live ({target.account_id})"
+    )
+    resolved_summary = (
+        summary.strip()
+        if isinstance(summary, str) and summary.strip()
+        else (
+            f"Company recommends promoting '{book_name}' ({source_book['fill_count']} paper fills, "
+            f"strategy {source_book['strategy_release_id'] or 'baseline'}) to Live venue "
+            f"{target.account_id} ({target.destination_id}) via {migration_mode} with zero virtual "
+            f"position carryover."
+        )
+    )
+    impact = {
+        "action": "migrate_paper_to_live",
+        "source_paper_binding_id": source_paper_binding_id,
+        "source_book_name": book_name,
+        "strategy_release_id": source_book["strategy_release_id"],
+        "target_live_binding_id": target_live_binding_id,
+        "target_account_id": target.account_id,
+        "target_destination_id": target.destination_id,
+        "qualification_receipt_id": qualification_receipt_id,
+        "migration_mode": migration_mode,
+        "source_paper_disposition": source_paper_disposition,
+        "confirm_verb": "Approve Live Migration",
+        "consequence_note": (
+            f"Activates Live Trading on {target.account_id} starting flat (0 virtual positions copied) "
+            f"under cap {target.exposure_limit_minor_units} {target.currency} minor units, and "
+            + (
+                "retains the source Paper Book in parallel as a Shadow Benchmark."
+                if source_paper_disposition == "keep_shadow"
+                else "retires the source Paper Book."
+            )
+        ),
+        "what_changes": [
+            {
+                "label": "Live Venue",
+                "value": f"{target.account_id} ({target.destination_id}) activated ({migration_mode})",
+            },
+            {
+                "label": "Source Paper Book",
+                "value": f"{book_name} transitions to "
+                + (
+                    "Shadow Benchmark"
+                    if source_paper_disposition == "keep_shadow"
+                    else "Retired"
+                ),
+            },
+            {
+                "label": "Position Carryover",
+                "value": "0 virtual positions copied (real capital starts flat)",
+            },
+        ],
+        "what_stays_untouched": [
+            {
+                "label": "Other Paper Books",
+                "value": "Peer Company Paper Books continue running undisturbed",
+            },
+            {
+                "label": "Agent Sandboxes",
+                "value": "Personal per-Agent sandboxes stay strictly isolated",
+            },
+            {
+                "label": "Host API Secrets",
+                "value": f"Resolved only in memory via {target.credential_handle_ref}",
+            },
+        ],
+    }
+
+    payload_hash = record_decision_question(
+        writer,
+        question_id=question_id,
+        kind="live_promotion",
+        title=resolved_title,
+        summary=resolved_summary,
+        impact=impact,
+        options=("approve", "decline"),
+        created_by_agent_id=created_by_agent_id,
+        respond_by_ns=respond_by_ns,
+    )
+
+    now = time_ns()
+    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
+        writer.verify()
+        db.execute(
+            """UPDATE company_paper_book
+               SET role = 'nominated', nominated_question_id = ?, updated_at_ns = ?
+               WHERE company_id = ? AND binding_id = ?""",
+            (question_id, now, writer.company_id, source_paper_binding_id),
+        )
+        append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="paper",
+            entity_type="company_paper_book",
+            entity_id=source_paper_binding_id,
+            event_type="execution_tier.paper_migration_nominated",
+            actor_id=created_by_agent_id,
+            payload={
+                "question_id": question_id,
+                "source_paper_binding_id": source_paper_binding_id,
+                "target_live_binding_id": target_live_binding_id,
+                "qualification_receipt_id": qualification_receipt_id,
+                "migration_mode": migration_mode,
+                "source_paper_disposition": source_paper_disposition,
+            },
+            recorded_at_ns=now,
+        )
+        writer.verify()
+
+    return {
+        "question_id": question_id,
+        "payload_hash": payload_hash,
+        "source_paper_binding_id": source_paper_binding_id,
+        "target_live_binding_id": target_live_binding_id,
+        "qualification_receipt_id": qualification_receipt_id,
+        "migration_mode": migration_mode,
+        "source_paper_disposition": source_paper_disposition,
+    }
+
+
+def execute_paper_to_live_migration(
+    writer: WriterLease,
+    *,
+    source_paper_binding_id: str,
+    target_live_binding_id: str,
+    qualification_receipt_id: str,
+    migration_mode: str = "clean_start",
+    source_paper_disposition: str = "keep_shadow",
+    reason: str = "Board approved Paper-to-Live migration",
+    question_id: str | None = None,
+    actor_id: str = "board_apply_decision",
+    expected_core_digest: str | None = None,
+    now_ns: int | None = None,
+) -> dict[str, Any]:
+    """Fail-closed execution engine migrating a soaked Paper Book into Live Trading.
+
+    Enforces:
+    1. Zero active company/execution/live risk restrictions.
+    2. Zero uncertain orders (and zero working/pending_cancel orders during drain_incumbent).
+    3. Source Paper Book soak readiness.
+    4. Passing external_test venue qualification receipt matching target rules + current core digest.
+    5. Valid opaque live credential handle isolation.
+    6. Explicit incumbent handling (clean_start refuses active incumbent; drain_incumbent safely retires it).
+    7. Strictly zero virtual paper positions copied (positions_copied = 0, real capital starts flat).
+    """
+    writer.verify()
+    _require_safe_id(source_paper_binding_id, "source_paper_binding_id")
+    _require_safe_id(target_live_binding_id, "target_live_binding_id")
+    _require_safe_id(qualification_receipt_id, "qualification_receipt_id")
+    clean_reason = _require_text(reason, "reason", max_len=1000)
+    if migration_mode not in VALID_MIGRATION_MODES:
+        raise ExecutionTierRefused(
+            "migration_mode must be 'clean_start' or 'drain_incumbent'"
+        )
+    if source_paper_disposition not in VALID_SOURCE_PAPER_DISPOSITIONS:
+        raise ExecutionTierRefused(
+            "source_paper_disposition must be 'keep_shadow' or 'retire_source'"
+        )
+    if question_id is not None:
+        _require_safe_id(question_id, "question_id")
+
+    core_digest = (
+        compute_trading_core_digest()
+        if expected_core_digest is None
+        else expected_core_digest
+    )
+    now = time_ns() if now_ns is None else now_ns
+
+    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
+        writer.verify()
+        if _identity(db) != writer.company_id:
+            raise ExecutionTierRefused("Company identity mismatch")
+        if not is_domain_installed(db, "paper"):
+            raise ExecutionTierRefused("Paper domain is not installed")
+
+        # Gate 1: Zero active company/execution/live restrictions.
+        restr_row = db.execute(
+            """SELECT restriction_id, scope_ref, reason
+               FROM restriction_cause
+               WHERE company_id = ? AND active = 1
+                 AND scope_ref IN ('company:all', 'execution:all', 'execution:live')
+               LIMIT 1""",
+            (writer.company_id,),
+        ).fetchone()
+        if restr_row is not None:
+            raise ExecutionTierRefused(
+                f"Migration blocked by active restriction {restr_row[0]} ({restr_row[1]}): {restr_row[2]}"
+            )
+
+        # Gate 2: Zero unresolved paper orders or pending binding changes.
+        unresolved_count = int(
+            db.execute(
+                """SELECT COUNT(*) FROM paper_order o
+                   LEFT JOIN paper_cancellation c ON c.order_id = o.order_id
+                   WHERE c.order_id IS NULL
+                     AND (SELECT COALESCE(SUM(f.quantity), 0) FROM paper_fill f WHERE f.order_id = o.order_id) < o.quantity"""
+            ).fetchone()[0]
+        )
+        if unresolved_count > 0:
+            raise ExecutionTierRefused(
+                f"Migration blocked: {unresolved_count} unresolved order(s) must settle or cancel before live activation"
+            )
+        pending_binding_changes = int(
+            db.execute(
+                "SELECT COUNT(*) FROM paper_binding_change WHERE effective_at_ns IS NULL"
+            ).fetchone()[0]
+        )
+        if pending_binding_changes > 0:
+            raise ExecutionTierRefused(
+                "Migration blocked: pending paper_binding_change must finalize before live activation"
+            )
+
+        # Gate 3: Source Paper Book active & soak ready.
+        source_book = read_company_paper_book_portfolio_from_db(
+            db, writer.company_id, source_paper_binding_id
+        )
+        if source_book is None or source_book["status"] != "active":
+            raise ExecutionTierRefused(
+                "Source paper book must be an active company_paper binding"
+            )
+        if not source_book["soak_ready"]:
+            raise ExecutionTierRefused(
+                "Source paper book lacks soak evidence required for live migration"
+            )
+        if (
+            source_paper_disposition == "retire_source"
+            and source_book["open_orders_count"] > 0
+        ):
+            raise ExecutionTierRefused(
+                f"Cannot retire source paper book while {source_book['open_orders_count']} resting order(s) remain open"
+            )
+
+        # Gate 4: Target Live binding valid & opaque credential handle verified.
+        target_row = db.execute(
+            f"{_SELECT_BINDING_COLS} WHERE company_id = ? AND binding_id = ?",
+            (writer.company_id, target_live_binding_id),
+        ).fetchone()
+        if target_row is None:
+            raise ExecutionTierRefused("Target live candidate binding was not found")
+        target = _row_to_binding(target_row)
+        if target.tier != TIER_COMPANY_LIVE or target.environment != ENV_LIVE:
+            raise ExecutionTierRefused(
+                "Migration target must be a company_live binding"
+            )
+        if target.status not in ("registered", "suspended"):
+            raise ExecutionTierRefused(
+                f"Cannot migrate into target live binding in status '{target.status}'"
+            )
+        _validate_credential_handle(
+            target.credential_handle_ref, environment=ENV_LIVE, required=True
+        )
+
+        # Gate 5: Matching PASS external_test venue qualification receipt & current core digest.
+        qual_row = db.execute(
+            """SELECT environment, instrument_rules_digest, core_digest,
+                      verdict, cases_passed, cases_failed, cases_unrun
+               FROM venue_qualification_receipt
+               WHERE company_id = ? AND receipt_id = ?""",
+            (writer.company_id, qualification_receipt_id),
+        ).fetchone()
+        if qual_row is None:
+            raise ExecutionTierRefused(
+                "External testnet venue qualification receipt is missing"
+            )
+        if (
+            str(qual_row[0]) != ENV_EXTERNAL_TEST
+            or str(qual_row[3]) != "PASS"
+            or int(qual_row[4]) <= 0
+            or int(qual_row[5]) != 0
+            or int(qual_row[6]) != 0
+        ):
+            raise ExecutionTierRefused(
+                "Migration requires a PASS external_test qualification receipt with zero failures or unrun cases"
+            )
+        if str(qual_row[1]) != target.instrument_rules_digest:
+            raise ExecutionTierRefused(
+                "Qualification receipt instrument_rules_digest does not match target live binding"
+            )
+        if str(qual_row[2]) != core_digest:
+            raise ExecutionTierRefused(
+                "Qualification receipt core_digest does not match current trading core"
+            )
+
+        # Gate 6: Incumbent live binding handling.
+        incumbent_row = db.execute(
+            """SELECT binding_id FROM execution_environment_binding
+               WHERE company_id = ? AND tier = ? AND status = 'active'""",
+            (writer.company_id, TIER_COMPANY_LIVE),
+        ).fetchone()
+        replaced_live_binding_id: str | None = None
+        if incumbent_row is not None:
+            incumbent_id = str(incumbent_row[0])
+            if migration_mode == "clean_start":
+                raise ExecutionTierRefused(
+                    f"Active incumbent live binding ({incumbent_id}) exists; use migration_mode='drain_incumbent' or demote incumbent first"
+                )
+            replaced_live_binding_id = incumbent_id
+            db.execute(
+                """UPDATE execution_environment_binding
+                   SET status = 'retired', updated_at_ns = ?
+                   WHERE binding_id = ?""",
+                (now, incumbent_id),
+            )
+            db.execute(
+                """UPDATE company_paper_book
+                   SET role = 'active', shadow_of_live_binding_id = NULL, updated_at_ns = ?
+                   WHERE company_id = ? AND shadow_of_live_binding_id = ? AND role = 'shadow'""",
+                (now, writer.company_id, incumbent_id),
+            )
+
+        # Activate target Live binding (real capital starts flat: positions_copied = 0).
+        db.execute(
+            """UPDATE execution_environment_binding
+               SET status = 'active', updated_at_ns = ?
+               WHERE binding_id = ?""",
+            (now, target_live_binding_id),
+        )
+
+        # Transition source Paper Book to shadow benchmark OR retired.
+        if source_paper_disposition == "keep_shadow":
+            db.execute(
+                """UPDATE company_paper_book
+                   SET role = 'shadow',
+                       shadow_of_live_binding_id = ?,
+                       nominated_question_id = COALESCE(?, nominated_question_id),
+                       updated_at_ns = ?
+                   WHERE company_id = ? AND binding_id = ?""",
+                (
+                    target_live_binding_id,
+                    question_id,
+                    now,
+                    writer.company_id,
+                    source_paper_binding_id,
+                ),
+            )
+            source_book_final_role = "shadow"
+        else:
+            db.execute(
+                """UPDATE company_paper_book
+                   SET role = 'retired',
+                       shadow_of_live_binding_id = NULL,
+                       nominated_question_id = COALESCE(?, nominated_question_id),
+                       updated_at_ns = ?
+                   WHERE company_id = ? AND binding_id = ?""",
+                (question_id, now, writer.company_id, source_paper_binding_id),
+            )
+            db.execute(
+                """UPDATE execution_environment_binding
+                   SET status = 'retired', updated_at_ns = ?
+                   WHERE binding_id = ?""",
+                (now, source_paper_binding_id),
+            )
+            source_book_final_role = "retired"
+
+        migration_id = f"mig-{uuid4().hex[:16]}"
+        pre_check_summary = {
+            "active_restrictions": 0,
+            "unresolved_orders": unresolved_count,
+            "pending_binding_changes": pending_binding_changes,
+            "source_book_fills": source_book["fill_count"],
+            "source_book_soak_ready": True,
+            "qualification_cases_passed": int(qual_row[4]),
+            "core_digest_verified": True,
+            "positions_copied": 0,
+        }
+        db.execute(
+            """INSERT INTO paper_live_migration_record (
+                   migration_id, company_id, question_id,
+                   source_paper_binding_id, target_live_binding_id,
+                   replaced_live_binding_id, qualification_receipt_id,
+                   migration_mode, source_paper_disposition, positions_copied,
+                   pre_check_summary_json, reason, recorded_at_ns
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+            (
+                migration_id,
+                writer.company_id,
+                question_id,
+                source_paper_binding_id,
+                target_live_binding_id,
+                replaced_live_binding_id,
+                qualification_receipt_id,
+                migration_mode,
+                source_paper_disposition,
+                _canonical_json(pre_check_summary),
+                clean_reason,
+                now,
+            ),
+        )
+        result = {
+            "migration_id": migration_id,
+            "question_id": question_id,
+            "source_paper_binding_id": source_paper_binding_id,
+            "source_book_name": source_book["book_name"],
+            "source_book_final_role": source_book_final_role,
+            "target_live_binding_id": target_live_binding_id,
+            "target_account_id": target.account_id,
+            "replaced_live_binding_id": replaced_live_binding_id,
+            "qualification_receipt_id": qualification_receipt_id,
+            "migration_mode": migration_mode,
+            "source_paper_disposition": source_paper_disposition,
+            "positions_copied": 0,
+            "pre_check_summary": pre_check_summary,
+            "recorded_at_ns": now,
+        }
+        append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="paper",
+            entity_type="paper_live_migration_record",
+            entity_id=migration_id,
+            event_type="execution_tier.paper_migrated_to_live",
+            actor_id=actor_id,
+            payload=result,
+            recorded_at_ns=now,
+        )
+        writer.verify()
+        return result
+
+
 def read_execution_tiers_snapshot(db: Connection, company_id: str) -> dict[str, Any]:
     """Read a redacted snapshot of all three execution tiers inside an open read_tx."""
     if not is_domain_installed(db, "paper"):
         return {
             "paper_domain_installed": False,
             "company_paper": None,
+            "company_paper_books": [],
             "company_paper_soak_ready": False,
             "company_live": None,
             "live_candidates": [],
             "agent_sandboxes": [],
             "qualification_receipts": [],
             "promotion_history": [],
+            "migration_history": [],
             "current_core_digest": compute_trading_core_digest(),
         }
 
@@ -2319,16 +3445,61 @@ def read_execution_tiers_snapshot(db: Connection, company_id: str) -> dict[str, 
             (company_id,),
         ).fetchall()
     ]
+    company_paper_books = []
+    binding_account_by_id = {b.binding_id: b.account_id for b in bindings}
+    book_name_by_id: dict[str, str] = {}
+    for b in bindings:
+        if b.tier == TIER_COMPANY_PAPER:
+            book = read_company_paper_book_portfolio_from_db(
+                db, company_id, b.binding_id
+            )
+            if book is not None:
+                company_paper_books.append(book)
+                book_name_by_id[b.binding_id] = str(book["book_name"])
+
+    migrations = [
+        {
+            "migration_id": str(r[0]),
+            "question_id": None if r[1] is None else str(r[1]),
+            "source_paper_binding_id": str(r[2]),
+            "source_book_name": book_name_by_id.get(
+                str(r[2]), binding_account_by_id.get(str(r[2]), str(r[2]))
+            ),
+            "target_live_binding_id": str(r[3]),
+            "target_account_id": binding_account_by_id.get(str(r[3]), str(r[3])),
+            "replaced_live_binding_id": None if r[4] is None else str(r[4]),
+            "qualification_receipt_id": str(r[5]),
+            "migration_mode": str(r[6]),
+            "source_paper_disposition": str(r[7]),
+            "positions_copied": int(r[8]),
+            "pre_check_summary": json.loads(str(r[9])),
+            "reason": str(r[10]),
+            "recorded_at_ns": int(r[11]),
+        }
+        for r in db.execute(
+            """SELECT migration_id, question_id, source_paper_binding_id,
+                      target_live_binding_id, replaced_live_binding_id,
+                      qualification_receipt_id, migration_mode,
+                      source_paper_disposition, positions_copied,
+                      pre_check_summary_json, reason, recorded_at_ns
+               FROM paper_live_migration_record
+               WHERE company_id = ?
+               ORDER BY recorded_at_ns DESC LIMIT 20""",
+            (company_id,),
+        ).fetchall()
+    ]
     return {
         "paper_domain_installed": True,
         "charter_revision": charter_revision,
         "company_paper": company_paper,
+        "company_paper_books": company_paper_books,
         "company_paper_soak_ready": _has_company_paper_soak_evidence(db, company_id),
         "company_live": company_live,
         "live_candidates": live_candidates,
         "agent_sandboxes": agent_sandboxes,
         "qualification_receipts": qual_receipts,
         "promotion_history": promotions,
+        "migration_history": migrations,
         "current_core_digest": current_core,
     }
 

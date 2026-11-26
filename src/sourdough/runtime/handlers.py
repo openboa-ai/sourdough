@@ -30,6 +30,8 @@ from ..board_control import (
 )
 from ..execution_tiers import (
     AgentSandboxTools,
+    ExecutionTierRefused,
+    execute_paper_to_live_migration,
     open_agent_sandbox,
     read_execution_tiers_snapshot,
 )
@@ -472,6 +474,50 @@ def build_production_duty_registry(
                 slippage_bps=int(impact.get("slippage_bps", 2)),
             )
             summary = f"opened sandbox {binding.binding_id} for {target_agent}"
+        elif action == "migrate_paper_to_live":
+            try:
+                mig = execute_paper_to_live_migration(
+                    ctx.writer,
+                    source_paper_binding_id=str(impact["source_paper_binding_id"]),
+                    target_live_binding_id=str(impact["target_live_binding_id"]),
+                    qualification_receipt_id=str(impact["qualification_receipt_id"]),
+                    migration_mode=str(impact.get("migration_mode") or "clean_start"),
+                    source_paper_disposition=str(
+                        impact.get("source_paper_disposition") or "keep_shadow"
+                    ),
+                    reason=str(
+                        impact.get("reason")
+                        or f"Board approved live migration decision {question_id}"
+                    ),
+                    question_id=question_id,
+                    actor_id="board_apply_decision",
+                    now_ns=ctx.now_ns,
+                )
+                summary = (
+                    f"migrated paper book {mig['source_paper_binding_id']} -> "
+                    f"live {mig['target_live_binding_id']} "
+                    f"(mode={mig['migration_mode']}, source={mig['source_book_final_role']}, "
+                    f"positions_copied=0)"
+                )
+            except ExecutionTierRefused as exc:
+                failure_summary = f"migration_refused: {exc}"
+                record_decision_application_result(
+                    ctx.writer,
+                    question_id=question_id,
+                    application_status="failed",
+                    delivery_status="delivered",
+                    effect_summary=failure_summary,
+                    now_ns=ctx.now_ns,
+                )
+                return DutyOutcome(
+                    disposition="completed",
+                    result={
+                        "question_id": question_id,
+                        "action": action,
+                        "application_status": "failed",
+                        "effect_summary": failure_summary,
+                    },
+                )
         else:
             summary = f"recorded approved advisory decision ({action or 'advisory'})"
 

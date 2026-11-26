@@ -151,6 +151,19 @@ export function LiveTradingHomeView() {
     );
   const charterRevision = data.charter_revision || meta?.charter_revision || "";
   const liveActive = data.company_live !== null;
+  const paperBooks = data.company_paper_books ?? [];
+  const soakReadyBooksCount = paperBooks.filter((b) => b.soak_ready && b.status === "active").length;
+  const migrationHistory = data.migration_history ?? [];
+  const activeLiveMigration = data.company_live
+    ? migrationHistory.find((m) => m.target_live_binding_id === data.company_live?.binding_id) ??
+      null
+    : null;
+  const activeShadowBook = data.company_live
+    ? paperBooks.find(
+        (b) =>
+          b.role === "shadow" && b.shadow_of_live_binding_id === data.company_live?.binding_id
+      ) ?? null
+    : null;
   const passingReceiptsCount = data.qualification_receipts.filter(
     (q) =>
       q.verdict === "PASS" &&
@@ -450,6 +463,18 @@ export function LiveTradingHomeView() {
               <Text variant="help">
                 {data.company_live.account_id} · {data.company_live.destination_id}
               </Text>
+              {activeLiveMigration ? (
+                <Text variant="meta">
+                  Migrated from {activeLiveMigration.source_book_name} ({activeLiveMigration.migration_mode} · 0 virtual positions copied)
+                </Text>
+              ) : null}
+              {activeShadowBook ? (
+                <Inline gap={6} align="center" wrap>
+                  <Badge tone="success" variant="soft" dot={false}>
+                    Shadow Benchmark: {activeShadowBook.book_name}
+                  </Badge>
+                </Inline>
+              ) : null}
               <Inline gap={8} wrap>
                 <Button
                   emphasis="soft"
@@ -518,7 +543,17 @@ export function LiveTradingHomeView() {
             </Badge>
           }
         >
-          {data.company_paper ? (
+          {paperBooks.length > 0 ? (
+            <Stack gap={8}>
+              <Text className="sd-kpi-value sd-tabular">
+                {paperBooks.length} {paperBooks.length === 1 ? "book" : "books"}
+              </Text>
+              <Text variant="help" className="sd-tabular">
+                {soakReadyBooksCount} soak ready
+                {activeShadowBook ? ` · 1 shadow benchmark` : ""}
+              </Text>
+            </Stack>
+          ) : data.company_paper ? (
             <Stack gap={8}>
               <Text className="sd-kpi-value sd-tabular">
                 {formatMinorCurrency(
@@ -691,6 +726,35 @@ export function LiveTradingHomeView() {
           />
         )}
       </Card>
+
+      {migrationHistory.length > 0 ? (
+        <Card
+          title="Paper-to-Live Migration Ledger"
+          description="Audited fail-closed migrations from Company Paper Books into production Live Trading (0 virtual positions copied)"
+          variant="raised"
+        >
+          <List label="Paper to live migration history" divided>
+            {migrationHistory.map((mig) => (
+              <li key={mig.migration_id} className="yg-list-item">
+                <WorkEvent
+                  event={{
+                    id: mig.migration_id,
+                    kind: "review",
+                    title: `${mig.source_book_name} → ${mig.target_account_id}`,
+                    detail: `${mig.migration_mode} · Source: ${
+                      mig.source_paper_disposition === "keep_shadow"
+                        ? "Shadow Benchmark"
+                        : "Retired"
+                    } · ${mig.positions_copied} virtual positions copied · Qual ${mig.qualification_receipt_id} · ${mig.reason}`,
+                    time: formatTs(mig.recorded_at_ns),
+                    state: "ready",
+                  }}
+                />
+              </li>
+            ))}
+          </List>
+        </Card>
+      ) : null}
 
       <Card
         title="Promotion & Demotion Ledger"
