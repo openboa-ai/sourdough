@@ -10,6 +10,7 @@ import socket
 import sqlite3
 import stat
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
 from dataclasses import dataclass
@@ -227,6 +228,7 @@ class CompanyDaemon:
         evaluator_store: Path | None = None,
         bootstrap_challenge: str | None = None,
         request_timeout: float = 10.0,
+        on_commit: Callable[[], None] | None = None,
     ) -> None:
         self._store = store.absolute()
         self._company_id = company_id
@@ -248,6 +250,7 @@ class CompanyDaemon:
         self._bootstrap_challenge = bootstrap_challenge or secrets.token_hex(16)
         self._service_incarnation_id = secrets.token_hex(12)
         self._request_timeout = validate_timeout_seconds(request_timeout)
+        self._on_commit = on_commit
 
         self._stack: ExitStack | None = None
         self._writer: WriterLease | None = None
@@ -289,10 +292,22 @@ class CompanyDaemon:
             daemon_pid=os.getpid(),
         )
 
-    def notify_commit(self) -> None:
+    @property
+    def writer_lease(self) -> WriterLease:
+        if self._writer is None:
+            raise IpcRefused("CompanyDaemon is not running")
+        return self._writer
+
+    @property
+    def write_lock(self) -> threading.RLock:
+        return self._write_lock
+
+    def notify_commit(self, *, invoke_hook: bool = True) -> None:
         """Wake waiting /v1/events subscribers after an external company-store commit."""
         with self._event_cond:
             self._event_cond.notify_all()
+        if invoke_hook and self._on_commit is not None:
+            self._on_commit()
 
     def start(self) -> DaemonInfo:
         if self._started:

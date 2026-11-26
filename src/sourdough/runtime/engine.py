@@ -1,9 +1,10 @@
 """Unified CompanyRuntime dispatching registered duties on one SQLite store."""
 
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from time import time_ns
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -83,122 +84,163 @@ class CompanyRuntime:
         truncate_wal_on_exit: bool = False,
     ) -> RuntimeStepSummary:
         """Run one durable recovery, wake, condition-evaluation, and dispatch cycle."""
-        if max_dispatches < 0:
-            raise RuntimeRefused("max_dispatches must be nonnegative")
-        read_clock: Callable[[], int] = (
-            self._clock if now_ns is None else (lambda: now_ns)
-        )
         with hold_company_writer(
             self._store,
             self._company_id,
             lease_directory=self._lease_directory,
             expected_store_key=self._expected_store_key,
         ) as writer:
-            if on_ready is not None:
-                on_ready(writer)
+            return self.step_with_writer(
+                writer,
+                max_dispatches=max_dispatches,
+                now_ns=now_ns,
+                observed_assets=observed_assets,
+                event_key=event_key,
+                triggering_actor_id=triggering_actor_id,
+                on_ready=on_ready,
+                truncate_wal_on_exit=truncate_wal_on_exit,
+            )
 
-            sweep_now = read_clock()
+    def step_with_writer(
+        self,
+        writer: WriterLease,
+        *,
+        max_dispatches: int = 8,
+        now_ns: int | None = None,
+        observed_assets: dict[str, str] | None = None,
+        event_key: str | None = None,
+        triggering_actor_id: str | None = None,
+        on_ready: Callable[[WriterLease], None] | None = None,
+        truncate_wal_on_exit: bool = False,
+        tx_lock: threading.RLock | None = None,
+        on_commit: Callable[[], None] | None = None,
+    ) -> RuntimeStepSummary:
+        """Execute one durable sweep/claim/dispatch cycle using an already-held WriterLease."""
+        if max_dispatches < 0:
+            raise RuntimeRefused("max_dispatches must be nonnegative")
+        read_clock: Callable[[], int] = (
+            self._clock if now_ns is None else (lambda: now_ns)
+        )
+        lock_ctx = tx_lock if tx_lock is not None else nullcontext()
+
+        writer.verify_for(self._store, self._company_id)
+        if on_ready is not None:
+            on_ready(writer)
+
+        sweep_now = read_clock()
+        with (
+            lock_ctx,
+            closing(open_writer(self._store, lease=writer)) as conn,
+            write_tx(conn),
+        ):
+            fenced = reclaim_expired_runs(conn, self._company_id, now_ns=sweep_now)
+            woken = wake_waiting_runs(
+                conn,
+                self._company_id,
+                now_ns=sweep_now,
+                event_key=event_key,
+                triggering_actor_id=triggering_actor_id,
+            )
+            admitted_items = evaluate_conditions(
+                conn,
+                self._company_id,
+                now_ns=sweep_now,
+                observed_assets=observed_assets,
+                triggering_actor_id=triggering_actor_id,
+            )
+        if on_commit is not None and (fenced or woken or admitted_items):
+            on_commit()
+
+        executed: list[str] = []
+        blocked: list[str] = []
+        for _ in range(max_dispatches):
+            writer.verify()
+            claim_now = read_clock()
+            with lock_ctx:
+                claimed = self._claim_next(writer, claim_now, blocked)
+            if claimed is None:
+                break
+            item, run, descriptor = claimed
+            if on_commit is not None:
+                on_commit()
+            # Execute outside any open SQLite write transaction or tx_lock with a live clock.
+            try:
+                outcome = descriptor.execute(
+                    DutyContext(writer, self._company_id, item, run, read_clock)
+                )
+            except Exception as error:
+                try:
+                    writer.verify()
+                    fail_now = read_clock()
+                    with (
+                        lock_ctx,
+                        closing(open_writer(self._store, lease=writer)) as conn,
+                        write_tx(conn),
+                    ):
+                        fail_work_run(
+                            conn,
+                            run.run_id,
+                            run.fencing_token,
+                            error_summary=type(error).__name__,
+                            return_to_due=True,
+                            now_ns=fail_now,
+                        )
+                    if on_commit is not None:
+                        on_commit()
+                except RunFenced:
+                    pass
+                raise
+            writer.verify()
+            commit_now = read_clock()
             with (
+                lock_ctx,
                 closing(open_writer(self._store, lease=writer)) as conn,
                 write_tx(conn),
             ):
-                fenced = reclaim_expired_runs(conn, self._company_id, now_ns=sweep_now)
-                woken = wake_waiting_runs(
-                    conn,
-                    self._company_id,
-                    now_ns=sweep_now,
-                    event_key=event_key,
-                    triggering_actor_id=triggering_actor_id,
-                )
-                admitted_items = evaluate_conditions(
-                    conn,
-                    self._company_id,
-                    now_ns=sweep_now,
-                    observed_assets=observed_assets,
-                    triggering_actor_id=triggering_actor_id,
-                )
-
-            executed: list[str] = []
-            blocked: list[str] = []
-            for _ in range(max_dispatches):
-                writer.verify()
-                claim_now = read_clock()
-                claimed = self._claim_next(writer, claim_now, blocked)
-                if claimed is None:
-                    break
-                item, run, descriptor = claimed
-                # Execute outside any open SQLite write transaction with a live clock!
-                try:
-                    outcome = descriptor.execute(
-                        DutyContext(writer, self._company_id, item, run, read_clock)
+                if outcome.disposition == "waiting":
+                    # Handlers such as open_peer_request() may already have
+                    # transitioned this fenced run into durable waiting state.
+                    status_row = conn.execute(
+                        """SELECT status FROM work_runs
+                           WHERE run_id = ? AND fencing_token = ?""",
+                        (run.run_id, run.fencing_token),
+                    ).fetchone()
+                    if status_row is None or status_row[0] != "waiting":
+                        yield_run_to_wait(
+                            conn,
+                            run.run_id,
+                            run.fencing_token,
+                            wait_until_ns=outcome.wait_until_ns,
+                            wait_event_key=outcome.wait_event_key,
+                            reason=outcome.wait_reason,
+                            now_ns=commit_now,
+                        )
+                elif outcome.disposition == "blocked":
+                    complete_work_run(
+                        conn,
+                        run.run_id,
+                        run.fencing_token,
+                        outcome=outcome.result,
+                        item_state="blocked",
+                        now_ns=commit_now,
                     )
-                except Exception as error:
-                    try:
-                        writer.verify()
-                        fail_now = read_clock()
-                        with (
-                            closing(open_writer(self._store, lease=writer)) as conn,
-                            write_tx(conn),
-                        ):
-                            fail_work_run(
-                                conn,
-                                run.run_id,
-                                run.fencing_token,
-                                error_summary=type(error).__name__,
-                                return_to_due=True,
-                                now_ns=fail_now,
-                            )
-                    except RunFenced:
-                        pass
-                    raise
-                writer.verify()
-                commit_now = read_clock()
-                with (
-                    closing(open_writer(self._store, lease=writer)) as conn,
-                    write_tx(conn),
-                ):
-                    if outcome.disposition == "waiting":
-                        # Handlers such as open_peer_request() may already have
-                        # transitioned this fenced run into durable waiting state.
-                        status_row = conn.execute(
-                            """SELECT status FROM work_runs
-                               WHERE run_id = ? AND fencing_token = ?""",
-                            (run.run_id, run.fencing_token),
-                        ).fetchone()
-                        if status_row is None or status_row[0] != "waiting":
-                            yield_run_to_wait(
-                                conn,
-                                run.run_id,
-                                run.fencing_token,
-                                wait_until_ns=outcome.wait_until_ns,
-                                wait_event_key=outcome.wait_event_key,
-                                reason=outcome.wait_reason,
-                                now_ns=commit_now,
-                            )
-                    elif outcome.disposition == "blocked":
-                        complete_work_run(
-                            conn,
-                            run.run_id,
-                            run.fencing_token,
-                            outcome=outcome.result,
-                            item_state="blocked",
-                            now_ns=commit_now,
-                        )
-                        blocked.append(item.work_item_id)
-                    else:
-                        complete_work_run(
-                            conn,
-                            run.run_id,
-                            run.fencing_token,
-                            outcome=outcome.result,
-                            item_state="settled",
-                            next_condition=outcome.next_condition,
-                            now_ns=commit_now,
-                        )
-                executed.append(run.run_id)
+                    blocked.append(item.work_item_id)
+                else:
+                    complete_work_run(
+                        conn,
+                        run.run_id,
+                        run.fencing_token,
+                        outcome=outcome.result,
+                        item_state="settled",
+                        next_condition=outcome.next_condition,
+                        now_ns=commit_now,
+                    )
+            executed.append(run.run_id)
+            if on_commit is not None:
+                on_commit()
 
-            with closing(open_writer(self._store, lease=writer)) as conn:
-                wal_checkpoint(conn, "TRUNCATE" if truncate_wal_on_exit else "PASSIVE")
+        with lock_ctx, closing(open_writer(self._store, lease=writer)) as conn:
+            wal_checkpoint(conn, "TRUNCATE" if truncate_wal_on_exit else "PASSIVE")
 
         return RuntimeStepSummary(
             fenced_runs=fenced,
