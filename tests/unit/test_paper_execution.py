@@ -7,7 +7,6 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from sourdough.company import FoundingTerms, found
-from sourdough.company_run import run_paper_company
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_execution import (
     PaperExecution,
@@ -17,6 +16,7 @@ from sourdough.paper_execution import (
     VenueRefused,
 )
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.company_run import run_paper_company
 
 
 class ExecutionPort(unittest.TestCase):
@@ -139,7 +139,7 @@ class ExecutionPort(unittest.TestCase):
         venue.position_offline = False
         with (
             patch(
-                "sourdough.company_run.finish_first_duty",
+                "sourdough.trading.company_run.finish_first_duty",
                 side_effect=OSError("cut before settlement"),
             ),
             self.assertRaisesRegex(OSError, "cut before settlement"),

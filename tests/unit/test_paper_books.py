@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
 from sourdough.storage.db import StorageRefused
-from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import (
     PostingRefused,
@@ -23,6 +22,8 @@ from sourdough.paper_execution import VenueCancellation
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
 from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading import TradingDomainPlugin
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.work_projection import read_local_board_timeline
 
 
@@ -205,7 +206,9 @@ class PaperBooksTests(unittest.TestCase):
         self.assertEqual(
             (original_source.order_id, original_source.fee_minor_units), (order_id, 1)
         )
-        projection = read_local_board_timeline(self.store, self.company_id)["paper"]
+        projection = read_local_board_timeline(
+            self.store, self.company_id, domain_plugins=(TradingDomainPlugin(),)
+        )["domains"]["trading"]["paper"]
         [order] = projection["orders"]
         self.assertEqual(
             (
@@ -261,7 +264,9 @@ class PaperBooksTests(unittest.TestCase):
         self.assertEqual(
             (second_source.order_id, second_source.fee_minor_units), (order_id, 2)
         )
-        projection = read_local_board_timeline(self.store, self.company_id)["paper"]
+        projection = read_local_board_timeline(
+            self.store, self.company_id, domain_plugins=(TradingDomainPlugin(),)
+        )["domains"]["trading"]["paper"]
         [order] = projection["orders"]
         self.assertEqual(
             (
@@ -312,9 +317,9 @@ class PaperBooksTests(unittest.TestCase):
         first = TerminalVenue(self.journal, "first", 1, 80, 1)
         early = reconcile_paper_orders(self.store, self.company_id, first, now=100)
         self.assertEqual((early.recovered, early.unresolved), ((), 1))
-        [position] = read_local_board_timeline(self.store, self.company_id)["paper"][
-            "orders"
-        ]
+        [position] = read_local_board_timeline(
+            self.store, self.company_id, domain_plugins=(TradingDomainPlugin(),)
+        )["domains"]["trading"]["paper"]["orders"]
         self.assertEqual(
             (
                 position["reserved_minor_units"],
@@ -333,9 +338,9 @@ class PaperBooksTests(unittest.TestCase):
             post_confirmed_fill(self.store, self.company_id, order_id, first),
             completed.posting,
         )
-        [position] = read_local_board_timeline(self.store, self.company_id)["paper"][
-            "orders"
-        ]
+        [position] = read_local_board_timeline(
+            self.store, self.company_id, domain_plugins=(TradingDomainPlugin(),)
+        )["domains"]["trading"]["paper"]["orders"]
         self.assertEqual(
             (
                 position["status"],
@@ -369,9 +374,9 @@ class PaperBooksTests(unittest.TestCase):
         )
         self.assertIsNone(read_booked_fill(self.store, self.company_id, order_id))
         self.assertEqual(position_quantity(self.store, self.company_id), 0)
-        [order] = read_local_board_timeline(self.store, self.company_id)["paper"][
-            "orders"
-        ]
+        [order] = read_local_board_timeline(
+            self.store, self.company_id, domain_plugins=(TradingDomainPlugin(),)
+        )["domains"]["trading"]["paper"]["orders"]
         self.assertEqual(
             (order["status"], order["reserved_minor_units"]), ("cancelled", 0)
         )

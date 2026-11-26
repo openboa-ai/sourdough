@@ -6,18 +6,21 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, _connect, found
-from sourdough.duty_run import PAPER_EXECUTION, DutyRefused, start_run
-from sourdough.first_duty import claim_first_duty
+from sourdough.duty_run import DutyRefused, start_run
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import capture_position, post_confirmed_fill, read_position
 from sourdough.paper_decision import PaperDecision, persist_paper_decision
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.duty import (
+    PAPER_EXECUTION,
+    claim_paper_first_duty as claim_first_duty,
+    claim_paper_follow_up as claim_follow_up,
+    finish_paper_first_duty as finish_first_duty,
+)
 from sourdough.work import (
     FollowUpClaim,
     ResultReference,
-    claim_follow_up,
-    finish_first_duty,
     read_follow_up_result,
 )
 

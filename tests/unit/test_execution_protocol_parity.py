@@ -12,7 +12,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time_ns
 
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import DutyRefused, claim_first_duty
+from sourdough.duty_run import DutyRefused
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.paper_account import (
@@ -33,6 +33,7 @@ from sourdough.paper_execution import (
     require_separate_journal,
 )
 from sourdough.paper_order import OrderRefused, submit_paper_order
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
 

@@ -1,7 +1,7 @@
 """Persist a completed duty and claim its eligible successor."""
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,15 +10,13 @@ from uuid import uuid4
 from .company import SCHEMA_REVISION, _company_version, _connect
 from .duty_run import (
     ASSESSMENT_REVIEW,
-    PAPER_EXECUTION,
-    POSITION_REVIEW,
     DutyClaim,
     DutyRefused,
     has_turn_capacity,
     resolve_run,
     start_run,
 )
-from .first_duty import FIRST_DUTY_SCOPE, resolve_first_run
+from .first_duty import resolve_first_run
 
 
 def _time(value: int) -> int:
@@ -51,14 +49,14 @@ class FollowUp:
     duty_id: str
     due_at: int
     result: ResultReference
-    purpose: str = POSITION_REVIEW
+    purpose: str
 
 
 @dataclass(frozen=True)
 class FollowUpClaim:
     claim: DutyClaim
     result: ResultReference
-    purpose: str = POSITION_REVIEW
+    purpose: str
 
 
 @dataclass(frozen=True)
@@ -124,9 +122,10 @@ def schedule_follow_up(
     result: ResultReference,
     due_at: int,
     *,
-    purpose: str = POSITION_REVIEW,
+    purpose: str,
+    allowed_purposes: Collection[str] = (ASSESSMENT_REVIEW,),
 ) -> FollowUp:
-    if purpose not in (POSITION_REVIEW, PAPER_EXECUTION, ASSESSMENT_REVIEW):
+    if purpose not in set(allowed_purposes) | {ASSESSMENT_REVIEW}:
         raise DutyRefused("Unsupported duty purpose")
     successor = FollowUp(uuid4().hex, due_at, result, purpose)
     connection.execute(
@@ -168,14 +167,17 @@ def finish_first_duty(
     result: ResultReference,
     *,
     due_at: int,
-    purpose: str = POSITION_REVIEW,
+    purpose: str,
+    first_purpose: str,
+    expected_scope: str,
+    allowed_purposes: Collection[str] | None = None,
 ) -> FollowUp:
     """Consume an internal result receipt; callers cannot mint one through Work."""
     _time(due_at)
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _check_store(connection, claim.company_id)
-        authority = resolve_first_run(connection, claim)
+        authority = resolve_first_run(connection, claim, purpose=first_purpose)
         scope, state = authority.current_scope, authority.duty_state
         existing = connection.execute(
             """SELECT duty_id, due_at, purpose, result_kind, result_id, result_revision, available_at
@@ -192,11 +194,17 @@ def finish_first_duty(
             ):
                 raise DutyRefused("Work settlement conflicts with the original receipt")
             return FollowUp(duty_id, due_at, result, purpose)
-        authority.require_current(PAPER_EXECUTION)
-        if (scope, state) != (FIRST_DUTY_SCOPE, "running"):
+        authority.require_current(first_purpose)
+        if (scope, state) != (expected_scope, "running"):
             raise DutyRefused("Current duty cannot be settled")
         return schedule_follow_up(
-            connection, claim, scope, result, due_at, purpose=purpose
+            connection,
+            claim,
+            scope,
+            result,
+            due_at,
+            purpose=purpose,
+            allowed_purposes=allowed_purposes or (purpose,),
         )
 
 
@@ -206,22 +214,23 @@ def claim_follow_up(
     execution_profile: str,
     *,
     now: int,
-    allow_paper_execution: bool = False,
-    eligible_paper_result: Callable[[sqlite3.Connection, ResultReference], bool]
+    purposes: tuple[str, ...],
+    agent_id: str | None = None,
+    eligible_result: ResultEligibility | None = None,
+    eligible_by_purpose: Mapping[
+        str, Callable[[sqlite3.Connection, ResultReference], bool]
+    ]
     | None = None,
 ) -> FollowUpClaim | None:
-    purposes = (
-        (POSITION_REVIEW, PAPER_EXECUTION)
-        if allow_paper_execution
-        else (POSITION_REVIEW,)
-    )
     return _claim_follow_up(
         store,
         company_id,
         execution_profile,
         now,
         purposes,
-        eligible_paper_result=eligible_paper_result,
+        agent_id=agent_id,
+        eligible_result=eligible_result,
+        eligible_by_purpose=eligible_by_purpose,
     )
 
 
@@ -245,11 +254,17 @@ def claim_assessment_review(
     )
 
 
-def claim_bound_position_review(
-    store: Path, company_id: str, agent_id: str, execution_profile: str, *, now: int
+def claim_agent_follow_up(
+    store: Path,
+    company_id: str,
+    agent_id: str,
+    execution_profile: str,
+    *,
+    now: int,
+    purpose: str,
 ) -> FollowUpClaim | None:
     return _claim_follow_up(
-        store, company_id, execution_profile, now, (POSITION_REVIEW,), agent_id=agent_id
+        store, company_id, execution_profile, now, (purpose,), agent_id=agent_id
     )
 
 
@@ -310,10 +325,14 @@ def _claim_follow_up(
     *,
     agent_id: str | None = None,
     eligible_result: ResultEligibility | None = None,
-    eligible_paper_result: Callable[[sqlite3.Connection, ResultReference], bool]
+    eligible_by_purpose: Mapping[
+        str, Callable[[sqlite3.Connection, ResultReference], bool]
+    ]
     | None = None,
 ) -> FollowUpClaim | None:
     _time(now)
+    if not purposes:
+        return None
     placeholders = ", ".join("?" for _ in purposes)
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -340,6 +359,7 @@ def _claim_follow_up(
                 *purposes,
             ),
         )
+        purpose_filters = eligible_by_purpose or {}
         row = next(
             (
                 candidate
@@ -352,9 +372,8 @@ def _claim_follow_up(
                     )
                 )
                 and (
-                    eligible_paper_result is None
-                    or candidate[4] != PAPER_EXECUTION
-                    or eligible_paper_result(
+                    candidate[4] not in purpose_filters
+                    or purpose_filters[candidate[4]](
                         connection, ResultReference(*candidate[5:])
                     )
                 )
@@ -420,13 +439,14 @@ def read_follow_up_result(
     *,
     now: int,
     read: Callable[[sqlite3.Connection, ResultReference], dict],
-    purpose: str = POSITION_REVIEW,
+    purpose: str | None = None,
 ) -> dict:
     _time(now)
     claim = follow_up.claim
+    target_purpose = follow_up.purpose if purpose is None else purpose
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        state, _ = follow_up_state(connection, follow_up, purpose)
+        state, _ = follow_up_state(connection, follow_up, target_purpose)
         if state != "running" or now < follow_up.result.available_at:
             raise DutyRefused("Review cannot read this result")
         result = read(connection, follow_up.result)
@@ -468,36 +488,30 @@ def settle_review(
     decision: ReviewDecision,
     *,
     now: int,
-    successor_purpose: str = POSITION_REVIEW,
+    successor_purpose: str | None = None,
     successor_result: ResultReference | None = None,
-    historical_paper: bool = False,
-    paper_review_only: bool = False,
     eligible_result: ResultEligibility | None = None,
+    allow_transition: Callable[[str, str, ResultReference | None], bool] | None = None,
 ) -> FollowUp:
     _time(now)
     next_due = _time(now + decision.next_check_seconds)
     result = successor_result or follow_up.result
     claim = follow_up.claim
-    transition = (
-        (paper_review_only or historical_paper)
-        and follow_up.purpose == PAPER_EXECUTION
-        and (
-            (successor_purpose == PAPER_EXECUTION and successor_result is not None)
-            or (successor_purpose == POSITION_REVIEW and successor_result is None)
-        )
+    target_purpose = (
+        follow_up.purpose if successor_purpose is None else successor_purpose
     )
-    if not transition and (
-        follow_up.purpose not in (POSITION_REVIEW, ASSESSMENT_REVIEW)
-        or (
-            (follow_up.purpose == ASSESSMENT_REVIEW)
-            != (successor_purpose == ASSESSMENT_REVIEW)
-        )
+    if (follow_up.purpose == ASSESSMENT_REVIEW) != (
+        target_purpose == ASSESSMENT_REVIEW
     ):
         raise DutyRefused("Review cannot cross into a different work domain")
-    if successor_result is not None and (
-        (follow_up.purpose != POSITION_REVIEW and not transition)
-        or result.available_at > next_due
-    ):
+    if allow_transition is not None:
+        if not allow_transition(follow_up.purpose, target_purpose, successor_result):
+            raise DutyRefused("Review cannot cross into a different work domain")
+    elif follow_up.purpose != ASSESSMENT_REVIEW or target_purpose != ASSESSMENT_REVIEW:
+        raise DutyRefused("Review cannot cross into a different work domain")
+    elif successor_result is not None:
+        raise DutyRefused("New review successor does not have an eligible observation")
+    if successor_result is not None and result.available_at > next_due:
         raise DutyRefused("New review successor does not have an eligible observation")
     with closing(_connect(store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -523,7 +537,7 @@ def settle_review(
             if (
                 replay is not None
                 and replay[:6] == terms
-                and replay[8] == successor_purpose
+                and replay[8] == target_purpose
                 and ResultReference(*replay[9:]) == result
             ):
                 return FollowUp(replay[6], replay[7], result, replay[8])
@@ -545,7 +559,8 @@ def settle_review(
             scope,
             result,
             next_due,
-            purpose=successor_purpose,
+            purpose=target_purpose,
+            allowed_purposes=(target_purpose,),
         )
 
 

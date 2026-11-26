@@ -6,18 +6,23 @@ from tempfile import TemporaryDirectory
 
 from sourdough.abandoned_work import requeue_uncommitted_work
 from sourdough.company import FoundingTerms, found
-from sourdough.duty_run import POSITION_REVIEW, DutyRefused
-from sourdough.first_duty import claim_first_duty, require_paper_authority
+from sourdough.duty_run import DutyRefused
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_order import PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.duty import (
+    POSITION_REVIEW,
+    claim_paper_first_duty as claim_first_duty,
+    claim_paper_follow_up as claim_follow_up,
+    finish_paper_first_duty as finish_first_duty,
+    has_trading_committed_result,
+    require_paper_authority,
+    settle_paper_review as settle_review,
+)
 from sourdough.work import (
     ResultReference,
     ReviewDecision,
-    claim_follow_up,
-    finish_first_duty,
     read_follow_up_result,
-    settle_review,
 )
 from sourdough.writer_lease import hold_company_writer
 
@@ -34,7 +39,11 @@ class RecoverAbandonedWork(unittest.TestCase):
         with hold_company_writer(
             self.store, self.company_id, lease_directory=self.root / "lease"
         ) as writer:
-            return requeue_uncommitted_work(writer, **filters)
+            return requeue_uncommitted_work(
+                writer,
+                committed_predicates=(has_trading_committed_result,),
+                **filters,
+            )
 
     def start(self):
         return claim_first_duty(self.store, self.company_id, "profile")
@@ -106,6 +115,23 @@ class RecoverAbandonedWork(unittest.TestCase):
             self.assertEqual(
                 connection.execute("SELECT state FROM duty").fetchone(), ("running",)
             )
+
+    def test_core_only_requeue_ignores_unregistered_domain_tables(self):
+        core_store = self.root / "core-only.sqlite"
+        core_receipt = found(
+            core_store, FoundingTerms("core", "charter-v1", "manage", "profile-v1")
+        )
+        from sourdough.first_duty import claim_first_duty
+
+        claim = claim_first_duty(
+            core_store,
+            core_receipt.company_id,
+            "profile-v1",
+            scope="manage",
+            purpose="core_duty",
+        )
+        with hold_company_writer(core_store, core_receipt.company_id) as writer:
+            self.assertEqual(requeue_uncommitted_work(writer), (claim.run_id,))
 
     def test_hired_review_recovery_does_not_fence_the_founder_review(self):
         opening = self.start()

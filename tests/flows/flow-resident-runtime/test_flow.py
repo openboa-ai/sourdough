@@ -31,12 +31,12 @@ from sourdough.board_control import (
 from sourdough.company import FoundingTerms, found
 from sourdough.ipc import ControlPlaneClient
 from sourdough.runtime import (
-    DUTY_QUANT_AGENT_SANDBOX,
     ResidentCompanyService,
     build_production_duty_registry,
     create_work_item,
 )
 from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
+from sourdough.trading import DUTY_QUANT_AGENT_SANDBOX, TradingDomainPlugin
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -263,12 +263,14 @@ class ConnectedFlow(unittest.TestCase):
                         anthropic_base_url=mock.base_url,
                         allow_loopback_override=True,
                     )
+                    plugins = (TradingDomainPlugin(),)
                     duties = build_production_duty_registry(
                         adapter_registry=adapters,
                         profile_bindings={
                             founder_id: ceo_profile,
                             quant_id: quant_profile,
                         },
+                        domain_plugins=plugins,
                     )
                     return ResidentCompanyService(
                         store,
@@ -277,6 +279,7 @@ class ConnectedFlow(unittest.TestCase):
                         socket_dir=sock_dir,
                         lease_directory=leases,
                         tick_interval_seconds=0.15,
+                        domain_plugins=plugins,
                     )
 
                 # 2. Boot ResidentCompanyService with ZERO connected Board Clients.

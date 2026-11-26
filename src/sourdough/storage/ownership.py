@@ -35,11 +35,14 @@ SEPARATE_DB_MODULES: frozenset[str] = frozenset(
     }
 )
 
+# Dedicated schema migration modules permitted to execute transactional table rebuild DDL.
+SCHEMA_MIGRATION_MODULES: frozenset[str] = frozenset({"storage/migration.py"})
+
 # Maps each authoritative SQLite table to the set of module paths (relative to
 # src/sourdough/) authorized to execute SQL mutations against it.
 DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Storage & kernel tables
-    "installed_domains": frozenset({"storage/schema.py"}),
+    "installed_domains": frozenset({"storage/schema.py", "storage/migration.py"}),
     "audit_event": frozenset({"storage/kernel.py"}),
     "command_receipt": frozenset({"storage/kernel.py"}),
     "external_actions": frozenset({"storage/kernel.py"}),
@@ -89,6 +92,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
             "paper_research.py",
             "company_assessment.py",
             "retirement.py",
+            "storage/migration.py",
             "work_handoff.py",
             "work_peer_response.py",
         }
@@ -105,7 +109,9 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
             "work_peer_response.py",
         }
     ),
-    "work_follow_up": frozenset({"work.py", "abandoned_work.py", "work_handoff.py"}),
+    "work_follow_up": frozenset(
+        {"work.py", "abandoned_work.py", "storage/migration.py", "work_handoff.py"}
+    ),
     "work_result_read": frozenset({"work.py"}),
     "work_review_decision": frozenset({"work.py"}),
     "assessment_source": frozenset({"company_assessment.py"}),
@@ -121,7 +127,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Board Client governance, messaging, restriction & profile tables
     "board_binding": frozenset({"board_control.py"}),
     "ceo_message": frozenset({"board_control.py"}),
-    "decision_question": frozenset({"board_control.py"}),
+    "decision_question": frozenset({"board_control.py", "storage/migration.py"}),
     "restriction_cause": frozenset({"board_control.py"}),
     "agent_profile": frozenset({"board_control.py"}),
     # Opt-in paper domain tables (company store)
@@ -235,7 +241,7 @@ def audit_domain_write_ownership(src_root: Path) -> list[str]:
                 violations.append(
                     f"{rel}: unauthorized mutation of table '{table}' (owners: {sorted(owners)})"
                 )
-        if rel not in SEPARATE_DB_MODULES:
+        if rel not in SEPARATE_DB_MODULES and rel not in SCHEMA_MIGRATION_MODULES:
             for ddl_table in sorted(_extract_tables(source, _SQL_DDL_RE)):
                 violations.append(
                     f"{rel}: inline company-store DDL prohibited for '{ddl_table}' (declare in storage/schema/v1/)"

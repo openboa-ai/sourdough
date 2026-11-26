@@ -5,14 +5,15 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from sourdough.board_control import (
+    BoardControlRefused,
+    read_local_command_receipt_status,
+)
 from sourdough.company import (
     SCHEMA_REVISION,
     FoundingTerms,
     found,
 )
-from sourdough.company_run import run_paper_company
-from sourdough.duty_run import PAPER_EXECUTION, POSITION_REVIEW
-from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import capture_position, post_confirmed_fill
 from sourdough.paper_execution import PaperIntent
@@ -23,12 +24,18 @@ from sourdough.paper_risk import (
     PaperRiskRefused,
     PaperSuspension,
     _resume_with_evidence,
-    read_local_command_receipt_status,
     read_paper_risk_receipt,
     suspend_paper_risk,
 )
 from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.work import ResultReference, finish_first_duty
+from sourdough.trading.company_run import run_paper_company
+from sourdough.trading.duty import (
+    PAPER_EXECUTION,
+    POSITION_REVIEW,
+    claim_paper_first_duty as claim_first_duty,
+    finish_paper_first_duty as finish_first_duty,
+)
+from sourdough.work import ResultReference
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -308,7 +315,9 @@ class PaperRiskControl(unittest.TestCase):
         self.assertNotIn("principal", status)
         self.assertNotIn("reason", status)
         self.assertNotIn("result", status)
-        with self.assertRaisesRegex(PaperRiskRefused, "authorized board control scope"):
+        with self.assertRaisesRegex(
+            BoardControlRefused, "does not match the requested operation"
+        ):
             read_local_command_receipt_status(
                 self.store,
                 self.company.company_id,
@@ -317,7 +326,7 @@ class PaperRiskControl(unittest.TestCase):
             )
         symlink = self.root / "store-link.sqlite"
         symlink.symlink_to(self.store)
-        with self.assertRaisesRegex(PaperRiskRefused, "store owner"):
+        with self.assertRaisesRegex(BoardControlRefused, "store owner"):
             read_local_command_receipt_status(
                 symlink, self.company.company_id, self.command.request_id
             )

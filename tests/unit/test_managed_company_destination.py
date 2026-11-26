@@ -5,9 +5,9 @@ from unittest.mock import patch
 
 from sourdough.cli import main
 from sourdough.company import FoundingTerms, found
-from sourdough.company_run import CompanyRun
 from sourdough.nautilus_paper import NautilusPaperVenue
 from sourdough.supervisor import SupervisionResult
+from sourdough.trading.company_run import CompanyRun
 
 
 class ManagedCompanyDestination(unittest.TestCase):
@@ -38,7 +38,7 @@ class ManagedCompanyDestination(unittest.TestCase):
                 patch("sys.argv", ["sourdough", role, *self.scope]),
                 patch("builtins.print"),
                 patch(
-                    "sourdough.cli.supervise_worker",
+                    "sourdough.trading.cli.supervise_worker",
                     return_value=SupervisionResult((), True),
                 ) as supervise,
             ):
@@ -72,10 +72,11 @@ class ManagedCompanyDestination(unittest.TestCase):
                     ],
                 ),
                 patch("builtins.print"),
-                patch("sourdough.cli.EmployeeProcess"),
-                patch("sourdough.cli.FixedQuoteVenue") as fixture,
+                patch("sourdough.trading.cli.EmployeeProcess"),
+                patch("sourdough.trading.cli.FixedQuoteVenue") as fixture,
                 patch(
-                    f"sourdough.cli.{function}", return_value=CompanyRun(None, None)
+                    f"sourdough.trading.cli.{function}",
+                    return_value=CompanyRun(None, None),
                 ) as run,
             ):
                 self.assertEqual(main(), 0)

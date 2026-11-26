@@ -15,7 +15,7 @@ from sourdough.paper_execution import VenueRefused
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.runtime.engine import CompanyRuntime, build_default_registry
 from sourdough.runtime.registry import DutyContext, DutyOutcome
-from sourdough.runtime.venue_coordinator import (
+from sourdough.trading.venue_coordinator import (
     BoundedVenueCoordinator,
     VenueSegmentPolicy,
 )
@@ -240,7 +240,7 @@ class ConnectedFlow(unittest.TestCase):
         self.assertEqual(operated["review"]["decision"]["action"], "hold")
 
         timeline = _cli("inspect-work", store, "--company-id", company_id)
-        self.assertEqual(timeline["paper"]["booked_position"], 2)
+        self.assertEqual(timeline["domains"]["trading"]["paper"]["booked_position"], 2)
 
         # 3. Three-entity Work kernel: standing responsibility, condition replacement,
         # anti-self-wake, zero-compute wait, and lease fencing
@@ -483,7 +483,9 @@ class ConnectedFlow(unittest.TestCase):
         restored_timeline = _cli(
             "inspect-work", restored_db, "--company-id", company_id
         )
-        self.assertEqual(restored_timeline["paper"]["booked_position"], 2)
+        self.assertEqual(
+            restored_timeline["domains"]["trading"]["paper"]["booked_position"], 2
+        )
         with self.assertRaisesRegex(StorageRefused, "retired"):
             open_writer(store)
 

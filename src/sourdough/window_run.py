@@ -21,8 +21,8 @@ from .paper_statement_store import StatementRequest, retain_paper_statement
 from .paper_valuation import read_window_samples
 from .paper_window import RegisteredWindow, WindowRefused, read_window
 from .runtime.registry import DutyContext, DutyDescriptor, DutyOutcome, DutyRegistry
-from .runtime.venue_coordinator import BoundedVenueCoordinator, VenueSegmentPolicy
 from .supervisor import SupervisionResult
+from .trading.venue_coordinator import BoundedVenueCoordinator, VenueSegmentPolicy
 
 
 _SECOND = 10**9

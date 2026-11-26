@@ -108,6 +108,7 @@ from time import time
 from sourdough import assessment_run, cli, company_assessment, hired_paper_run, onboarding
 from sourdough import paper_research, staffing_tools
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading import cli as trading_cli
 marker = Path(sys.argv.pop(1))
 fault_site = sys.argv.pop(1)
 def interrupted():
@@ -174,7 +175,7 @@ def environment_clock():
 assessment_run.time = environment_clock
 hired_paper_run.time = environment_clock
 hired_paper_run._apply_paper_order = withheld_order
-cli.FixedQuoteVenue = WithheldFill
+trading_cli.FixedQuoteVenue = WithheldFill
 company_assessment.publish_assessment = withheld_assessment
 onboarding.accept_first_duty = withheld_acceptance
 staffing_tools.record_choice = withheld_choice
@@ -185,6 +186,7 @@ raise SystemExit(cli.main())
 DRIVER = """
 import sys
 from sourdough import cli
+from sourdough.trading import cli as trading_cli
 worker, marker, fault_site = sys.argv[1:4]
 del sys.argv[1:4]
 supervise = cli.supervise_worker
@@ -192,6 +194,7 @@ def start(command, store, company_id, **options):
     candidate = [sys.executable, "-IB", "-c", worker, marker, fault_site, *command[4:]]
     return supervise(candidate, store, company_id, **options)
 cli.supervise_worker = start
+trading_cli.supervise_worker = start
 raise SystemExit(cli.main())
 """
 

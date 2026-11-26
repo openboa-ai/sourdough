@@ -11,8 +11,6 @@ from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time, time_ns
 
 from sourdough.company import FoundingTerms, found
-from sourdough.duty_run import PAPER_EXECUTION
-from sourdough.first_duty import claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.paper_account import (
@@ -31,8 +29,13 @@ from sourdough.paper_research import (
     find_unsubmitted_opening,
     stage_research_inputs,
 )
+from sourdough.trading.duty import (
+    PAPER_EXECUTION,
+    claim_paper_first_duty as claim_first_duty,
+    finish_paper_first_duty as finish_first_duty,
+)
+from sourdough.work import ResultReference
 from sourdough.writer_lease import hold_company_writer
-from sourdough.work import ResultReference, finish_first_duty
 
 
 REOPEN = """
@@ -41,7 +44,7 @@ from dataclasses import asdict
 from pathlib import Path
 from time import time
 from types import SimpleNamespace
-import sourdough.company_run as company_run
+import sourdough.trading.company_run as company_run
 from sourdough.nautilus_paper import NautilusPaperVenue
 
 def review(read):

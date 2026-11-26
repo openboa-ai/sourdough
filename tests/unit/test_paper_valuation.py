@@ -14,9 +14,7 @@ from unittest.mock import Mock, patch
 
 from sourdough.accounting_close import CloseRequest, ExpectedCost, close_period
 from sourdough.company import FoundingTerms, found
-from sourdough.company_run import run_paper_company
 from sourdough.duty_run import count_company_runs
-from sourdough.first_duty import claim_first_duty
 from sourdough.first_trade import TradeRefused
 from sourdough.general_ledger import JournalEntry, JournalLine, post_journal
 from sourdough.market_worker import SpotInstrumentTerms
@@ -40,6 +38,8 @@ from sourdough.paper_valuation import (
     read_window_samples,
     read_window_valuation,
 )
+from sourdough.trading.company_run import run_paper_company
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.paper_window import WindowPlan, WindowRefused, register_window
 from sourdough.paper_window_movement import read_paper_movement
@@ -451,7 +451,8 @@ class PaperValuationTests(unittest.TestCase):
         with (
             patch.object(WindowSampler, "_collect"),
             patch(
-                "sourdough.company_run.run_first_trade", side_effect=interrupted_turn
+                "sourdough.trading.company_run.run_first_trade",
+                side_effect=interrupted_turn,
             ) as employee,
         ):
             with self.assertRaisesRegex(TradeRefused, "stopped before its decision"):
@@ -492,7 +493,7 @@ class PaperValuationTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=1) as pool:
             source = pool.submit(quote_source)
             try:
-                with patch("sourdough.company_run.run_first_trade") as employee:
+                with patch("sourdough.trading.company_run.run_first_trade") as employee:
                     result = run_paper_company(
                         self.store,
                         self.company_id,

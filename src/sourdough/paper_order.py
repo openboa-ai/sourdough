@@ -8,7 +8,6 @@ from uuid import uuid4
 
 from .company import _connect
 from .duty_run import DutyClaim
-from .first_duty import require_historical_claim, require_paper_authority
 from .onboarding import is_hired_first_duty
 from .paper_account import has_pending_binding_change, reopen_binding
 from .paper_decision import has_matching_paper_decision
@@ -16,6 +15,10 @@ from .paper_execution import PaperDestination, PaperIntent, VenueRefused
 from .paper_research import allows_hired_research_order, allows_research_order
 from .paper_risk import effective_paper_risk
 from .storage.schema import is_domain_installed, require_domain
+from .trading.duty import (
+    require_historical_paper_claim as require_historical_claim,
+    require_paper_authority,
+)
 from .writer_lease import WriterLease
 
 

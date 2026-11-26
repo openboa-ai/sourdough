@@ -1,12 +1,12 @@
 """Connect a delegated staffing turn to the hire's first accepted duty."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import monotonic, sleep, time
 
 from .duty_run import DutyClaim
-from .employee_process import EmployeeProcess
-from .first_trade import TradeRefused
+from .employee_process import EmployeeProcess, EmployeeProcessRefused
 from .onboarding import (
     OnboardingStatus,
     ResumeWork,
@@ -33,10 +33,20 @@ class HiringRun:
 
 
 def run_hiring(
-    store: Path, company_id: str, runtime: EmployeeProcess, *, first_purpose: str
+    store: Path,
+    company_id: str,
+    runtime: EmployeeProcess,
+    *,
+    first_purpose: str,
+    purpose_scopes: Mapping[str, str] | None = None,
 ) -> HiringRun:
     def _execute(writer: WriterLease) -> HiringRun:
-        prepared = prepare_hiring(writer, runtime, first_purpose=first_purpose)
+        prepared = prepare_hiring(
+            writer,
+            runtime,
+            first_purpose=first_purpose,
+            purpose_scopes=purpose_scopes,
+        )
         hire_claim = prepared.hire_claim
         if hire_claim is None:
             return prepared
@@ -44,7 +54,7 @@ def run_hiring(
             runtime.onboarding(
                 lambda name, args: invoke_onboarding(writer, hire_claim, name, args)
             )
-        except TradeRefused:
+        except EmployeeProcessRefused:
             if not first_duty_accepted(writer, hire_claim):
                 raise
         return replace(prepared, accepted=first_duty_accepted(writer, hire_claim))
@@ -64,9 +74,14 @@ def prepare_hiring(
     first_purpose: str,
     allow_staffing: bool = True,
     resume_work: ResumeWork | None = None,
+    purpose_scopes: Mapping[str, str] | None = None,
 ) -> HiringRun:
     manager = pending_onboarding(
-        writer, runtime.profile, first_purpose, resume_work=resume_work
+        writer,
+        runtime.profile,
+        first_purpose,
+        resume_work=resume_work,
+        purpose_scopes=purpose_scopes,
     )
     resumed = manager is not None
     if manager is None:
@@ -81,7 +96,7 @@ def prepare_hiring(
         manager_tools = StaffingTools(writer, manager)
         try:
             runtime.staffing(manager_tools.invoke)
-        except TradeRefused:
+        except EmployeeProcessRefused:
             interrupted = read_staffing_outcome(writer, manager)
             if interrupted is None or (
                 interrupted.action == "hire" and interrupted.hire is None
@@ -96,12 +111,19 @@ def prepare_hiring(
             return False
         try:
             runtime.check_ready()
-        except TradeRefused:
+        except EmployeeProcessRefused:
             return False
         return True
 
     hire_id = outcome.hire.agent_id
-    status = provision_hire(writer, hire_id, first_purpose, ready, now=int(time()))
+    status = provision_hire(
+        writer,
+        hire_id,
+        first_purpose,
+        ready,
+        now=int(time()),
+        purpose_scopes=purpose_scopes,
+    )
     deadline = monotonic() + 125
     while status.first_duty_id is None and status.retry_at is not None:
         remaining = deadline - monotonic()
@@ -110,12 +132,24 @@ def prepare_hiring(
         wait = max(0, status.retry_at - time())
         if wait:
             sleep(min(wait, remaining))
-        status = provision_hire(writer, hire_id, first_purpose, ready, now=int(time()))
+        status = provision_hire(
+            writer,
+            hire_id,
+            first_purpose,
+            ready,
+            now=int(time()),
+            purpose_scopes=purpose_scopes,
+        )
     return HiringRun(
         manager,
         outcome,
         status,
         claim_hired_first(
-            writer, hire_id, runtime.profile, resume=resumed, resume_work=resume_work
+            writer,
+            hire_id,
+            runtime.profile,
+            resume=resumed,
+            resume_work=resume_work,
+            purpose_scopes=purpose_scopes,
         ),
     )

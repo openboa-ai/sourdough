@@ -25,8 +25,7 @@ from .company_assessment import (
     settle_assessment,
 )
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, count_company_runs
-from .employee_process import EmployeeProcess
-from .first_trade import TradeRefused
+from .employee_process import EmployeeProcess, EmployeeProcessRefused
 from .harness import ScopedRun, ScopedWorkflow, tool
 from .hiring_run import HiringRun, prepare_hiring
 from .runtime.engine import CompanyRuntime
@@ -117,7 +116,7 @@ class AssessmentRun:
     later_reviews: tuple[AssessmentReview, ...] = ()
 
 
-class _ReviewInterrupted(TradeRefused):
+class _ReviewInterrupted(EmployeeProcessRefused):
     def __init__(self, claim: DutyClaim, reason: str = "No committed decision"):
         super().__init__(f"Review {claim.duty_id} is incomplete: {reason}")
 
@@ -400,7 +399,7 @@ def _run_assessment(
                 writer, claim, workflow, invoke, clock=lambda: int(time())
             ),
         )
-    except TradeRefused:
+    except EmployeeProcessRefused:
         if peer_wait_for_run(writer, claim) is None and not any(
             original == claim for original, _ in pending_publications(writer)
         ):
@@ -426,7 +425,7 @@ def _run_peer_answer(
         employee.run_scoped(
             "assessment_review", ScopedRun(writer, claim, _PEER_WORKFLOW, invoke)
         )
-    except TradeRefused:
+    except EmployeeProcessRefused:
         if not peer_turn_has_disposition(writer, claim, now=int(time())):
             raise
     if not peer_turn_has_disposition(writer, claim, now=int(time())):
@@ -487,7 +486,7 @@ def _run_review(
     )
     try:
         employee.run_scoped("assessment_review", run)
-    except TradeRefused as error:
+    except EmployeeProcessRefused as error:
         if committed is None:
             raise _ReviewInterrupted(work.claim, str(error)) from error
     if committed is None:

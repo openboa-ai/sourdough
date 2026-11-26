@@ -42,13 +42,14 @@ raise SystemExit(cli.main())
 FAULT_SUPERVISOR = """
 import sys
 from sourdough import cli
+from sourdough.trading import cli as trading_cli
 marker, child = sys.argv[1:3]
 del sys.argv[1:3]
-supervise = cli.supervise_worker
+supervise = trading_cli.supervise_worker
 def inject(command, store, company_id, **options):
     instrumented = [sys.executable, "-IB", "-c", child, marker, *command[4:]]
     return supervise(instrumented, store, company_id, **options)
-cli.supervise_worker = inject
+trading_cli.supervise_worker = inject
 raise SystemExit(cli.main())
 """
 

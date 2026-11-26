@@ -20,7 +20,7 @@ from time import time_ns
 from typing import Any
 
 from ..agent_desk import _check_no_symlinks, _drafts_directory
-from ..board_control import resolve_board_access
+from ..board_control import AuthorizeBoard, resolve_board_access
 from ..company import FoundingRefused, _identity
 from ..execution_tiers import (
     ENV_LIVE,
@@ -31,7 +31,7 @@ from ..execution_tiers import (
     read_execution_tiers_snapshot,
     read_trading_book_state_from_db,
 )
-from ..paper_risk import AuthorizeBoard, effective_paper_risk
+from ..paper_risk import effective_paper_risk
 from ..storage.db import open_reader, read_tx
 from ..storage.kernel import max_event_seq
 from ..storage.schema import installed_domains, is_domain_installed

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from sourdough.company import FoundingRefused, FoundingTerms, found
 from sourdough.paper_risk import PaperSuspension, suspend_paper_risk
+from sourdough.trading import TradingDomainPlugin
 from sourdough.work_projection import read_local_board_timeline
 from sourdough.writer_lease import hold_company_writer
 
@@ -39,15 +40,19 @@ class BoardTimeline(unittest.TestCase):
                 }
             ],
         )
-        self.assertIsNone(first["paper"])
-        self.assertIsNone(first["risk_control"])
+        self.assertEqual(first["domains"], {})
+        self.assertNotIn("paper", first)
+        self.assertNotIn("risk_control", first)
         self.assertEqual(second["revision"], first["revision"])
         self.assertGreaterEqual(second["as_of_ns"], first["as_of_ns"])
         self.assertEqual(self.store.read_bytes(), before)
 
     def test_risk_projection_reports_only_the_effective_receipt_without_writes(self):
         company_id = self.receipt.company_id
-        original = read_local_board_timeline(self.store, company_id)
+        plugins = (TradingDomainPlugin(),)
+        original = read_local_board_timeline(
+            self.store, company_id, domain_plugins=plugins
+        )
 
         def authorize(*args):
             return "verification-principal"
@@ -65,9 +70,11 @@ class BoardTimeline(unittest.TestCase):
             )
         self.assertEqual(conflict.disposition, "conflicting_revision")
         before = self.store.read_bytes()
-        observed = read_local_board_timeline(self.store, company_id)
+        observed = read_local_board_timeline(
+            self.store, company_id, domain_plugins=plugins
+        )
         self.assertEqual(
-            observed["risk_control"],
+            observed["domains"]["trading"]["risk_control"],
             {
                 "state": "suspended",
                 "effective_revision": applied.effective_revision,
@@ -128,7 +135,9 @@ class BoardTimeline(unittest.TestCase):
         with closing(sqlite3.connect(self.store)) as database, database:
             database.execute("DELETE FROM paper_risk_state")
         self.assertEqual(
-            read_local_board_timeline(self.store, company_id)["risk_control"],
+            read_local_board_timeline(self.store, company_id, domain_plugins=plugins)[
+                "domains"
+            ]["trading"]["risk_control"],
             {"state": "unavailable", "effective_revision": None, "last_applied": None},
         )
 

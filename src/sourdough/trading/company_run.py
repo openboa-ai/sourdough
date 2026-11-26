@@ -7,33 +7,30 @@ from pathlib import Path
 from sqlite3 import Connection
 from time import monotonic, sleep, time, time_ns
 
-from .abandoned_work import requeue_uncommitted_work
-from .company import _connect
-from .storage.db import open_reader, read_tx
-from .duty_run import (
-    PAPER_EXECUTION,
-    POSITION_REVIEW,
+from ..abandoned_work import requeue_uncommitted_work
+from ..company import _connect
+from ..duty_run import (
     DutyClaim,
     DutyRefused,
     count_company_runs,
     employment_cutoff,
 )
-from .employee_process import EmployeeProcess
-from .first_duty import founding_duty_due
-from .first_trade import (
+from ..employee_process import EmployeeProcess
+from ..first_duty import founding_duty_due
+from ..first_trade import (
     TradeRefused,
     TradeResult,
     _apply_paper_order,
     resume_opening_research,
     run_first_trade,
 )
-from .onboarding import is_hired_first_duty
-from .paper_account import (
+from ..onboarding import is_hired_first_duty
+from ..paper_account import (
     has_pending_binding_change,
     is_retired_account_scope,
     reopen_binding,
 )
-from .paper_books import (
+from ..paper_books import (
     NoFillObservation,
     Posting,
     PostingRefused,
@@ -43,7 +40,7 @@ from .paper_books import (
     read_booked_no_fill,
     read_captured_position,
 )
-from .paper_decision import (
+from ..paper_decision import (
     PaperDecision,
     PaperDecisionReceipt,
     persist_paper_decision,
@@ -51,28 +48,33 @@ from .paper_decision import (
     reopen_unsubmitted_decisions,
     settle_paper_decision,
 )
-from .paper_execution import PaperExecution, PaperIntent, observe_bound_position
-from .paper_order import reserved_exposure
-from .paper_reconcile import PaperReconciliation, reconcile_paper_orders
-from .paper_research import read_research_result, reopen_research_decision
-from .paper_review import bind_review_quote, observe_review_quote
-from .paper_risk import effective_paper_risk
-from .paper_window import RegisteredWindow
-from .runtime.engine import CompanyRuntime, build_default_registry
-from .runtime.registry import DutyOutcome
-from .window_sampler import WindowSampler
-from .writer_lease import WriterLease
-from .work import (
+from ..paper_execution import PaperExecution, PaperIntent, observe_bound_position
+from ..paper_order import reserved_exposure
+from ..paper_reconcile import PaperReconciliation, reconcile_paper_orders
+from ..paper_research import read_research_result, reopen_research_decision
+from ..paper_review import bind_review_quote, observe_review_quote
+from ..paper_risk import effective_paper_risk
+from ..paper_window import RegisteredWindow
+from ..runtime.engine import CompanyRuntime, build_default_registry
+from ..runtime.registry import DutyOutcome
+from ..storage.db import open_reader, read_tx
+from ..window_sampler import WindowSampler
+from ..work import (
     FollowUp,
     FollowUpClaim,
     ResultReference,
     ReviewDecision,
-    claim_follow_up,
-    finish_first_duty,
-    mark_review_incomplete,
     read_follow_up_result,
     reopen_follow_up,
-    settle_review,
+)
+from ..writer_lease import WriterLease
+from .duty import (
+    PAPER_EXECUTION,
+    POSITION_REVIEW,
+    claim_paper_follow_up,
+    finish_paper_first_duty as finish_first_duty,
+    has_trading_committed_result,
+    settle_paper_review,
 )
 
 
@@ -159,7 +161,7 @@ def run_paper_company(
     return company_runtime.run_bound_handler(
         "paper.company_operation",
         _run_with_sampler,
-        venue=venue,
+        process_guard=venue,
     )
 
 
@@ -203,7 +205,9 @@ def _operate(
     repeat_paper = repeat_paper and not (switching or suspended)
     next_purpose = PAPER_EXECUTION if repeat_paper else POSITION_REVIEW
     reconciliation, blocked = _recover(writer, venue, next_purpose)
-    fenced_runs = requeue_uncommitted_work(writer)
+    fenced_runs = requeue_uncommitted_work(
+        writer, committed_predicates=(has_trading_committed_result,)
+    )
     if on_ready is not None:
         on_ready(writer)
     first = (
@@ -313,7 +317,7 @@ def _operate(
         writer.verify()
         follow_up = None
         if turn_budget:
-            follow_up = claim_follow_up(
+            follow_up = claim_paper_follow_up(
                 store,
                 company_id,
                 runtime.profile,
@@ -561,7 +565,7 @@ def _review(
                             baseline.revision,
                             baseline.available_at,
                         )
-        next_duty = settle_review(
+        next_duty = settle_paper_review(
             store,
             follow_up,
             decision,
@@ -629,7 +633,12 @@ def _trade(
             store, follow_up, now=int(time()), read=project, purpose=PAPER_EXECUTION
         )
 
-    decision = PaperDecision.from_proposal(runtime.trade(read_result))
+    raw_proposal = (
+        runtime.follow_up_exchange("trade_duty", read_result)
+        if isinstance(runtime, EmployeeProcess)
+        else runtime.trade(read_result)
+    )
+    decision = PaperDecision.from_proposal(raw_proposal)
     writer.verify()
     receipt = persist_paper_decision(store, follow_up, decision, now=int(time()))
     return _apply_later_decision(writer, follow_up, venue, receipt)
@@ -682,3 +691,6 @@ def _apply_later_decision(
     writer.verify()
     next_duty = settle_paper_decision(store, follow_up, receipt, result)
     return LaterPaperTrade(claim, receipt, order.order_id, order.posting, next_duty)
+
+
+from ..work import mark_review_incomplete  # noqa: E402

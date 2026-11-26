@@ -7,7 +7,6 @@ from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found
 from sourdough.duty_run import DutyRefused
-from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_execution import PaperOrderSizing
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
@@ -17,6 +16,7 @@ from sourdough.paper_research import (
     stage_research_inputs,
 )
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 
 
 class PaperResearch(unittest.TestCase):

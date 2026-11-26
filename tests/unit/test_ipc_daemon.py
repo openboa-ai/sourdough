@@ -25,6 +25,7 @@ from sourdough.paper_risk import (
     PAPER_RISK_COMMAND,
     SUSPEND_NEW_RISK,
 )
+from sourdough.trading import TradingDomainPlugin
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 
 
@@ -54,6 +55,7 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             socket_path=socket_path,
             lease_directory=self.leases,
             authorize_board=authorize,
+            domain_plugins=(TradingDomainPlugin(),),
         )
 
     def test_writer_lease_exclusivity_socket_permissions_and_stale_recovery(self):
@@ -126,7 +128,7 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             assert timeline_v1 is not None
             self.assertEqual(timeline_v1["contract_revision"], WORK_TIMELINE_V1)
             self.assertEqual(timeline_v1["company_id"], self.company)
-            self.assertIsNone(timeline_v1["risk_control"])
+            self.assertEqual(timeline_v1["domains"], {})
 
             # Matching If-None-Match yields 304 Not Modified without body.
             status_304, etag_again, body_304 = client.work_timeline(
@@ -265,8 +267,16 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             self.assertEqual(status_after, 200)
             self.assertNotEqual(etag_after, etag_v1)
             assert timeline_after is not None
-            self.assertEqual(timeline_after["risk_control"]["state"], "suspended")
-            self.assertEqual(timeline_after["risk_control"]["effective_revision"], 1)
+            self.assertEqual(
+                timeline_after["domains"]["trading"]["risk_control"]["state"],
+                "suspended",
+            )
+            self.assertEqual(
+                timeline_after["domains"]["trading"]["risk_control"][
+                    "effective_revision"
+                ],
+                1,
+            )
 
         # Verify DB persisted kernel peer_pid (not spoofed 999999).
         with closing(sqlite3.connect(self.store)) as db:

@@ -6,14 +6,14 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from sourdough.company import FoundingTerms, found
-from sourdough.company_run import run_paper_company
-from sourdough.first_duty import claim_first_duty
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_books import PostingRefused, post_confirmed_fill
 from sourdough.paper_execution import VenueCancellation
 from sourdough.paper_order import PaperIntent, submit_paper_order
 from sourdough.paper_reconcile import MAX_LOOKUP_ATTEMPTS, reconcile_paper_orders
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.company_run import run_paper_company
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 
 
 class RecoveryView(FixedQuoteVenue):

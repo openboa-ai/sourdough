@@ -11,7 +11,6 @@ from time import monotonic, sleep, time_ns
 
 from sourdough.company import FoundingRefused, FoundingTerms, found
 from sourdough.company_checkpoint import checkpoint_company
-from sourdough.first_duty import claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.paper_account import PaperMandate, bind
@@ -20,6 +19,7 @@ from sourdough.paper_order import OrderRefused, submit_paper_order
 from sourdough.paper_restore import restore_managed_paper_checkpoint
 from sourdough.paper_risk import SUSPEND_NEW_RISK, PaperSuspension, suspend_paper_risk
 from sourdough.paper_sender_lease import hold_sender_lease
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.trading_engine import VERSION
 from sourdough.writer_lease import hold_company_writer
 
@@ -114,10 +114,17 @@ class ConnectedFlow(unittest.TestCase):
             company_cut, venue_cut = source.read_bytes(), venue.journal.read_bytes()
             pending = inspect_work(source, company_id)
             self.assertEqual(
-                pending["risk_control"]["last_applied"]["request_id"], "suspend"
+                pending["domains"]["trading"]["risk_control"]["last_applied"][
+                    "request_id"
+                ],
+                "suspend",
             )
-            self.assertEqual(pending["paper"]["unresolved_orders"], 1)
-            self.assertEqual(pending["paper"]["booked_position"], 0)
+            self.assertEqual(
+                pending["domains"]["trading"]["paper"]["unresolved_orders"], 1
+            )
+            self.assertEqual(
+                pending["domains"]["trading"]["paper"]["booked_position"], 0
+            )
             self.assertEqual(source.read_bytes(), company_cut)
             self.assertEqual(venue.journal.read_bytes(), venue_cut)
             with hold_sender_lease(venue.journal):
@@ -151,10 +158,17 @@ class ConnectedFlow(unittest.TestCase):
                 self.fail("The source regained writer authority")
         restored_cut = replacement.read_bytes()
         settled = inspect_work(replacement, company_id)
-        self.assertEqual(settled["risk_control"], pending["risk_control"])
-        self.assertEqual(settled["risk_control"]["state"], "suspended")
-        self.assertEqual(settled["paper"]["unresolved_orders"], 0)
-        self.assertEqual(settled["paper"]["booked_position"], quantity)
+        self.assertEqual(
+            settled["domains"]["trading"]["risk_control"],
+            pending["domains"]["trading"]["risk_control"],
+        )
+        self.assertEqual(
+            settled["domains"]["trading"]["risk_control"]["state"], "suspended"
+        )
+        self.assertEqual(settled["domains"]["trading"]["paper"]["unresolved_orders"], 0)
+        self.assertEqual(
+            settled["domains"]["trading"]["paper"]["booked_position"], quantity
+        )
         with closing(
             sqlite3.connect(replacement.as_uri() + "?mode=ro", uri=True)
         ) as database:

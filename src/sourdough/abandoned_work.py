@@ -1,32 +1,27 @@
 """Fence a departed claimant without discarding committed decisions or effects."""
 
+from __future__ import annotations
+
+from collections.abc import Sequence
 from contextlib import closing
 from sqlite3 import Connection
 
 from .company import _connect, _identity
 from .duty_run import ASSESSMENT_REVIEW, DutyRefused
+from .runtime.domains import CommittedResultPredicate
 from .writer_lease import WriterLease
 
 
 def _no_committed_result(tables: set[str]) -> str:
     committed = (
         "assessment_publication",
-        "paper_research_decision",
-        "paper_decision",
         "work_review_decision",
     )
-    exclusions = " ".join(
+    return " ".join(
         f"AND NOT EXISTS (SELECT 1 FROM {table} known WHERE known.duty_id = d.id)"
         for table in committed
         if table in tables
     )
-    if "paper_order" in tables:
-        exclusions += """
-            AND NOT EXISTS (
-                SELECT 1 FROM paper_order o JOIN duty_run original ON original.run_id = o.run_id
-                WHERE original.duty_id = d.id
-            )"""
-    return exclusions
 
 
 def _tables(connection: Connection) -> set[str]:
@@ -38,19 +33,42 @@ def _tables(connection: Connection) -> set[str]:
     }
 
 
-def has_uncommitted_work(connection: Connection, duty_id: str) -> bool:
-    return (
-        connection.execute(
-            f"""SELECT 1 FROM duty d WHERE d.id=? AND d.state='running'
-            {_no_committed_result(_tables(connection))}""",
-            (duty_id,),
-        ).fetchone()
-        is not None
+def _has_domain_committed_result(
+    connection: Connection,
+    tables: set[str],
+    duty_id: str,
+    committed_predicates: Sequence[CommittedResultPredicate],
+) -> bool:
+    return any(
+        predicate(connection, tables, duty_id) for predicate in committed_predicates
+    )
+
+
+def has_uncommitted_work(
+    connection: Connection,
+    duty_id: str,
+    *,
+    committed_predicates: Sequence[CommittedResultPredicate] = (),
+) -> bool:
+    tables = _tables(connection)
+    row = connection.execute(
+        f"""SELECT 1 FROM duty d WHERE d.id=? AND d.state='running'
+        {_no_committed_result(tables)}""",
+        (duty_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    return not _has_domain_committed_result(
+        connection, tables, duty_id, committed_predicates
     )
 
 
 def requeue_uncommitted_work(
-    writer: WriterLease, *, purpose: str | None = None, hired_only: bool = False
+    writer: WriterLease,
+    *,
+    purpose: str | None = None,
+    hired_only: bool = False,
+    committed_predicates: Sequence[CommittedResultPredicate] = (),
 ) -> tuple[str, ...]:
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -63,7 +81,7 @@ def requeue_uncommitted_work(
         ownership = (
             "JOIN hire_receipt hire ON hire.agent_id = actor.id" if hired_only else ""
         )
-        recovered = connection.execute(
+        candidates = connection.execute(
             f"""SELECT d.id, run.run_id,
                        CASE WHEN founding.due_work_id IS NOT NULL THEN 'due' ELSE 'scheduled' END
                 FROM duty d JOIN duty_run run ON run.duty_id = d.id AND run.is_current = 1
@@ -78,6 +96,13 @@ def requeue_uncommitted_work(
                 ORDER BY d.rowid""",
             (writer.company_id, purpose == ASSESSMENT_REVIEW, purpose, purpose),
         ).fetchall()
+        recovered = [
+            (duty_id, old_run, next_state)
+            for duty_id, old_run, next_state in candidates
+            if not _has_domain_committed_result(
+                connection, tables, duty_id, committed_predicates
+            )
+        ]
         from .runtime.work_kernel import sync_duty_terminal
 
         for duty_id, old_run, next_state in recovered:

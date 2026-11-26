@@ -10,9 +10,9 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from ..duty_run import has_turn_capacity
-from ..paper_execution import PaperExecution
 from ..storage.db import open_writer, wal_checkpoint, write_tx
 from ..writer_lease import WriterLease, hold_company_writer
+from .domains import IndependentProcessGuard
 from .registry import (
     DutyContext,
     DutyDescriptor,
@@ -20,7 +20,6 @@ from .registry import (
     DutyRegistry,
     RuntimeRefused,
 )
-from .venue_coordinator import BoundedVenueCoordinator, VenueSegmentPolicy
 from .work_kernel import (
     RunFenced,
     WorkItem,
@@ -255,18 +254,14 @@ class CompanyRuntime:
         duty_kind: str,
         execute: Callable[[WriterLease], _ResultT],
         *,
-        venue: PaperExecution | None = None,
-        venue_policy: VenueSegmentPolicy | None = None,
+        process_guard: IndependentProcessGuard | None = None,
         now_ns: int | None = None,
         truncate_wal_on_exit: bool = False,
     ) -> _ResultT:
-        """Execute a registered company duty under one WriterLease, Work sweep, and venue boundary."""
+        """Execute a registered company duty under one WriterLease, Work sweep, and process guard."""
         self._registry.get(duty_kind)
-        if venue is not None:
-            coordinator = BoundedVenueCoordinator(
-                self._store, venue, policy=venue_policy
-            )
-            coordinator.verify_independence()
+        if process_guard is not None:
+            process_guard.require_independent_from(self._store)
         timestamp = self._clock() if now_ns is None else now_ns
         with hold_company_writer(
             self._store,

@@ -7,8 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .company import _connect
-from .duty_run import PAPER_EXECUTION, DutyClaim, DutyRefused
-from .first_duty import FIRST_DUTY_SCOPE
+from .duty_run import DutyClaim, DutyRefused
 from .paper_account import reopen_binding
 from .paper_books import (
     read_book_observation,
@@ -17,6 +16,7 @@ from .paper_books import (
     resolved_order_sql,
 )
 from .storage.schema import is_domain_installed
+from .trading.duty import FIRST_DUTY_SCOPE, PAPER_EXECUTION
 from .work import (
     FollowUp,
     FollowUpClaim,
@@ -301,5 +301,11 @@ def settle_paper_decision(
         if state != "running":
             raise DutyRefused("The paper duty cannot be settled")
         return schedule_follow_up(
-            connection, claim, scope, result, next_due, purpose=PAPER_EXECUTION
+            connection,
+            claim,
+            scope,
+            result,
+            next_due,
+            purpose=PAPER_EXECUTION,
+            allowed_purposes=(PAPER_EXECUTION,),
         )

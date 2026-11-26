@@ -8,7 +8,6 @@ from time import monotonic, sleep, time_ns
 
 from sourdough.company import FoundingRefused, FoundingTerms, found
 from sourdough.company_checkpoint import checkpoint_company
-from sourdough.first_duty import claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.paper_account import PaperMandate, bind
@@ -16,6 +15,7 @@ from sourdough.paper_execution import PaperIntent, VenueRefused
 from sourdough.paper_order import submit_paper_order
 from sourdough.paper_restore import restore_managed_paper_checkpoint
 from sourdough.paper_sender_lease import hold_sender_lease
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.trading_engine import VERSION
 from sourdough.writer_lease import hold_company_writer
 

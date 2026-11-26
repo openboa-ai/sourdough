@@ -14,10 +14,13 @@ from threading import Thread
 from sourdough.agent_desk import desk_directory, save_draft
 from sourdough.company import FoundingTerms, _connect, found
 from sourdough.company_assets import Selection, assign_project, publish_selection
-from sourdough.duty_run import PAPER_EXECUTION, DutyRefused, start_run
+from sourdough.duty_run import DutyRefused, start_run
 from sourdough.employee_process import EmployeeProcess, _ToolEndpoint
-from sourdough.first_duty import claim_first_duty
 from sourdough.harness import ScopedRun, ScopedWorkflow, tool
+from sourdough.trading.duty import (
+    PAPER_EXECUTION,
+    claim_paper_first_duty as claim_first_duty,
+)
 from sourdough.writer_lease import hold_company_writer
 
 

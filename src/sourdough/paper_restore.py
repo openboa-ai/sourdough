@@ -6,14 +6,14 @@ from sqlite3 import Connection
 
 from .company_checkpoint import CheckpointRefused
 from .company_restore import CoreRestore, _restore_checkpoint
-from .company_run import _recover
-from .duty_run import POSITION_REVIEW
 from .nautilus_paper import CONNECTOR, NautilusPaperVenue
 from .nautilus_runtime import paper_venue
 from .paper_account import read_current_binding, reopen_binding
 from .paper_sender_lease import hold_sender_lease, verify_sender_lease
 from .storage.db import open_reader, read_tx
 from .storage.schema import is_domain_installed
+from .trading.company_run import _recover
+from .trading.duty import POSITION_REVIEW
 from .writer_lease import hold_company_writer
 
 

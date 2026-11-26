@@ -2,12 +2,13 @@
 
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
 
 from .company import _connect, founding_execution_profile
-from .first_duty import DutyClaim, claim_first_duty
+from .duty_run import DutyClaim
+from .employee_process import EmployeeProcess, EmployeeProcessRefused
 from .paper_account import reopen_binding
 from .paper_books import Posting, post_confirmed_fill
 from .paper_execution import (
@@ -24,10 +25,11 @@ from .paper_research import (
     reopen_research_decision,
     requires_research,
 )
+from .trading.duty import claim_paper_first_duty
 from .writer_lease import WriterLease
 
 
-class TradeRefused(Exception):
+class TradeRefused(EmployeeProcessRefused):
     """The initial trading duty cannot use this operating configuration."""
 
 
@@ -88,7 +90,7 @@ def run_first_trade(
             lambda lease: _run_first_trade_bound(
                 store, company_id, venue, runtime, writer=lease
             ),
-            venue=venue,
+            process_guard=venue,
         )
     return _run_first_trade_bound(store, company_id, venue, runtime, writer=writer)
 
@@ -120,7 +122,7 @@ def _run_first_trade_bound(
     runtime.check_ready()
     if writer is not None:
         writer.verify_for(store, company_id)
-    claim = claim_first_duty(store, company_id, runtime.profile)
+    claim = claim_paper_first_duty(store, company_id, runtime.profile)
     context = TradingContext(
         claim,
         account.account_id,
@@ -156,8 +158,11 @@ def _run_first_trade_bound(
             replay_cut=replay_cut,
         )
         try:
-            runtime.research(tools.invoke)
-        except TradeRefused:
+            if isinstance(runtime, EmployeeProcess):
+                runtime.scoped_tool_exchange("research_duty", tools.invoke, timeout=100)
+            else:
+                runtime.research(tools.invoke)
+        except EmployeeProcessRefused:
             if find_unsubmitted_opening(store, company_id) is None:
                 raise
         research = reopen_research_decision(store, claim)
@@ -170,7 +175,29 @@ def _run_first_trade_bound(
                 research.decision.limit_minor_units,
             )
     else:
-        runtime.run(context, order_tool)
+        if isinstance(runtime, EmployeeProcess):
+            response = runtime.run_first_duty_exchange(
+                context=asdict(context), tools=("paper_buy",)
+            )
+            if response != {"action": "hold"}:
+                if (
+                    set(response)
+                    != {
+                        "tool",
+                        "call_id",
+                        "quantity",
+                        "limit_minor_units",
+                    }
+                    or response["tool"] != "paper_buy"
+                ):
+                    raise TradeRefused("Unexpected employee tool request")
+                order_tool(
+                    response["call_id"],
+                    response["quantity"],
+                    response["limit_minor_units"],
+                )
+        else:
+            runtime.run(context, order_tool)
     return _trade_result(store, claim, result, venue, research)
 
 

@@ -12,8 +12,17 @@ from time import time_ns
 from .db import SCHEMA_VERSION, StorageRefused
 from .kernel import append_audit_event
 
-VALID_DOMAINS: tuple[str, ...] = ("core", "paper")
+VALID_DOMAINS: tuple[str, ...] = ("core", "trading", "paper")
 _SCHEMA_ROOT = Path(__file__).resolve().parent / "schema" / "v1"
+
+
+def canonical_domain_name(domain: str) -> str:
+    """Map legacy domain aliases to their canonical schema domain name."""
+    if domain == "core":
+        return "core"
+    if domain in ("trading", "paper"):
+        return "trading"
+    raise StorageRefused(f"Unsupported schema domain: {domain}")
 
 
 @dataclass(frozen=True)
@@ -52,6 +61,10 @@ def load_domain_pack(domain: str) -> SchemaPack:
     if domain not in VALID_DOMAINS:
         raise StorageRefused(f"Unsupported schema domain: {domain}")
     domain_dir = _SCHEMA_ROOT / domain
+    if domain == "trading" and not domain_dir.is_dir():
+        fallback_dir = _SCHEMA_ROOT / "paper"
+        if fallback_dir.is_dir():
+            domain_dir = fallback_dir
     if not domain_dir.is_dir():
         raise StorageRefused(f"Missing canonical v1 schema directory for {domain}")
     files: list[tuple[str, str]] = []
@@ -90,7 +103,11 @@ def compute_sqlite_schema_sha256(connection: sqlite3.Connection) -> str:
 
 def _canonical_domain_order(domains: frozenset[str]) -> tuple[str, ...]:
     invalid = set(domains) - set(VALID_DOMAINS)
-    if invalid or "core" not in domains:
+    if (
+        invalid
+        or "core" not in domains
+        or ("trading" in domains and "paper" in domains)
+    ):
         raise StorageRefused(f"Invalid active schema domain set: {sorted(domains)}")
     return tuple(domain for domain in VALID_DOMAINS if domain in domains)
 
@@ -166,14 +183,17 @@ def installed_domains(
 
 
 def is_domain_installed(connection: sqlite3.Connection, domain: str) -> bool:
-    if domain not in VALID_DOMAINS:
-        raise StorageRefused(f"Unsupported schema domain: {domain}")
-    return domain in installed_domains(connection)
+    canonical = canonical_domain_name(domain)
+    installed = installed_domains(connection)
+    if canonical == "core":
+        return "core" in installed
+    return "trading" in installed or "paper" in installed
 
 
 def require_domain(connection: sqlite3.Connection, domain: str) -> None:
-    if not is_domain_installed(connection, domain):
-        raise StorageRefused(f"Required schema domain '{domain}' is not installed")
+    canonical = canonical_domain_name(domain)
+    if not is_domain_installed(connection, canonical):
+        raise StorageRefused(f"Required schema domain '{canonical}' is not installed")
 
 
 def verify_v1_schema(connection: sqlite3.Connection) -> frozenset[str]:
@@ -185,7 +205,11 @@ def verify_v1_schema(connection: sqlite3.Connection) -> frozenset[str]:
         )
     records = installed_domains(connection)
     active = frozenset(records)
-    if "core" not in active or not active.issubset(set(VALID_DOMAINS)):
+    if (
+        "core" not in active
+        or not active.issubset(set(VALID_DOMAINS))
+        or ("trading" in active and "paper" in active)
+    ):
         raise StorageRefused(
             f"Invalid installed schema domains in company store: {sorted(active)}"
         )
@@ -266,21 +290,28 @@ def enable_domain_v1(
         )
     if domain not in VALID_DOMAINS or domain == "core":
         raise StorageRefused(f"Unsupported opt-in schema domain: {domain}")
+    target_domain = (
+        canonical_domain_name(domain) if (_SCHEMA_ROOT / "trading").is_dir() else domain
+    )
     active = verify_v1_schema(connection)
-    pack = load_domain_pack(domain)
-    if domain in active:
+    pack = load_domain_pack(target_domain)
+    if canonical_domain_name(target_domain) == "trading" and (
+        "trading" in active or "paper" in active
+    ):
         return False
     for _name, sql in pack.files:
         _execute_sql_script_in_tx(connection, sql)
-    new_active = frozenset(active | {domain})
+    new_active = frozenset(active | {target_domain})
     actual_schema_hash = compute_sqlite_schema_sha256(connection)
     expected_schema_hash = expected_sqlite_schema_sha256(new_active)
     if actual_schema_hash != expected_schema_hash:
         raise StorageRefused(
-            f"Activated domain '{domain}' failed canonical sqlite_schema check"
+            f"Activated domain '{target_domain}' failed canonical sqlite_schema check"
         )
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-        raise StorageRefused(f"Activated domain '{domain}' failed foreign_key_check")
+        raise StorageRefused(
+            f"Activated domain '{target_domain}' failed foreign_key_check"
+        )
     now = time_ns()
     connection.execute(
         "UPDATE installed_domains SET sqlite_schema_sha256 = ?",
@@ -290,7 +321,7 @@ def enable_domain_v1(
         """INSERT INTO installed_domains (
                domain, schema_version, pack_sha256, sqlite_schema_sha256, activated_at_ns
            ) VALUES (?, ?, ?, ?, ?)""",
-        (domain, SCHEMA_VERSION, pack.pack_sha256, actual_schema_hash, now),
+        (target_domain, SCHEMA_VERSION, pack.pack_sha256, actual_schema_hash, now),
     )
     resolved_company_id = company_id
     if resolved_company_id is None:
@@ -305,9 +336,9 @@ def enable_domain_v1(
             company_id=resolved_company_id,
             domain="ops",
             entity_type="domain",
-            entity_id=domain,
+            entity_id=target_domain,
             event_type="domain.activated",
             actor_id=actor_id,
-            payload={"domain": domain, "pack_sha256": pack.pack_sha256},
+            payload={"domain": target_domain, "pack_sha256": pack.pack_sha256},
         )
     return True

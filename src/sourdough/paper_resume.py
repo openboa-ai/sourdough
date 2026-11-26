@@ -6,6 +6,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from time import time_ns
 
+from .board_control import AuthorizeBoard
 from .nautilus_paper import CONNECTOR
 from .nautilus_runtime import paper_venue
 from .paper_account import (
@@ -15,7 +16,6 @@ from .paper_account import (
 )
 from .paper_books import pending_no_fill_observation_sql, resolved_order_sql
 from .paper_risk import (
-    AuthorizeBoard,
     PaperRiskReceipt,
     PaperRiskRefused,
     PaperSuspension,

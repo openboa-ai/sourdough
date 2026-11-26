@@ -10,7 +10,7 @@ import sys
 from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
-from time import sleep, time_ns
+from time import sleep
 
 from sourdough.accounting_close import CloseRefused
 from sourdough.agent_runtime import (
@@ -19,7 +19,11 @@ from sourdough.agent_runtime import (
     build_default_adapter_registry,
 )
 from sourdough.assessment_run import run_assessment_company
-from sourdough.board_control import BoardControlRefused, bind_board_principal
+from sourdough.board_control import (
+    BoardControlRefused,
+    bind_board_principal,
+    read_local_command_receipt_status,
+)
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
 from sourdough.company_assessment import SourceRecord, seal_assessment_source
 from sourdough.company_checkpoint import (
@@ -27,54 +31,25 @@ from sourdough.company_checkpoint import (
     checkpoint_company,
     inspect_company_checkpoint,
 )
-from sourdough.company_run import run_paper_company
-from sourdough.duty_run import count_company_runs
-from sourdough.employee_process import EmployeeProcess
-from sourdough.first_duty import DutyRefused
-from sourdough.first_trade import TradeRefused, run_first_trade
-from sourdough.fund_returns import ReturnRefused
+from sourdough.duty_run import DutyRefused, count_company_runs
+from sourdough.employee_process import EmployeeProcess, EmployeeProcessRefused
 from sourdough.general_ledger import JournalRefused
-from sourdough.hired_paper_run import run_hired_paper_company
 from sourdough.hiring_run import run_hiring
 from sourdough.ipc import ClientWebBridge, CompanyDaemon, ControlPlaneClient, IpcRefused
-from sourdough.market_runtime import observe_market
-from sourdough.market_worker import MarketRefused
-from sourdough.nautilus_runtime import bind_paper as bind_nautilus_paper
-from sourdough.nautilus_runtime import (
-    paper_venue,
-    prepare_paper,
-    supervise_paper,
-    switch_paper,
-)
-from sourdough.paper_account import BindingRefused, PaperAccount, PaperMandate, bind
-from sourdough.paper_books import PostingRefused
-from sourdough.paper_execution import VenueRefused
-from sourdough.paper_order import OrderRefused
-from sourdough.paper_research import stage_research_inputs
-from sourdough.paper_risk import PaperRiskRefused, read_local_command_receipt_status
-from sourdough.paper_statement_store import (
-    StatementRequest,
-    read_retained_statement,
-    retain_paper_statement,
-)
-from sourdough.paper_valuation import ValuationRefused
-from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.paper_window import WindowPlan, WindowRefused
-from sourdough.paper_window_statement import read_paper_statement
 from sourdough.runtime import (
+    DomainCliRefused,
     ResidentCompanyService,
     build_production_duty_registry,
+    load_domain_plugins,
+    merge_work_policies,
 )
 from sourdough.runtime.registry import RuntimeRefused
 from sourdough.runtime.work_kernel import WorkKernelRefused
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
 from sourdough.storage.db import StorageRefused
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
-from sourdough.trading_engine import EngineRefused, prepare_engine
-from sourdough.window_sampler import WindowSampler, register_managed_window
-from sourdough.window_run import run_window
-from sourdough.writer_lease import WriterRefused, hold_company_writer
 from sourdough.work_projection import WORK_TIMELINE_REVISION, read_local_board_timeline
+from sourdough.writer_lease import WriterRefused, hold_company_writer
 
 
 def _store_key(value: str) -> tuple[int, int]:
@@ -99,20 +74,15 @@ def _emit_event(event: dict) -> None:
 
 
 def _start_supervisor(args, *, emit=_emit_event):
-    assessment = args.command == "supervise-assessment"
-    worker_name = {
-        "supervise-assessment": "_assessment-worker",
-        "supervise-hired-paper": "_hired-paper-worker",
-        "supervise-paper": "_paper-worker",
-    }[args.command]
+    if args.command != "supervise-assessment":
+        raise DutyRefused(f"Unsupported supervision command: {args.command}")
     command = [
         sys.executable,
         "-I",
         "-m",
         "sourdough.cli",
-        worker_name,
+        "_assessment-worker",
         str(args.store),
-        *([] if assessment else [str(args.journal)]),
         "--company-id",
         args.company_id,
         "--employee",
@@ -124,26 +94,6 @@ def _start_supervisor(args, *, emit=_emit_event):
         "--budget-from",
         str(count_company_runs(args.store, args.company_id)),
     ]
-    if getattr(args, "repeat_paper", False):
-        command.append("--repeat-paper")
-    if getattr(args, "managed_engine", False):
-        command.append("--managed-engine")
-    if args.command == "supervise-paper":
-        sampler = _paper_sampler(args, args.journal, managed=args.managed_engine)
-        if sampler is not None:
-            command.extend(("--observe-window", sampler.window_id))
-            if sampler.observe_through_ns is not None:
-                remaining = sampler.observe_through_ns - time_ns()
-                if not 0 < remaining < (args.max_seconds - 1) * 10**9:
-                    raise WindowRefused(
-                        "Observation cutoff does not fit the supervisor deadline"
-                    )
-                command.extend(
-                    ("--observe-through-ns", str(sampler.observe_through_ns))
-                )
-        work_cutoff = getattr(args, "start_work_before_ns", None)
-        if work_cutoff is not None:
-            command.extend(("--start-work-before-ns", str(work_cutoff)))
     return supervise_worker(
         command,
         args.store,
@@ -155,68 +105,8 @@ def _start_supervisor(args, *, emit=_emit_event):
     )
 
 
-def _run_paper_window(args):
-    def company(through_ns, work_before_ns, max_seconds):
-        options = argparse.Namespace(
-            **(
-                vars(args)
-                | {
-                    "command": "supervise-paper",
-                    "journal": args.directory,
-                    "managed_engine": True,
-                    "observe_window": args.window_id,
-                    "observe_through_ns": through_ns,
-                    "start_work_before_ns": work_before_ns,
-                    "idle_seconds": max(0, min(900, (through_ns - time_ns()) // 10**9)),
-                    "startup_seconds": min(35, max_seconds),
-                    "max_seconds": max_seconds,
-                    "max_restarts": 1,
-                }
-            )
-        )
-        return _start_supervisor(
-            options, emit=lambda event: _emit_event(event | {"actor": "company"})
-        )
-
-    return run_window(
-        args.store,
-        args.company_id,
-        args.directory,
-        args.window_id,
-        company,
-        segment_seconds=args.segment_seconds,
-        emit=_emit_event,
-    )
-
-
-def _paper_destination(args):
-    if getattr(args, "managed_engine", False):
-        return paper_venue(args.store, args.journal)
-    return FixedQuoteVenue(args.journal)
-
-
-def _paper_sampler(args, directory: Path, *, managed: bool) -> WindowSampler | None:
-    through = getattr(args, "observe_through_ns", None)
-    if args.observe_window is None:
-        if through is not None:
-            raise WindowRefused("Observation cutoff requires a sealed window")
-        return None
-    if not managed:
-        raise WindowRefused(
-            "Only a managed current-market activation can sample a window"
-        )
-    return WindowSampler(directory, args.observe_window, through)
-
-
-def _managed_destination_flag(command):
-    command.add_argument(
-        "--managed-engine",
-        action="store_true",
-        help="Use the original managed engine directory instead of a fixture journal",
-    )
-
-
 def main() -> int:
+    plugins = load_domain_plugins()
     parser = argparse.ArgumentParser(prog="sourdough")
     commands = parser.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("found", help="Persist the initial board mandate")
@@ -254,9 +144,7 @@ def main() -> int:
     receipt_read.add_argument("store", type=Path)
     receipt_read.add_argument("--company-id", required=True)
     receipt_read.add_argument("--command-id", required=True)
-    receipt_read.add_argument(
-        "--operation", choices=("suspend_new_risk", "resume_new_risk")
-    )
+    receipt_read.add_argument("--operation")
     daemon_cmd = commands.add_parser(
         "serve-company-daemon",
         help="Run the resident single-writer CompanyDaemon over a local Unix socket",
@@ -328,9 +216,7 @@ def main() -> int:
     bridge_receipt = bridge_ops.add_parser("read-command-receipt")
     bridge_receipt.add_argument("--company-id", required=True)
     bridge_receipt.add_argument("--command-id", required=True)
-    bridge_receipt.add_argument(
-        "--operation", choices=("suspend_new_risk", "resume_new_risk")
-    )
+    bridge_receipt.add_argument("--operation")
     bridge_events = bridge_ops.add_parser("events")
     bridge_events.add_argument("--company-id")
     bridge_events.add_argument("--after-seq", type=int, default=0)
@@ -339,91 +225,6 @@ def main() -> int:
     profile = commands.add_parser("employee-profile")
     profile.add_argument("executable", type=Path)
     profile.add_argument("--sandbox", help="User-selected sandbox backend")
-    seal = commands.add_parser("seal-paper-window")
-    seal.add_argument("store", type=Path)
-    seal.add_argument("directory", type=Path)
-    seal.add_argument("--company-id", required=True)
-    seal.add_argument("--plan", required=True, type=Path)
-    operating = commands.add_parser("run-paper-window")
-    operating.add_argument("store", type=Path)
-    operating.add_argument("directory", type=Path)
-    operating.add_argument("--company-id", required=True)
-    operating.add_argument("--employee", required=True, type=Path)
-    operating.add_argument("--window-id", required=True)
-    operating.add_argument("--segment-seconds", type=int, default=600)
-    operating.add_argument("--turn-budget", type=int, choices=range(1, 9), default=8)
-    operating.add_argument("--repeat-paper", action="store_true")
-    for command in ("inspect-paper-window", "close-paper-window"):
-        statement = commands.add_parser(command)
-        statement.add_argument("store", type=Path)
-        statement.add_argument("directory", type=Path)
-        statement.add_argument("--company-id", required=True)
-        statement.add_argument("--window-id", required=True)
-        if command == "inspect-paper-window":
-            lookup = statement.add_mutually_exclusive_group()
-            lookup.add_argument("--accounting-close")
-            lookup.add_argument("--report-id")
-        else:
-            statement.add_argument("--accounting-close")
-            statement.add_argument("--request-id", required=True)
-            statement.add_argument("--supersedes")
-    engine = commands.add_parser("prepare-trading-engine")
-    engine.add_argument("store", type=Path)
-    engine.add_argument("directory", type=Path)
-    engine.add_argument("--company-id", required=True)
-    engine.add_argument("--wheelhouse", type=Path)
-    market = commands.add_parser("observe-trading-market")
-    market.add_argument("store", type=Path)
-    market.add_argument("directory", type=Path)
-    market.add_argument("--company-id", required=True)
-    market.add_argument("--symbol", required=True)
-    market.add_argument("--max-age-seconds", type=int, default=15)
-    market.add_argument("--samples", type=int, default=3)
-    for command in (
-        "prepare-nautilus-paper",
-        "bind-nautilus-paper",
-        "switch-nautilus-paper",
-        "serve-nautilus-paper",
-        "operate-nautilus-paper",
-    ):
-        sandbox = commands.add_parser(command)
-        sandbox.add_argument("store", type=Path)
-        sandbox.add_argument("directory", type=Path)
-        sandbox.add_argument("--company-id", required=True)
-        if command == "prepare-nautilus-paper":
-            sandbox.add_argument("--account-id", required=True)
-            sandbox.add_argument("--starting-atoms", required=True, type=int)
-            sandbox.add_argument("--replay-tape", type=Path)
-        elif command in ("bind-nautilus-paper", "switch-nautilus-paper"):
-            sandbox.add_argument("--revision", required=True)
-            sandbox.add_argument("--charter-revision", required=True)
-            sandbox.add_argument("--exposure-atoms", required=True, type=int)
-            sandbox.add_argument("--replay", action="store_true")
-            if command == "switch-nautilus-paper":
-                sandbox.add_argument("--previous-directory", type=Path, required=True)
-                sandbox.add_argument("--previous-revision", required=True)
-                sandbox.add_argument("--from-replay", action="store_true")
-        elif command == "serve-nautilus-paper":
-            sandbox.add_argument("--seconds", type=int, default=60)
-            sandbox.add_argument("--replay-tape", type=Path)
-        else:
-            sandbox.add_argument("--employee", type=Path, required=True)
-            sandbox.add_argument("--turn-budget", type=int, default=1)
-            sandbox.add_argument("--idle-seconds", type=int, default=0)
-            sandbox.add_argument("--replay", action="store_true")
-            sandbox.add_argument("--observe-window")
-    paper = commands.add_parser("bind-paper")
-    paper.add_argument("store", type=Path)
-    paper.add_argument("journal", type=Path)
-    for name in ("company-id", "charter-revision", "revision", "account-id", "rules"):
-        paper.add_argument(f"--{name}", required=True)
-    for name in ("starting-minor-units", "exposure-minor-units", "quote-minor-units"):
-        paper.add_argument(f"--{name}", required=True, type=int)
-    paper.add_argument("--fee-bps", type=int, default=0)
-    inputs = commands.add_parser("stage-paper-observations")
-    inputs.add_argument("store", type=Path)
-    inputs.add_argument("observations", type=Path)
-    inputs.add_argument("--company-id", required=True)
     staffing = commands.add_parser("stage-staffing")
     staffing.add_argument("store", type=Path)
     staffing.add_argument("envelope", type=Path)
@@ -432,17 +233,9 @@ def main() -> int:
     source.add_argument("store", type=Path)
     source.add_argument("records", type=Path)
     source.add_argument("--company-id", required=True)
-    for command in (
-        "supervise-assessment",
-        "_assessment-worker",
-        "supervise-hired-paper",
-        "_hired-paper-worker",
-    ):
+    for command in ("supervise-assessment", "_assessment-worker"):
         managed = commands.add_parser(command)
         managed.add_argument("store", type=Path)
-        if "hired-paper" in command:
-            managed.add_argument("journal", type=Path)
-            _managed_destination_flag(managed)
         managed.add_argument("--company-id", required=True)
         managed.add_argument("--employee", type=Path, required=True)
         managed.add_argument("--turn-budget", type=int, default=3)
@@ -459,32 +252,9 @@ def main() -> int:
     hiring.add_argument("store", type=Path)
     hiring.add_argument("--company-id", required=True)
     hiring.add_argument("--employee", type=Path, required=True)
-    hiring.add_argument(
-        "--first-purpose", required=True, choices=("assessment", "paper_execution")
-    )
-    for command in ("first-duty", "operate-paper", "supervise-paper", "_paper-worker"):
-        running = commands.add_parser(command)
-        running.add_argument("store", type=Path)
-        running.add_argument("journal", type=Path)
-        running.add_argument("--company-id", required=True)
-        running.add_argument("--employee", type=Path, required=True)
-        if command != "first-duty":
-            _managed_destination_flag(running)
-            running.add_argument("--repeat-paper", action="store_true")
-            running.add_argument("--turn-budget", type=int, default=2)
-            running.add_argument("--idle-seconds", type=int, default=0)
-            running.add_argument("--observe-window")
-        if command == "supervise-paper":
-            running.add_argument("--observe-through-ns", type=int)
-            running.add_argument("--max-restarts", type=int, default=2)
-            running.add_argument("--startup-seconds", type=int, default=60)
-            running.add_argument("--max-seconds", type=int, default=180)
-        if command == "_paper-worker":
-            running.add_argument("--observe-through-ns", type=int)
-            running.add_argument("--start-work-before-ns", type=int)
-            running.add_argument("--ready-fd", type=int, required=True)
-            running.add_argument("--store-key", type=_store_key, required=True)
-            running.add_argument("--budget-from", type=int, required=True)
+    hiring.add_argument("--first-purpose", required=True)
+    for plugin in plugins:
+        plugin.register_cli_subcommands(commands)
     args = parser.parse_args()
 
     try:
@@ -511,6 +281,7 @@ def main() -> int:
                         args.store,
                         args.company_id,
                         contract_revision=args.contract_revision,
+                        domain_plugins=plugins,
                     )
                 )
             )
@@ -561,6 +332,7 @@ def main() -> int:
                     expected_store_key=args.store_key,
                     engine_directory=args.engine_dir,
                     evaluator_store=args.evaluator_store,
+                    domain_plugins=plugins,
                 ) as daemon:
                     announcement = json.dumps(asdict(daemon.info), sort_keys=True)
                     if args.ready_fd is not None:
@@ -609,6 +381,7 @@ def main() -> int:
             duty_registry = build_production_duty_registry(
                 adapter_registry=adapter_registry,
                 profile_bindings=profile_bindings,
+                domain_plugins=plugins,
             )
 
             stop_requested = False
@@ -634,6 +407,7 @@ def main() -> int:
                             engine_directory=args.engine_dir,
                             evaluator_store=args.evaluator_store,
                             tick_interval_seconds=args.tick_interval,
+                            domain_plugins=plugins,
                         )
                     )
                     payload = asdict(service.info)
@@ -756,53 +530,10 @@ def main() -> int:
                     print(json.dumps(event, sort_keys=True))
                 return 0
             raise IpcRefused("Unsupported client-bridge operation")
-        elif args.command == "run-paper-window":
-            result = _run_paper_window(args)
-            print(json.dumps(asdict(result)))
-            return 0 if result.completed else 1
-        elif args.command == "inspect-paper-window":
-            if args.report_id is not None:
-                saved = read_retained_statement(
-                    args.store, args.company_id, args.report_id
-                )
-                if saved is None or saved.request.window_id != args.window_id:
-                    raise WindowRefused(
-                        "No retained statement for the requested window"
-                    )
-                report = saved.as_receipt()
-            else:
-                report = read_paper_statement(
-                    args.store,
-                    args.company_id,
-                    args.directory,
-                    args.window_id,
-                    close_id=args.accounting_close,
-                ).as_report()
-            print(json.dumps(report))
-            return 0
-        elif args.command == "close-paper-window":
-            request = StatementRequest(
-                args.request_id, args.window_id, args.accounting_close, args.supersedes
-            )
-            with hold_company_writer(args.store, args.company_id) as writer:
-                saved = retain_paper_statement(writer, args.directory, request)
-            print(json.dumps(saved.as_receipt()))
-            return 0
-        elif args.command == "seal-paper-window":
-            with args.plan.open("rb") as source:
-                payload = source.read(16_385)
-            if len(payload) > 16_384:
-                raise WindowRefused("Window plan exceeds its size limit")
-            try:
-                plan = WindowPlan(**json.loads(payload))
-            except (ValueError, TypeError) as error:
-                raise WindowRefused("Window plan is not a valid declaration") from error
-            with hold_company_writer(args.store, args.company_id) as writer:
-                result = register_managed_window(writer, args.directory, plan)
         elif args.command == "employee-profile":
             employee = EmployeeProcess(args.executable)
             if args.sandbox != employee.sandbox_backend:
-                raise TradeRefused(
+                raise EmployeeProcessRefused(
                     "Select the sandbox backend declared by this employee adapter"
                 )
             selection = {"execution_profile": employee.profile}
@@ -810,134 +541,7 @@ def main() -> int:
                 selection["sandbox_backend"] = employee.sandbox_backend
             print(json.dumps(selection))
             return 0
-        elif args.command == "prepare-trading-engine":
-            with hold_company_writer(args.store, args.company_id) as writer:
-                result = prepare_engine(
-                    writer, args.directory, wheelhouse=args.wheelhouse
-                )
-        elif args.command == "observe-trading-market":
-            result = observe_market(
-                args.store,
-                args.company_id,
-                args.directory,
-                symbol=args.symbol,
-                max_age_seconds=args.max_age_seconds,
-                samples=args.samples,
-                emit=lambda event: print(
-                    json.dumps(event), file=sys.stderr, flush=True
-                ),
-            )
-            print(json.dumps(asdict(result)))
-            return 0 if result.completed else 1
-        elif args.command == "prepare-nautilus-paper":
-            with hold_company_writer(args.store, args.company_id) as writer:
-                identity = prepare_paper(
-                    writer,
-                    args.directory,
-                    args.account_id,
-                    args.starting_atoms,
-                    tape_path=args.replay_tape,
-                )
-            print(json.dumps({"destination_id": identity}))
-            return 0
-        elif args.command == "bind-nautilus-paper":
-            with hold_company_writer(args.store, args.company_id) as writer:
-                result = bind_nautilus_paper(
-                    writer,
-                    args.directory,
-                    revision=args.revision,
-                    charter_revision=args.charter_revision,
-                    exposure_atoms=args.exposure_atoms,
-                    replay=args.replay,
-                )
-        elif args.command == "switch-nautilus-paper":
-            with hold_company_writer(args.store, args.company_id) as writer:
-                result = switch_paper(
-                    writer,
-                    args.previous_directory,
-                    args.directory,
-                    previous_revision=args.previous_revision,
-                    revision=args.revision,
-                    charter_revision=args.charter_revision,
-                    exposure_atoms=args.exposure_atoms,
-                    from_replay=args.from_replay,
-                    replay=args.replay,
-                )
-        elif args.command == "serve-nautilus-paper":
-            result = supervise_paper(
-                args.store,
-                args.company_id,
-                args.directory,
-                seconds=args.seconds,
-                tape_path=args.replay_tape,
-                emit=lambda event: print(
-                    json.dumps(event), file=sys.stderr, flush=True
-                ),
-            )
-            print(json.dumps(asdict(result)))
-            return 0 if result.completed else 1
-        elif args.command == "operate-nautilus-paper":
-            sampler = _paper_sampler(args, args.directory, managed=not args.replay)
-            result = run_paper_company(
-                args.store,
-                args.company_id,
-                paper_venue(args.store, args.directory, replay=args.replay),
-                EmployeeProcess(args.employee),
-                turn_budget=args.turn_budget,
-                idle_seconds=args.idle_seconds,
-                sampler=sampler,
-            )
-        elif args.command == "bind-paper":
-            venue = FixedQuoteVenue(args.journal)
-            venue.require_independent_from(args.store)
-            account = PaperAccount(
-                args.account_id,
-                "fixed-quote-v1",
-                args.rules,
-                "USD",
-                args.starting_minor_units,
-                "paper",
-            )
-            with hold_company_writer(args.store, args.company_id) as writer:
-                writer.verify()
-                account = venue.provision(
-                    account, args.quote_minor_units, fee_bps=args.fee_bps
-                )
-                writer.verify()
-                result = bind(
-                    args.store,
-                    PaperMandate(
-                        args.revision,
-                        args.company_id,
-                        args.charter_revision,
-                        account,
-                        args.exposure_minor_units,
-                    ),
-                    venue,
-                )
-        elif args.command == "stage-paper-observations":
-            with hold_company_writer(args.store, args.company_id) as writer:
-                writer.verify()
-                with args.observations.open("rb") as source:
-                    content = source.read(64_001)
-                if len(content) > 64_000:
-                    raise DutyRefused(
-                        "Research observation input exceeds its size limit"
-                    )
-                try:
-                    observations = json.loads(content)
-                except (UnicodeError, ValueError) as error:
-                    raise DutyRefused("Invalid research observation input") from error
-                result = stage_research_inputs(
-                    args.store, args.company_id, observations
-                )
-            print(json.dumps(result))
-            return 0
-        elif args.command in (
-            "supervise-paper",
-            "supervise-assessment",
-            "supervise-hired-paper",
-        ):
+        elif args.command == "supervise-assessment":
             result = _start_supervisor(args)
             print(json.dumps(asdict(result)))
             return 0 if result.completed else 1
@@ -980,83 +584,42 @@ def main() -> int:
                 store_key=args.store_key,
                 on_ready=lambda lease: announce_ready(args.ready_fd, lease),
             )
-        elif args.command == "_hired-paper-worker":
-            result = run_hired_paper_company(
-                args.store,
-                args.company_id,
-                _paper_destination(args),
-                lambda: EmployeeProcess(args.employee),
-                turn_budget=args.turn_budget,
-                idle_seconds=args.idle_seconds,
-                budget_from=args.budget_from,
-                store_key=args.store_key,
-                on_ready=lambda lease: announce_ready(args.ready_fd, lease),
-            )
         elif args.command == "operate-hiring":
+            policies = [
+                policy
+                for plugin in plugins
+                if (policy := plugin.work_policy()) is not None
+            ]
+            merged_policy = merge_work_policies(*policies)
             result = run_hiring(
                 args.store,
                 args.company_id,
                 EmployeeProcess(args.employee),
                 first_purpose=args.first_purpose,
+                purpose_scopes=merged_policy.purpose_scopes,
             )
         else:
-            inputs = (
-                args.store,
-                args.company_id,
-                _paper_destination(args),
-                EmployeeProcess(args.employee),
-            )
-            if args.command == "first-duty":
-                result = run_first_trade(*inputs)
-            elif args.command == "_paper-worker":
-                result = run_paper_company(
-                    *inputs,
-                    repeat_paper=args.repeat_paper,
-                    turn_budget=args.turn_budget,
-                    idle_seconds=args.idle_seconds,
-                    expected_store_key=args.store_key,
-                    budget_from=args.budget_from,
-                    on_ready=lambda lease: announce_ready(args.ready_fd, lease),
-                    sampler=_paper_sampler(
-                        args, args.journal, managed=args.managed_engine
-                    ),
-                    start_work_before_ns=args.start_work_before_ns,
-                )
-            else:
-                result = run_paper_company(
-                    *inputs,
-                    repeat_paper=args.repeat_paper,
-                    turn_budget=args.turn_budget,
-                    idle_seconds=args.idle_seconds,
-                    sampler=_paper_sampler(
-                        args, args.journal, managed=args.managed_engine
-                    ),
-                )
+            for plugin in plugins:
+                handled = plugin.handle_cli_command(args)
+                if handled is not None:
+                    return handled
+            raise DutyRefused(f"Unsupported command: {args.command}")
     except (
         AgentRuntimeRefused,
         BoardControlRefused,
         CheckpointRefused,
         CloseRefused,
-        FoundingRefused,
-        BindingRefused,
+        DomainCliRefused,
         DutyRefused,
+        EmployeeProcessRefused,
+        FoundingRefused,
         IpcRefused,
         JournalRefused,
-        TradeRefused,
-        EngineRefused,
-        MarketRefused,
-        OrderRefused,
-        PaperRiskRefused,
-        PostingRefused,
-        ReturnRefused,
         RuntimeRefused,
         StorageRefused,
-        VenueRefused,
-        WorkKernelRefused,
         SupervisionRefused,
+        WorkKernelRefused,
         WriterRefused,
-        ValuationRefused,
-        WindowRefused,
         sqlite3.Error,
         OSError,
     ) as error:
@@ -1064,8 +627,7 @@ def main() -> int:
         return 1
     fields = (
         _agent_receipt
-        if args.command
-        in ("operate-hiring", "_assessment-worker", "_hired-paper-worker")
+        if args.command in ("operate-hiring", "_assessment-worker")
         else dict
     )
     print(json.dumps(asdict(result, dict_factory=fields)))

@@ -40,6 +40,7 @@ from sourdough.execution_tiers import (
 from sourdough.ipc import ClientWebBridge
 from sourdough.runtime.handlers import build_production_duty_registry
 from sourdough.runtime.resident import ResidentCompanyService
+from sourdough.trading import TradingDomainPlugin
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -217,9 +218,11 @@ class ConnectedFlow(unittest.TestCase):
                 model="gpt-5-codex",
                 revision="v1",
             )
+            plugins = (TradingDomainPlugin(),)
             duty_registry = build_production_duty_registry(
                 adapter_registry=adapters,
                 profile_bindings=lambda _aid: profile,
+                domain_plugins=plugins,
             )
 
             # Phase 1: Live Standby + Multi-Book Paper Desk + Board Approval Migration over HTTP.
@@ -231,6 +234,7 @@ class ConnectedFlow(unittest.TestCase):
                     socket_dir=sock_dir,
                     lease_directory=leases,
                     tick_interval_seconds=0.05,
+                    domain_plugins=plugins,
                 ) as resident,
                 ClientWebBridge(
                     resident.socket_path,
@@ -372,6 +376,7 @@ class ConnectedFlow(unittest.TestCase):
                     socket_dir=sock_dir,
                     lease_directory=leases,
                     tick_interval_seconds=0.05,
+                    domain_plugins=plugins,
                 ) as resident,
                 ClientWebBridge(
                     resident.socket_path,

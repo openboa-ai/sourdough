@@ -18,8 +18,10 @@ from sourdough.board_control import (
     SEND_CEO_MESSAGE,
     SUBMIT_DECISION_ANSWER,
     WORK_COMMAND,
+    BoardControlRefused,
     bind_board_principal,
     record_ceo_reply,
+    record_decision_application_result,
     record_decision_question,
     upsert_agent_profile,
 )
@@ -417,3 +419,79 @@ class BoardControlPlaneTests(unittest.TestCase):
                     self.root / "checkpoints" / rec_ckpt["result"]["archive_name"]
                 ).is_file()
             )
+
+    def test_record_decision_application_result_validates_statuses_and_allows_failed(
+        self,
+    ):
+        with hold_company_writer(
+            self.store, self.company_id, lease_directory=self.leases
+        ) as writer:
+            record_decision_question(
+                writer,
+                question_id="q-status-check",
+                kind="advisory",
+                title="Check status validation",
+                summary="Confirm",
+                impact={"action": "advisory"},
+                options=("approve",),
+                created_by_agent_id=self.founder_id,
+                now_ns=1_000,
+            )
+            with self.assertRaisesRegex(BoardControlRefused, "application_status"):
+                record_decision_application_result(
+                    writer,
+                    question_id="q-status-check",
+                    application_status="bogus",
+                    delivery_status="delivered",
+                    now_ns=2_000,
+                )
+            with self.assertRaisesRegex(BoardControlRefused, "delivery_status"):
+                record_decision_application_result(
+                    writer,
+                    question_id="q-status-check",
+                    application_status="failed",
+                    delivery_status="bogus",
+                    now_ns=2_000,
+                )
+            with self.assertRaisesRegex(BoardControlRefused, "effect_summary"):
+                record_decision_application_result(
+                    writer,
+                    question_id="q-status-check",
+                    application_status="failed",
+                    delivery_status="delivered",
+                    effect_summary=None,  # type: ignore[arg-type]
+                    now_ns=2_000,
+                )
+            with self.assertRaisesRegex(BoardControlRefused, "effect_summary"):
+                record_decision_application_result(
+                    writer,
+                    question_id="q-status-check",
+                    application_status="failed",
+                    delivery_status="delivered",
+                    effect_summary=123,  # type: ignore[arg-type]
+                    now_ns=2_000,
+                )
+            record_decision_application_result(
+                writer,
+                question_id="q-status-check",
+                application_status="failed",
+                delivery_status="delivered",
+                effect_summary="",
+                now_ns=1_500,
+            )
+            record_decision_application_result(
+                writer,
+                question_id="q-status-check",
+                application_status="failed",
+                delivery_status="delivered",
+                effect_summary="action_refused: validation check",
+                now_ns=2_000,
+            )
+        from sourdough.storage.db import open_reader, read_tx
+
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            row = db.execute(
+                "SELECT application_status, delivery_status FROM decision_question WHERE question_id = ?",
+                ("q-status-check",),
+            ).fetchone()
+            self.assertEqual(row, ("failed", "delivered"))

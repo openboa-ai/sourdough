@@ -10,7 +10,6 @@ from time import monotonic, sleep, time_ns
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import claim_first_duty
 from sourdough.general_ledger import JournalRefused
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
@@ -25,6 +24,7 @@ from sourdough.paper_fee_bridge import (
 )
 from sourdough.paper_order import PaperIntent, submit_paper_order
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.writer_lease import hold_company_writer
 
 

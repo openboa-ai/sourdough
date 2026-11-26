@@ -8,8 +8,8 @@ from time import time_ns
 from typing import TYPE_CHECKING, Protocol
 
 from .company import _connect, _identity
-from .duty_run import PAPER_EXECUTION
 from .storage.schema import enable_domain_v1, is_domain_installed, require_domain
+from .trading.duty import PAPER_EXECUTION
 
 if TYPE_CHECKING:
     from .writer_lease import WriterLease

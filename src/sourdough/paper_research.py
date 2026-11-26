@@ -11,13 +11,18 @@ from uuid import uuid4
 
 from .abandoned_work import has_uncommitted_work
 from .company import _connect, _identity
-from .duty_run import PAPER_EXECUTION, DutyClaim, DutyRefused
-from .first_duty import require_historical_claim, require_paper_authority
+from .duty_run import DutyClaim, DutyRefused
 from .onboarding import has_hired_acceptance
 from .paper_account import PaperAccount, reopen_binding, was_applied_binding_change
 from .paper_decision import PaperDecision
 from .paper_execution import PaperOrderSizing, ReplayAvailability
 from .storage.schema import is_domain_installed
+from .trading.duty import (
+    PAPER_EXECUTION,
+    has_trading_committed_result,
+    require_historical_paper_claim as require_historical_claim,
+    require_paper_authority,
+)
 from .writer_lease import WriterLease
 
 
@@ -408,9 +413,9 @@ def _pending_buy(connection: Connection, duty_id: str) -> bool:
 
 
 def recoverable_hired_research(connection: Connection, duty_id: str) -> bool:
-    return has_uncommitted_work(connection, duty_id) or _pending_buy(
-        connection, duty_id
-    )
+    return has_uncommitted_work(
+        connection, duty_id, committed_predicates=(has_trading_committed_result,)
+    ) or _pending_buy(connection, duty_id)
 
 
 def read_pending_hired_buy(

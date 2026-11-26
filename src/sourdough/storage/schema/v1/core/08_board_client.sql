@@ -52,7 +52,7 @@ CREATE TABLE decision_question (
     resolution_choice TEXT,
     resolution_reason TEXT,
     application_status TEXT NOT NULL DEFAULT 'pending' CHECK (
-        application_status IN ('pending', 'applied', 'declined', 'not_applicable')
+        application_status IN ('pending', 'applied', 'declined', 'not_applicable', 'failed')
     ),
     delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (
         delivery_status IN ('pending', 'delivered', 'acknowledged')

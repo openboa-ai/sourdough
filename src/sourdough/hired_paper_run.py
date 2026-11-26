@@ -8,23 +8,13 @@ from time import monotonic, sleep, time
 
 from .abandoned_work import requeue_uncommitted_work
 from .company import _connect
-from .company_run import (
-    PositionReview,
-    _order_reference,
-    _recover,
-    _refresh_recovery,
-    _retry_reconciliation,
-    _review,
-)
 from .duty_run import (
-    PAPER_EXECUTION,
-    POSITION_REVIEW,
     DutyClaim,
     DutyRefused,
     count_company_runs,
 )
-from .employee_process import EmployeeProcess
-from .first_trade import TradeRefused, _apply_paper_order, resume_opening_research
+from .employee_process import EmployeeProcess, EmployeeProcessRefused
+from .first_trade import _apply_paper_order, resume_opening_research
 from .hiring_run import HiringRun, prepare_hiring
 from .onboarding import first_duty_accepted, invoke_onboarding
 from .paper_account import has_pending_binding_change, reopen_binding
@@ -42,12 +32,23 @@ from .paper_research import (
 )
 from .runtime.engine import CompanyRuntime, build_default_registry
 from .runtime.registry import DutyOutcome
-from .work import (
-    ResultReference,
-    claim_bound_position_review,
-    finish_first_duty,
-    owed_hired_follow_up_owner,
+from .trading.company_run import (
+    PositionReview,
+    _order_reference,
+    _recover,
+    _refresh_recovery,
+    _retry_reconciliation,
+    _review,
 )
+from .trading.duty import (
+    FIRST_DUTY_SCOPE,
+    PAPER_EXECUTION,
+    POSITION_REVIEW,
+    claim_bound_position_review,
+    finish_paper_first_duty as finish_first_duty,
+    has_trading_committed_result,
+)
+from .work import ResultReference, owed_hired_follow_up_owner
 from .writer_lease import WriterLease
 
 
@@ -127,8 +128,8 @@ def _hired_research(
 
     interrupted = None
     try:
-        employee.research_hired(invoke)
-    except TradeRefused as error:
+        employee.scoped_tool_exchange("hired_research_duty", invoke, timeout=100)
+    except EmployeeProcessRefused as error:
         interrupted = error
     receipt = reopen_research_decision(writer.store, claim)
     if receipt is None:
@@ -209,7 +210,7 @@ def run_hired_paper_company(
             budget_from=budget_from,
             on_ready=on_ready,
         ),
-        venue=venue,
+        process_guard=venue,
     )
 
 
@@ -226,7 +227,12 @@ def _run_hired_paper(
     on_ready: Callable[[WriterLease], None],
 ) -> HiredPaperRun:
     reconciled, blocked = _recover(writer, venue, POSITION_REVIEW)
-    requeue_uncommitted_work(writer, purpose=POSITION_REVIEW, hired_only=True)
+    requeue_uncommitted_work(
+        writer,
+        purpose=POSITION_REVIEW,
+        hired_only=True,
+        committed_predicates=(has_trading_committed_result,),
+    )
     on_ready(writer)
     deadline = monotonic() + idle_seconds
     if reconciled.next_query_at is not None:
@@ -271,6 +277,7 @@ def _run_hired_paper(
             first_purpose=PAPER_EXECUTION,
             allow_staffing=remaining >= 2,
             resume_work=recoverable_hired_research,
+            purpose_scopes={PAPER_EXECUTION: FIRST_DUTY_SCOPE},
         )
         claim = hiring.hire_claim
         if claim is None:

@@ -22,7 +22,18 @@ CREATE TABLE standing_grant (
 CREATE TABLE duty (
     id TEXT PRIMARY KEY NOT NULL,
     agent_id TEXT NOT NULL REFERENCES agent(id),
-    state TEXT NOT NULL
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'due',
+            'scheduled',
+            'running',
+            'waiting',
+            'settled',
+            'incomplete',
+            'archived',
+            'handed_off'
+        )
+    )
 ) STRICT;
 
 CREATE TABLE founding_receipt (
@@ -43,7 +54,7 @@ CREATE TABLE work_follow_up (
     result_id TEXT NOT NULL,
     result_revision TEXT NOT NULL,
     available_at INTEGER NOT NULL,
-    purpose TEXT NOT NULL DEFAULT 'position_review'
+    purpose TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE duty_run (

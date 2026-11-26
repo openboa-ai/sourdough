@@ -11,7 +11,6 @@ from time import monotonic, sleep, time_ns
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import claim_first_duty
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxBalance, SandboxPlan
 from sourdough.paper_account import PaperMandate, bind
@@ -20,6 +19,8 @@ from sourdough.paper_execution import PaperIntent, VenueRefused
 from sourdough.paper_order import OrderRefused, OrderReplyUnknown, submit_paper_order
 from sourdough.paper_reconcile import reconcile_paper_orders
 from sourdough.spot_cash import SpotCashUnits
+from sourdough.trading import TradingDomainPlugin
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.work_projection import read_local_board_timeline
 
 
@@ -153,9 +154,9 @@ class NautilusPaperPort(unittest.TestCase):
         self.assertIsNone(
             post_confirmed_fill(store, founded.company_id, order_id, self.venue)
         )
-        [order] = read_local_board_timeline(store, founded.company_id)["paper"][
-            "orders"
-        ]
+        [order] = read_local_board_timeline(
+            store, founded.company_id, domain_plugins=(TradingDomainPlugin(),)
+        )["domains"]["trading"]["paper"]["orders"]
         self.assertEqual(
             (order["status"], order["open_reservation_minor_units"]),
             ("unresolved", 20 * price),
@@ -182,9 +183,9 @@ class NautilusPaperPort(unittest.TestCase):
             )
         result = read_booked_no_fill(store, founded.company_id, order_id)
         self.assertEqual((result.status, result.position_quantity), ("rejected", 0))
-        [order] = read_local_board_timeline(store, founded.company_id)["paper"][
-            "orders"
-        ]
+        [order] = read_local_board_timeline(
+            store, founded.company_id, domain_plugins=(TradingDomainPlugin(),)
+        )["domains"]["trading"]["paper"]["orders"]
         self.assertEqual(
             (order["status"], order["open_reservation_minor_units"]), ("rejected", 0)
         )

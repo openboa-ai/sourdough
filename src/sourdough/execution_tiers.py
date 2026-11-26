@@ -35,6 +35,7 @@ from uuid import uuid4
 
 from .board_control import (
     BOARD_CONTROL_ROLE,
+    AuthorizeBoard,
     BoardCommandOutcome,
     BoardControlConflict,
     BoardControlForbidden,
@@ -44,7 +45,6 @@ from .board_control import (
 )
 from .company import _identity
 from .duty_run import employment_cutoff
-from .paper_risk import AuthorizeBoard
 from .storage.db import open_reader, open_writer, read_tx, write_tx
 from .storage.kernel import (
     CommandConflict,

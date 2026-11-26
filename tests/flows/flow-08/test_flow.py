@@ -15,7 +15,7 @@ from unittest.mock import patch
 from sourdough.accounting_close import CloseRequest, ExpectedCost, close_period
 from sourdough.cli import main
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import claim_first_duty
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.general_ledger import JournalEntry, JournalLine, post_journal
 from sourdough.market_worker import SpotInstrumentTerms
 from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan

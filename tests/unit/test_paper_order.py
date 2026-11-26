@@ -6,9 +6,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import DutyRefused, claim_first_duty
+from sourdough.duty_run import DutyRefused
 from sourdough.paper_account import PaperAccount, PaperMandate, bind
 from sourdough.paper_order import OrderRefused, PaperIntent, submit_paper_order
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 
 
 class ObservingDestination:

@@ -25,11 +25,10 @@ from sourdough.company_assessment import (
 )
 from sourdough.duty_run import (
     ASSESSMENT_REVIEW,
-    PAPER_EXECUTION,
     DutyRefused,
     count_company_runs,
 )
-from sourdough.first_trade import TradeRefused
+from sourdough.employee_process import EmployeeProcessRefused
 from sourdough.hiring_run import run_hiring
 from sourdough.onboarding import (
     accept_first_duty,
@@ -51,12 +50,16 @@ from sourdough.staffing import (
     stage_staffing,
 )
 from sourdough.staffing_tools import StaffingTools
+from sourdough.trading.duty import (
+    FIRST_DUTY_SCOPE,
+    PAPER_EXECUTION,
+    claim_paper_follow_up,
+    finish_paper_first_duty,
+)
 from sourdough.work import (
     ResultReference,
     ReviewDecision,
     claim_assessment_review,
-    claim_follow_up,
-    finish_first_duty,
     settle_review,
 )
 from sourdough.writer_lease import hold_company_writer
@@ -516,10 +519,12 @@ class Staffing(unittest.TestCase):
         def interrupted(operation, run):
             self.assertEqual(operation, "assessment_review")
             run.call("read_work_result", {})
-            raise TradeRefused("Lost employee session before review settlement")
+            raise EmployeeProcessRefused(
+                "Lost employee session before review settlement"
+            )
 
         employee.run_scoped.side_effect = interrupted
-        with self.assertRaisesRegex(TradeRefused, "Lost employee session"):
+        with self.assertRaisesRegex(EmployeeProcessRefused, "Lost employee session"):
             self.activate_assessment(employee)
         (departed,) = self.rows(
             "SELECT run_id, is_current FROM duty_run WHERE purpose='assessment_review'"
@@ -586,13 +591,24 @@ class Staffing(unittest.TestCase):
     def test_general_paper_scheduler_cannot_claim_beyond_a_hire_allocation(self):
         self.authority = replace(self.authority, allowed_scope="paper")
         _, hire = self.arrange_hire(turns=1)
+        paper_scopes = {PAPER_EXECUTION: FIRST_DUTY_SCOPE}
         provision_hire(
-            self.writer, hire.agent_id, PAPER_EXECUTION, lambda _: True, now=self.now
+            self.writer,
+            hire.agent_id,
+            PAPER_EXECUTION,
+            lambda _: True,
+            now=self.now,
+            purpose_scopes=paper_scopes,
         )
-        started = claim_hired_first(self.writer, hire.agent_id, "profile")
+        started = claim_hired_first(
+            self.writer,
+            hire.agent_id,
+            "profile",
+            purpose_scopes=paper_scopes,
+        )
         first = read_first_duty(self.writer, started)
         accept_first_duty(self.writer, started, first["revision"], "Review the market.")
-        due = finish_first_duty(
+        due = finish_paper_first_duty(
             self.store,
             started,
             ResultReference("paper_position", "original", "position", self.now),
@@ -600,7 +616,7 @@ class Staffing(unittest.TestCase):
             purpose=PAPER_EXECUTION,
         )
         self.assertIsNone(
-            claim_follow_up(
+            claim_paper_follow_up(
                 self.store,
                 self.founding.company_id,
                 "profile",

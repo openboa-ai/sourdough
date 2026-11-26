@@ -3,7 +3,7 @@
 -- unified store retirement fencing with replacement digest.
 
 CREATE TABLE installed_domains (
-    domain TEXT PRIMARY KEY CHECK (domain IN ('core', 'paper')),
+    domain TEXT PRIMARY KEY CHECK (domain IN ('core', 'trading', 'paper')),
     schema_version INTEGER NOT NULL CHECK (schema_version = 1),
     pack_sha256 TEXT NOT NULL,
     sqlite_schema_sha256 TEXT NOT NULL,

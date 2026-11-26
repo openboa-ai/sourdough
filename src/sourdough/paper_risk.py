@@ -11,6 +11,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from time import time_ns
 
+from .board_control import AuthorizeBoard
 from .company import _company_version, _identity
 from .storage.db import StorageRefused, open_reader, open_writer, read_tx, write_tx
 from .storage.kernel import (
@@ -29,7 +30,6 @@ PAPER_RISK_COMMAND = "paper-risk-command-v1"
 SUSPEND_NEW_RISK = "suspend_new_risk"
 RESUME_NEW_RISK = "resume_new_risk"
 _RISK_OPERATIONS = (SUSPEND_NEW_RISK, RESUME_NEW_RISK)
-AuthorizeBoard = Callable[[Connection, str, str], str | None]
 
 
 class PaperRiskRefused(Exception):

@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from time import time_ns
 from unittest.mock import patch
 
-from sourdough.cli import _run_paper_window
+from sourdough.trading.cli import _run_paper_window
 from sourdough.company import FoundingTerms, found
 from sourdough.general_ledger import JournalRefused
 from sourdough.market_worker import SpotInstrumentTerms
@@ -166,9 +166,9 @@ class WindowRunDutiesTests(unittest.TestCase):
             turn_budget=1,
         )
         with (
-            patch("sourdough.cli.run_window", side_effect=fake_run_window),
-            patch("sourdough.cli._start_supervisor", side_effect=fake_start),
-            patch("sourdough.cli.time_ns", return_value=now),
+            patch("sourdough.trading.cli.run_window", side_effect=fake_run_window),
+            patch("sourdough.trading.cli._start_supervisor", side_effect=fake_start),
+            patch("sourdough.trading.cli.time_ns", return_value=now),
         ):
             _run_paper_window(args)
         self.assertEqual(captured, [120])

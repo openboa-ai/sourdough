@@ -150,7 +150,8 @@ print(json.dumps(result))
         worker = """
 import os, signal, sys
 from pathlib import Path
-from sourdough import cli, company_run
+from sourdough import cli
+from sourdough.trading import cli as trading_cli, company_run
 marker = Path(sys.argv.pop(1))
 persist = company_run.persist_paper_decision
 def cut(*args, **kwargs):
@@ -165,13 +166,14 @@ raise SystemExit(cli.main())
         driver = """
 import sys
 from sourdough import cli
+from sourdough.trading import cli as trading_cli
 worker, marker = sys.argv[1:3]
 del sys.argv[1:3]
-supervise = cli.supervise_worker
+supervise = trading_cli.supervise_worker
 def launch(command, store, company_id, **options):
     child = [sys.executable, "-IB", "-c", worker, marker, *command[4:]]
     return supervise(child, store, company_id, **options)
-cli.supervise_worker = launch
+trading_cli.supervise_worker = launch
 raise SystemExit(cli.main())
 """
         for action, count in (("hold", 1), ("buy", 2)):
@@ -465,6 +467,7 @@ from pathlib import Path
 from time import sleep
 from sourdough import cli
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading import cli as trading_cli
 
 marker = Path(sys.argv.pop(1))
 class ReceiptBarrier(FixedQuoteVenue):
@@ -473,7 +476,7 @@ class ReceiptBarrier(FixedQuoteVenue):
         with marker.open("x") as stream:
             json.dump({"pid":os.getpid(),"order_id":order_id},stream)
         sleep(30)
-cli.FixedQuoteVenue = ReceiptBarrier
+trading_cli.FixedQuoteVenue = ReceiptBarrier
 raise SystemExit(cli.main())
 """
         driver = """
@@ -665,11 +668,12 @@ raise SystemExit(0 if bound.completed else 1)
         before = self.store.read_bytes()
         view = self.success("inspect-work", self.store, *self.identity)
         first, follow_up = view["duties"]
-        (order,) = view["paper"]["orders"]
+        paper_view = view["domains"]["trading"]["paper"]
+        (order,) = paper_view["orders"]
         self.assertEqual(first["decision"]["finding_id"], receipt["finding_id"])
         self.assertEqual(first["decision"]["decision_id"], order["action_id"])
         self.assertEqual(follow_up["due_at"], chain[5])
-        self.assertEqual(view["paper"]["booked_position"], 2)
+        self.assertEqual(paper_view["booked_position"], 2)
         self.assertEqual(self.store.read_bytes(), before)
 
     def test_research_investigation_without_order_arms_a_read_only_follow_up(self):

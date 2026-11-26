@@ -19,6 +19,7 @@ from pathlib import Path
 from time import sleep
 from sourdough import cli
 from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading import cli as trading_cli
 
 barrier = Path(sys.argv.pop(1))
 class WithheldReceipt(FixedQuoteVenue):
@@ -27,19 +28,20 @@ class WithheldReceipt(FixedQuoteVenue):
         with barrier.open("x") as stream:
             json.dump({"pid":os.getpid(),"order_id":order_id}, stream)
         sleep(120)
-cli.FixedQuoteVenue = WithheldReceipt
+trading_cli.FixedQuoteVenue = WithheldReceipt
 raise SystemExit(cli.main())
 """
 SUPERVISED_FIXTURE = """
 import sys
 from sourdough import cli
+from sourdough.trading import cli as trading_cli
 marker, worker = sys.argv[1:3]
 del sys.argv[1:3]
-supervise = cli.supervise_worker
+supervise = trading_cli.supervise_worker
 def trace_transport(command, store, company_id, **options):
     candidate = [sys.executable, "-IB", "-c", worker, marker, *command[4:]]
     return supervise(candidate, store, company_id, **options)
-cli.supervise_worker = trace_transport
+trading_cli.supervise_worker = trace_transport
 raise SystemExit(cli.main())
 """
 
@@ -340,8 +342,9 @@ def observe(output: Path, employee: Path):
     assert read(store, "PRAGMA foreign_key_check") == []
     before_inspection = store.read_bytes()
     projection = cli("inspect-work", store, *identity)
-    orders = projection["paper"]["orders"]
-    assert projection["paper"]["booked_position"] == quantity
+    paper_projection = projection["domains"]["trading"]["paper"]
+    orders = paper_projection["orders"]
+    assert paper_projection["booked_position"] == quantity
     assert (
         len(orders) == 1
         and orders[0]["fill_id"] == fill_id

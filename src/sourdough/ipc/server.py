@@ -10,7 +10,7 @@ import socket
 import sqlite3
 import stat
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
 from dataclasses import dataclass
@@ -20,7 +20,6 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..board_control import (
-    ACTIVATE_STRATEGY_RELEASE,
     CANCEL_WORK,
     CEO_CHAT_COMMAND,
     CHECKPOINT_COMMAND,
@@ -32,18 +31,16 @@ from ..board_control import (
     REGISTER_OWNER,
     RESTRICTION_COMMAND,
     RESUME_COMPANY,
-    ROLLBACK_STRATEGY_DEPLOYMENT,
     SEND_CEO_MESSAGE,
-    STRATEGY_COMMAND,
     SUBMIT_DECISION_ANSWER,
     WORK_COMMAND,
+    AuthorizeBoard,
     BoardControlConflict,
     BoardControlForbidden,
     BoardControlRefused,
     apply_company_restriction,
     clear_company_restriction,
     execute_cut_checkpoint_command,
-    execute_strategy_command,
     execute_work_control_command,
     make_board_authorizer,
     post_ceo_message,
@@ -68,11 +65,15 @@ from ..paper_risk import (
     PAPER_RISK_COMMAND,
     RESUME_NEW_RISK,
     SUSPEND_NEW_RISK,
-    AuthorizeBoard,
     PaperRiskRefused,
     PaperSuspension,
     effective_paper_risk,
     suspend_paper_risk,
+)
+from ..runtime.domains import (
+    CommandDescriptor,
+    CommandDispatchContext,
+    DomainPlugin,
 )
 from ..storage.db import StorageRefused, open_reader, read_tx
 from ..storage.kernel import max_event_seq
@@ -230,6 +231,7 @@ class CompanyDaemon:
         bootstrap_challenge: str | None = None,
         request_timeout: float = 10.0,
         on_commit: Callable[[], None] | None = None,
+        domain_plugins: Sequence[DomainPlugin] = (),
     ) -> None:
         self._store = store.absolute()
         self._company_id = company_id
@@ -252,6 +254,11 @@ class CompanyDaemon:
         self._service_incarnation_id = secrets.token_hex(12)
         self._request_timeout = validate_timeout_seconds(request_timeout)
         self._on_commit = on_commit
+        self._domain_plugins = tuple(domain_plugins)
+        self._plugin_commands: dict[tuple[str, str], CommandDescriptor] = {}
+        for plugin in self._domain_plugins:
+            for cmd in plugin.contribute_commands():
+                self._plugin_commands[(cmd.command_type, cmd.contract_version)] = cmd
 
         self._stack: ExitStack | None = None
         self._writer: WriterLease | None = None
@@ -556,8 +563,6 @@ class CompanyDaemon:
             SUBMIT_DECISION_ANSWER: [DECISION_COMMAND],
             PAUSE_COMPANY: [RESTRICTION_COMMAND],
             RESUME_COMPANY: [RESTRICTION_COMMAND],
-            ACTIVATE_STRATEGY_RELEASE: [STRATEGY_COMMAND],
-            ROLLBACK_STRATEGY_DEPLOYMENT: [STRATEGY_COMMAND],
             INTERRUPT_RUN: [WORK_COMMAND],
             CANCEL_WORK: [WORK_COMMAND],
             CUT_CHECKPOINT: [CHECKPOINT_COMMAND],
@@ -567,6 +572,10 @@ class CompanyDaemon:
         }
         if self._engine_directory is not None:
             supported[RESUME_NEW_RISK] = [PAPER_RISK_COMMAND]
+        for cmd in self._plugin_commands.values():
+            versions = supported.setdefault(cmd.command_type, [])
+            if cmd.contract_version not in versions:
+                versions.append(cmd.contract_version)
         return supported
 
     def _principal_hint(self, request: HttpRequest) -> str | None:
@@ -884,7 +893,11 @@ class CompanyDaemon:
                     (self._company_id,),
                 ).fetchone()[0]
             )
-            paper_risk_state = effective_paper_risk(db) if "paper" in domains else None
+            paper_risk_state = (
+                effective_paper_risk(db)
+                if ("paper" in domains or "trading" in domains)
+                else None
+            )
             paper_suspended = (
                 bool(paper_risk_state.suspended) if paper_risk_state else False
             )
@@ -943,7 +956,7 @@ class CompanyDaemon:
             )
             return
         timeline, seq = read_local_board_timeline_with_seq(
-            self._store, self._company_id
+            self._store, self._company_id, domain_plugins=self._domain_plugins
         )
         if contract_revision == WORK_TIMELINE_V2:
             dev, ino = writer.store_key
@@ -1372,19 +1385,32 @@ class CompanyDaemon:
                     principal_hint=principal_hint,
                     peer_pid=peer.pid,
                 )
-            elif contract_version == STRATEGY_COMMAND and command_type in (
-                ACTIVATE_STRATEGY_RELEASE,
-                ROLLBACK_STRATEGY_DEPLOYMENT,
-            ):
-                outcome = execute_strategy_command(
-                    writer,
-                    command_id=idem_key,
-                    command_type=command_type,
-                    preconditions=preconditions,
-                    payload=payload,
-                    authorize=self._authorize_board,
-                    principal_hint=principal_hint,
-                    peer_pid=peer.pid,
+            elif (command_type, contract_version) in self._plugin_commands:
+                cmd_desc = self._plugin_commands[(command_type, contract_version)]
+                if (
+                    cmd_desc.precondition_keys is not None
+                    and set(preconditions.keys()) != cmd_desc.precondition_keys
+                ):
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                outcome = cmd_desc.execute(
+                    CommandDispatchContext(
+                        writer=writer,
+                        company_id=self._company_id,
+                        command_id=idem_key,
+                        command_type=command_type,
+                        contract_version=contract_version,
+                        preconditions=preconditions,
+                        payload=payload,
+                        authorize_board=self._authorize_board,
+                        principal_hint=principal_hint,
+                        peer_pid=peer.pid,
+                    )
                 )
             elif (
                 contract_version == CHECKPOINT_COMMAND
