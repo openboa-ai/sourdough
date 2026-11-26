@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/openboa-ai/yogurt/main/design/assets/projects/sourdough.svg" alt="Sourdough project mark" width="96">
+
 # sourdough
 
 put the dough to work
