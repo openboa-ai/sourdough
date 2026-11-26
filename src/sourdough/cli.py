@@ -13,6 +13,7 @@ from time import sleep, time_ns
 
 from sourdough.accounting_close import CloseRefused
 from sourdough.assessment_run import run_assessment_company
+from sourdough.board_control import BoardControlRefused, bind_board_principal
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
 from sourdough.company_assessment import SourceRecord, seal_assessment_source
 from sourdough.company_checkpoint import (
@@ -29,7 +30,7 @@ from sourdough.fund_returns import ReturnRefused
 from sourdough.general_ledger import JournalRefused
 from sourdough.hired_paper_run import run_hired_paper_company
 from sourdough.hiring_run import run_hiring
-from sourdough.ipc import CompanyDaemon, ControlPlaneClient, IpcRefused
+from sourdough.ipc import ClientWebBridge, CompanyDaemon, ControlPlaneClient, IpcRefused
 from sourdough.market_runtime import observe_market
 from sourdough.market_worker import MarketRefused
 from sourdough.nautilus_runtime import bind_paper as bind_nautilus_paper
@@ -256,8 +257,32 @@ def main() -> int:
     daemon_cmd.add_argument("--socket", type=Path)
     daemon_cmd.add_argument("--lease-dir", type=Path)
     daemon_cmd.add_argument("--engine-dir", type=Path)
+    daemon_cmd.add_argument("--evaluator-store", type=Path)
     daemon_cmd.add_argument("--store-key", type=_store_key)
     daemon_cmd.add_argument("--ready-fd", type=int)
+
+    web_cmd = commands.add_parser(
+        "client-web",
+        help="Serve the authenticated loopback Board Client UI over the local CompanyDaemon UDS",
+    )
+    web_cmd.add_argument("--socket", required=True, type=Path)
+    web_cmd.add_argument("--port", type=int, default=0)
+    web_cmd.add_argument("--static-dir", type=Path)
+    web_cmd.add_argument("--pending-dir", type=Path)
+    web_cmd.add_argument("--principal")
+    web_cmd.add_argument("--timeout-seconds", type=float, default=10.0)
+
+    bind_board_cmd = commands.add_parser(
+        "bind-board",
+        help="Bind a Board principal role (board_viewer or board_control) in the company store",
+    )
+    bind_board_cmd.add_argument("store", type=Path)
+    bind_board_cmd.add_argument("--company-id", required=True)
+    bind_board_cmd.add_argument("--principal-id", required=True)
+    bind_board_cmd.add_argument(
+        "--role", choices=("board_viewer", "board_control"), default="board_control"
+    )
+    bind_board_cmd.add_argument("--scope-ref", default="company:all")
 
     bridge_cmd = commands.add_parser(
         "client-bridge",
@@ -506,6 +531,7 @@ def main() -> int:
                     lease_directory=args.lease_dir,
                     expected_store_key=args.store_key,
                     engine_directory=args.engine_dir,
+                    evaluator_store=args.evaluator_store,
                 ) as daemon:
                     announcement = json.dumps(asdict(daemon.info), sort_keys=True)
                     if args.ready_fd is not None:
@@ -521,6 +547,53 @@ def main() -> int:
                 signal.signal(signal.SIGTERM, previous_sigterm)
                 signal.signal(signal.SIGHUP, previous_sighup)
             return 0
+        elif args.command == "client-web":
+            stop_requested = False
+
+            def _request_web_stop(_signum, _frame):
+                nonlocal stop_requested
+                stop_requested = True
+
+            previous_sigint = signal.signal(signal.SIGINT, _request_web_stop)
+            previous_sigterm = signal.signal(signal.SIGTERM, _request_web_stop)
+            previous_sighup = signal.signal(signal.SIGHUP, _request_web_stop)
+            try:
+                with ClientWebBridge(
+                    args.socket,
+                    port=args.port,
+                    static_dir=args.static_dir,
+                    pending_dir=args.pending_dir,
+                    principal=args.principal,
+                    timeout_seconds=args.timeout_seconds,
+                ) as bridge:
+                    info = bridge.info
+                    print(
+                        json.dumps(
+                            {
+                                "host": info.host,
+                                "port": info.port,
+                                "url": info.url,
+                                "socket_path": info.socket_path,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    while not stop_requested:
+                        sleep(0.25)
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint)
+                signal.signal(signal.SIGTERM, previous_sigterm)
+                signal.signal(signal.SIGHUP, previous_sighup)
+            return 0
+        elif args.command == "bind-board":
+            with hold_company_writer(args.store, args.company_id) as writer:
+                result = bind_board_principal(
+                    writer,
+                    principal_id=args.principal_id,
+                    role_name=args.role,
+                    scope_ref=args.scope_ref,
+                )
         elif args.command == "client-bridge":
             client = ControlPlaneClient(
                 args.socket, timeout_seconds=args.timeout_seconds
@@ -846,6 +919,7 @@ def main() -> int:
                     ),
                 )
     except (
+        BoardControlRefused,
         CheckpointRefused,
         CloseRefused,
         FoundingRefused,

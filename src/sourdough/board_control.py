@@ -1,0 +1,1918 @@
+"""Authoritative Board Client authority, CEO direct messaging, approvals, and restrictions.
+
+Owns board_binding, ceo_message, decision_question, restriction_cause, and agent_profile.
+All state-mutating Board commands persist idempotent command_receipt rows and redacted
+append-only audit_event entries inside a single BEGIN IMMEDIATE SQLite transaction.
+Routine employee retirement remains strictly CEO-delegated (no retire_employee command).
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+from contextlib import closing
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
+from sqlite3 import Connection
+from time import time_ns
+from typing import Any
+from uuid import uuid4
+
+from .company import _identity
+from .paper_risk import AuthorizeBoard
+from .runtime.work_kernel import (
+    WorkKernelRefused,
+    cancel_work_item,
+    interrupt_work_run,
+)
+from .storage.checkpoint import CheckpointRefused, checkpoint_store
+from .storage.db import open_reader, open_writer, read_tx, write_tx
+from .storage.kernel import (
+    CommandConflict,
+    CommandReceipt,
+    CommandUnauthorized,
+    admit_command_receipt,
+    append_audit_event,
+    read_command_receipt,
+)
+from .strategy_comparison import (
+    StrategyComparisonRefused,
+    activate_strategy_release,
+    rollback_strategy_deployment,
+)
+from .writer_lease import WriterLease
+
+CEO_CHAT_COMMAND = "ceo-chat-command-v1"
+SEND_CEO_MESSAGE = "send_ceo_message"
+
+DECISION_COMMAND = "decision-command-v1"
+SUBMIT_DECISION_ANSWER = "submit_decision_answer"
+
+RESTRICTION_COMMAND = "restriction-command-v1"
+PAUSE_COMPANY = "pause_company"
+RESUME_COMPANY = "resume_company"
+
+STRATEGY_COMMAND = "strategy-command-v1"
+ACTIVATE_STRATEGY_RELEASE = "activate_strategy_release"
+ROLLBACK_STRATEGY_DEPLOYMENT = "rollback_strategy_deployment"
+
+WORK_COMMAND = "work-command-v1"
+INTERRUPT_RUN = "interrupt_run"
+CANCEL_WORK = "cancel_work"
+
+CHECKPOINT_COMMAND = "checkpoint-command-v1"
+CUT_CHECKPOINT = "cut_checkpoint"
+
+RBAC_COMMAND = "rbac-command-v1"
+REGISTER_OWNER = "register_owner"
+BIND_BOARD_PRINCIPAL = "bind_board_principal"
+
+BOARD_VIEWER_ROLE = "board_viewer"
+BOARD_CONTROL_ROLE = "board_control"
+_VALID_ROLES = frozenset({BOARD_VIEWER_ROLE, BOARD_CONTROL_ROLE})
+
+_ALLOWED_AVATAR_VARIANTS = frozenset(
+    {
+        "wide-oval-top",
+        "wide-oval-bottom",
+        "wide-oval-right",
+        "wide-oval-left",
+        "low-dome-bottom",
+        "low-dome-left",
+        "low-dome-right",
+        "round-triangle-bottom",
+        "round-triangle-right",
+        "round-triangle-left",
+        "tall-capsule-top",
+        "tall-capsule-bottom",
+        "tall-capsule-right",
+        "tall-capsule-left",
+        "round-diamond-left",
+        "round-diamond-right",
+        "wide-base-top",
+        "wide-base-bottom",
+        "wide-base-right",
+        "wide-crown-top",
+        "wide-crown-left",
+        "wide-crown-right",
+        "tilted-oval-top",
+        "tilted-oval-bottom",
+        "tilted-oval-left",
+        "drop-bottom",
+        "drop-right",
+        "drop-left",
+        "round-star-right",
+        "round-star-left",
+        "bean-top",
+        "bean-bottom",
+        "bean-left",
+        "round-pentagon-bottom",
+        "round-pentagon-right",
+        "round-pentagon-left",
+        "round-heart-right",
+        "round-heart-left",
+    }
+)
+
+
+class BoardControlRefused(Exception):
+    """A Board Client governance or control request was invalid or refused."""
+
+
+class BoardControlForbidden(BoardControlRefused):
+    """The caller lacks required board_control authority or targeted a disallowed entity."""
+
+
+class BoardControlConflict(BoardControlRefused):
+    """A command_id was reused with conflicting payload or preconditions."""
+
+
+@dataclass(frozen=True)
+class BoardAccess:
+    bootstrap_locked: bool
+    principal_id: str | None
+    role: str | None
+    binding_revision: int
+
+
+@dataclass(frozen=True)
+class BoardCommandOutcome:
+    command_id: str
+    command_type: str
+    state: str
+    disposition: str
+    denial_code: str | None
+    effective_revision: int
+    recorded_at_ns: int
+    peer_pid: int | None
+    result: dict[str, Any]
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _require_text(value: Any, field: str, *, max_len: int = 256) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > max_len:
+        raise BoardControlRefused(f"Invalid or missing {field}")
+    return value.strip()
+
+
+def _require_nonneg_int(value: Any, field: str) -> int:
+    if type(value) is not int or not 0 <= value < 2**63:
+        raise BoardControlRefused(f"Invalid {field}")
+    return value
+
+
+def _current_charter_revision(connection: Connection, company_id: str) -> str:
+    row = connection.execute(
+        "SELECT charter_revision FROM company WHERE id = ?",
+        (company_id,),
+    ).fetchone()
+    if row is None:
+        raise BoardControlRefused("Company identity not found")
+    return str(row[0])
+
+
+def _founder_agent_id(connection: Connection, company_id: str) -> str:
+    row = connection.execute(
+        "SELECT founder_id FROM founding_receipt WHERE company_id = ?",
+        (company_id,),
+    ).fetchone()
+    if row is None:
+        raise BoardControlRefused("Company founder record is missing")
+    return str(row[0])
+
+
+def resolve_board_access(
+    connection: Connection,
+    company_id: str,
+    *,
+    authorize_board: AuthorizeBoard | None = None,
+    operation: str = "inspect",
+    principal_hint: str | None = None,
+) -> BoardAccess:
+    """Resolve current board principal and role fail-closed inside a SQLite snapshot."""
+    if _identity(connection) != company_id:
+        raise BoardControlForbidden("Company identity mismatch")
+
+    if authorize_board is not None:
+        principal = authorize_board(connection, company_id, operation)
+        if isinstance(principal, str) and principal.strip():
+            return BoardAccess(
+                bootstrap_locked=False,
+                principal_id=principal.strip(),
+                role=BOARD_CONTROL_ROLE,
+                binding_revision=1,
+            )
+        return BoardAccess(
+            bootstrap_locked=False,
+            principal_id=None,
+            role=None,
+            binding_revision=0,
+        )
+
+    total_ever_bound = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM board_binding WHERE company_id = ?",
+            (company_id,),
+        ).fetchone()[0]
+    )
+    if total_ever_bound == 0:
+        return BoardAccess(
+            bootstrap_locked=True,
+            principal_id=None,
+            role=None,
+            binding_revision=0,
+        )
+
+    rows = connection.execute(
+        """SELECT principal_id, role_name, binding_revision
+           FROM board_binding
+           WHERE company_id = ? AND revoked_at_ns IS NULL
+           ORDER BY CASE role_name WHEN 'board_viewer' THEN 0 ELSE 1 END,
+                    bound_at_ns ASC, principal_id ASC""",
+        (company_id,),
+    ).fetchall()
+    if not rows:
+        return BoardAccess(
+            bootstrap_locked=False,
+            principal_id=None,
+            role=None,
+            binding_revision=0,
+        )
+    if principal_hint is not None:
+        for row in rows:
+            if str(row[0]) == principal_hint:
+                return BoardAccess(
+                    bootstrap_locked=False,
+                    principal_id=str(row[0]),
+                    role=str(row[1]),
+                    binding_revision=int(row[2]),
+                )
+        return BoardAccess(
+            bootstrap_locked=False,
+            principal_id=None,
+            role=None,
+            binding_revision=0,
+        )
+    # Least-privilege default when principal_hint is omitted: if a single principal
+    # is bound, resolve it; if multiple roles exist, prefer board_viewer over board_control.
+    top = rows[0]
+    return BoardAccess(
+        bootstrap_locked=False,
+        principal_id=str(top[0]),
+        role=str(top[1]),
+        binding_revision=int(top[2]),
+    )
+
+
+def _require_board_control(
+    connection: Connection,
+    company_id: str,
+    *,
+    authorize_board: AuthorizeBoard | None,
+    operation: str,
+    principal_hint: str | None = None,
+) -> str:
+    access = resolve_board_access(
+        connection,
+        company_id,
+        authorize_board=authorize_board,
+        operation=operation,
+        principal_hint=principal_hint,
+    )
+    if access.bootstrap_locked:
+        raise BoardControlForbidden(
+            "Company is bootstrap-locked until an initial owner is bound"
+        )
+    if access.role != BOARD_CONTROL_ROLE or not access.principal_id:
+        raise BoardControlForbidden(
+            "Current board_control authority is required for this command"
+        )
+    return access.principal_id
+
+
+def make_board_authorizer(
+    *,
+    authorize_board: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+) -> AuthorizeBoard:
+    """Create a paper_risk-compatible AuthorizeBoard backed by board_binding."""
+
+    def _authorize(
+        connection: Connection, company_id: str, operation: str
+    ) -> str | None:
+        try:
+            return _require_board_control(
+                connection,
+                company_id,
+                authorize_board=authorize_board,
+                operation=operation,
+                principal_hint=principal_hint,
+            )
+        except BoardControlForbidden:
+            return None
+
+    return _authorize
+
+
+def bind_board_principal(
+    writer: WriterLease,
+    *,
+    principal_id: str,
+    role_name: str,
+    scope_ref: str = "company:all",
+    actor_id: str = "system",
+    now_ns: int | None = None,
+) -> BoardAccess:
+    """Bind or update a Board principal role directly under WriterLease."""
+    safe_principal = _require_text(principal_id, "principal_id", max_len=128)
+    safe_scope = _require_text(scope_ref, "scope_ref", max_len=128)
+    safe_actor = _require_text(actor_id, "actor_id", max_len=128)
+    if role_name not in _VALID_ROLES:
+        raise BoardControlRefused("Unsupported board role")
+    writer.verify()
+    timestamp = time_ns() if now_ns is None else now_ns
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        if _identity(db) != writer.company_id:
+            raise BoardControlForbidden("Company identity mismatch")
+        existing = db.execute(
+            """SELECT binding_revision FROM board_binding
+               WHERE company_id = ? AND principal_id = ?""",
+            (writer.company_id, safe_principal),
+        ).fetchone()
+        if existing is None:
+            revision = 1
+            db.execute(
+                """INSERT INTO board_binding (
+                       principal_id, company_id, role_name, scope_ref,
+                       binding_revision, bound_at_ns, revoked_at_ns
+                   ) VALUES (?, ?, ?, ?, 1, ?, NULL)""",
+                (safe_principal, writer.company_id, role_name, safe_scope, timestamp),
+            )
+        else:
+            revision = int(existing[0]) + 1
+            db.execute(
+                """UPDATE board_binding
+                   SET role_name = ?, scope_ref = ?, binding_revision = ?,
+                       bound_at_ns = ?, revoked_at_ns = NULL
+                   WHERE company_id = ? AND principal_id = ?""",
+                (
+                    role_name,
+                    safe_scope,
+                    revision,
+                    timestamp,
+                    writer.company_id,
+                    safe_principal,
+                ),
+            )
+        append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="governance",
+            entity_type="board_binding",
+            entity_id=sha256(safe_principal.encode("utf-8")).hexdigest()[:16],
+            event_type="governance.board_principal_bound",
+            actor_id=safe_actor,
+            payload={"role_name": role_name, "binding_revision": revision},
+            recorded_at_ns=timestamp,
+        )
+    return BoardAccess(
+        bootstrap_locked=False,
+        principal_id=safe_principal,
+        role=role_name,
+        binding_revision=revision,
+    )
+
+
+def register_owner_command(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    principal_id: str,
+    challenge: str,
+    proof: str,
+    expected_challenge: str,
+    peer_pid: int | None = None,
+    now_ns: int | None = None,
+) -> BoardCommandOutcome:
+    """Bind the initial board_control owner while the company is bootstrap_locked."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    safe_principal = _require_text(principal_id, "principal_id", max_len=128)
+    safe_challenge = _require_text(challenge, "challenge", max_len=128)
+    safe_proof = _require_text(proof, "proof", max_len=128)
+    expected_proof = sha256(
+        f"{expected_challenge}:{writer.company_id}".encode("utf-8")
+    ).hexdigest()
+    if not hmac.compare_digest(
+        safe_challenge, expected_challenge
+    ) or not hmac.compare_digest(safe_proof, expected_proof):
+        raise BoardControlForbidden("Owner bootstrap proof verification failed")
+
+    preconditions = {"bootstrap_state": "locked"}
+    payload_hash = _canonical_sha256({"principal_id": safe_principal})
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        if _identity(db) != writer.company_id:
+            raise BoardControlForbidden("Company identity mismatch")
+        existing_receipt = db.execute(
+            """SELECT company_id, command_id, actor_id, peer_pid, command_type,
+                      contract_version, payload_sha256, preconditions_json, state,
+                      denial_code, result_json, applied_seq, created_at_ns, finalized_at_ns
+               FROM command_receipt
+               WHERE company_id = ? AND command_id = ?""",
+            (writer.company_id, safe_cmd),
+        ).fetchone()
+        if existing_receipt is not None:
+            prior = CommandReceipt(*existing_receipt)
+            if (
+                prior.actor_id != safe_principal
+                or prior.command_type != REGISTER_OWNER
+                or prior.contract_version != RBAC_COMMAND
+                or prior.payload_sha256 != payload_hash
+            ):
+                raise BoardControlConflict(
+                    "Command ID is already in use with conflicting terms"
+                )
+            return _outcome_from_receipt(prior)
+
+        bound_count = int(
+            db.execute(
+                "SELECT COUNT(*) FROM board_binding WHERE company_id = ?",
+                (writer.company_id,),
+            ).fetchone()[0]
+        )
+        if bound_count > 0:
+            raise BoardControlForbidden("Company owner is already registered")
+
+        db.execute(
+            """INSERT INTO board_binding (
+                   principal_id, company_id, role_name, scope_ref,
+                   binding_revision, bound_at_ns, revoked_at_ns
+               ) VALUES (?, ?, 'board_control', 'company:all', 1, ?, NULL)""",
+            (safe_principal, writer.company_id, timestamp),
+        )
+        seq = append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="governance",
+            entity_type="board_binding",
+            entity_id=sha256(safe_principal.encode("utf-8")).hexdigest()[:16],
+            event_type="governance.owner_registered",
+            actor_id=safe_principal,
+            command_id=safe_cmd,
+            payload={"role_name": BOARD_CONTROL_ROLE, "binding_revision": 1},
+            recorded_at_ns=timestamp,
+        )
+        result = {
+            "disposition": "applied",
+            "effective_revision": 1,
+            "recorded_at_ns": timestamp,
+            "role_name": BOARD_CONTROL_ROLE,
+        }
+        try:
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=safe_principal,
+                peer_pid=peer_pid,
+                command_type=REGISTER_OWNER,
+                contract_version=RBAC_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=preconditions,
+                state="applied",
+                result=result,
+                applied_seq=seq,
+                now_ns=timestamp,
+            )
+        except CommandConflict as error:
+            raise BoardControlConflict(
+                "Command ID is already in use with conflicting terms"
+            ) from error
+        return _outcome_from_receipt(receipt)
+
+
+def upsert_agent_profile(
+    writer: WriterLease,
+    *,
+    agent_id: str,
+    display_name: str,
+    role_label: str,
+    avatar_variant: str = "wide-oval-top",
+    monthly_budget_minor: int = 0,
+    now_ns: int | None = None,
+) -> None:
+    """Persist display metadata and monthly operating budget for an existing agent."""
+    safe_agent = _require_text(agent_id, "agent_id", max_len=128)
+    safe_name = _require_text(display_name, "display_name", max_len=120)
+    safe_role = _require_text(role_label, "role_label", max_len=80)
+    if avatar_variant not in _ALLOWED_AVATAR_VARIANTS:
+        raise BoardControlRefused("Unsupported agent avatar variant")
+    safe_budget = _require_nonneg_int(monthly_budget_minor, "monthly_budget_minor")
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        if _identity(db) != writer.company_id:
+            raise BoardControlForbidden("Company identity mismatch")
+        exists = db.execute(
+            "SELECT 1 FROM agent WHERE id = ? AND company_id = ?",
+            (safe_agent, writer.company_id),
+        ).fetchone()
+        if exists is None:
+            raise BoardControlRefused("Agent does not belong to this company")
+        db.execute(
+            """INSERT INTO agent_profile (
+                   agent_id, company_id, display_name, role_label,
+                   avatar_variant, monthly_budget_minor, updated_at_ns
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(agent_id) DO UPDATE SET
+                   display_name = excluded.display_name,
+                   role_label = excluded.role_label,
+                   avatar_variant = excluded.avatar_variant,
+                   monthly_budget_minor = excluded.monthly_budget_minor,
+                   updated_at_ns = excluded.updated_at_ns""",
+            (
+                safe_agent,
+                writer.company_id,
+                safe_name,
+                safe_role,
+                avatar_variant,
+                safe_budget,
+                timestamp,
+            ),
+        )
+
+
+def post_ceo_message(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    target_agent_id: str,
+    charter_revision: str,
+    body: str,
+    expected_ceo_agent_id: str | None = None,
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+    peer_pid: int | None = None,
+    context_kind: str | None = None,
+    context_id: str | None = None,
+    context_label: str | None = None,
+    now_ns: int | None = None,
+) -> BoardCommandOutcome:
+    """Record an advisory Board -> CEO 1:1 message. Strictly refuses non-CEO targets."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    safe_target = _require_text(target_agent_id, "target_agent_id", max_len=128)
+    safe_expected_ceo = (
+        _require_text(expected_ceo_agent_id, "ceo_agent_id", max_len=128)
+        if expected_ceo_agent_id is not None
+        else safe_target
+    )
+    if safe_expected_ceo != safe_target:
+        raise BoardControlForbidden(
+            "Precondition ceo_agent_id must match payload target_agent_id"
+        )
+    safe_charter = _require_text(charter_revision, "charter_revision", max_len=128)
+    safe_body = _require_text(body, "body", max_len=4000)
+    safe_ctx_kind = (
+        _require_text(context_kind, "context_kind", max_len=64)
+        if context_kind is not None
+        else None
+    )
+    safe_ctx_id = (
+        _require_text(context_id, "context_id", max_len=128)
+        if context_id is not None
+        else None
+    )
+    safe_ctx_label = (
+        _require_text(context_label, "context_label", max_len=240)
+        if context_label is not None
+        else None
+    )
+    preconditions = {
+        "ceo_agent_id": safe_target,
+        "charter_revision": safe_charter,
+    }
+    payload_hash = _canonical_sha256(
+        {
+            "target_agent_id": safe_target,
+            "body": safe_body,
+            "context_kind": safe_ctx_kind,
+            "context_id": safe_ctx_id,
+            "context_label": safe_ctx_label,
+        }
+    )
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        principal = _require_board_control(
+            db,
+            writer.company_id,
+            authorize_board=authorize,
+            operation=SEND_CEO_MESSAGE,
+            principal_hint=principal_hint,
+        )
+        founder_id = _founder_agent_id(db, writer.company_id)
+        if safe_target != founder_id:
+            raise BoardControlForbidden(
+                "Advisory messages may only target the designated CEO agent"
+            )
+        # Check idempotent replay first so replays succeed even after charter bumps.
+        replayed = _maybe_replay_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            command_type=SEND_CEO_MESSAGE,
+            contract_version=CEO_CHAT_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+        )
+        if replayed is not None:
+            return replayed
+
+        current_charter = _current_charter_revision(db, writer.company_id)
+        if current_charter != safe_charter:
+            result = {
+                "disposition": "conflicting_revision",
+                "effective_revision": 0,
+                "recorded_at_ns": timestamp,
+            }
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=principal,
+                peer_pid=peer_pid,
+                command_type=SEND_CEO_MESSAGE,
+                contract_version=CEO_CHAT_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=preconditions,
+                state="denied",
+                denial_code="conflicting_revision",
+                result=result,
+                now_ns=timestamp,
+            )
+            return _outcome_from_receipt(receipt)
+
+        message_id = f"msg-{uuid4().hex[:16]}"
+        db.execute(
+            """INSERT INTO ceo_message (
+                   message_id, company_id, sender_kind, sender_id, target_agent_id,
+                   body, context_kind, context_id, context_label, command_id,
+                   delivery_state, recorded_at_ns
+               ) VALUES (?, ?, 'board', ?, ?, ?, ?, ?, ?, ?, 'recorded', ?)""",
+            (
+                message_id,
+                writer.company_id,
+                principal,
+                founder_id,
+                safe_body,
+                safe_ctx_kind,
+                safe_ctx_id,
+                safe_ctx_label,
+                safe_cmd,
+                timestamp,
+            ),
+        )
+        msg_count = int(
+            db.execute(
+                "SELECT COUNT(*) FROM ceo_message WHERE company_id = ?",
+                (writer.company_id,),
+            ).fetchone()[0]
+        )
+        seq = append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="messages",
+            entity_type="ceo_message",
+            entity_id=message_id,
+            event_type="board.ceo_message_sent",
+            actor_id=principal,
+            command_id=safe_cmd,
+            payload={
+                "message_id": message_id,
+                "target_agent_id": founder_id,
+                "has_context": safe_ctx_id is not None,
+            },
+            recorded_at_ns=timestamp,
+        )
+        result = {
+            "disposition": "applied",
+            "effective_revision": msg_count,
+            "recorded_at_ns": timestamp,
+            "message_id": message_id,
+        }
+        receipt, _ = admit_command_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            peer_pid=peer_pid,
+            command_type=SEND_CEO_MESSAGE,
+            contract_version=CEO_CHAT_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+            state="applied",
+            result=result,
+            applied_seq=seq,
+            now_ns=timestamp,
+        )
+        return _outcome_from_receipt(receipt)
+
+
+def record_ceo_reply(
+    writer: WriterLease,
+    *,
+    body: str,
+    context_kind: str | None = None,
+    context_id: str | None = None,
+    context_label: str | None = None,
+    now_ns: int | None = None,
+) -> str:
+    """Record a CEO reply in the Board <-> CEO direct thread."""
+    safe_body = _require_text(body, "body", max_len=4000)
+    timestamp = time_ns() if now_ns is None else now_ns
+    message_id = f"msg-{uuid4().hex[:16]}"
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        if _identity(db) != writer.company_id:
+            raise BoardControlForbidden("Company identity mismatch")
+        founder_id = _founder_agent_id(db, writer.company_id)
+        db.execute(
+            """INSERT INTO ceo_message (
+                   message_id, company_id, sender_kind, sender_id, target_agent_id,
+                   body, context_kind, context_id, context_label, command_id,
+                   delivery_state, recorded_at_ns
+               ) VALUES (?, ?, 'ceo', ?, ?, ?, ?, ?, ?, NULL, 'delivered', ?)""",
+            (
+                message_id,
+                writer.company_id,
+                founder_id,
+                founder_id,
+                safe_body,
+                context_kind,
+                context_id,
+                context_label,
+                timestamp,
+            ),
+        )
+        append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="messages",
+            entity_type="ceo_message",
+            entity_id=message_id,
+            event_type="ceo.message_replied",
+            actor_id=founder_id,
+            payload={"message_id": message_id},
+            recorded_at_ns=timestamp,
+        )
+    return message_id
+
+
+def record_decision_question(
+    writer: WriterLease,
+    *,
+    question_id: str,
+    kind: str,
+    title: str,
+    summary: str,
+    impact: dict[str, Any],
+    options: tuple[str, ...] = ("approve", "decline"),
+    created_by_agent_id: str,
+    respond_by_ns: int | None = None,
+    now_ns: int | None = None,
+) -> str:
+    """Create a pending Board decision question and return its canonical payload_hash."""
+    safe_qid = _require_text(question_id, "question_id", max_len=128)
+    safe_kind = _require_text(kind, "kind", max_len=64)
+    safe_title = _require_text(title, "title", max_len=240)
+    safe_summary = _require_text(summary, "summary", max_len=2000)
+    safe_creator = _require_text(
+        created_by_agent_id, "created_by_agent_id", max_len=128
+    )
+    if not isinstance(impact, dict) or not options:
+        raise BoardControlRefused(
+            "Decision question requires impact object and options"
+        )
+    impact_json = json.dumps(impact, sort_keys=True, separators=(",", ":"))
+    options_json = json.dumps(list(options), separators=(",", ":"))
+    payload_hash = _canonical_sha256(
+        {
+            "question_id": safe_qid,
+            "kind": safe_kind,
+            "title": safe_title,
+            "summary": safe_summary,
+            "impact": impact,
+            "options": list(options),
+        }
+    )
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        if _identity(db) != writer.company_id:
+            raise BoardControlForbidden("Company identity mismatch")
+        db.execute(
+            """INSERT INTO decision_question (
+                   question_id, company_id, kind, title, summary, impact_json,
+                   options_json, revision, payload_hash, state, respond_by_ns,
+                   created_by_agent_id, created_at_ns, resolved_at_ns,
+                   resolved_command_id, resolution_choice, resolution_reason,
+                   application_status, delivery_status
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 'open', ?, ?, ?, NULL, NULL, NULL, NULL, 'pending', 'pending')""",
+            (
+                safe_qid,
+                writer.company_id,
+                safe_kind,
+                safe_title,
+                safe_summary,
+                impact_json,
+                options_json,
+                payload_hash,
+                respond_by_ns,
+                safe_creator,
+                timestamp,
+            ),
+        )
+        append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="governance",
+            entity_type="decision_question",
+            entity_id=safe_qid,
+            event_type="governance.decision_opened",
+            actor_id=safe_creator,
+            payload={"kind": safe_kind, "revision": 1},
+            recorded_at_ns=timestamp,
+        )
+    return payload_hash
+
+
+def submit_decision_answer(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    question_id: str,
+    expected_revision: int,
+    expected_payload_hash: str,
+    choice: str,
+    reason: str,
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+    peer_pid: int | None = None,
+    now_ns: int | None = None,
+) -> BoardCommandOutcome:
+    """Resolve an open Board DecisionQuestion with optimistic revision & payload_hash check."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    safe_qid = _require_text(question_id, "question_id", max_len=128)
+    safe_rev = _require_nonneg_int(expected_revision, "expected_revision")
+    safe_hash = _require_text(
+        expected_payload_hash, "expected_payload_hash", max_len=128
+    )
+    safe_choice = _require_text(choice, "choice", max_len=64)
+    safe_reason = _require_text(reason, "reason", max_len=2000)
+
+    preconditions = {
+        "question_id": safe_qid,
+        "expected_revision": safe_rev,
+        "expected_payload_hash": safe_hash,
+    }
+    payload_hash = _canonical_sha256({"choice": safe_choice, "reason": safe_reason})
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        principal = _require_board_control(
+            db,
+            writer.company_id,
+            authorize_board=authorize,
+            operation=SUBMIT_DECISION_ANSWER,
+            principal_hint=principal_hint,
+        )
+        replayed = _maybe_replay_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            command_type=SUBMIT_DECISION_ANSWER,
+            contract_version=DECISION_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+        )
+        if replayed is not None:
+            return replayed
+
+        row = db.execute(
+            """SELECT revision, payload_hash, state, options_json, respond_by_ns
+               FROM decision_question
+               WHERE company_id = ? AND question_id = ?""",
+            (writer.company_id, safe_qid),
+        ).fetchone()
+        if row is None:
+            raise BoardControlRefused("Decision question not found")
+        current_rev, current_hash, state, options_json, respond_by_ns = (
+            int(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            None if row[4] is None else int(row[4]),
+        )
+        allowed_options = json.loads(options_json)
+        if safe_choice not in allowed_options:
+            raise BoardControlRefused("Unsupported decision choice")
+
+        expired = respond_by_ns is not None and timestamp > respond_by_ns
+        if (
+            state != "open"
+            or current_rev != safe_rev
+            or current_hash != safe_hash
+            or expired
+        ):
+            denial = (
+                "expired" if (state == "open" and expired) else "conflicting_revision"
+            )
+            if state == "open" and expired:
+                db.execute(
+                    """UPDATE decision_question
+                       SET state = 'expired', application_status = 'not_applicable'
+                       WHERE company_id = ? AND question_id = ? AND state = 'open'""",
+                    (writer.company_id, safe_qid),
+                )
+            result = {
+                "disposition": denial,
+                "effective_revision": current_rev,
+                "recorded_at_ns": timestamp,
+            }
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=principal,
+                peer_pid=peer_pid,
+                command_type=SUBMIT_DECISION_ANSWER,
+                contract_version=DECISION_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=preconditions,
+                state="denied",
+                denial_code=denial,
+                result=result,
+                now_ns=timestamp,
+            )
+            return _outcome_from_receipt(receipt)
+
+        next_rev = current_rev + 1
+        next_state = "declined" if safe_choice == "decline" else "applied"
+        app_status = "declined" if safe_choice == "decline" else "applied"
+        db.execute(
+            """UPDATE decision_question
+               SET state = ?, revision = ?, resolved_at_ns = ?,
+                   resolved_command_id = ?, resolution_choice = ?,
+                   resolution_reason = ?, application_status = ?,
+                   delivery_status = 'delivered'
+               WHERE company_id = ? AND question_id = ? AND state = 'open'
+                 AND revision = ?""",
+            (
+                next_state,
+                next_rev,
+                timestamp,
+                safe_cmd,
+                safe_choice,
+                safe_reason,
+                app_status,
+                writer.company_id,
+                safe_qid,
+                current_rev,
+            ),
+        )
+        seq = append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="governance",
+            entity_type="decision_question",
+            entity_id=safe_qid,
+            event_type="governance.decision_answered",
+            actor_id=principal,
+            command_id=safe_cmd,
+            payload={
+                "choice": safe_choice,
+                "state": next_state,
+                "effective_revision": next_rev,
+            },
+            recorded_at_ns=timestamp,
+        )
+        result = {
+            "disposition": "applied",
+            "effective_revision": next_rev,
+            "recorded_at_ns": timestamp,
+            "question_id": safe_qid,
+            "decision_state": next_state,
+        }
+        receipt, _ = admit_command_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            peer_pid=peer_pid,
+            command_type=SUBMIT_DECISION_ANSWER,
+            contract_version=DECISION_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+            state="applied",
+            result=result,
+            applied_seq=seq,
+            now_ns=timestamp,
+        )
+        return _outcome_from_receipt(receipt)
+
+
+def apply_company_restriction(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    restriction_id: str,
+    charter_revision: str,
+    expected_restriction_revision: int,
+    cause_category: str,
+    scope_ref: str,
+    reason: str,
+    operator_releasable: bool = True,
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+    peer_pid: int | None = None,
+    now_ns: int | None = None,
+) -> BoardCommandOutcome:
+    """Activate a distinct cause-scoped restriction without altering other active stops."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    safe_rid = _require_text(restriction_id, "restriction_id", max_len=128)
+    safe_charter = _require_text(charter_revision, "charter_revision", max_len=128)
+    safe_rev = _require_nonneg_int(
+        expected_restriction_revision, "expected_restriction_revision"
+    )
+    safe_cat = _require_text(cause_category, "cause_category", max_len=64)
+    safe_scope = _require_text(scope_ref, "scope_ref", max_len=128)
+    safe_reason = _require_text(reason, "reason", max_len=2000)
+    if not isinstance(operator_releasable, bool):
+        raise BoardControlRefused("operator_releasable must be a boolean")
+
+    preconditions = {
+        "charter_revision": safe_charter,
+        "restriction_id": safe_rid,
+        "expected_restriction_revision": safe_rev,
+    }
+    payload_hash = _canonical_sha256(
+        {
+            "cause_category": safe_cat,
+            "scope_ref": safe_scope,
+            "reason": safe_reason,
+            "operator_releasable": operator_releasable,
+        }
+    )
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        principal = _require_board_control(
+            db,
+            writer.company_id,
+            authorize_board=authorize,
+            operation=PAUSE_COMPANY,
+            principal_hint=principal_hint,
+        )
+        replayed = _maybe_replay_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            command_type=PAUSE_COMPANY,
+            contract_version=RESTRICTION_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+        )
+        if replayed is not None:
+            return replayed
+
+        current_charter = _current_charter_revision(db, writer.company_id)
+        existing = db.execute(
+            """SELECT restriction_revision, active
+               FROM restriction_cause
+               WHERE company_id = ? AND restriction_id = ?""",
+            (writer.company_id, safe_rid),
+        ).fetchone()
+        current_rev = 0 if existing is None else int(existing[0])
+        if current_charter != safe_charter or current_rev != safe_rev:
+            result = {
+                "disposition": "conflicting_revision",
+                "effective_revision": current_rev,
+                "recorded_at_ns": timestamp,
+            }
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=principal,
+                peer_pid=peer_pid,
+                command_type=PAUSE_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=preconditions,
+                state="denied",
+                denial_code="conflicting_revision",
+                result=result,
+                now_ns=timestamp,
+            )
+            return _outcome_from_receipt(receipt)
+
+        next_rev = current_rev + 1
+        if existing is None:
+            db.execute(
+                """INSERT INTO restriction_cause (
+                       restriction_id, company_id, cause_category, scope_ref,
+                       restriction_revision, active, operator_releasable, reason,
+                       recorded_at_ns, cleared_at_ns, last_command_id
+                   ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)""",
+                (
+                    safe_rid,
+                    writer.company_id,
+                    safe_cat,
+                    safe_scope,
+                    next_rev,
+                    int(operator_releasable),
+                    safe_reason,
+                    timestamp,
+                    safe_cmd,
+                ),
+            )
+        else:
+            db.execute(
+                """UPDATE restriction_cause
+                   SET cause_category = ?, scope_ref = ?, restriction_revision = ?,
+                       active = 1, operator_releasable = ?, reason = ?,
+                       recorded_at_ns = ?, cleared_at_ns = NULL, last_command_id = ?
+                   WHERE company_id = ? AND restriction_id = ?""",
+                (
+                    safe_cat,
+                    safe_scope,
+                    next_rev,
+                    int(operator_releasable),
+                    safe_reason,
+                    timestamp,
+                    safe_cmd,
+                    writer.company_id,
+                    safe_rid,
+                ),
+            )
+        seq = append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="governance",
+            entity_type="restriction_cause",
+            entity_id=safe_rid,
+            event_type="governance.restriction_applied",
+            actor_id=principal,
+            command_id=safe_cmd,
+            payload={
+                "cause_category": safe_cat,
+                "scope_ref": safe_scope,
+                "effective_revision": next_rev,
+            },
+            recorded_at_ns=timestamp,
+        )
+        result = {
+            "disposition": "applied",
+            "effective_revision": next_rev,
+            "recorded_at_ns": timestamp,
+            "restriction_id": safe_rid,
+        }
+        receipt, _ = admit_command_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            peer_pid=peer_pid,
+            command_type=PAUSE_COMPANY,
+            contract_version=RESTRICTION_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+            state="applied",
+            result=result,
+            applied_seq=seq,
+            now_ns=timestamp,
+        )
+        return _outcome_from_receipt(receipt)
+
+
+def clear_company_restriction(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    restriction_id: str,
+    charter_revision: str,
+    expected_restriction_revision: int,
+    reason: str,
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+    peer_pid: int | None = None,
+    now_ns: int | None = None,
+) -> BoardCommandOutcome:
+    """Clear strictly one restriction_id, leaving all other active stops untouched."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    safe_rid = _require_text(restriction_id, "restriction_id", max_len=128)
+    safe_charter = _require_text(charter_revision, "charter_revision", max_len=128)
+    safe_rev = _require_nonneg_int(
+        expected_restriction_revision, "expected_restriction_revision"
+    )
+    safe_reason = _require_text(reason, "reason", max_len=2000)
+
+    preconditions = {
+        "charter_revision": safe_charter,
+        "restriction_id": safe_rid,
+        "expected_restriction_revision": safe_rev,
+    }
+    payload_hash = _canonical_sha256({"reason": safe_reason})
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        principal = _require_board_control(
+            db,
+            writer.company_id,
+            authorize_board=authorize,
+            operation=RESUME_COMPANY,
+            principal_hint=principal_hint,
+        )
+        replayed = _maybe_replay_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            command_type=RESUME_COMPANY,
+            contract_version=RESTRICTION_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+        )
+        if replayed is not None:
+            return replayed
+
+        current_charter = _current_charter_revision(db, writer.company_id)
+        existing = db.execute(
+            """SELECT restriction_revision, active, operator_releasable
+               FROM restriction_cause
+               WHERE company_id = ? AND restriction_id = ?""",
+            (writer.company_id, safe_rid),
+        ).fetchone()
+        if existing is None:
+            raise BoardControlRefused("Restriction cause not found")
+        current_rev, active, releasable = (
+            int(existing[0]),
+            int(existing[1]),
+            int(existing[2]),
+        )
+        if releasable == 0:
+            raise BoardControlForbidden(
+                "This restriction cause is system-held and cannot be cleared directly"
+            )
+        if current_charter != safe_charter or active != 1 or current_rev != safe_rev:
+            result = {
+                "disposition": "conflicting_revision",
+                "effective_revision": current_rev,
+                "recorded_at_ns": timestamp,
+            }
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=principal,
+                peer_pid=peer_pid,
+                command_type=RESUME_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=preconditions,
+                state="denied",
+                denial_code="conflicting_revision",
+                result=result,
+                now_ns=timestamp,
+            )
+            return _outcome_from_receipt(receipt)
+
+        next_rev = current_rev + 1
+        db.execute(
+            """UPDATE restriction_cause
+               SET active = 0, restriction_revision = ?,
+                   cleared_at_ns = ?, last_command_id = ?
+               WHERE company_id = ? AND restriction_id = ? AND active = 1""",
+            (next_rev, timestamp, safe_cmd, writer.company_id, safe_rid),
+        )
+        remaining_active = int(
+            db.execute(
+                """SELECT COUNT(*) FROM restriction_cause
+                   WHERE company_id = ? AND active = 1""",
+                (writer.company_id,),
+            ).fetchone()[0]
+        )
+        seq = append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="governance",
+            entity_type="restriction_cause",
+            entity_id=safe_rid,
+            event_type="governance.restriction_cleared",
+            actor_id=principal,
+            command_id=safe_cmd,
+            payload={
+                "effective_revision": next_rev,
+                "remaining_active_causes": remaining_active,
+            },
+            recorded_at_ns=timestamp,
+        )
+        result = {
+            "disposition": "applied",
+            "effective_revision": next_rev,
+            "recorded_at_ns": timestamp,
+            "restriction_id": safe_rid,
+            "remaining_active_causes": remaining_active,
+        }
+        receipt, _ = admit_command_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            peer_pid=peer_pid,
+            command_type=RESUME_COMPANY,
+            contract_version=RESTRICTION_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+            state="applied",
+            result=result,
+            applied_seq=seq,
+            now_ns=timestamp,
+        )
+        return _outcome_from_receipt(receipt)
+
+
+def execute_work_control_command(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    command_type: str,
+    preconditions: dict[str, Any],
+    payload: dict[str, Any],
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+    peer_pid: int | None = None,
+    now_ns: int | None = None,
+) -> BoardCommandOutcome:
+    """Interrupt a running work_run or cancel a pending work_item via work_kernel."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    safe_reason = _require_text(payload.get("reason"), "reason", max_len=2000)
+    if command_type == INTERRUPT_RUN:
+        if set(preconditions.keys()) != {"run_id", "expected_fencing_token"}:
+            raise BoardControlRefused(
+                "interrupt_run requires strictly run_id and expected_fencing_token preconditions"
+            )
+        canonical_pre = {
+            "run_id": _require_text(preconditions.get("run_id"), "run_id", max_len=128),
+            "expected_fencing_token": _require_nonneg_int(
+                preconditions.get("expected_fencing_token"),
+                "expected_fencing_token",
+            ),
+        }
+    elif command_type == CANCEL_WORK:
+        if set(preconditions.keys()) != {"work_item_id", "expected_state"}:
+            raise BoardControlRefused(
+                "cancel_work requires strictly work_item_id and expected_state preconditions"
+            )
+        canonical_pre = {
+            "work_item_id": _require_text(
+                preconditions.get("work_item_id"), "work_item_id", max_len=128
+            ),
+            "expected_state": _require_text(
+                preconditions.get("expected_state"), "expected_state", max_len=32
+            ),
+        }
+    else:
+        raise BoardControlRefused("Unsupported work control command")
+
+    timestamp = time_ns() if now_ns is None else now_ns
+    payload_hash = _canonical_sha256({"reason": safe_reason})
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        principal = _require_board_control(
+            db,
+            writer.company_id,
+            authorize_board=authorize,
+            operation=command_type,
+            principal_hint=principal_hint,
+        )
+        replayed = _maybe_replay_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            command_type=command_type,
+            contract_version=WORK_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=canonical_pre,
+        )
+        if replayed is not None:
+            return replayed
+
+        try:
+            if command_type == INTERRUPT_RUN:
+                run_id = str(canonical_pre["run_id"])
+                token = int(canonical_pre["expected_fencing_token"])
+                applied, effective = interrupt_work_run(
+                    db,
+                    company_id=writer.company_id,
+                    run_id=run_id,
+                    expected_fencing_token=token,
+                    actor_id=principal,
+                    reason=safe_reason,
+                    command_id=safe_cmd,
+                    now_ns=timestamp,
+                )
+                result_extra: dict[str, Any] = {"run_id": run_id}
+            else:
+                work_item_id = str(canonical_pre["work_item_id"])
+                expected_state = str(canonical_pre["expected_state"])
+                applied, current_state = cancel_work_item(
+                    db,
+                    company_id=writer.company_id,
+                    work_item_id=work_item_id,
+                    expected_state=expected_state,
+                    actor_id=principal,
+                    reason=safe_reason,
+                    command_id=safe_cmd,
+                    now_ns=timestamp,
+                )
+                effective = 1 if applied else 0
+                result_extra = {
+                    "work_item_id": work_item_id,
+                    "work_state": current_state,
+                }
+        except WorkKernelRefused as error:
+            raise BoardControlRefused(str(error)) from error
+
+        if not applied:
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=principal,
+                peer_pid=peer_pid,
+                command_type=command_type,
+                contract_version=WORK_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=canonical_pre,
+                state="denied",
+                denial_code="conflicting_revision",
+                result={
+                    "disposition": "conflicting_revision",
+                    "effective_revision": effective,
+                    "recorded_at_ns": timestamp,
+                }
+                | result_extra,
+                now_ns=timestamp,
+            )
+            return _outcome_from_receipt(receipt)
+
+        seq = int(
+            db.execute(
+                "SELECT COALESCE(MAX(event_seq), 1) FROM audit_event WHERE company_id = ?",
+                (writer.company_id,),
+            ).fetchone()[0]
+        )
+        receipt, _ = admit_command_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            peer_pid=peer_pid,
+            command_type=command_type,
+            contract_version=WORK_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=canonical_pre,
+            state="applied",
+            result={
+                "disposition": "applied",
+                "effective_revision": max(effective, 1),
+                "recorded_at_ns": timestamp,
+            }
+            | result_extra,
+            applied_seq=seq,
+            now_ns=timestamp,
+        )
+        return _outcome_from_receipt(receipt)
+
+
+def execute_strategy_command(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    command_type: str,
+    preconditions: dict[str, Any],
+    payload: dict[str, Any],
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+    peer_pid: int | None = None,
+) -> BoardCommandOutcome:
+    """Delegate strategy activation or forward rollback to strategy_comparison.py."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    auth_fn = make_board_authorizer(
+        authorize_board=authorize, principal_hint=principal_hint
+    )
+
+    def _deploy_auth(
+        db: Connection, company_id: str, op: str, _release_id: str
+    ) -> str | None:
+        return auth_fn(db, company_id, op)
+
+    try:
+        if command_type == ACTIVATE_STRATEGY_RELEASE:
+            release_id = _require_text(
+                payload.get("release_id"), "release_id", max_len=128
+            )
+            binding_rev = _require_text(
+                preconditions.get("binding_revision"), "binding_revision", max_len=128
+            )
+            comparison_id = payload.get("comparison_id")
+            expected_active = preconditions.get("expected_active_deployment_id")
+            deployment = activate_strategy_release(
+                writer,
+                command_id=safe_cmd,
+                release_id=release_id,
+                binding_revision=binding_rev,
+                authorize_deploy=_deploy_auth,
+                comparison_id=comparison_id,
+                expected_active_deployment_id=expected_active,
+            )
+        elif command_type == ROLLBACK_STRATEGY_DEPLOYMENT:
+            target_release = _require_text(
+                payload.get("target_release_id"), "target_release_id", max_len=128
+            )
+            expected_active = _require_text(
+                preconditions.get("expected_active_deployment_id"),
+                "expected_active_deployment_id",
+                max_len=128,
+            )
+            deployment = rollback_strategy_deployment(
+                writer,
+                command_id=safe_cmd,
+                target_release_id=target_release,
+                expected_active_deployment_id=expected_active,
+                authorize_deploy=_deploy_auth,
+            )
+        else:
+            raise BoardControlRefused("Unsupported strategy command")
+    except StrategyComparisonRefused as error:
+        msg = str(error)
+        low = msg.lower()
+        if (
+            "authority" in low
+            or "authorized" in low
+            or "grant is required" in low
+            or "cannot self-activate" in low
+        ):
+            raise BoardControlForbidden(msg) from error
+        if "already in use" in low or "conflict" in low:
+            raise BoardControlConflict(msg) from error
+        raise BoardControlRefused(msg) from error
+
+    return BoardCommandOutcome(
+        command_id=safe_cmd,
+        command_type=command_type,
+        state="applied",
+        disposition="applied",
+        denial_code=None,
+        effective_revision=1,
+        recorded_at_ns=deployment.activated_at_ns,
+        peer_pid=peer_pid,
+        result={
+            "deployment_id": deployment.deployment_id,
+            "release_id": deployment.release_id,
+            "status": deployment.status,
+        },
+    )
+
+
+def execute_cut_checkpoint_command(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    charter_revision: str,
+    reason: str,
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+    peer_pid: int | None = None,
+    now_ns: int | None = None,
+) -> BoardCommandOutcome:
+    """Cut a verified checkpoint under <store.parent>/checkpoints/ with receipt tracking."""
+    import os
+    import stat
+
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    safe_charter = _require_text(charter_revision, "charter_revision", max_len=128)
+    safe_reason = _require_text(reason, "reason", max_len=2000)
+    preconditions = {"charter_revision": safe_charter}
+    payload_hash = _canonical_sha256({"reason": safe_reason})
+    timestamp = time_ns() if now_ns is None else now_ns
+
+    writer.verify()
+    with closing(open_reader(writer.store)) as db, read_tx(db):
+        principal = _require_board_control(
+            db,
+            writer.company_id,
+            authorize_board=authorize,
+            operation=CUT_CHECKPOINT,
+            principal_hint=principal_hint,
+        )
+        replayed = _maybe_replay_receipt(
+            db,
+            company_id=writer.company_id,
+            command_id=safe_cmd,
+            actor_id=principal,
+            command_type=CUT_CHECKPOINT,
+            contract_version=CHECKPOINT_COMMAND,
+            payload_sha256=payload_hash,
+            preconditions=preconditions,
+        )
+        if replayed is not None:
+            return replayed
+        current_charter = _current_charter_revision(db, writer.company_id)
+
+    if current_charter != safe_charter:
+        with closing(open_writer(writer.store)) as db, write_tx(db):
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=principal,
+                peer_pid=peer_pid,
+                command_type=CUT_CHECKPOINT,
+                contract_version=CHECKPOINT_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=preconditions,
+                state="denied",
+                denial_code="conflicting_revision",
+                result={
+                    "disposition": "conflicting_revision",
+                    "effective_revision": 0,
+                    "recorded_at_ns": timestamp,
+                },
+                now_ns=timestamp,
+            )
+            return _outcome_from_receipt(receipt)
+
+    checkpoints_dir = writer.store.resolve(strict=False).parent / "checkpoints"
+    if os.path.lexists(checkpoints_dir):
+        st = os.lstat(checkpoints_dir)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise BoardControlRefused(
+                "Checkpoints directory must be a regular directory"
+            )
+    else:
+        checkpoints_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safe_name = sha256(safe_cmd.encode("utf-8")).hexdigest()[:16]
+    archive_path = checkpoints_dir / f"checkpoint-{safe_name}.zip"
+    if os.path.lexists(archive_path) and stat.S_ISLNK(os.lstat(archive_path).st_mode):
+        raise BoardControlRefused("Refusing to write checkpoint through symlink")
+    try:
+        manifest = checkpoint_store(writer.store, writer.company_id, archive_path)
+    except CheckpointRefused as error:
+        raise BoardControlRefused(str(error)) from error
+
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        principal = _require_board_control(
+            db,
+            writer.company_id,
+            authorize_board=authorize,
+            operation=CUT_CHECKPOINT,
+            principal_hint=principal_hint,
+        )
+        if _current_charter_revision(db, writer.company_id) != safe_charter:
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=principal,
+                peer_pid=peer_pid,
+                command_type=CUT_CHECKPOINT,
+                contract_version=CHECKPOINT_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=preconditions,
+                state="denied",
+                denial_code="conflicting_revision",
+                result={
+                    "disposition": "conflicting_revision",
+                    "effective_revision": 0,
+                    "recorded_at_ns": timestamp,
+                },
+                now_ns=timestamp,
+            )
+            return _outcome_from_receipt(receipt)
+        seq = append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="ops",
+            entity_type="checkpoint",
+            entity_id=manifest.cut_id,
+            event_type="ops.checkpoint_cut",
+            actor_id=principal,
+            command_id=safe_cmd,
+            payload={
+                "archive_name": archive_path.name,
+                "sha256": manifest.sha256,
+                "cut_id": manifest.cut_id,
+            },
+            recorded_at_ns=timestamp,
+        )
+        try:
+            receipt, _ = admit_command_receipt(
+                db,
+                company_id=writer.company_id,
+                command_id=safe_cmd,
+                actor_id=principal,
+                peer_pid=peer_pid,
+                command_type=CUT_CHECKPOINT,
+                contract_version=CHECKPOINT_COMMAND,
+                payload_sha256=payload_hash,
+                preconditions=preconditions,
+                state="applied",
+                result={
+                    "disposition": "applied",
+                    "effective_revision": seq,
+                    "recorded_at_ns": timestamp,
+                    "archive_name": archive_path.name,
+                    "sha256": manifest.sha256,
+                    "cut_id": manifest.cut_id,
+                },
+                applied_seq=seq,
+                now_ns=timestamp,
+            )
+        except CommandConflict as error:
+            raise BoardControlConflict(
+                "Command ID is already in use with conflicting terms"
+            ) from error
+        return _outcome_from_receipt(receipt)
+
+
+def read_scoped_command_receipt(
+    store: Path,
+    company_id: str,
+    command_id: str,
+    *,
+    operation: str | None = None,
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+) -> dict[str, Any]:
+    """Read a redacted command receipt strictly scoped to (principal, operation)."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    with closing(open_reader(store)) as db, read_tx(db):
+        if _identity(db) != company_id:
+            raise BoardControlForbidden("Company identity mismatch")
+        access = resolve_board_access(
+            db,
+            company_id,
+            authorize_board=authorize,
+            operation=operation or "read_receipt",
+            principal_hint=principal_hint,
+        )
+        if operation is not None and access.principal_id is not None:
+            try:
+                receipt = read_command_receipt(
+                    db,
+                    company_id,
+                    safe_cmd,
+                    principal=access.principal_id,
+                    operation=operation,
+                )
+            except CommandUnauthorized as error:
+                raise BoardControlForbidden(str(error)) from error
+        else:
+            row = db.execute(
+                """SELECT company_id, command_id, actor_id, peer_pid, command_type,
+                          contract_version, payload_sha256, preconditions_json, state,
+                          denial_code, result_json, applied_seq, created_at_ns, finalized_at_ns
+                   FROM command_receipt
+                   WHERE company_id = ? AND command_id = ?""",
+                (company_id, safe_cmd),
+            ).fetchone()
+            if row is None:
+                receipt = None
+            else:
+                # Fail closed: an existing receipt MUST NOT be disclosed to an
+                # unauthorized/unbound principal or without an explicit operation match.
+                if access.principal_id is None or operation is None:
+                    raise BoardControlForbidden(
+                        "Authenticated principal and matching operation are required to inspect a command receipt"
+                    )
+                receipt = CommandReceipt(*row)
+                if (receipt.actor_id, receipt.command_type) != (
+                    access.principal_id,
+                    operation,
+                ):
+                    raise BoardControlForbidden(
+                        "Command receipt does not belong to this principal and operation"
+                    )
+    if receipt is None:
+        return {
+            "status": "not_found",
+            "company_id": company_id,
+            "command_id": safe_cmd,
+            "operation": operation,
+        }
+    outcome = _outcome_from_receipt(receipt)
+    return {
+        "status": "found",
+        "company_id": company_id,
+        "command_id": outcome.command_id,
+        "command_type": outcome.command_type,
+        "state": outcome.state,
+        "disposition": outcome.disposition,
+        "denial_code": outcome.denial_code,
+        "effective_revision": outcome.effective_revision,
+        "recorded_at_ns": outcome.recorded_at_ns,
+        "peer_pid": outcome.peer_pid,
+    }
+
+
+def _maybe_replay_receipt(
+    db: Connection,
+    *,
+    company_id: str,
+    command_id: str,
+    actor_id: str,
+    command_type: str,
+    contract_version: str,
+    payload_sha256: str,
+    preconditions: dict[str, Any],
+) -> BoardCommandOutcome | None:
+    row = db.execute(
+        """SELECT company_id, command_id, actor_id, peer_pid, command_type,
+                  contract_version, payload_sha256, preconditions_json, state,
+                  denial_code, result_json, applied_seq, created_at_ns, finalized_at_ns
+           FROM command_receipt
+           WHERE company_id = ? AND command_id = ?""",
+        (company_id, command_id),
+    ).fetchone()
+    if row is None:
+        return None
+    prior = CommandReceipt(*row)
+    expected_pre = json.dumps(preconditions, sort_keys=True, separators=(",", ":"))
+    if (
+        prior.actor_id != actor_id
+        or prior.command_type != command_type
+        or prior.contract_version != contract_version
+        or prior.payload_sha256 != payload_sha256
+        or prior.preconditions_json != expected_pre
+    ):
+        raise BoardControlConflict(
+            "Command ID is already in use with conflicting terms"
+        )
+    return _outcome_from_receipt(prior)
+
+
+def _outcome_from_receipt(receipt: CommandReceipt) -> BoardCommandOutcome:
+    parsed: dict[str, Any] = {}
+    if receipt.result_json:
+        try:
+            loaded = json.loads(receipt.result_json)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except json.JSONDecodeError:
+            parsed = {}
+    disposition = str(
+        parsed.get(
+            "disposition",
+            "applied"
+            if receipt.state == "applied"
+            else (receipt.denial_code or "denied"),
+        )
+    )
+    raw_rev = parsed.get("effective_revision")
+    effective_rev = (
+        raw_rev if type(raw_rev) is int and raw_rev >= 0 else (receipt.applied_seq or 0)
+    )
+    raw_ts = parsed.get("recorded_at_ns")
+    recorded_ts = (
+        raw_ts
+        if type(raw_ts) is int and raw_ts > 0
+        else (receipt.finalized_at_ns or receipt.created_at_ns)
+    )
+    return BoardCommandOutcome(
+        command_id=receipt.command_id,
+        command_type=receipt.command_type,
+        state=receipt.state,
+        disposition=disposition,
+        denial_code=receipt.denial_code,
+        effective_revision=effective_rev,
+        recorded_at_ns=recorded_ts,
+        peer_pid=receipt.peer_pid,
+        result={
+            k: v
+            for k, v in parsed.items()
+            if k not in ("principal", "reason", "actor_id")
+        },
+    )

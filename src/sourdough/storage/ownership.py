@@ -118,6 +118,12 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "journal_entry": frozenset({"general_ledger.py"}),
     "journal_line": frozenset({"general_ledger.py"}),
     "accounting_close": frozenset({"accounting_close.py"}),
+    # Board Client governance, messaging, restriction & profile tables
+    "board_binding": frozenset({"board_control.py"}),
+    "ceo_message": frozenset({"board_control.py"}),
+    "decision_question": frozenset({"board_control.py"}),
+    "restriction_cause": frozenset({"board_control.py"}),
+    "agent_profile": frozenset({"board_control.py"}),
     # Opt-in paper domain tables (company store)
     "paper_binding": frozenset({"paper_account.py"}),
     "paper_binding_change": frozenset({"paper_account.py"}),

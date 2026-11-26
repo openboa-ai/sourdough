@@ -58,6 +58,11 @@ TABLES = (
     "journal_entry",
     "journal_line",
     "accounting_close",
+    "board_binding",
+    "ceo_message",
+    "decision_question",
+    "restriction_cause",
+    "agent_profile",
 )
 
 

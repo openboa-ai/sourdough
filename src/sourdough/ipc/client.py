@@ -81,8 +81,59 @@ class ControlPlaneClient:
             return IpcRefused(f"HTTP {response.status}: {detail}")
         return IpcRefused(f"HTTP {response.status}")
 
-    def meta(self) -> dict[str, Any]:
-        response = self._request("GET", "/v1/meta")
+    def raw_request(
+        self,
+        method: str,
+        target: str,
+        *,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
+    ) -> HttpResponse:
+        """Forward a bounded HTTP/1.1 request over the verified private UDS."""
+        return self._request(method, target, headers=headers, body=body)
+
+    def projection(
+        self,
+        name: str,
+        *,
+        query: dict[str, str] | None = None,
+        if_none_match: str | None = None,
+        expected_company_id: str | None = None,
+        principal: str | None = None,
+    ) -> tuple[int, str | None, dict[str, Any] | None]:
+        target = f"/v1/projections/{name}"
+        if query:
+            target = f"{target}?{urlencode(query)}"
+        headers: dict[str, str] = {}
+        if if_none_match:
+            headers["If-None-Match"] = if_none_match
+        if principal:
+            headers["X-Sourdough-Principal"] = principal
+        response = self._request("GET", target, headers=headers or None)
+        etag = response.headers.get("etag")
+        header_company = response.headers.get("x-sourdough-company-id")
+        if response.status == 304:
+            if (
+                expected_company_id is not None
+                and header_company != expected_company_id
+            ):
+                raise IpcRefused(
+                    "HTTP 403: Control plane company identity mismatch on 304 response"
+                )
+            return 304, etag, None
+        payload = self._decode_json(response)
+        if response.status != 200:
+            raise self._http_error(response, payload)
+        if expected_company_id is not None and (
+            payload.get("company_id") != expected_company_id
+            or (header_company is not None and header_company != expected_company_id)
+        ):
+            raise IpcRefused("HTTP 403: Control plane company identity mismatch")
+        return 200, etag, payload
+
+    def meta(self, *, principal: str | None = None) -> dict[str, Any]:
+        headers = {"X-Sourdough-Principal": principal} if principal else None
+        response = self._request("GET", "/v1/meta", headers=headers)
         payload = self._decode_json(response)
         if response.status != 200:
             raise self._http_error(response, payload)
@@ -126,13 +177,15 @@ class ControlPlaneClient:
         command_id: str,
         *,
         operation: str | None = None,
+        principal: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(command_id, str) or not command_id.strip():
             raise IpcRefused("Command identifier is required")
         target = f"/v1/commands/{quote(command_id, safe='')}"
         if operation is not None:
             target = f"{target}?{urlencode({'operation': operation})}"
-        response = self._request("GET", target)
+        headers = {"X-Sourdough-Principal": principal} if principal else None
+        response = self._request("GET", target, headers=headers)
         payload = self._decode_json(response)
         if response.status in (200, 404):
             return payload
@@ -147,6 +200,7 @@ class ControlPlaneClient:
         contract_version: str,
         preconditions: dict[str, Any],
         payload: dict[str, Any],
+        principal: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         body = json.dumps(
             {
@@ -160,13 +214,16 @@ class ControlPlaneClient:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Idempotency-Key": command_id,
+        }
+        if principal:
+            headers["X-Sourdough-Principal"] = principal
         response = self._request(
             "POST",
             "/v1/commands",
-            headers={
-                "Content-Type": "application/json",
-                "Idempotency-Key": command_id,
-            },
+            headers=headers,
             body=body,
         )
         decoded = self._decode_json(response)

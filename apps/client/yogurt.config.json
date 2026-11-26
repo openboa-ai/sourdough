@@ -1,0 +1,8 @@
+{
+  "surfaces": {
+    "app": {
+      "target": "web",
+      "root": "src"
+    }
+  }
+}
