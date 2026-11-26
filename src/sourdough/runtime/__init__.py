@@ -1,6 +1,16 @@
-"""Unified CompanyRuntime, DutyRegistry, three-entity Work kernel, and venue boundary."""
+"""Unified CompanyRuntime, ResidentCompanyService, DutyRegistry, Work kernel, and venue boundary."""
 
 from .engine import CompanyRuntime, RuntimeStepSummary, build_default_registry
+from .handlers import (
+    DUTY_BOARD_APPLY_DECISION,
+    DUTY_CEO_RESPOND_MESSAGE,
+    DUTY_QUANT_AGENT_SANDBOX,
+    DUTY_QUANT_PAPER_DECISION,
+    DUTY_QUANT_RECONCILE,
+    ProfileBindingLookup,
+    build_production_duty_registry,
+    sync_board_triggers,
+)
 from .registry import (
     DutyContext,
     DutyDescriptor,
@@ -8,6 +18,7 @@ from .registry import (
     DutyRegistry,
     RuntimeRefused,
 )
+from .resident import ResidentCompanyService, ResidentHealth
 from .venue_coordinator import (
     DRAIN_MARGIN_SECONDS,
     MAX_SEGMENT_SECONDS,
@@ -48,6 +59,11 @@ __all__ = [
     "BoundedVenueCoordinator",
     "CompanyRuntime",
     "DRAIN_MARGIN_SECONDS",
+    "DUTY_BOARD_APPLY_DECISION",
+    "DUTY_CEO_RESPOND_MESSAGE",
+    "DUTY_QUANT_AGENT_SANDBOX",
+    "DUTY_QUANT_PAPER_DECISION",
+    "DUTY_QUANT_RECONCILE",
     "DutyContext",
     "DutyDescriptor",
     "DutyOutcome",
@@ -55,6 +71,9 @@ __all__ = [
     "MAX_SEGMENT_SECONDS",
     "MIN_SEGMENT_SECONDS",
     "PeerRequest",
+    "ProfileBindingLookup",
+    "ResidentCompanyService",
+    "ResidentHealth",
     "RunFenced",
     "RuntimeRefused",
     "RuntimeStepSummary",
@@ -67,6 +86,7 @@ __all__ = [
     "WorkRun",
     "assert_run_fencing",
     "build_default_registry",
+    "build_production_duty_registry",
     "cancel_condition",
     "claim_work_run",
     "complete_work_run",
@@ -82,6 +102,7 @@ __all__ = [
     "resolve_peer_request",
     "revoke_responsibility",
     "set_condition",
+    "sync_board_triggers",
     "wake_waiting_runs",
     "yield_run_to_wait",
 ]

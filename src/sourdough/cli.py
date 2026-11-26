@@ -7,11 +7,17 @@ import signal
 import sqlite3
 import stat
 import sys
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from time import sleep, time_ns
 
 from sourdough.accounting_close import CloseRefused
+from sourdough.agent_runtime import (
+    AgentProfileBinding,
+    AgentRuntimeRefused,
+    build_default_adapter_registry,
+)
 from sourdough.assessment_run import run_assessment_company
 from sourdough.board_control import BoardControlRefused, bind_board_principal
 from sourdough.company import FoundingRefused, FoundingTerms, found, reopen
@@ -55,6 +61,10 @@ from sourdough.paper_valuation import ValuationRefused
 from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.paper_window import WindowPlan, WindowRefused
 from sourdough.paper_window_statement import read_paper_statement
+from sourdough.runtime import (
+    ResidentCompanyService,
+    build_production_duty_registry,
+)
 from sourdough.runtime.registry import RuntimeRefused
 from sourdough.runtime.work_kernel import WorkKernelRefused
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
@@ -260,6 +270,25 @@ def main() -> int:
     daemon_cmd.add_argument("--evaluator-store", type=Path)
     daemon_cmd.add_argument("--store-key", type=_store_key)
     daemon_cmd.add_argument("--ready-fd", type=int)
+
+    run_company_cmd = commands.add_parser(
+        "run-company",
+        help="Run the unified resident Sourdough company (UDS daemon + autonomous scheduler + optional web UI)",
+    )
+    run_company_cmd.add_argument("store", type=Path)
+    run_company_cmd.add_argument("--company-id", required=True)
+    run_company_cmd.add_argument("--profiles-json", type=Path)
+    run_company_cmd.add_argument("--socket-dir", type=Path)
+    run_company_cmd.add_argument("--socket", type=Path)
+    run_company_cmd.add_argument("--lease-dir", type=Path)
+    run_company_cmd.add_argument("--engine-dir", type=Path)
+    run_company_cmd.add_argument("--evaluator-store", type=Path)
+    run_company_cmd.add_argument("--store-key", type=_store_key)
+    run_company_cmd.add_argument("--tick-interval", type=float, default=1.0)
+    run_company_cmd.add_argument("--web-port", type=int)
+    run_company_cmd.add_argument("--static-dir", type=Path)
+    run_company_cmd.add_argument("--principal")
+    run_company_cmd.add_argument("--ready-fd", type=int)
 
     web_cmd = commands.add_parser(
         "client-web",
@@ -534,6 +563,91 @@ def main() -> int:
                     evaluator_store=args.evaluator_store,
                 ) as daemon:
                     announcement = json.dumps(asdict(daemon.info), sort_keys=True)
+                    if args.ready_fd is not None:
+                        with os.fdopen(args.ready_fd, "w", encoding="utf-8") as ready:
+                            ready.write(announcement + "\n")
+                            ready.flush()
+                    else:
+                        print(announcement, flush=True)
+                    while not stop_requested:
+                        sleep(0.25)
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint)
+                signal.signal(signal.SIGTERM, previous_sigterm)
+                signal.signal(signal.SIGHUP, previous_sighup)
+            return 0
+        elif args.command == "run-company":
+            if args.ready_fd is not None:
+                if args.ready_fd < 3:
+                    raise IpcRefused("ready-fd must be an inherited descriptor >= 3")
+                try:
+                    fd_info = os.fstat(args.ready_fd)
+                except OSError as error:
+                    raise IpcRefused(
+                        "ready-fd is not an open file descriptor"
+                    ) from error
+                if not (
+                    stat.S_ISFIFO(fd_info.st_mode) or stat.S_ISREG(fd_info.st_mode)
+                ):
+                    raise IpcRefused("ready-fd must refer to a pipe or regular file")
+
+            profile_bindings: dict[str, AgentProfileBinding] = {}
+            if args.profiles_json is not None:
+                raw_profiles = json.loads(
+                    args.profiles_json.read_text(encoding="utf-8")
+                )
+                if not isinstance(raw_profiles, dict):
+                    raise RuntimeRefused("profiles-json must be a JSON object")
+                for agent_id, spec in raw_profiles.items():
+                    if not isinstance(spec, dict):
+                        raise RuntimeRefused(
+                            f"Invalid profile binding for agent '{agent_id}'"
+                        )
+                    profile_bindings[str(agent_id)] = AgentProfileBinding(**spec)
+
+            adapter_registry = build_default_adapter_registry()
+            duty_registry = build_production_duty_registry(
+                adapter_registry=adapter_registry,
+                profile_bindings=profile_bindings,
+            )
+
+            stop_requested = False
+
+            def _request_resident_stop(_signum, _frame):
+                nonlocal stop_requested
+                stop_requested = True
+
+            previous_sigint = signal.signal(signal.SIGINT, _request_resident_stop)
+            previous_sigterm = signal.signal(signal.SIGTERM, _request_resident_stop)
+            previous_sighup = signal.signal(signal.SIGHUP, _request_resident_stop)
+            try:
+                with ExitStack() as stack:
+                    service = stack.enter_context(
+                        ResidentCompanyService(
+                            args.store,
+                            args.company_id,
+                            duty_registry,
+                            socket_dir=args.socket_dir,
+                            socket_path=args.socket,
+                            lease_directory=args.lease_dir,
+                            expected_store_key=args.store_key,
+                            engine_directory=args.engine_dir,
+                            evaluator_store=args.evaluator_store,
+                            tick_interval_seconds=args.tick_interval,
+                        )
+                    )
+                    payload = asdict(service.info)
+                    if args.web_port is not None:
+                        bridge = stack.enter_context(
+                            ClientWebBridge(
+                                service.socket_path,
+                                port=args.web_port,
+                                static_dir=args.static_dir,
+                                principal=args.principal,
+                            )
+                        )
+                        payload["web_url"] = bridge.info.url
+                    announcement = json.dumps(payload, sort_keys=True)
                     if args.ready_fd is not None:
                         with os.fdopen(args.ready_fd, "w", encoding="utf-8") as ready:
                             ready.write(announcement + "\n")
@@ -919,6 +1033,7 @@ def main() -> int:
                     ),
                 )
     except (
+        AgentRuntimeRefused,
         BoardControlRefused,
         CheckpointRefused,
         CloseRefused,

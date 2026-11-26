@@ -775,6 +775,93 @@ def record_ceo_reply(
     return message_id
 
 
+def mark_ceo_message_delivered(
+    writer: WriterLease,
+    *,
+    message_id: str,
+    now_ns: int | None = None,
+) -> bool:
+    """Mark an inbound Board -> CEO message as delivered once the CEO shift has handled it."""
+    safe_mid = _require_text(message_id, "message_id", max_len=128)
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        if _identity(db) != writer.company_id:
+            raise BoardControlForbidden("Company identity mismatch")
+        cursor = db.execute(
+            """UPDATE ceo_message
+               SET delivery_state = 'delivered'
+               WHERE company_id = ? AND message_id = ?
+                 AND sender_kind = 'board' AND delivery_state != 'delivered'""",
+            (writer.company_id, safe_mid),
+        )
+        updated = cursor.rowcount > 0
+        if updated:
+            founder_id = _founder_agent_id(db, writer.company_id)
+            append_audit_event(
+                db,
+                company_id=writer.company_id,
+                domain="messages",
+                entity_type="ceo_message",
+                entity_id=safe_mid,
+                event_type="ceo.message_delivered",
+                actor_id=founder_id,
+                payload={"message_id": safe_mid},
+                recorded_at_ns=timestamp,
+            )
+    return updated
+
+
+def record_decision_application_result(
+    writer: WriterLease,
+    *,
+    question_id: str,
+    application_status: str,
+    delivery_status: str = "delivered",
+    effect_summary: str = "",
+    now_ns: int | None = None,
+) -> None:
+    """Record the durable application/delivery outcome for a resolved Board decision."""
+    safe_qid = _require_text(question_id, "question_id", max_len=128)
+    safe_app = _require_text(application_status, "application_status", max_len=64)
+    safe_deliv = _require_text(delivery_status, "delivery_status", max_len=64)
+    timestamp = time_ns() if now_ns is None else now_ns
+    writer.verify()
+    with closing(open_writer(writer.store)) as db, write_tx(db):
+        if _identity(db) != writer.company_id:
+            raise BoardControlForbidden("Company identity mismatch")
+        row = db.execute(
+            """SELECT state FROM decision_question
+               WHERE company_id = ? AND question_id = ?""",
+            (writer.company_id, safe_qid),
+        ).fetchone()
+        if row is None:
+            raise BoardControlRefused("Decision question not found")
+        db.execute(
+            """UPDATE decision_question
+               SET application_status = ?, delivery_status = ?
+               WHERE company_id = ? AND question_id = ?""",
+            (safe_app, safe_deliv, writer.company_id, safe_qid),
+        )
+        founder_id = _founder_agent_id(db, writer.company_id)
+        append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="governance",
+            entity_type="decision_question",
+            entity_id=safe_qid,
+            event_type="governance.decision_effect_applied",
+            actor_id=founder_id,
+            payload={
+                "question_id": safe_qid,
+                "application_status": safe_app,
+                "delivery_status": safe_deliv,
+                "effect_summary": effect_summary[:240],
+            },
+            recorded_at_ns=timestamp,
+        )
+
+
 def record_decision_question(
     writer: WriterLease,
     *,
