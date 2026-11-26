@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import secrets
 import socket
 import sqlite3
 import stat
@@ -17,6 +18,39 @@ from time import monotonic
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from ..board_control import (
+    ACTIVATE_STRATEGY_RELEASE,
+    CANCEL_WORK,
+    CEO_CHAT_COMMAND,
+    CHECKPOINT_COMMAND,
+    CUT_CHECKPOINT,
+    DECISION_COMMAND,
+    INTERRUPT_RUN,
+    PAUSE_COMPANY,
+    RBAC_COMMAND,
+    REGISTER_OWNER,
+    RESTRICTION_COMMAND,
+    RESUME_COMPANY,
+    ROLLBACK_STRATEGY_DEPLOYMENT,
+    SEND_CEO_MESSAGE,
+    STRATEGY_COMMAND,
+    SUBMIT_DECISION_ANSWER,
+    WORK_COMMAND,
+    BoardControlConflict,
+    BoardControlForbidden,
+    BoardControlRefused,
+    apply_company_restriction,
+    clear_company_restriction,
+    execute_cut_checkpoint_command,
+    execute_strategy_command,
+    execute_work_control_command,
+    make_board_authorizer,
+    post_ceo_message,
+    read_scoped_command_receipt,
+    register_owner_command,
+    resolve_board_access,
+    submit_decision_answer,
+)
 from ..company import FoundingRefused, _identity
 from ..paper_account import BindingRefused
 from ..paper_execution import VenueRefused
@@ -28,7 +62,7 @@ from ..paper_risk import (
     AuthorizeBoard,
     PaperRiskRefused,
     PaperSuspension,
-    read_local_command_receipt_status,
+    effective_paper_risk,
     suspend_paper_risk,
 )
 from ..storage.db import StorageRefused, open_reader, read_tx
@@ -37,6 +71,23 @@ from ..storage.schema import installed_domains
 from ..trading_engine import EngineRefused
 from ..work_projection import read_local_board_timeline_with_seq
 from ..writer_lease import WriterLease, WriterRefused, hold_company_writer
+from .projections import (
+    ALL_CLIENT_PROJECTIONS,
+    projection_etag,
+    read_agent_detail_projection,
+    read_agents_graph_projection,
+    read_approvals_projection,
+    read_finance_projection,
+    read_live_trading_projection,
+    read_messages_projection,
+    read_order_trace_projection,
+    read_org_projection,
+    read_restrictions_projection,
+    read_strategies_projection,
+    read_system_audit_projection,
+    read_system_evals_projection,
+    read_system_safety_projection,
+)
 from .protocol import (
     CONTROL_PLANE_VERSION,
     MAX_EVENTS_BATCH,
@@ -60,6 +111,15 @@ _MAX_IN_FLIGHT = 32
 _MAX_EVENT_WAITERS = 8
 _MAX_WAIT_MS = 5000
 _ALLOWED_PRECONDITION_KEYS = frozenset({"charter_revision", "expected_revision"})
+_CEO_PRECONDITION_KEYS = frozenset({"ceo_agent_id", "charter_revision"})
+_DECISION_PRECONDITION_KEYS = frozenset(
+    {"question_id", "expected_revision", "expected_payload_hash"}
+)
+_RESTRICTION_PRECONDITION_KEYS = frozenset(
+    {"charter_revision", "restriction_id", "expected_restriction_revision"}
+)
+_CHECKPOINT_PRECONDITION_KEYS = frozenset({"charter_revision"})
+_RBAC_BOOTSTRAP_KEYS = frozenset({"bootstrap_state"})
 
 
 @dataclass(frozen=True)
@@ -83,6 +143,22 @@ def _etag_matches(header_value: str | None, etag: str) -> bool:
         if candidate == etag or candidate == f"W/{etag}":
             return True
     return False
+
+
+def _valid_path_segment(raw: str) -> str | None:
+    if "/" in raw or not raw:
+        return None
+    decoded = unquote(raw)
+    if (
+        "/" in decoded
+        or "\\" in decoded
+        or "\x00" in decoded
+        or decoded in (".", "..")
+        or not decoded.strip()
+        or len(decoded) > 128
+    ):
+        return None
+    return decoded
 
 
 def _probe_socket_is_active(target: Path) -> bool:
@@ -130,6 +206,8 @@ class CompanyDaemon:
         expected_store_key: tuple[int, int] | None = None,
         authorize_board: AuthorizeBoard | None = None,
         engine_directory: Path | None = None,
+        evaluator_store: Path | None = None,
+        bootstrap_challenge: str | None = None,
         request_timeout: float = 10.0,
     ) -> None:
         self._store = store.absolute()
@@ -146,6 +224,11 @@ class CompanyDaemon:
         self._engine_directory = (
             engine_directory.absolute() if engine_directory is not None else None
         )
+        self._evaluator_store = (
+            evaluator_store.absolute() if evaluator_store is not None else None
+        )
+        self._bootstrap_challenge = bootstrap_challenge or secrets.token_hex(16)
+        self._service_incarnation_id = secrets.token_hex(12)
         self._request_timeout = validate_timeout_seconds(request_timeout)
 
         self._stack: ExitStack | None = None
@@ -172,6 +255,10 @@ class CompanyDaemon:
         return self._socket_path
 
     @property
+    def bootstrap_challenge(self) -> str:
+        return self._bootstrap_challenge
+
+    @property
     def info(self) -> DaemonInfo:
         if self._writer is None or self._socket_path is None:
             raise IpcRefused("CompanyDaemon is not running")
@@ -183,6 +270,11 @@ class CompanyDaemon:
             socket_path=str(self._socket_path),
             daemon_pid=os.getpid(),
         )
+
+    def notify_commit(self) -> None:
+        """Wake waiting /v1/events subscribers after an external company-store commit."""
+        with self._event_cond:
+            self._event_cond.notify_all()
 
     def start(self) -> DaemonInfo:
         if self._started:
@@ -242,8 +334,6 @@ class CompanyDaemon:
                     os.umask(previous_umask)
             bound_info = os.lstat(target.name, dir_fd=dir_fd)
             bound_key = (bound_info.st_dev, bound_info.st_ino)
-            # Ensure partial startup failure removes only our newly bound socket inode
-            # BEFORE dir_fd is closed and BEFORE WriterLease is released.
             stack.callback(_unlink_owned_socket, dir_fd, target.name, bound_key)
             if (
                 not stat.S_ISSOCK(bound_info.st_mode)
@@ -303,8 +393,6 @@ class CompanyDaemon:
             self._accept_thread.join(timeout=5.0)
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
-        # ExitStack closes in LIFO order: unlinks bound socket via pinned dir_fd
-        # (verifying inode), closes listener, closes dir_fd, then releases WriterLease.
         if self._stack is not None:
             self._stack.close()
         self._stack = None
@@ -383,10 +471,15 @@ class CompanyDaemon:
                     self._dispatch(conn, request, peer, deadline=deadline)
                 except (WriterRefused, StorageRefused, EngineRefused) as error:
                     self._safe_error(conn, 503, str(error), deadline=deadline)
+                except BoardControlConflict as error:
+                    self._safe_error(conn, 409, str(error), deadline=deadline)
+                except BoardControlForbidden as error:
+                    self._safe_error(conn, 403, str(error), deadline=deadline)
                 except (
                     FoundingRefused,
                     BindingRefused,
                     VenueRefused,
+                    BoardControlRefused,
                     IpcRefused,
                 ) as error:
                     self._safe_error(conn, 400, str(error), deadline=deadline)
@@ -424,10 +517,24 @@ class CompanyDaemon:
     def _supported_commands(self) -> dict[str, list[str]]:
         supported: dict[str, list[str]] = {
             SUSPEND_NEW_RISK: [PAPER_RISK_COMMAND],
+            SEND_CEO_MESSAGE: [CEO_CHAT_COMMAND],
+            SUBMIT_DECISION_ANSWER: [DECISION_COMMAND],
+            PAUSE_COMPANY: [RESTRICTION_COMMAND],
+            RESUME_COMPANY: [RESTRICTION_COMMAND],
+            ACTIVATE_STRATEGY_RELEASE: [STRATEGY_COMMAND],
+            ROLLBACK_STRATEGY_DEPLOYMENT: [STRATEGY_COMMAND],
+            INTERRUPT_RUN: [WORK_COMMAND],
+            CANCEL_WORK: [WORK_COMMAND],
+            CUT_CHECKPOINT: [CHECKPOINT_COMMAND],
+            REGISTER_OWNER: [RBAC_COMMAND],
         }
         if self._engine_directory is not None:
             supported[RESUME_NEW_RISK] = [PAPER_RISK_COMMAND]
         return supported
+
+    def _principal_hint(self, request: HttpRequest) -> str | None:
+        raw = request.headers.get("x-sourdough-principal", "").strip()
+        return raw if raw else None
 
     def _dispatch(
         self,
@@ -456,7 +563,7 @@ class CompanyDaemon:
             if request.method != "GET":
                 self._safe_error(conn, 405, "Method not allowed", deadline=deadline)
                 return
-            self._handle_meta(conn, writer, deadline=deadline)
+            self._handle_meta(conn, writer, request, deadline=deadline)
             return
 
         if path == "/v1/projections/work-timeline":
@@ -464,6 +571,15 @@ class CompanyDaemon:
                 self._safe_error(conn, 405, "Method not allowed", deadline=deadline)
                 return
             self._handle_work_timeline(conn, writer, request, query, deadline=deadline)
+            return
+
+        if path.startswith("/v1/projections/"):
+            if request.method != "GET":
+                self._safe_error(conn, 405, "Method not allowed", deadline=deadline)
+                return
+            self._handle_client_projection(
+                conn, path, request, query, deadline=deadline
+            )
             return
 
         if path == "/v1/events":
@@ -484,47 +600,253 @@ class CompanyDaemon:
             if request.method != "GET":
                 self._safe_error(conn, 405, "Method not allowed", deadline=deadline)
                 return
-            raw_command_id = path[len("/v1/commands/") :]
-            if "/" in raw_command_id or not raw_command_id:
-                self._safe_error(
-                    conn, 400, "Invalid command identifier path", deadline=deadline
-                )
-                return
-            command_id = unquote(raw_command_id)
-            if (
-                "/" in command_id
-                or "\\" in command_id
-                or "\x00" in command_id
-                or command_id in (".", "..")
-                or not command_id.strip()
-            ):
+            command_id = _valid_path_segment(path[len("/v1/commands/") :])
+            if command_id is None:
                 self._safe_error(
                     conn, 400, "Invalid command identifier", deadline=deadline
                 )
                 return
-            self._handle_read_command(conn, command_id, query, deadline=deadline)
+            self._handle_read_command(
+                conn, command_id, request, query, deadline=deadline
+            )
+            return
+
+        self._safe_error(conn, 404, "Endpoint not found", deadline=deadline)
+
+    def _send_projection(
+        self,
+        conn: socket.socket,
+        request: HttpRequest,
+        payload: dict[str, Any] | None,
+        seq: int,
+        *,
+        deadline: float,
+    ) -> None:
+        if payload is None:
+            self._safe_error(conn, 404, "Resource not found", deadline=deadline)
+            return
+        etag = projection_etag(payload, seq)
+        extra = {
+            "ETag": etag,
+            "X-Sourdough-Event-Seq": str(seq),
+            "X-Sourdough-Company-Id": self._company_id,
+        }
+        if _etag_matches(request.headers.get("if-none-match"), etag):
+            write_http_response(
+                conn, 304, body=b"", extra_headers=extra, deadline=deadline
+            )
+            return
+        write_http_response(
+            conn,
+            200,
+            body=_json_bytes(payload),
+            extra_headers=extra,
+            deadline=deadline,
+        )
+
+    def _handle_client_projection(
+        self,
+        conn: socket.socket,
+        path: str,
+        request: HttpRequest,
+        query: dict[str, list[str]],
+        *,
+        deadline: float,
+    ) -> None:
+        suffix = path[len("/v1/projections/") :]
+        if suffix == "live-trading":
+            since_raw = query.get("since_seq", [None])[0]
+            since_seq: int | None = None
+            if since_raw is not None:
+                try:
+                    since_seq = int(since_raw)
+                except ValueError:
+                    self._safe_error(
+                        conn, 400, "Invalid since_seq parameter", deadline=deadline
+                    )
+                    return
+                if since_seq < 0:
+                    self._safe_error(
+                        conn, 400, "Invalid since_seq parameter", deadline=deadline
+                    )
+                    return
+            payload, seq = read_live_trading_projection(
+                self._store,
+                self._company_id,
+                since_seq=since_seq,
+                authorize_board=self._authorize_board,
+                principal_hint=self._principal_hint(request),
+            )
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix.startswith("orders/"):
+            order_id = _valid_path_segment(suffix[len("orders/") :])
+            if order_id is None:
+                self._safe_error(
+                    conn, 400, "Invalid order identifier", deadline=deadline
+                )
+                return
+            payload, seq = read_order_trace_projection(
+                self._store, self._company_id, order_id
+            )
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "agents-graph":
+            payload, seq = read_agents_graph_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix.startswith("agents/"):
+            agent_id = _valid_path_segment(suffix[len("agents/") :])
+            if agent_id is None:
+                self._safe_error(
+                    conn, 400, "Invalid agent identifier", deadline=deadline
+                )
+                return
+            payload, seq = read_agent_detail_projection(
+                self._store, self._company_id, agent_id
+            )
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "messages":
+            payload, seq = read_messages_projection(
+                self._store,
+                self._company_id,
+                authorize_board=self._authorize_board,
+                principal_hint=self._principal_hint(request),
+            )
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "approvals":
+            payload, seq = read_approvals_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "strategies":
+            payload, seq = read_strategies_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "finance":
+            payload, seq = read_finance_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "org":
+            payload, seq = read_org_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "restrictions":
+            payload, seq = read_restrictions_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "system-safety":
+            payload, seq = read_system_safety_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "system-evals":
+            payload, seq = read_system_evals_projection(
+                self._store,
+                self._company_id,
+                evaluator_store=self._evaluator_store,
+            )
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "system-audit":
+            payload, seq = read_system_audit_projection(self._store, self._company_id)
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
             return
 
         self._safe_error(conn, 404, "Endpoint not found", deadline=deadline)
 
     def _handle_meta(
-        self, conn: socket.socket, writer: WriterLease, *, deadline: float
+        self,
+        conn: socket.socket,
+        writer: WriterLease,
+        request: HttpRequest,
+        *,
+        deadline: float,
     ) -> None:
+        principal_hint = self._principal_hint(request)
         with closing(open_reader(self._store)) as db, read_tx(db):
             if _identity(db) != self._company_id:
                 raise StorageRefused("Company identity mismatch")
             domains = sorted(installed_domains(db))
             seq = max_event_seq(db, self._company_id)
+            charter_rev = str(
+                db.execute(
+                    "SELECT charter_revision FROM company WHERE id = ?",
+                    (self._company_id,),
+                ).fetchone()[0]
+            )
+            founder_row = db.execute(
+                "SELECT founder_id FROM founding_receipt WHERE company_id = ?",
+                (self._company_id,),
+            ).fetchone()
+            founder_id = str(founder_row[0]) if founder_row else None
+            access = resolve_board_access(
+                db,
+                self._company_id,
+                authorize_board=self._authorize_board,
+                principal_hint=principal_hint,
+            )
+            pending_approvals = int(
+                db.execute(
+                    """SELECT COUNT(*) FROM decision_question
+                       WHERE company_id = ? AND state = 'open'""",
+                    (self._company_id,),
+                ).fetchone()[0]
+            )
+            active_restrictions = int(
+                db.execute(
+                    """SELECT COUNT(*) FROM restriction_cause
+                       WHERE company_id = ? AND active = 1""",
+                    (self._company_id,),
+                ).fetchone()[0]
+            )
+            paper_risk_state = effective_paper_risk(db) if "paper" in domains else None
+            paper_suspended = (
+                bool(paper_risk_state.suspended) if paper_risk_state else False
+            )
+            paper_risk_rev = int(paper_risk_state.revision) if paper_risk_state else 0
         dev, ino = writer.store_key
+        board_access: dict[str, Any] = {
+            "bootstrap_locked": access.bootstrap_locked,
+            "role": access.role,
+            "principal_id": access.principal_id,
+            "binding_revision": access.binding_revision,
+        }
+        if access.bootstrap_locked:
+            board_access["bootstrap_challenge"] = self._bootstrap_challenge
         body = {
             "control_plane_version": CONTROL_PLANE_VERSION,
             "company_id": self._company_id,
+            "charter_revision": charter_rev,
+            "founder_id": founder_id,
             "store_key": f"{dev}:{ino}",
+            "service_incarnation_id": self._service_incarnation_id,
             "schema_version": 1,
             "active_domains": domains,
             "daemon_pid": os.getpid(),
             "event_seq": seq,
-            "supported_projections": [WORK_TIMELINE_V1, WORK_TIMELINE_V2],
+            "board_access": board_access,
+            "pending_approvals_count": pending_approvals,
+            "active_restrictions_count": active_restrictions,
+            "paper_risk_suspended": paper_suspended,
+            "paper_risk_effective_revision": paper_risk_rev,
+            "supported_projections": [
+                WORK_TIMELINE_V1,
+                WORK_TIMELINE_V2,
+                *ALL_CLIENT_PROJECTIONS,
+            ],
             "supported_commands": self._supported_commands(),
         }
         write_http_response(conn, 200, body=_json_bytes(body), deadline=deadline)
@@ -548,7 +870,6 @@ class CompanyDaemon:
                 deadline=deadline,
             )
             return
-        # Single SQLite read_tx snapshot guarantees timeline and event_seq cannot tear.
         timeline, seq = read_local_board_timeline_with_seq(
             self._store, self._company_id
         )
@@ -664,31 +985,22 @@ class CompanyDaemon:
         self,
         conn: socket.socket,
         command_id: str,
+        request: HttpRequest,
         query: dict[str, list[str]],
         *,
         deadline: float,
     ) -> None:
         operations = query.get("operation")
         operation = operations[0] if operations else None
-        try:
-            status_payload = read_local_command_receipt_status(
-                self._store,
-                self._company_id,
-                command_id,
-                operation=operation,
-            )
-        except PaperRiskRefused as error:
-            message = str(error)
-            if "Invalid" in message or "Unsupported" in message:
-                code = 400
-            elif "unavailable" in message or "changed while" in message:
-                code = 503
-            elif "Corrupted" in message:
-                code = 500
-            else:
-                code = 403
-            self._safe_error(conn, code, message, deadline=deadline)
-            return
+        principal_hint = self._principal_hint(request)
+        status_payload = read_scoped_command_receipt(
+            self._store,
+            self._company_id,
+            command_id,
+            operation=operation,
+            authorize=self._authorize_board,
+            principal_hint=principal_hint,
+        )
         http_status = 404 if status_payload["status"] == "not_found" else 200
         write_http_response(
             conn, http_status, body=_json_bytes(status_payload), deadline=deadline
@@ -777,83 +1089,296 @@ class CompanyDaemon:
                 deadline=deadline,
             )
             return
-        if set(preconditions.keys()) != _ALLOWED_PRECONDITION_KEYS:
-            self._safe_error(
-                conn,
-                400,
-                "Command preconditions contain unsupported or missing fields",
-                deadline=deadline,
-            )
-            return
 
-        charter_revision = preconditions.get("charter_revision")
-        expected_revision = preconditions.get("expected_revision")
-        reason = payload.get("reason")
-        try:
-            command = PaperSuspension(
-                request_id=idem_key,
-                charter_revision=charter_revision,
-                expected_revision=expected_revision,
-                reason=reason,
-                contract_revision=contract_version,
-            )
-        except PaperRiskRefused as error:
-            self._safe_error(conn, 400, str(error), deadline=deadline)
-            return
+        principal_hint = self._principal_hint(request)
 
-        try:
-            if command_type == SUSPEND_NEW_RISK:
-                with self._write_lock:
+        # 1. Existing paper-risk-command-v1 (preserved verbatim for backward compatibility)
+        if contract_version == PAPER_RISK_COMMAND:
+            if set(preconditions.keys()) != _ALLOWED_PRECONDITION_KEYS:
+                self._safe_error(
+                    conn,
+                    400,
+                    "Command preconditions contain unsupported or missing fields",
+                    deadline=deadline,
+                )
+                return
+            try:
+                command = PaperSuspension(
+                    request_id=idem_key,
+                    charter_revision=preconditions.get("charter_revision"),
+                    expected_revision=preconditions.get("expected_revision"),
+                    reason=payload.get("reason"),
+                    contract_revision=contract_version,
+                )
+            except PaperRiskRefused as error:
+                self._safe_error(conn, 400, str(error), deadline=deadline)
+                return
+
+            authorizer = (
+                self._authorize_board
+                if self._authorize_board is not None
+                else make_board_authorizer(principal_hint=principal_hint)
+            )
+            try:
+                if command_type == SUSPEND_NEW_RISK:
+                    with self._write_lock:
+                        writer.verify()
+                        receipt = suspend_paper_risk(
+                            writer,
+                            command,
+                            authorizer,
+                            peer_pid=peer.pid,
+                        )
+                else:
+                    assert self._engine_directory is not None
                     writer.verify()
-                    receipt = suspend_paper_risk(
+                    receipt = resume_managed_paper_risk(
                         writer,
                         command,
-                        self._authorize_board,
+                        self._engine_directory,
+                        authorizer,
                         peer_pid=peer.pid,
                     )
-            else:
-                # resume_managed_paper_risk runs external venue observation lock-free
-                # and uses BEGIN IMMEDIATE + busy_timeout inside SQLite for serialization.
-                assert self._engine_directory is not None
-                writer.verify()
-                receipt = resume_managed_paper_risk(
-                    writer,
-                    command,
-                    self._engine_directory,
-                    self._authorize_board,
-                    peer_pid=peer.pid,
-                )
-        except PaperRiskRefused as error:
-            message = str(error)
-            if "already in use" in message:
-                self._safe_error(conn, 409, message, deadline=deadline)
-            elif (
-                "grant is required" in message
-                or "not authorized" in message
-                or "authorization changed" in message
-                or "identity mismatch" in message
-            ):
-                self._safe_error(conn, 403, message, deadline=deadline)
-            else:
-                self._safe_error(conn, 400, message, deadline=deadline)
+            except PaperRiskRefused as error:
+                message = str(error)
+                if "already in use" in message:
+                    self._safe_error(conn, 409, message, deadline=deadline)
+                elif (
+                    "grant is required" in message
+                    or "not authorized" in message
+                    or "authorization changed" in message
+                    or "identity mismatch" in message
+                ):
+                    self._safe_error(conn, 403, message, deadline=deadline)
+                else:
+                    self._safe_error(conn, 400, message, deadline=deadline)
+                return
+
+            self.notify_commit()
+            persisted_pid = self._persisted_peer_pid(receipt.request_id, peer.pid)
+            applied = receipt.disposition == "applied"
+            response_payload = {
+                "status": "found",
+                "company_id": self._company_id,
+                "command_id": receipt.request_id,
+                "command_type": receipt.operation,
+                "state": "applied" if applied else "denied",
+                "disposition": receipt.disposition,
+                "denial_code": None if applied else "conflicting_revision",
+                "effective_revision": receipt.effective_revision,
+                "recorded_at_ns": receipt.recorded_at_ns,
+                "peer_pid": persisted_pid,
+            }
+            write_http_response(
+                conn, 200, body=_json_bytes(response_payload), deadline=deadline
+            )
             return
 
-        with self._event_cond:
-            self._event_cond.notify_all()
+        # 2. Board Client governance & operations commands
+        with self._write_lock:
+            writer.verify()
+            if (
+                contract_version == CEO_CHAT_COMMAND
+                and command_type == SEND_CEO_MESSAGE
+            ):
+                if set(preconditions.keys()) != _CEO_PRECONDITION_KEYS:
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                ctx = payload.get("context_ref")
+                if ctx is not None and not isinstance(ctx, dict):
+                    self._safe_error(
+                        conn, 400, "Invalid context_ref object", deadline=deadline
+                    )
+                    return
+                outcome = post_ceo_message(
+                    writer,
+                    command_id=idem_key,
+                    target_agent_id=payload.get("target_agent_id"),
+                    expected_ceo_agent_id=preconditions.get("ceo_agent_id"),
+                    charter_revision=preconditions.get("charter_revision"),
+                    body=payload.get("body"),
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
+                    peer_pid=peer.pid,
+                    context_kind=ctx.get("kind") if ctx else None,
+                    context_id=ctx.get("id") if ctx else None,
+                    context_label=ctx.get("label") if ctx else None,
+                )
+            elif (
+                contract_version == DECISION_COMMAND
+                and command_type == SUBMIT_DECISION_ANSWER
+            ):
+                if set(preconditions.keys()) != _DECISION_PRECONDITION_KEYS:
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                outcome = submit_decision_answer(
+                    writer,
+                    command_id=idem_key,
+                    question_id=preconditions.get("question_id"),
+                    expected_revision=preconditions.get("expected_revision"),
+                    expected_payload_hash=preconditions.get("expected_payload_hash"),
+                    choice=payload.get("choice"),
+                    reason=payload.get("reason"),
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
+                    peer_pid=peer.pid,
+                )
+            elif (
+                contract_version == RESTRICTION_COMMAND
+                and command_type == PAUSE_COMPANY
+            ):
+                if set(preconditions.keys()) != _RESTRICTION_PRECONDITION_KEYS:
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                outcome = apply_company_restriction(
+                    writer,
+                    command_id=idem_key,
+                    restriction_id=preconditions.get("restriction_id"),
+                    charter_revision=preconditions.get("charter_revision"),
+                    expected_restriction_revision=preconditions.get(
+                        "expected_restriction_revision"
+                    ),
+                    cause_category=payload.get("cause_category", "board_pause"),
+                    scope_ref=payload.get("scope_ref", "company:all"),
+                    reason=payload.get("reason"),
+                    operator_releasable=payload.get("operator_releasable", True),
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
+                    peer_pid=peer.pid,
+                )
+            elif (
+                contract_version == RESTRICTION_COMMAND
+                and command_type == RESUME_COMPANY
+            ):
+                if set(preconditions.keys()) != _RESTRICTION_PRECONDITION_KEYS:
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                outcome = clear_company_restriction(
+                    writer,
+                    command_id=idem_key,
+                    restriction_id=preconditions.get("restriction_id"),
+                    charter_revision=preconditions.get("charter_revision"),
+                    expected_restriction_revision=preconditions.get(
+                        "expected_restriction_revision"
+                    ),
+                    reason=payload.get("reason"),
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
+                    peer_pid=peer.pid,
+                )
+            elif contract_version == WORK_COMMAND and command_type in (
+                INTERRUPT_RUN,
+                CANCEL_WORK,
+            ):
+                outcome = execute_work_control_command(
+                    writer,
+                    command_id=idem_key,
+                    command_type=command_type,
+                    preconditions=preconditions,
+                    payload=payload,
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
+                    peer_pid=peer.pid,
+                )
+            elif contract_version == STRATEGY_COMMAND and command_type in (
+                ACTIVATE_STRATEGY_RELEASE,
+                ROLLBACK_STRATEGY_DEPLOYMENT,
+            ):
+                outcome = execute_strategy_command(
+                    writer,
+                    command_id=idem_key,
+                    command_type=command_type,
+                    preconditions=preconditions,
+                    payload=payload,
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
+                    peer_pid=peer.pid,
+                )
+            elif (
+                contract_version == CHECKPOINT_COMMAND
+                and command_type == CUT_CHECKPOINT
+            ):
+                if set(preconditions.keys()) != _CHECKPOINT_PRECONDITION_KEYS:
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                outcome = execute_cut_checkpoint_command(
+                    writer,
+                    command_id=idem_key,
+                    charter_revision=preconditions.get("charter_revision"),
+                    reason=payload.get("reason"),
+                    authorize=self._authorize_board,
+                    principal_hint=principal_hint,
+                    peer_pid=peer.pid,
+                )
+            elif contract_version == RBAC_COMMAND and command_type == REGISTER_OWNER:
+                if (
+                    set(preconditions.keys()) != _RBAC_BOOTSTRAP_KEYS
+                    or preconditions.get("bootstrap_state") != "locked"
+                ):
+                    self._safe_error(
+                        conn,
+                        400,
+                        "Command preconditions contain unsupported or missing fields",
+                        deadline=deadline,
+                    )
+                    return
+                outcome = register_owner_command(
+                    writer,
+                    command_id=idem_key,
+                    principal_id=payload.get("principal_id"),
+                    challenge=payload.get("challenge"),
+                    proof=payload.get("proof"),
+                    expected_challenge=self._bootstrap_challenge,
+                    peer_pid=peer.pid,
+                )
+            else:
+                self._safe_error(
+                    conn,
+                    422,
+                    "Unsupported command type or contract version",
+                    deadline=deadline,
+                )
+                return
 
-        persisted_pid = self._persisted_peer_pid(receipt.request_id, peer.pid)
-        applied = receipt.disposition == "applied"
+        self.notify_commit()
+        persisted_pid = self._persisted_peer_pid(outcome.command_id, peer.pid)
         response_payload = {
             "status": "found",
             "company_id": self._company_id,
-            "command_id": receipt.request_id,
-            "command_type": receipt.operation,
-            "state": "applied" if applied else "denied",
-            "disposition": receipt.disposition,
-            "denial_code": None if applied else "conflicting_revision",
-            "effective_revision": receipt.effective_revision,
-            "recorded_at_ns": receipt.recorded_at_ns,
+            "command_id": outcome.command_id,
+            "command_type": outcome.command_type,
+            "state": outcome.state,
+            "disposition": outcome.disposition,
+            "denial_code": outcome.denial_code,
+            "effective_revision": outcome.effective_revision,
+            "recorded_at_ns": outcome.recorded_at_ns,
             "peer_pid": persisted_pid,
+            "result": outcome.result,
         }
         write_http_response(
             conn, 200, body=_json_bytes(response_payload), deadline=deadline

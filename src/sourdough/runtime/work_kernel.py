@@ -2365,3 +2365,139 @@ def read_peer_request_outcome(
         "outcome": str(state),
         "answer": answer,
     }
+
+
+def interrupt_work_run(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    run_id: str,
+    expected_fencing_token: int,
+    actor_id: str,
+    reason: str,
+    command_id: str | None = None,
+    now_ns: int | None = None,
+) -> tuple[bool, int]:
+    """Cancel an active or waiting work_run with optimistic fencing_token check.
+
+    Returns (applied, current_fencing_token). Returns (False, current_token) on
+    fencing mismatch or already-terminal state so callers can persist a
+    conflicting_revision receipt cleanly.
+    """
+    _require_nonempty(company_id, "company_id")
+    _require_nonempty(run_id, "run_id")
+    _require_nonempty(actor_id, "actor_id")
+    row = connection.execute(
+        """SELECT work_item_id, status, fencing_token
+           FROM work_runs
+           WHERE company_id = ? AND run_id = ?""",
+        (company_id, run_id),
+    ).fetchone()
+    if row is None:
+        raise WorkKernelRefused("Work run not found for company")
+    work_item_id, status, current_token = str(row[0]), str(row[1]), int(row[2])
+    if (
+        status not in ("queued", "running", "waiting")
+        or current_token != expected_fencing_token
+    ):
+        return False, current_token
+    timestamp = time_ns() if now_ns is None else now_ns
+    outcome = json.dumps({"interrupted": True}, sort_keys=True)
+    changed = connection.execute(
+        """UPDATE work_runs
+           SET status = 'cancelled',
+               lease_owner = NULL,
+               lease_expires_at_ns = NULL,
+               wait_until_ns = NULL,
+               wait_event_key = NULL,
+               outcome_json = ?,
+               updated_at_ns = ?
+           WHERE company_id = ? AND run_id = ?
+             AND status IN ('queued', 'running', 'waiting')
+             AND fencing_token = ?""",
+        (outcome, timestamp, company_id, run_id, expected_fencing_token),
+    )
+    if changed.rowcount != 1:
+        return False, current_token
+    connection.execute(
+        """UPDATE work_items
+           SET state = 'cancelled', updated_at_ns = ?
+           WHERE company_id = ? AND work_item_id = ?
+             AND state IN ('due', 'scheduled', 'running', 'waiting', 'blocked')""",
+        (timestamp, company_id, work_item_id),
+    )
+    append_audit_event(
+        connection,
+        company_id=company_id,
+        domain="work",
+        entity_type="work_run",
+        entity_id=run_id,
+        event_type="work.run_interrupted",
+        actor_id=actor_id,
+        run_id=run_id,
+        command_id=command_id,
+        payload={"work_item_id": work_item_id, "fencing_token": current_token},
+        recorded_at_ns=timestamp,
+    )
+    return True, current_token
+
+
+def cancel_work_item(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    work_item_id: str,
+    expected_state: str,
+    actor_id: str,
+    reason: str,
+    command_id: str | None = None,
+    now_ns: int | None = None,
+) -> tuple[bool, str]:
+    """Cancel a non-terminal work_item and any active/waiting work_runs."""
+    _require_nonempty(company_id, "company_id")
+    _require_nonempty(work_item_id, "work_item_id")
+    _require_nonempty(actor_id, "actor_id")
+    row = connection.execute(
+        """SELECT state FROM work_items
+           WHERE company_id = ? AND work_item_id = ?""",
+        (company_id, work_item_id),
+    ).fetchone()
+    if row is None:
+        raise WorkKernelRefused("Work item not found for company")
+    current_state = str(row[0])
+    if current_state in ("settled", "cancelled") or current_state != expected_state:
+        return False, current_state
+    timestamp = time_ns() if now_ns is None else now_ns
+    outcome = json.dumps({"cancelled": True}, sort_keys=True)
+    connection.execute(
+        """UPDATE work_runs
+           SET status = 'cancelled',
+               lease_owner = NULL,
+               lease_expires_at_ns = NULL,
+               wait_until_ns = NULL,
+               wait_event_key = NULL,
+               outcome_json = COALESCE(outcome_json, ?),
+               updated_at_ns = ?
+           WHERE company_id = ? AND work_item_id = ?
+             AND status IN ('queued', 'running', 'waiting')""",
+        (outcome, timestamp, company_id, work_item_id),
+    )
+    connection.execute(
+        """UPDATE work_items
+           SET state = 'cancelled', updated_at_ns = ?
+           WHERE company_id = ? AND work_item_id = ?""",
+        (timestamp, company_id, work_item_id),
+    )
+    append_audit_event(
+        connection,
+        company_id=company_id,
+        domain="work",
+        entity_type="work_item",
+        entity_id=work_item_id,
+        event_type="work.item_cancelled",
+        actor_id=actor_id,
+        command_id=command_id,
+        payload={"previous_state": current_state},
+        recorded_at_ns=timestamp,
+    )
+    return True, "cancelled"
