@@ -1,6 +1,6 @@
 # Three-tier execution accounts, realistic paper simulation, and live promotion gate (`flow-tiered-trading`)
 
-Status: Accepted specification · Target branch: `feat/flow-tiered-trading` · Owner: Quant execution, storage kernel, and Board control plane.
+Status: **Superseded (Legacy Compatibility)** by [flow-core-domain-cleanup](../flow-core-domain-cleanup/spec.md) · Original branch: `feat/flow-tiered-trading` · Note: 3-tier isolation invariants remain enforced, while the legacy `v1/paper/` SQL pack, `paper_*` / `agent_sandbox_*` tables, monolithic `execution_tiers.py`, and `/v1/projections/execution-tiers` endpoint were superseded and unified onto `v1/trading/` (`execution_environment_binding` + `trading_book_*`), `src/sourdough/trading/`, and `trading-desk-v1`.
 
 ## 1. Intent
 

@@ -1,6 +1,6 @@
 # Responsibility and unattended-operation design audit
 
-Design review · **2026-11-21** · Documentation only · All product and acceptance observations **UNRUN**. [Responsibility hierarchy and diagrams](../company-agent-quant.md) · [Ownership map](../README.md#system-hierarchy) · [Delivery lifecycle](lifecycle.md)
+Design review · **2026-11-21** *(Historical baseline snapshot prior to Modular IA and Core Company OS / Trading domain separation in [flow-core-domain-cleanup](flow-core-domain-cleanup/spec.md))* · Documentation only · All product and acceptance observations **UNRUN**. [Responsibility hierarchy and diagrams](../company-agent-quant.md) · [Ownership map](../README.md#system-hierarchy) · [Delivery lifecycle](lifecycle.md)
 
 ## Scope and method
 

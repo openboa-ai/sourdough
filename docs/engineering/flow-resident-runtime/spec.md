@@ -4,24 +4,24 @@ Status: Accepted specification · Target branch: `feat/flow-resident-runtime` ·
 
 ## 1. Intent
 
-Unify Sourdough's UDS Control Plane (`CompanyDaemon`) and autonomous Work scheduler (`CompanyRuntime`) into one resident process (`ResidentCompanyService`) holding a single exclusive `WriterLease`, backed by production `DutyRegistry` handlers (`ceo.respond_message`, `board.apply_decision`, `quant.agent_sandbox`, `quant.paper_decision`, `quant.reconcile`) and a single `sourdough run-company` CLI entry point.
+Unify Sourdough's UDS Control Plane (`CompanyDaemon`) and autonomous Work scheduler (`CompanyRuntime`) into one resident process (`ResidentCompanyService`) holding a single exclusive `WriterLease`, backed by Core `DutyRegistry` handlers (`ceo.respond_message`, `board.apply_decision`) plus `DomainPlugin`-contributed Trading duty handlers (`quant.agent_sandbox`, `trading.agent_sandbox`, `quant.paper_decision`, `quant.reconcile`, registered via `src/sourdough/trading/plugin.py` per [flow-core-domain-cleanup](../flow-core-domain-cleanup/spec.md)) and a single `sourdough run-company` CLI entry point.
 
 With this change, a Sourdough company runs continuously with **zero Board Clients connected**: Agents wake on due work items, execute real multi-provider LLM shifts over `OuterToolBroker`, settle compute expenses into `general_ledger`, and commit state cleanly. When a Board Client connects over UDS (or `ClientWebBridge`), it immediately receives live `/v1/events` push notifications and can converse with Founder·CEO or resolve inline approval decisions that trigger real authorized company execution.
 
 ## 2. Authority & Data Boundaries
 
 - **Single WriterLease coordination:** `ResidentCompanyService` starts `CompanyDaemon` (which owns the single `WriterLease`) and runs `CompanyRuntime.step_with_writer(writer, tx_lock=daemon.write_lock, on_commit=daemon.notify_commit)` on a dedicated scheduler thread. Short SQLite write transactions serialize under `daemon.write_lock`; slow LLM/CLI shift execution runs outside any SQLite transaction or lock so IPC reads and Board commands remain non-blocking.
-- **Strict domain table ownership:** Every SQLite mutation stays inside its registered module owner (`board_control.py`, `runtime/work_kernel.py`, `execution_tiers.py`, `general_ledger.py`). Zero cross-domain SQL writes.
-- **Fail-closed risk restriction boundary:** Active `restriction_cause` rows (`active = 1`) block new company risk duties (`quant.paper_decision`) while still permitting Board advisory dialogue (`ceo.respond_message`), isolated Tier 1 per-Agent sandboxes (`quant.agent_sandbox`), and reconciliation (`quant.reconcile`).
+- **Strict domain table ownership:** Every SQLite mutation stays inside its registered module owner (`board_control.py`, `runtime/work_kernel.py`, `src/sourdough/trading/` modules via `DomainPlugin`, `general_ledger.py`). Zero cross-domain SQL writes.
+- **Fail-closed risk restriction boundary:** Active `restriction_cause` rows (`active = 1`) block new company risk duties (`quant.paper_decision`) while still permitting Board advisory dialogue (`ceo.respond_message`), isolated Tier 1 per-Agent sandboxes (`quant.agent_sandbox` / `trading.agent_sandbox`), and reconciliation (`quant.reconcile`).
 - **Board-trigger intake (`sync_board_triggers`):** Idempotently maps unacknowledged Board CEO messages (`ceo_message.delivery_state = 'recorded'`) and approved actionable decisions (`decision_question.state = 'applied' AND resolution_choice = 'approve'`) into deduped `work_items` owned by Founder·CEO, catching up seamlessly after any restart.
 
 ## 3. Production Duty Handlers (`src/sourdough/runtime/handlers.py`)
 
 1. `ceo.respond_message`: Hydrates the Founder·CEO's shift context with the Board's message and recent thread history, executes the CEO's pinned provider adapter over `OuterToolBroker` (read-only company/tier status tools), settles compute cost to `general_ledger`, posts the reply via `board_control.record_ceo_reply`, and marks the inbound Board message delivered via `board_control.mark_ceo_message_delivered`.
 2. `board.apply_decision`: Executes the concrete domain effect declared in an approved `decision_question.impact_json` (e.g., `update_agent_budget` updating `agent_profile.monthly_budget_minor`, or `open_agent_sandbox` opening a Tier 1 sandbox), then seals the application audit receipt via `board_control.record_decision_application_result`.
-3. `quant.agent_sandbox`: Runs an employee Agent's pinned provider adapter wired strictly to `AgentSandboxTools(writer, agent_id=owner_agent_id)` over `OuterToolBroker`, then settles compute spend into `general_ledger`. Never requires `company_live` and remains isolated from company funds.
+3. `quant.agent_sandbox` / `trading.agent_sandbox`: Runs an employee Agent's pinned provider adapter wired strictly to `AgentSandboxTools(writer, agent_id=owner_agent_id)` over `OuterToolBroker`, then settles compute spend into `general_ledger`. Never requires `company_live` and remains isolated from company funds.
 4. `quant.paper_decision`: Guarded by a precondition verifying zero active company risk restrictions; executes the quant Agent's pinned provider adapter with read-only status tools and settles compute spend into `general_ledger`.
-5. `quant.reconcile`: Audits active execution tiers (`read_execution_tiers_snapshot`) and records deterministic reconciliation summary even during active risk restrictions.
+5. `quant.reconcile`: Audits active execution tiers (`read_execution_tiers_snapshot` in `src/sourdough/trading/projections.py`) and records deterministic reconciliation summary even during active risk restrictions.
 
 ## 4. Lifecycle Failures, Wakeups, & Recovery
 
