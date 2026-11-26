@@ -1224,7 +1224,7 @@ export function AgentsActivityView() {
             <Text variant="help">{node.current_task}</Text>
             {node.sandbox_activity ? (
               <Badge tone="neutral" variant="outline" dot={false}>
-                Paper Sandbox ·{" "}
+                Trading Sandbox ·{" "}
                 {node.sandbox_activity.fill_count > 0
                   ? `${node.sandbox_activity.fill_count} ${node.sandbox_activity.fill_count === 1 ? "fill" : "fills"}`
                   : "active"}
@@ -1440,7 +1440,7 @@ export function AgentsActivityView() {
             {node.sandbox_activity ? (
               <Inline gap={6} align="center" wrap>
                 <Badge tone="neutral" variant="outline" dot={false}>
-                  Paper Sandbox ·{" "}
+                  Trading Sandbox ·{" "}
                   {node.sandbox_activity.fill_count > 0
                     ? `${node.sandbox_activity.fill_count} ${node.sandbox_activity.fill_count === 1 ? "fill" : "fills"}`
                     : "active"}
@@ -1768,9 +1768,9 @@ export function AgentsActivityView() {
                         emphasis="soft"
                         size="compact"
                         shape="pill"
-                        onClick={() => navigate("/company/org")}
+                        onClick={() => navigate("/reports")}
                       >
-                        View Org
+                        View Reports
                       </Button>
                     </Inline>
                   </Surface>

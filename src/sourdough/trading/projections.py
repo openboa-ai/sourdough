@@ -477,6 +477,9 @@ def read_trading_desk_projection(
                     "company_paper_soak_ready": bool(
                         tiers.get("company_paper_soak_ready", False)
                     ),
+                    "paper_soak_ready": bool(
+                        tiers.get("company_paper_soak_ready", False)
+                    ),
                     "paper_books_count": len(paper_books),
                     "soak_ready_books_count": soak_ready_books,
                     "current_core_digest": tiers.get("current_core_digest", ""),

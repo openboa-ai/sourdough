@@ -495,7 +495,7 @@ export function ApprovalsView() {
               emphasis="soft"
               size="compact"
               shape="pill"
-              onClick={() => navigate("/company/approvals")}
+              onClick={() => navigate("/approvals")}
             >
               Show all approvals
             </Button>
@@ -670,12 +670,8 @@ export function ApprovalsView() {
                               whatChanges: decisionMeta.whatChanges,
                               whatStaysUntouched: item.impact.what_stays_untouched ?? [
                                 {
-                                  label: "Paper-only boundary",
-                                  value: "Live trading remains disabled",
-                                },
-                                {
-                                  label: "Existing positions",
-                                  value: "Open exposure untouched",
+                                  label: "Unrelated scope",
+                                  value: "Unrelated domains and records remain unchanged",
                                 },
                               ],
                               technicalDetails: [
@@ -708,15 +704,15 @@ export function ApprovalsView() {
         <Card
           variant="raised"
           title="Strategy Promotion Candidates"
-          description="Challenger trials with PROMOTE verdict linked to Strategy Trials"
+          description="Challenger trials with PROMOTE verdict linked to Strategies"
           headerAction={
             <Button
               emphasis="soft"
               size="compact"
               shape="pill"
-              onClick={() => navigate("/company/strategy-trials")}
+              onClick={() => navigate("/trading/strategies")}
             >
-              Strategy Trials →
+              Strategies →
             </Button>
           }
         >
@@ -737,7 +733,7 @@ export function ApprovalsView() {
                         .filter(Boolean)
                         .join(" · "),
                     }}
-                    onOpen={() => navigate("/company/strategy-trials")}
+                    onOpen={() => navigate("/trading/strategies")}
                   />
                 </li>
               );
@@ -818,7 +814,10 @@ export function ApprovalsView() {
                 }));
                 const untouchedFacts: Fact[] = (
                   item.impact.what_stays_untouched ?? [
-                    { label: "Paper-only boundary", value: "Live trading remains disabled" },
+                    {
+                      label: "Unrelated scope",
+                      value: "Unrelated domains and records remain unchanged",
+                    },
                   ]
                 ).map((entry, idx) => ({
                   id: `stay-${item.question_id}-${idx}`,

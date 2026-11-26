@@ -27,10 +27,10 @@ import {
   formatMinorCurrency,
   formatNsClock,
   formatRelativeNs,
-} from "../api/client";
-import type { OrderTraceProjection } from "../api/types";
-import { SpaBreadcrumb } from "../components/SpaBreadcrumb";
-import { useApp, useEscapeBack } from "../state/store";
+} from "../../api/client";
+import type { OrderTraceProjection } from "../../api/types";
+import { SpaBreadcrumb } from "../../components/SpaBreadcrumb";
+import { useApp, useEscapeBack } from "../../state/store";
 
 type RelatedPublicationItem = OrderTraceProjection["related_publications"][number];
 
@@ -77,8 +77,36 @@ function getRemainingOpenQty(order: { status: string; remaining_qty: number }): 
   return isTerminalOrderStatus(order.status) ? 0 : order.remaining_qty;
 }
 
+function resolveBackMeta(
+  backLink: string,
+  agentName: string
+): {
+  label: string;
+  breadcrumbItems: Array<{ id: string; label: string; href: string }>;
+} {
+  if (backLink === "/trading/live") {
+    return {
+      label: "Back to Live Trading",
+      breadcrumbItems: [{ id: "live", label: "Live Trading", href: "/trading/live" }],
+    };
+  }
+  if (backLink.startsWith("/agents/")) {
+    return {
+      label: `Back to ${agentName || "Agent"}`,
+      breadcrumbItems: [
+        { id: "agents", label: "Agents", href: "/agents" },
+        { id: "agent", label: agentName || "Agent", href: backLink },
+      ],
+    };
+  }
+  return {
+    label: "Back to Paper Trading",
+    breadcrumbItems: [{ id: "paper", label: "Paper Trading", href: "/trading/paper" }],
+  };
+}
+
 export function OrderTraceView({ orderId }: { orderId: string }) {
-  const { navigate, refreshSeq, reportApiError, askCeo } = useApp();
+  const { navigate, refreshSeq, routeSearchParams, reportApiError, askCeo } = useApp();
   const [data, setData] = useState<OrderTraceProjection | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -86,12 +114,15 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
   const [retrySeq, setRetrySeq] = useState(0);
   const prevOrderIdRef = useRef(orderId);
 
+  const envHint = routeSearchParams.get("env");
+  const fallbackBackLink = envHint === "live" ? "/trading/live" : "/trading/paper";
   const activeData = data && data.order.order_id === orderId ? data : null;
   const resolvedFocusReturnId = resolveOrderFocusReturnId(
     activeData ? activeData.order.order_id : orderId
   );
+  const backLink = activeData?.order.back_link || fallbackBackLink;
 
-  useEscapeBack("/trading/paper", resolvedFocusReturnId);
+  useEscapeBack(backLink, resolvedFocusReturnId);
 
   useEffect(() => {
     if (prevOrderIdRef.current !== orderId) {
@@ -135,6 +166,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
 
   if (!activeData) {
     const isNotFound = errorStatus === 404 || error === null;
+    const fallbackMeta = resolveBackMeta(fallbackBackLink, "Agent");
     return (
       <Result
         title={isNotFound ? "Order trace not found" : "Order trace unavailable"}
@@ -157,9 +189,9 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
             <Button
               emphasis="soft"
               shape="pill"
-              onClick={() => navigate("/trading/paper", { focusReturnId: resolvedFocusReturnId })}
+              onClick={() => navigate(fallbackBackLink, { focusReturnId: resolvedFocusReturnId })}
             >
-              Back to Paper Trading
+              {fallbackMeta.label}
             </Button>
           </Inline>
         }
@@ -172,9 +204,18 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
   }
 
   const order = activeData.order;
+  const currency = order.currency || "USD";
   const focusReturnId = resolvedFocusReturnId;
   const isTerminal = isTerminalOrderStatus(order.status);
   const remainingOpen = getRemainingOpenQty(order);
+  const backMeta = resolveBackMeta(backLink, order.agent_name);
+  const isCancelled = order.status === "cancelled" || order.cancelled_at_ns !== null;
+  const accountLabel =
+    order.environment === "live"
+      ? "Live Account"
+      : order.environment === "agent_sandbox"
+        ? "Sandbox Account"
+        : "Paper Account";
 
   const traceEvents: TraceEvent[] = activeData.causal_steps.map((step, idx) => ({
     id: `${step.stage}-${idx}`,
@@ -213,6 +254,13 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
       sortValue: (row) => fillById.get(row.id)?.price_minor_units ?? null,
     },
     {
+      id: "notional",
+      label: "Notional",
+      kind: "numeric",
+      align: "end",
+      sortValue: (row) => fillById.get(row.id)?.notional_minor_units ?? null,
+    },
+    {
       id: "fee",
       label: "Venue Fee",
       kind: "numeric",
@@ -220,18 +268,24 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
       sortValue: (row) => fillById.get(row.id)?.fee_minor_units ?? null,
     },
     {
-      id: "pos",
-      label: "Observed Position",
+      id: "realized_pnl",
+      label: "Realized P&L",
       kind: "numeric",
       align: "end",
-      sortValue: (row) => fillById.get(row.id)?.position_quantity ?? null,
+      sortValue: (row) => fillById.get(row.id)?.realized_pnl_minor_units ?? null,
     },
     {
-      id: "available_at",
-      label: "Observed At",
+      id: "delivery",
+      label: "Fee Delivery",
+      kind: "role",
+      sortValue: (row) => fillById.get(row.id)?.delivery_status ?? "",
+    },
+    {
+      id: "filled_at",
+      label: "Filled At",
       kind: "numeric",
       align: "end",
-      sortValue: (row) => normalizeToNs(fillById.get(row.id)?.available_at) ?? null,
+      sortValue: (row) => normalizeToNs(fillById.get(row.id)?.filled_at_ns) ?? null,
     },
   ];
 
@@ -241,20 +295,46 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
       fill_id: <Text className="sd-mono">{f.fill_id}</Text>,
       qty: <Text className="sd-tabular">{f.quantity}</Text>,
       price: (
-        <Text className="sd-tabular">{formatMinorCurrency(f.price_minor_units)}</Text>
+        <Text className="sd-tabular">{formatMinorCurrency(f.price_minor_units, currency)}</Text>
+      ),
+      notional: (
+        <Text className="sd-tabular">
+          {formatMinorCurrency(f.notional_minor_units, currency)}
+        </Text>
       ),
       fee: (
-        <Text className="sd-tabular">
-          {f.fee_minor_units === null ? "No reading" : formatMinorCurrency(f.fee_minor_units)}
+        <Text className="sd-tabular">{formatMinorCurrency(f.fee_minor_units, currency)}</Text>
+      ),
+      realized_pnl: (
+        <Text
+          className={`sd-tabular ${
+            f.realized_pnl_minor_units > 0
+              ? "sd-tone-pos"
+              : f.realized_pnl_minor_units < 0
+                ? "sd-tone-neg"
+                : "sd-tone-muted"
+          }`}
+        >
+          {formatMinorCurrency(f.realized_pnl_minor_units, currency, { signed: true })}
         </Text>
       ),
-      pos: (
-        <Text className="sd-tabular">
-          {f.position_quantity === null ? "No reading" : f.position_quantity}
-        </Text>
+      delivery: (
+        <Badge
+          tone={
+            f.delivery_status === "acknowledged"
+              ? "success"
+              : f.delivery_status === "pending"
+                ? "warning"
+                : "neutral"
+          }
+          variant="soft"
+          dot={false}
+        >
+          {f.delivery_status ?? "none"}
+        </Badge>
       ),
-      available_at: (
-        <Text className="sd-tabular">{formatTimestamp(f.available_at, "No reading")}</Text>
+      filled_at: (
+        <Text className="sd-tabular">{formatTimestamp(f.filled_at_ns, "No reading")}</Text>
       ),
     },
   }));
@@ -263,22 +343,22 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
     <Stack gap={16}>
       <Navbar
         variant="back"
-        label="Back to Live Trading"
-        onBack={() => navigate("/", { focusReturnId })}
+        label={backMeta.label}
+        onBack={() => navigate(backLink, { focusReturnId })}
         action={<CopyButton value={order.order_id} presentation="quiet" />}
       />
 
       <SpaBreadcrumb
         focusReturnId={focusReturnId}
         items={[
-          { id: "paper", label: "Paper Trading", href: "/trading/paper" },
+          ...backMeta.breadcrumbItems,
           { id: "order", label: `Order ${order.order_id}`, href: `/orders/${order.order_id}` },
         ]}
       />
 
       <PageHeader
         title={`Order ${order.order_id}`}
-        detail={`${order.action.toUpperCase()} ${order.instrument} · Author: ${order.agent_name}`}
+        detail={`${order.side.toUpperCase()} ${order.instrument_id} · ${order.book_name} (${order.environment}) · Author: ${order.agent_name}`}
         action={
           <Inline gap={8} align="center" wrap>
             {order.agent_id ? (
@@ -286,9 +366,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                 emphasis="soft"
                 size="compact"
                 shape="pill"
-                onClick={() =>
-                  navigate(`/agents/${encodeURIComponent(order.agent_id!)}`)
-                }
+                onClick={() => navigate(`/agents/${encodeURIComponent(order.agent_id!)}`)}
               >
                 Inspect {order.agent_name}
               </Button>
@@ -299,9 +377,9 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
               shape="pill"
               onClick={() =>
                 askCeo({
-                  kind: "paper_order",
+                  kind: "trading_order",
                   id: order.order_id,
-                  label: `Order ${order.order_id} (${order.action.toUpperCase()} ${order.instrument})`,
+                  label: `Order ${order.order_id} (${order.side.toUpperCase()} ${order.instrument_id})`,
                 })
               }
             >
@@ -327,7 +405,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
         <Card title="Order & Exposure Summary" variant="raised">
           <div className="sd-facts-wrap">
             <RecordFacts
-              source="paper_order + paper_fill + paper_cancellation"
+              source="trading_book_order + trading_book_fill"
               asOf={`seq #${activeData.event_seq}`}
               facts={[
                 {
@@ -348,12 +426,23 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                     </Badge>
                   ),
                 },
-                { id: "inst", label: "Instrument", value: order.instrument },
+                { id: "env", label: "Environment", value: `${order.environment} (${order.tier})` },
+                { id: "book", label: "Book", value: order.book_name },
+                { id: "inst", label: "Instrument", value: order.instrument_id },
                 {
                   id: "acct",
-                  label: "Paper Account",
+                  label: accountLabel,
                   value: <Text className="sd-mono">{order.account_id}</Text>,
                 },
+                ...(order.external_order_id
+                  ? [
+                      {
+                        id: "ext_id",
+                        label: "External Order ID",
+                        value: <Text className="sd-mono">{order.external_order_id}</Text>,
+                      },
+                    ]
+                  : []),
                 {
                   id: "qty",
                   label: "Ordered / Filled / Remaining Open",
@@ -368,9 +457,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                   label: "Residual Net Position",
                   value: (
                     <Inline gap={6} align="center">
-                      <Text className="sd-tabular">
-                        {order.residual_position_qty ?? "No reading"}
-                      </Text>
+                      <Text className="sd-tabular">{order.residual_position_qty}</Text>
                       {order.cancel_not_flat ? (
                         <Badge tone="warning" dot={false}>
                           Open after cancel
@@ -382,7 +469,12 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                 {
                   id: "lim",
                   label: "Limit Price",
-                  value: formatMinorCurrency(order.limit_minor_units),
+                  value: formatMinorCurrency(order.limit_minor_units, currency),
+                },
+                {
+                  id: "mkt",
+                  label: "Market Price at Order",
+                  value: formatMinorCurrency(order.market_price_minor_units, currency),
                 },
                 {
                   id: "avg_fill",
@@ -390,32 +482,37 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                   value:
                     order.avg_fill_minor_units === null
                       ? "No reading"
-                      : formatMinorCurrency(order.avg_fill_minor_units),
-                },
-                {
-                  id: "reserved",
-                  label: "Reserved Margin",
-                  value: formatMinorCurrency(order.reserved_minor_units),
+                      : formatMinorCurrency(order.avg_fill_minor_units, currency),
                 },
                 {
                   id: "fees",
                   label: "Total Venue Fees",
-                  value:
-                    order.total_fee_minor_units === null
-                      ? "No reading"
-                      : formatMinorCurrency(order.total_fee_minor_units),
+                  value: formatMinorCurrency(order.total_fee_minor_units, currency),
                 },
-                { id: "mandate", label: "Mandate Revision", value: order.mandate_revision },
+                {
+                  id: "mandate",
+                  label: "Mandate Revision",
+                  value: order.mandate_revision ?? "Unavailable",
+                },
                 {
                   id: "run_id",
                   label: "Work Run ID",
-                  value: <Text className="sd-mono">{order.run_id}</Text>,
+                  value: order.run_id ? (
+                    <Text className="sd-mono">{order.run_id}</Text>
+                  ) : (
+                    "Direct"
+                  ),
                 },
                 {
-                  id: "duty_id",
-                  label: "Duty ID",
+                  id: "duty",
+                  label: "Duty",
                   value: order.duty_id ? (
-                    <Text className="sd-mono">{order.duty_id}</Text>
+                    <Text className="sd-mono">
+                      {order.duty_id}
+                      {order.duty_kind ? ` (${order.duty_kind})` : ""}
+                    </Text>
+                  ) : order.duty_kind ? (
+                    order.duty_kind
                   ) : (
                     "Unavailable"
                   ),
@@ -430,21 +527,22 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                   ),
                 },
                 {
-                  id: "decided_at",
-                  label: "Decided At",
-                  value: formatTimestamp(order.decided_at, "Unavailable"),
+                  id: "action_id",
+                  label: "Action ID",
+                  value: <Text className="sd-mono">{order.action_id}</Text>,
                 },
                 {
-                  id: "rationale",
-                  label: "Decision Rationale",
-                  value: order.rationale ?? "Unavailable",
+                  id: "created_at",
+                  label: "Submitted At",
+                  value: formatTimestamp(order.created_at_ns, "Unavailable"),
                 },
                 {
                   id: "cancelled_at",
                   label: "Cancelled At",
-                  value: order.cancellation
-                    ? formatTimestamp(order.cancellation.available_at, "No reading")
-                    : "Not cancelled",
+                  value:
+                    order.cancelled_at_ns !== null
+                      ? formatTimestamp(order.cancelled_at_ns, "No reading")
+                      : "Not cancelled",
                 },
               ]}
             />
@@ -452,57 +550,44 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
         </Card>
       </div>
 
-      <div className={order.reconciliation ? "sd-split-equal" : undefined}>
+      <div className={order.external_action ? "sd-split-equal" : undefined}>
         <Card title="Cancellation Details" variant="raised">
-          {order.cancellation === null ? (
+          {!isCancelled ? (
             <Text variant="help">Not cancelled — no cancellation record on this order.</Text>
           ) : (
             <div className="sd-facts-wrap">
               <RecordFacts
-                source="paper_cancellation"
+                source="trading_book_order"
                 asOf={`seq #${activeData.event_seq}`}
                 facts={[
                   {
-                    id: "cancel_event",
-                    label: "Cancellation Event ID",
-                    value: <Text className="sd-mono">{order.cancellation.event_id}</Text>,
+                    id: "cancel_reason",
+                    label: "Cancel Reason",
+                    value: order.cancel_reason ?? "Cancelled",
                   },
                   {
                     id: "cancel_outcome",
-                    label: "Outcome",
+                    label: "Position State",
                     value: (
-                      <Badge
-                        tone={order.cancel_not_flat ? "warning" : "neutral"}
-                        dot={false}
-                      >
-                        {order.cancellation.outcome}
+                      <Badge tone={order.cancel_not_flat ? "warning" : "neutral"} dot={false}>
+                        {order.cancel_not_flat ? "Open residual exposure" : "Flat"}
                       </Badge>
                     ),
                   },
                   {
-                    id: "cancel_released",
-                    label: "Reservation Released",
-                    value: order.cancellation.released
-                      ? "Yes (remaining reserve released)"
-                      : "No (reserve held)",
-                  },
-                  {
-                    id: "cancel_available_at",
-                    label: "Observed At",
-                    value: formatTimestamp(order.cancellation.available_at, "No reading"),
+                    id: "cancel_at",
+                    label: "Cancelled At",
+                    value: formatTimestamp(order.cancelled_at_ns, "No reading"),
                   },
                   {
                     id: "cancel_filled_qty",
                     label: "Filled Quantity at Cancel",
-                    value: String(order.cancellation.filled_quantity),
+                    value: String(order.filled_qty),
                   },
                   {
                     id: "cancel_pos_qty",
-                    label: "Position Quantity at Cancel",
-                    value:
-                      order.cancellation.position_quantity === null
-                        ? "No reading"
-                        : String(order.cancellation.position_quantity),
+                    label: "Observed Position Quantity",
+                    value: String(order.residual_position_qty),
                   },
                 ]}
               />
@@ -510,41 +595,62 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
           )}
         </Card>
 
-        {order.reconciliation ? (
-          <Card title="Venue Reconciliation" variant="raised">
+        {order.external_action ? (
+          <Card title="External Venue Action" variant="raised">
             <div className="sd-facts-wrap">
               <RecordFacts
-                source="paper_reconciliation"
+                source="external_actions"
                 asOf={`seq #${activeData.event_seq}`}
                 facts={[
                   {
-                    id: "recon_attempts",
-                    label: "Query Attempts",
-                    value: String(order.reconciliation.attempts),
+                    id: "ext_key",
+                    label: "Idempotency Key",
+                    value: <Text className="sd-mono">{order.external_action.idempotency_key}</Text>,
                   },
                   {
-                    id: "recon_next",
-                    label: "Next Query At",
-                    value: formatTimestamp(order.reconciliation.next_query_at, "Not scheduled"),
-                  },
-                  {
-                    id: "recon_fill",
-                    label: "Reconciled Fill ID",
-                    value: order.reconciliation.fill_id ? (
-                      <Text className="sd-mono">{order.reconciliation.fill_id}</Text>
-                    ) : (
-                      "No reading"
+                    id: "ext_status",
+                    label: "Status",
+                    value: (
+                      <Badge
+                        tone={
+                          order.external_action.status === "confirmed"
+                            ? "success"
+                            : order.external_action.status === "rejected"
+                              ? "danger"
+                              : "warning"
+                        }
+                        dot={false}
+                      >
+                        {order.external_action.status}
+                      </Badge>
                     ),
                   },
                   {
-                    id: "recon_sources",
-                    label: "Evidence Sources",
-                    value:
-                      Array.isArray(order.reconciliation.sources) &&
-                      order.reconciliation.sources.length > 0
-                        ? order.reconciliation.sources.map((s) => String(s)).join(", ")
-                        : "None",
+                    id: "ext_conn",
+                    label: "Connector",
+                    value: order.external_action.connector,
                   },
+                  {
+                    id: "ext_op",
+                    label: "Operation",
+                    value: order.external_action.operation,
+                  },
+                  ...(order.external_action.receipt !== null &&
+                  order.external_action.receipt !== undefined
+                    ? [
+                        {
+                          id: "ext_receipt",
+                          label: "Venue Receipt",
+                          value: (
+                            <Text className="sd-mono">
+                              {typeof order.external_action.receipt === "string"
+                                ? order.external_action.receipt
+                                : JSON.stringify(order.external_action.receipt)}
+                            </Text>
+                          ),
+                        },
+                      ]
+                    : []),
                 ]}
               />
             </div>
@@ -568,9 +674,9 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
             emphasis="quiet"
             size="compact"
             shape="pill"
-            onClick={() => navigate("/company/org")}
+            onClick={() => navigate("/reports")}
           >
-            All Org Reports
+            All Reports
           </Button>
         }
         variant="raised"
@@ -590,16 +696,16 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                       title: `${pub.asset_id} · #${pub.project_id}`,
                       detail: pub.excerpt,
                     }}
-                    onOpen={() => navigate("/company/org")}
+                    onOpen={() => navigate("/reports")}
                   />
                   <Inline gap={8} align="center" wrap>
                     <Button
                       emphasis="soft"
                       size="compact"
                       shape="pill"
-                      onClick={() => navigate("/company/org")}
+                      onClick={() => navigate("/reports")}
                     >
-                      View in Org &amp; Reports
+                      View in Reports
                     </Button>
                     <Button
                       emphasis="quiet"

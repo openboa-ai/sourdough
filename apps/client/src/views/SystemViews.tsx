@@ -792,7 +792,9 @@ export function SystemEvalsView({ embedded = false }: { embedded?: boolean } = {
 
 const AUDIT_DOMAINS = [
   "all",
-  "paper",
+  "trading",
+  "accounting",
+  "assets",
   "org",
   "work",
   "ceo",
@@ -808,8 +810,8 @@ export function SystemAuditView({
   embedded?: boolean;
   mode?: "audit" | "daemon";
 } = {}) {
-  const { refreshSeq, meta, daemonMode, navigate, reportApiError, registerEscapeBack } = useApp();
-  const effectiveDaemon = mode ? mode === "daemon" : daemonMode;
+  const { refreshSeq, meta, navigate, reportApiError, registerEscapeBack } = useApp();
+  const effectiveDaemon = mode === "daemon";
   const [data, setData] = useState<SystemAuditProjection | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1159,7 +1161,7 @@ export function SystemAuditView({
             focusReturnId="system-daemon-entry"
             items={[
               { id: "audit", label: "Audit", href: "/audit" },
-              { id: "daemon", label: "Daemon Diagnostics", href: "/system/daemon" },
+              { id: "daemon", label: "Daemon Diagnostics", href: "/audit?tab=daemon" },
             ]}
           />
           <PageHeader
@@ -1186,7 +1188,7 @@ export function SystemAuditView({
                   shape="pill"
                   data-focus-id="system-daemon-entry"
                   onClick={() =>
-                    navigate("/system/daemon", { focusReturnId: "system-daemon-entry" })
+                    navigate("/audit?tab=daemon", { focusReturnId: "system-daemon-entry" })
                   }
                 >
                   Daemon Diagnostics
@@ -1409,7 +1411,7 @@ export function BootstrapView() {
               ],
               whatStaysUntouched: [
                 { label: "Company charter", value: meta.charter_revision },
-                { label: "Paper boundary", value: "Strictly Paper environment" },
+                { label: "Store key", value: meta.store_key },
               ],
               technicalDetails: [
                 { label: "command_type", value: "register_owner" },

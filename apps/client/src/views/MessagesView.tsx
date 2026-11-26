@@ -39,8 +39,8 @@ import type {
   ApprovalsProjection,
   ContextRef,
   FinanceProjection,
-  LiveTradingProjection,
   MessagesProjection,
+  OrderTraceProjection,
   OrgProjection,
   RestrictionsProjection,
   StrategiesProjection,
@@ -89,30 +89,30 @@ function resolveContextHref(
   resolvedAgentId?: string | null
 ): string | null {
   switch (kind) {
-    case "paper_order":
+    case "trading_order":
       return `/orders/${encodeURIComponent(id)}`;
     case "decision_question":
-      return `/company/approvals/${encodeURIComponent(id)}`;
+      return `/approvals/${encodeURIComponent(id)}`;
     case "agent":
-      return `/office/agents/${encodeURIComponent(id)}`;
+      return `/agents/${encodeURIComponent(id)}`;
     case "shared_publication":
     case "company":
-      return "/company/org";
+      return "/reports";
     case "strategy_release":
     case "challenger_trial":
     case "strategy_trial":
-      return "/company/strategy-trials";
+      return "/trading/strategies";
     case "restriction":
     case "restriction_cause":
-      return "/restrictions";
+      return "/controls";
     case "work_run":
       return resolvedAgentId
-        ? `/office/agents/${encodeURIComponent(resolvedAgentId)}`
-        : "/system/audit";
+        ? `/agents/${encodeURIComponent(resolvedAgentId)}`
+        : "/audit";
     case "account_balance":
-      return "/company/finance";
+      return "/finance";
     case "audit_event":
-      return "/system/audit";
+      return "/audit";
     default:
       return null;
   }
@@ -143,14 +143,17 @@ async function resolveLiveContextState(
     detail: "Advisory context only · No actions execute from chat",
   };
 
-  if (ctx.kind === "paper_order") {
-    const res = await fetchProjection<LiveTradingProjection>("live-trading", { signal });
-    const order = res.data?.execution_tape.find((o) => o.order_id === ctx.id);
+  if (ctx.kind === "trading_order") {
+    const res = await fetchProjection<OrderTraceProjection>(
+      `orders/${encodeURIComponent(ctx.id)}`,
+      { signal }
+    );
+    const order = res.data?.order;
     if (!order) return fallback;
     return {
       statusLabel: order.status,
       statusTone: statusToneForOrder(order.status),
-      detail: `${order.action.toUpperCase()} ${order.instrument} · ${order.filled_qty}/${order.ordered_qty} filled · ${order.agent_name}`,
+      detail: `${order.side.toUpperCase()} ${order.instrument_id} · ${order.filled_qty}/${order.ordered_qty} filled · ${order.agent_name}`,
     };
   }
 
@@ -462,8 +465,8 @@ export function MessagesView() {
       return;
     }
     setCtxState({
-      statusLabel: meta.paper_risk_suspended ? "Paper suspended" : "Operational",
-      statusTone: meta.paper_risk_suspended ? "warning" : "success",
+      statusLabel: meta.active_restrictions_count > 0 ? "Restricted" : "Operational",
+      statusTone: meta.active_restrictions_count > 0 ? "warning" : "success",
       detail: `Company ${meta.company_id} · Charter ${meta.charter_revision} · ${meta.pending_approvals_count} pending approvals`,
       resolvedAgentId: null,
     });
@@ -762,8 +765,10 @@ export function MessagesView() {
               <div className="sd-thread-scroll">
                 {ceoMsgs.length === 0 ? (
                   <Text variant="help">
-                    No messages yet. Ask {ceoDisplayName} about trading posture, strategy trials, or
-                    pending approvals.
+                    No messages yet. Ask {ceoDisplayName} about{" "}
+                    {meta?.active_domains.includes("trading")
+                      ? "trading posture, strategy trials, or pending approvals."
+                      : "company posture, active work, or pending approvals."}
                   </Text>
                 ) : (
                   <Transcript
@@ -911,7 +916,7 @@ export function MessagesView() {
                         size="compact"
                         shape="pill"
                         onClick={() =>
-                          navigate(`/office/agents/${encodeURIComponent(m.agent_id)}`)
+                          navigate(`/agents/${encodeURIComponent(m.agent_id)}`)
                         }
                       >
                         {m.display_name} ({m.role_label})
@@ -969,9 +974,9 @@ export function MessagesView() {
                                       id: msg.asset_id,
                                       kind: "output",
                                       title: `Publication ${msg.asset_id}`,
-                                      detail: "Shared company report · Click to open in Org & Reports",
+                                      detail: "Shared company report · Click to open in Reports",
                                     }}
-                                    onOpen={() => navigate("/company/org")}
+                                    onOpen={() => navigate("/reports")}
                                   />
                                   <Inline gap={8} align="center" wrap>
                                     <Button

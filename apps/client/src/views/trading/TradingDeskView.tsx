@@ -8,6 +8,7 @@ import {
   Divider,
   FilterBar,
   Inline,
+  Link,
   List,
   Notice,
   PageHeader,
@@ -30,20 +31,30 @@ import {
   formatRelativeNs,
   formatSignedPct,
   newCommandId,
-} from "../api/client";
+} from "../../api/client";
 import type {
   LiveCandidateBindingItem,
   ReturnPoint,
   TradingDeskBookSummary,
   TradingDeskProjection,
-} from "../api/types";
+} from "../../api/types";
 import {
   ContextualApprovalList,
   usePendingApprovals,
-} from "../components/ContextualApprovalCard";
-import { ControlledInlineConfirm } from "../components/ControlledInlineConfirm";
-import { PortfolioChart } from "../components/PortfolioChart";
-import { useApp } from "../state/store";
+} from "../../components/ContextualApprovalCard";
+import { ControlledInlineConfirm } from "../../components/ControlledInlineConfirm";
+import { PortfolioChart } from "../../components/PortfolioChart";
+import { useApp } from "../../state/store";
+
+const ORDER_FOCUS_STORAGE_PREFIX = "sd.orderFocusReturn.";
+
+function persistOrderFocusReturn(orderId: string, focusId: string): void {
+  try {
+    window.sessionStorage.setItem(`${ORDER_FOCUS_STORAGE_PREFIX}${orderId}`, focusId);
+  } catch {
+    // Ignore storage failures in restricted contexts.
+  }
+}
 
 function formatShortHash(digest: string | null | undefined): string {
   if (!digest) return "Unavailable";
@@ -253,6 +264,20 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
       >
         {error ?? "Waiting for local control plane snapshot."}
       </Result>
+    );
+  }
+
+  if (!activeData.trading_enabled) {
+    return (
+      <Stack gap={16}>
+        <PageHeader
+          title={isLive ? "Live Trading" : "Paper Trading"}
+          detail="Trading domain not installed"
+        />
+        <Result title="Trading module inactive">
+          Activate the Trading domain module to access paper books, live venues, and execution controls.
+        </Result>
+      </Stack>
     );
   }
 
@@ -534,7 +559,20 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
     cells: {
       order: (
         <Stack gap={2}>
-          <Text className="sd-mono">{o.order_id}</Text>
+          <Link
+            href={`/orders/${encodeURIComponent(o.order_id)}?env=${mode}`}
+            className="sd-tape-order-link sd-mono"
+            data-focus-id={`order-${o.order_id}`}
+            onClick={(e) => {
+              e.preventDefault();
+              persistOrderFocusReturn(o.order_id, `order-${o.order_id}`);
+              navigate(`/orders/${encodeURIComponent(o.order_id)}?env=${mode}`, {
+                focusReturnId: `order-${o.order_id}`,
+              });
+            }}
+          >
+            {o.order_id}
+          </Link>
           {o.external_order_id ? (
             <Text variant="meta" className="sd-mono">
               {o.external_order_id}
@@ -655,7 +693,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
   const renderCandidateRow = (cand: LiveCandidateBindingItem, idx: number) => {
     const hasQual = Boolean(cand.matching_qualification_receipt_id && cand.promotion_payload_hash);
     const allGatesGreen =
-      activeData.governance.company_paper_soak_ready &&
+      activeData.governance.paper_soak_ready &&
       hasQual &&
       !liveActive &&
       canPromoteCommand;
@@ -671,10 +709,10 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
         label: "Paper Soak Readiness",
         value: (
           <Badge
-            tone={activeData.governance.company_paper_soak_ready ? "success" : "warning"}
+            tone={activeData.governance.paper_soak_ready ? "success" : "warning"}
             dot={false}
           >
-            {activeData.governance.company_paper_soak_ready
+            {activeData.governance.paper_soak_ready
               ? "Verified"
               : "Pending paper fills"}
           </Badge>
@@ -769,7 +807,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
                   <Notice title="Live promotion gate locked" tone="warning">
                     {liveActive
                       ? "Another live venue binding is already active. Demote the current live binding before promoting a replacement."
-                      : !activeData.governance.company_paper_soak_ready
+                      : !activeData.governance.paper_soak_ready
                         ? "Company paper trading must record fills or valuations before promoting to live."
                         : !hasQual
                           ? "A passing venue qualification receipt matching this connector revision, instrument rules, and current trading core digest is required."
@@ -856,7 +894,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
           <Inline gap={8} align="center" wrap>
             {isLive ? (
               <Status tone={liveActive ? "brand" : "success"}>
-                {liveActive ? "Live Active" : "Paper-Only Safe Mode"}
+                {liveActive ? "Live Active" : "Paper Standby"}
               </Status>
             ) : (
               <Status tone={activeData.risk_gate.suspended ? "warning" : "success"}>
@@ -989,7 +1027,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
                   revision: `${activeData.governance.company_live.binding_id}:${demoteAction}`,
                   title:
                     demoteAction === "demote_to_paper"
-                      ? `Demote ${activeData.governance.company_live.account_id} back to Paper-Only`
+                      ? `Demote ${activeData.governance.company_live.account_id} back to Paper Mode`
                       : `Emergency Suspend ${activeData.governance.company_live.account_id}`,
                   consequence:
                     demoteAction === "demote_to_paper"
@@ -1004,14 +1042,14 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
                   requireReason: true,
                   defaultReason:
                     demoteAction === "demote_to_paper"
-                      ? "Board returning execution to paper-only mode"
+                      ? "Board returning execution to paper standby mode"
                       : "Emergency Board suspension of live venue execution",
                   whatChanges: [
                     {
                       label: "Live Venue Status",
                       value:
                         demoteAction === "demote_to_paper"
-                          ? "active → registered (paper-only safe mode)"
+                          ? "active → registered (paper standby)"
                           : "active → suspended (safety hold)",
                     },
                   ],
@@ -1057,7 +1095,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
                     setDemoteAction(null);
                     pushToast(
                       demoteAction === "demote_to_paper"
-                        ? "Returned execution to Paper-Only Safe Mode."
+                        ? "Returned execution to Paper Standby Mode."
                         : "Suspended live venue execution."
                     );
                   }
@@ -1253,7 +1291,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
           benchmarkDriftPp={shadow?.execution_drift_pp ?? null}
           emptyMessage={
             isLive
-              ? "Live trading is in Paper-Only Safe Mode (0% capital deployed). Review a recommended Paper Book or promote a qualified candidate venue below to start plotting live performance."
+              ? "Live trading is in Paper Standby (0% capital deployed). Review a recommended Paper Book or promote a qualified candidate venue below to start plotting live performance."
               : "No valuation cuts recorded for this paper book yet. Once fills or marks land, cumulative performance will plot here on a 0% baseline."
           }
           emptyAction={
@@ -1370,7 +1408,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
           selectedBook
             ? `Active inventory on ${selectedBook.book_name} (${selectedBook.account_id}) marked to latest observed prices`
             : isLive
-              ? "No live positions — Paper-Only Safe Mode active"
+              ? "No live positions — Paper Standby active"
               : "No paper book selected"
         }
         variant="raised"
@@ -1533,7 +1571,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
             {activeData.governance.promotion_history.length === 0 ? (
               <Text variant="help">
                 No environment promotions or demotions recorded yet. The company remains in
-                paper-only safe mode.
+                paper standby mode.
               </Text>
             ) : (
               <List label="Environment promotion ledger" divided>
@@ -1546,7 +1584,7 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
                         title: `${rec.action} · ${rec.to_binding_id}`,
                         detail: `${rec.reason}${rec.qualification_receipt_id ? ` · receipt ${rec.qualification_receipt_id}` : ""} · hash ${formatShortHash(rec.payload_hash)}`,
                         time: formatTs(rec.recorded_at_ns),
-                        state: rec.action === "promote_to_live" ? "done" : "failed",
+                        state: rec.action === "promote_live" ? "done" : "failed",
                       }}
                     />
                   </li>

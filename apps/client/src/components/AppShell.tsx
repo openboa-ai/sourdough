@@ -6,7 +6,6 @@ import {
   CommandItem,
   CommandList,
 } from "@ui-sdk/react/command";
-import { CopyButton } from "@openboa/yogurt/motion-copy-button";
 import {
   Badge,
   Button,
@@ -17,13 +16,8 @@ import {
   Inline,
   Link,
   Notice,
-  Popover,
-  PopoverDescription,
-  PopoverTitle,
   ProjectMark,
-  RecordFacts,
   Result,
-  SegmentedControl,
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
@@ -35,18 +29,14 @@ import {
   Status,
   Text,
   ToastStack,
-  Tooltip,
   type IconName,
-  type Material,
 } from "@openboa/yogurt";
-import { newCommandId } from "../api/client";
 import {
   resolveActiveDomainModules,
   resolveHomeMode,
 } from "../domains/registry";
 import { splitRoute, useApp } from "../state/store";
 import { CommandOutboxPanel } from "./CommandOutboxPanel";
-import { ControlledInlineConfirm } from "./ControlledInlineConfirm";
 
 function hasOpenModalOrPopover(): boolean {
   const matches = document.querySelectorAll(
@@ -100,9 +90,9 @@ function describeFocusTarget(el: Element | null, depth = 0): SavedFocusTarget | 
       trigger = document.querySelector(`[aria-controls="${escapeSelectorAttr(popId)}"]`);
     }
     if (!trigger) {
-      trigger =
-        document.querySelector('header.sd-topbar button[aria-expanded="true"][aria-haspopup]') ??
-        document.querySelector('[data-focus-id="topbar-diagnostics-trigger"]');
+      trigger = document.querySelector(
+        'header.sd-topbar button[aria-expanded="true"][aria-haspopup]'
+      );
     }
     if (trigger && trigger !== el) {
       return describeFocusTarget(trigger, depth + 1);
@@ -246,22 +236,15 @@ export function AppShell({ children }: { children: ReactNode }) {
     lastEventSeq,
     hostLocked,
     setHostLocked,
-    controlsLocked,
-    canWrite,
-    outbox,
     unreadCeoReply,
-    dispatchCommand,
     forceRefresh,
     appearance,
     setAppearance,
-    material,
-    setMaterial,
     toasts,
     pushToast,
     dismissToast,
   } = useApp();
 
-  const [safetyStripOpen, setSafetyStripOpen] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
   const [unlocking, setUnlocking] = useState(false);
@@ -276,10 +259,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   const { pathname: path } = splitRoute(route);
   const activeModules = resolveActiveDomainModules(meta?.active_domains);
   const homeMode = resolveHomeMode(activeModules);
-  const paperActive = meta?.active_domains.includes("paper") ?? false;
-  const paperRiskSuspended = Boolean(meta?.paper_risk_suspended);
+  const tradingActive = activeModules.some((m) => m.id === "trading");
   const activeRestrictions = meta?.active_restrictions_count ?? 0;
-  const isAnyPaused = paperRiskSuspended || activeRestrictions > 0;
+  const isAnyPaused = activeRestrictions > 0;
   const pendingApprovals = meta?.pending_approvals_count ?? 0;
   const isDark = appearance === "dark";
 
@@ -302,22 +284,6 @@ export function AppShell({ children }: { children: ReactNode }) {
         : linkState === "unauthorized"
           ? "Access denied"
           : "Connecting";
-
-  const canResumePaper = Boolean(
-    meta?.supported_commands?.resume_new_risk?.includes("paper-risk-command-v1")
-  );
-
-  const safetyDisabledReason =
-    linkState !== "live"
-      ? "Unavailable while disconnected from local daemon"
-      : controlsLocked
-        ? "Resolve the pending command in the outbox first"
-        : meta?.board_access.role !== "board_control"
-          ? "Requires board_control role (read-only viewer)"
-          : "Control plane locked";
-
-  const resumeEngineNote =
-    "Server-side paper engine directory is required to resume trading; inspect Restrictions.";
 
   const isShieldActive = hostLocked && linkState !== "unauthorized";
 
@@ -548,9 +514,13 @@ export function AppShell({ children }: { children: ReactNode }) {
       if (gArmedUntilRef.current > now) {
         gArmedUntilRef.current = 0;
         const chordTargets: Record<string, string> = {
-          l: "/",
-          p: "/trading/paper",
-          s: "/trading/strategies",
+          ...(tradingActive
+            ? {
+                l: homeMode === "multi_overview" ? "/trading/live" : "/",
+                p: "/trading/paper",
+                s: "/trading/strategies",
+              }
+            : {}),
           a: "/agents",
           m: "/messages",
           v: "/approvals",
@@ -573,7 +543,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [commandOpen, hostLocked, navigate]);
+  }, [commandOpen, hostLocked, navigate, tradingActive, homeMode]);
 
   const commandItems: Array<{
     id: string;
@@ -730,12 +700,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem
             label="Approvals"
             icon={<Icon name="check" />}
-            active={
-              path === "/approvals" ||
-              path.startsWith("/approvals/") ||
-              path === "/company/approvals" ||
-              path.startsWith("/company/approvals/")
-            }
+            active={path === "/approvals" || path.startsWith("/approvals/")}
             badge={
               pendingApprovals > 0 ? (
                 <Badge tone="brand" dot={false}>
@@ -756,7 +721,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                 icon={<Icon name={item.icon} />}
                 active={
                   homeMode === "multi_overview" && item.path === "/"
-                    ? path === "/trading/live" || path === "/company/execution-tiers"
+                    ? path === "/trading/live"
                     : item.matches(path)
                 }
                 onSelect={() =>
@@ -778,8 +743,6 @@ export function AppShell({ children }: { children: ReactNode }) {
             active={
               path === "/agents" ||
               path.startsWith("/agents/") ||
-              path === "/office" ||
-              path.startsWith("/office/") ||
               (homeMode === "core_only" && path === "/")
             }
             onSelect={() => navigate("/agents")}
@@ -787,7 +750,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem
             label="Messages"
             icon={<Icon name="chat" />}
-            active={path === "/messages" || path === "/ceo"}
+            active={path === "/messages"}
             badge={
               unreadCeoReply ? (
                 <span className="sd-unread-badge" title="New CEO reply">
@@ -801,17 +764,13 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem
             label="Finance"
             icon={<Icon name="bookmark" />}
-            active={path === "/finance" || path === "/company/finance"}
+            active={path === "/finance"}
             onSelect={() => navigate("/finance")}
           />
           <SidebarItem
             label="Reports"
             icon={<Icon name="person" />}
-            active={
-              path === "/reports" ||
-              path === "/company/org" ||
-              path.startsWith("/company/org/")
-            }
+            active={path === "/reports"}
             onSelect={() => navigate("/reports")}
           />
         </SidebarGroup>
@@ -822,7 +781,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem
             label="Controls"
             icon={<Icon name="info" />}
-            active={path === "/controls" || path === "/restrictions"}
+            active={path === "/controls"}
             badge={
               activeRestrictions > 0 ? (
                 <Badge tone="warning" dot={false}>
@@ -835,18 +794,13 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem
             label="Backups"
             icon={<Icon name="calendar" />}
-            active={path === "/backups" || path === "/system/checkpoints"}
+            active={path === "/backups"}
             onSelect={() => navigate("/backups")}
           />
           <SidebarItem
             label="Audit"
             icon={<Icon name="folder" />}
-            active={
-              path === "/audit" ||
-              path === "/system/audit" ||
-              path === "/system/evaluations" ||
-              path === "/system/daemon"
-            }
+            active={path === "/audit"}
             onSelect={() => navigate("/audit")}
           />
           <SidebarItem
@@ -859,26 +813,38 @@ export function AppShell({ children }: { children: ReactNode }) {
       </SidebarContent>
 
       <SidebarFooter>
-        <Inline justify="between" align="center" className="sd-w-full">
-          <Text variant="meta">
-            {meta?.board_access.role === "board_control"
-              ? "Board Control"
-              : meta?.board_access.role === "board_viewer"
-                ? "Read-Only Viewer"
-                : meta?.board_access.bootstrap_locked
-                  ? "Bootstrap Locked"
-                  : "Unbound"}
-          </Text>
-          {activeModules.length > 0 ? (
-            <Badge tone="neutral" variant="outline" dot={false}>
-              {activeModules.map((m) => m.label).join(" · ")}
-            </Badge>
-          ) : (
-            <Badge tone="neutral" variant="outline" dot={false}>
-              Core OS
-            </Badge>
-          )}
-        </Inline>
+        <Stack gap={6} className="sd-w-full">
+          <Inline justify="between" align="center" className="sd-w-full">
+            <Text variant="meta">
+              {meta?.board_access.role === "board_control"
+                ? "Board Control"
+                : meta?.board_access.role === "board_viewer"
+                  ? "Read-Only Viewer"
+                  : meta?.board_access.bootstrap_locked
+                    ? "Bootstrap Locked"
+                    : "Unbound"}
+            </Text>
+            {activeModules.length > 0 ? (
+              <Badge tone="neutral" variant="outline" dot={false}>
+                {activeModules.map((m) => m.label).join(" · ")}
+              </Badge>
+            ) : (
+              <Badge tone="neutral" variant="outline" dot={false}>
+                Core OS
+              </Badge>
+            )}
+          </Inline>
+          <Button
+            emphasis="quiet"
+            size="compact"
+            shape="pill"
+            data-focus-id="sidebar-diagnostics-trigger"
+            aria-label="Open daemon diagnostics"
+            onClick={() => navigate("/audit?tab=daemon")}
+          >
+            <Status tone={statusTone}>{statusLabel}</Status>
+          </Button>
+        </Stack>
       </SidebarFooter>
     </>
   );
@@ -948,22 +914,17 @@ export function AppShell({ children }: { children: ReactNode }) {
             <Inline gap={8} align="center" wrap={false}>
               <SidebarTrigger label="Toggle sidebar" size="compact" />
               <Link
-                href="/"
+                href={homeMode === "core_only" ? "/agents" : "/"}
                 className="sd-brand-link"
                 onClick={(e) => {
                   e.preventDefault();
-                  navigate("/");
+                  navigate(homeMode === "core_only" ? "/agents" : "/");
                 }}
               >
                 <Text variant="body">
                   {meta ? `Company ${meta.company_id.slice(0, 12)}` : "Sourdough"}
                 </Text>
               </Link>
-              {paperActive ? (
-                <Badge tone="brand" variant="soft" dot={false}>
-                  Paper
-                </Badge>
-              ) : null}
             </Inline>
 
             <Inline gap={8} align="center" wrap>
@@ -1062,295 +1023,11 @@ export function AppShell({ children }: { children: ReactNode }) {
                   pushToast(`Switched appearance to ${next}.`);
                 }}
               />
-
-              <Popover
-                label="Control plane diagnostics"
-                align="end"
-                trigger={
-                  <Button
-                    emphasis="quiet"
-                    size="compact"
-                    shape="pill"
-                    data-focus-id="topbar-diagnostics-trigger"
-                  >
-                    <Status tone={statusTone}>{statusLabel}</Status>
-                  </Button>
-                }
-              >
-                <Stack gap={12}>
-                  <PopoverTitle>Control Plane &amp; Surface</PopoverTitle>
-                  <PopoverDescription>
-                    Single-writer local UDS daemon telemetry and Yogurt surface controls.
-                  </PopoverDescription>
-                  {meta ? (
-                    <Stack gap={8}>
-                      <RecordFacts
-                        source="GET /v1/meta"
-                        asOf={`seq #${lastEventSeq}`}
-                        facts={[
-                          { id: "co", label: "Company", value: meta.company_id },
-                          { id: "ch", label: "Charter", value: meta.charter_revision },
-                          { id: "pid", label: "Daemon PID", value: String(meta.daemon_pid) },
-                          { id: "key", label: "Store key", value: meta.store_key },
-                          {
-                            id: "role",
-                            label: "Board role",
-                            value: meta.board_access.role ?? "unbound",
-                          },
-                        ]}
-                      />
-                      <Inline justify="between" align="center">
-                        <Text variant="meta">Copy company ID</Text>
-                        <CopyButton value={meta.company_id} presentation="quiet" />
-                      </Inline>
-                    </Stack>
-                  ) : (
-                    <Text variant="help">Connecting to local daemon...</Text>
-                  )}
-
-                  <Divider />
-
-                  <Stack gap={6}>
-                    <Text variant="meta">Yogurt Surface Material</Text>
-                    <SegmentedControl
-                      label="Yogurt material"
-                      value={material}
-                      onValueChange={(next) => {
-                        setMaterial(next as Material);
-                        pushToast(`Surface material set to ${next}.`);
-                      }}
-                      options={[
-                        { id: "neutral", label: "Neutral" },
-                        { id: "paper", label: "Paper" },
-                        { id: "mist", label: "Mist" },
-                      ]}
-                    />
-                  </Stack>
-
-                  <Inline justify="between" align="center" wrap>
-                    <Button
-                      emphasis="soft"
-                      size="compact"
-                      shape="pill"
-                      onClick={() => {
-                        const diagTrigger =
-                          document.querySelector<HTMLElement>(
-                            '[data-focus-id="topbar-diagnostics-trigger"]'
-                          ) ??
-                          document.querySelector<HTMLElement>(
-                            "header.sd-topbar button[aria-haspopup]"
-                          );
-                        restoreFocusRef.current = describeFocusTarget(
-                          diagTrigger ?? document.activeElement
-                        );
-                        setUnlockError(null);
-                        setHostLocked(true);
-                      }}
-                    >
-                      Lock Screen
-                    </Button>
-                    <Button
-                      emphasis="quiet"
-                      size="compact"
-                      shape="pill"
-                      onClick={() => navigate("/audit")}
-                    >
-                      Open Audit
-                    </Button>
-                  </Inline>
-                </Stack>
-              </Popover>
-
-              {paperActive ? (
-                paperRiskSuspended ? (
-                  !canWrite ? (
-                    <Tooltip label={safetyDisabledReason}>
-                      {(tipProps) => (
-                        <span
-                          className="sd-tooltip-anchor"
-                          {...tipProps}
-                          title={safetyDisabledReason}
-                        >
-                          <Button
-                            emphasis="filled"
-                            tone="brand"
-                            size="compact"
-                            shape="pill"
-                            disabled
-                            aria-label={`Resume Trading (${safetyDisabledReason})`}
-                          >
-                            Resume Trading
-                          </Button>
-                        </span>
-                      )}
-                    </Tooltip>
-                  ) : !canResumePaper ? (
-                    <Tooltip label={resumeEngineNote}>
-                      {(tipProps) => (
-                        <span
-                          className="sd-tooltip-anchor"
-                          {...tipProps}
-                          title={resumeEngineNote}
-                        >
-                          <Button
-                            emphasis="filled"
-                            tone="brand"
-                            size="compact"
-                            shape="pill"
-                            aria-label={`Resume Trading (${resumeEngineNote})`}
-                            onClick={() => {
-                              pushToast(resumeEngineNote);
-                              navigate("/controls");
-                            }}
-                          >
-                            Resume Trading
-                          </Button>
-                        </span>
-                      )}
-                    </Tooltip>
-                  ) : (
-                    <Button
-                      emphasis="filled"
-                      tone="brand"
-                      size="compact"
-                      shape="pill"
-                      onClick={() => setSafetyStripOpen((v) => !v)}
-                    >
-                      Resume Trading
-                    </Button>
-                  )
-                ) : activeRestrictions > 0 ? (
-                  <Button
-                    emphasis="soft"
-                    tone="danger"
-                    size="compact"
-                    shape="pill"
-                    onClick={() => navigate("/controls")}
-                  >
-                    Active Stops ({activeRestrictions})
-                  </Button>
-                ) : !canWrite ? (
-                  <Tooltip label={safetyDisabledReason}>
-                    {(tipProps) => (
-                      <span
-                        className="sd-tooltip-anchor"
-                        {...tipProps}
-                        title={safetyDisabledReason}
-                      >
-                        <Button
-                          emphasis="soft"
-                          tone="danger"
-                          size="compact"
-                          shape="pill"
-                          disabled
-                          aria-label={`Pause New Orders (${safetyDisabledReason})`}
-                        >
-                          Pause New Orders
-                        </Button>
-                      </span>
-                    )}
-                  </Tooltip>
-                ) : (
-                  <Button
-                    emphasis="soft"
-                    tone="danger"
-                    size="compact"
-                    shape="pill"
-                    onClick={() => setSafetyStripOpen((v) => !v)}
-                  >
-                    Pause New Orders
-                  </Button>
-                )
-              ) : (
-                <Button
-                  emphasis="soft"
-                  size="compact"
-                  shape="pill"
-                  onClick={() => navigate("/messages")}
-                >
-                  Message CEO
-                </Button>
-              )}
             </Inline>
           </header>
 
           <div className="sd-main-wrap">
             <main className="sd-main">
-              {paperActive && meta && linkState !== "unauthorized" ? (
-                <ControlledInlineConfirm
-                  open={safetyStripOpen}
-                  pending={
-                    (outbox.lifecycle === "submitting" || outbox.lifecycle === "accepted") &&
-                    (outbox.intent?.command_type === "suspend_new_risk" ||
-                      outbox.intent?.command_type === "resume_new_risk")
-                  }
-                  onCancel={() => setSafetyStripOpen(false)}
-                  decision={{
-                    id: paperRiskSuspended ? "resume-paper-orders" : "pause-paper-orders",
-                    revision: `${meta.company_id}:${meta.charter_revision}:${meta.paper_risk_effective_revision}`,
-                    title: paperRiskSuspended
-                      ? "Resume New Paper Orders"
-                      : "Pause New Paper Orders",
-                    consequence: paperRiskSuspended
-                      ? "Allow authorized agents to submit new paper orders again. Server verifies live paper quote freshness (<= 15s) upon confirmation."
-                      : "Immediately block all new paper order submissions while keeping open positions and reconciliation active.",
-                    confirmLabel: paperRiskSuspended
-                      ? "Resume Paper Trading"
-                      : "Pause New Paper Orders",
-                    destructive: !paperRiskSuspended,
-                    available: canWrite && (!paperRiskSuspended || canResumePaper),
-                    requireReason: true,
-                    defaultReason: paperRiskSuspended
-                      ? "Board confirmed paper risk review complete"
-                      : "Board precautionary pause on new paper orders",
-                    whatChanges: paperRiskSuspended
-                      ? [
-                          { label: "Paper risk gate", value: "New paper orders re-enabled" },
-                          { label: "Freshness check", value: "Verified server-side (<= 15s)" },
-                        ]
-                      : [
-                          { label: "Paper risk gate", value: "New paper orders blocked immediately" },
-                          { label: "Audit trail", value: "Recorded in command_receipt & audit_event" },
-                        ],
-                    whatStaysUntouched: [
-                      { label: "Open paper positions", value: "Preserved unchanged (never auto-liquidated)" },
-                      { label: "In-flight fills & accounting", value: "Reconciliation continues normally" },
-                      { label: "Research & messaging", value: "Agents continue analysis & reporting" },
-                    ],
-                    technicalDetails: [
-                      { label: "command_type", value: paperRiskSuspended ? "resume_new_risk" : "suspend_new_risk" },
-                      { label: "contract_version", value: "paper-risk-command-v1" },
-                      { label: "charter_revision", value: meta.charter_revision },
-                      { label: "expected_revision", value: String(meta.paper_risk_effective_revision) },
-                      { label: "company_id", value: meta.company_id },
-                    ],
-                  }}
-                  onConfirm={async ({ reason }) => {
-                    const cmdType = paperRiskSuspended ? "resume_new_risk" : "suspend_new_risk";
-                    const lifecycle = await dispatchCommand({
-                      company_id: meta.company_id,
-                      command_id: newCommandId(paperRiskSuspended ? "resume" : "pause"),
-                      command_type: cmdType,
-                      contract_version: "paper-risk-command-v1",
-                      preconditions: {
-                        charter_revision: meta.charter_revision,
-                        expected_revision: meta.paper_risk_effective_revision,
-                      },
-                      payload: { reason },
-                      label: paperRiskSuspended ? "Resume new paper orders" : "Pause new paper orders",
-                      sent_ns: Date.now() * 1_000_000,
-                    });
-                    if (
-                      lifecycle === "applied" ||
-                      lifecycle === "accepted" ||
-                      lifecycle === "unknown"
-                    ) {
-                      setSafetyStripOpen(false);
-                    }
-                  }}
-                />
-              ) : null}
-
               {linkState === "stale" ? (
                 <Notice
                   title="Live connection interrupted — showing last known snapshot"
@@ -1375,7 +1052,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
               {linkState === "live" && isAnyPaused ? (
                 <Notice
-                  title="New paper orders or company operations are currently paused"
+                  title="Operational restrictions are currently active"
                   tone="warning"
                   action={
                     <Button
@@ -1388,7 +1065,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                     </Button>
                   }
                 >
-                  Open positions, fill reconciliation, and internal research continue undisturbed.
+                  Affected operations remain gated while unrestricted company work continues undisturbed.
                 </Notice>
               ) : null}
 

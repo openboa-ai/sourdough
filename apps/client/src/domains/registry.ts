@@ -13,7 +13,7 @@ export interface DomainNavItem {
 export interface DomainModuleDefinition {
   /** Logical module id (e.g. "trading", future "content", "saas"). */
   id: string;
-  /** Backend active_domains token activating this module (e.g. "paper" for Trading). */
+  /** Backend active_domains token activating this module (e.g. "trading"). */
   domainKey: string;
   /** Single-word sidebar section label. */
   label: string;
@@ -27,7 +27,7 @@ export interface DomainModuleDefinition {
 
 export const TRADING_DOMAIN_MODULE: DomainModuleDefinition = {
   id: "trading",
-  domainKey: "paper",
+  domainKey: "trading",
   label: "Trading",
   description:
     "Live production trading, multi-book company paper trading, and strategy release evaluation.",
@@ -48,10 +48,7 @@ export const TRADING_DOMAIN_MODULE: DomainModuleDefinition = {
         "Qualification",
         "Binance",
       ],
-      matches: (p) =>
-        p === "/" ||
-        p === "/trading/live" ||
-        p === "/company/execution-tiers",
+      matches: (p) => p === "/" || p === "/trading/live",
     },
     {
       id: "trading-paper",
@@ -69,11 +66,7 @@ export const TRADING_DOMAIN_MODULE: DomainModuleDefinition = {
         "Performance",
         "PnL",
       ],
-      matches: (p) =>
-        p === "/trading/paper" ||
-        p === "/paper" ||
-        p === "/performance" ||
-        p.startsWith("/orders/"),
+      matches: (p) => p === "/trading/paper" || p.startsWith("/orders/"),
     },
     {
       id: "trading-strategies",
@@ -90,8 +83,7 @@ export const TRADING_DOMAIN_MODULE: DomainModuleDefinition = {
         "History",
         "Rollback",
       ],
-      matches: (p) =>
-        p === "/trading/strategies" || p === "/company/strategy-trials",
+      matches: (p) => p === "/trading/strategies",
     },
   ],
 };
