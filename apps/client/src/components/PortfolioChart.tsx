@@ -7,6 +7,7 @@ import {
   useState,
   type KeyboardEvent,
   type PointerEvent,
+  type ReactNode,
 } from "react";
 import {
   Slider,
@@ -34,6 +35,16 @@ interface PortfolioChartProps {
   points: ReturnPoint[];
   currency: string;
   asOfLabel: string;
+  title?: string;
+  subtitlePct?: string;
+  subtitlePnl?: string;
+  emptyMessage?: string;
+  emptyAction?: ReactNode;
+  navColumnLabel?: string;
+  primarySeriesLabel?: string;
+  benchmarkLabel?: string;
+  benchmarkPoints?: ReturnPoint[];
+  benchmarkDriftPp?: number | null;
 }
 
 type Timeframe = "all" | "30d" | "7d" | "1d";
@@ -136,7 +147,21 @@ function formatAxisTick(value: number, unit: "pct" | "pnl", currency: string): s
   return absFormatted;
 }
 
-export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartProps) {
+export function PortfolioChart({
+  points,
+  currency,
+  asOfLabel,
+  title = "Paper Cumulative Performance",
+  subtitlePct,
+  subtitlePnl,
+  emptyMessage,
+  emptyAction,
+  navColumnLabel = "Sealed NAV",
+  primarySeriesLabel,
+  benchmarkLabel,
+  benchmarkPoints,
+  benchmarkDriftPp,
+}: PortfolioChartProps) {
   const [unit, setUnit] = useState<"pct" | "pnl">("pct");
   const [timeframe, setTimeframe] = useState<Timeframe>("all");
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
@@ -232,11 +257,45 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
     [visiblePoints, unit]
   );
 
-  const validValues = values.filter((v): v is number => v !== null && Number.isFinite(v));
-  const hasAny = validValues.length > 0;
+  const visibleBenchmarkPoints = useMemo(() => {
+    if (!benchmarkPoints || benchmarkPoints.length === 0) return [] as ReturnPoint[];
+    if (visiblePoints.length === 0) return benchmarkPoints;
+    const visTimes = visiblePoints.map((pt) => extractPointTimeMs(pt as TimestampedReturnPoint));
+    const benchTimes = benchmarkPoints.map((pt) => extractPointTimeMs(pt as TimestampedReturnPoint));
+    if (visTimes.every((t) => t !== null) && benchTimes.every((t) => t !== null)) {
+      const minVis = Math.min(...(visTimes as number[]));
+      const maxVis = Math.max(...(visTimes as number[]));
+      const filtered = benchmarkPoints.filter((_, i) => {
+        const bt = (benchTimes as number[])[i];
+        return bt >= minVis - 1_000 && bt <= maxVis + 1_000;
+      });
+      return filtered.length > 0 ? filtered : benchmarkPoints;
+    }
+    return benchmarkPoints;
+  }, [benchmarkPoints, visiblePoints]);
 
-  const minVal = hasAny ? Math.min(0, ...validValues) : -1;
-  const maxVal = hasAny ? Math.max(0, ...validValues) : 1;
+  const benchmarkValues = useMemo(
+    () =>
+      visibleBenchmarkPoints.map((pt) =>
+        unit === "pct"
+          ? pt.return_pct
+          : pt.pnl_minor === null
+            ? null
+            : pt.pnl_minor / 100
+      ),
+    [visibleBenchmarkPoints, unit]
+  );
+
+  const validValues = values.filter((v): v is number => v !== null && Number.isFinite(v));
+  const validBenchValues = benchmarkValues.filter(
+    (v): v is number => v !== null && Number.isFinite(v)
+  );
+  const hasAny = validValues.length > 0;
+  const hasBenchmark = validBenchValues.length > 0;
+
+  const allValidForScale = hasBenchmark ? [...validValues, ...validBenchValues] : validValues;
+  const minVal = hasAny ? Math.min(0, ...allValidForScale) : -1;
+  const maxVal = hasAny ? Math.max(0, ...allValidForScale) : 1;
   const span = Math.max(maxVal - minVal, 0.5);
   const pad = span * 0.16;
   const yMin = minVal - pad;
@@ -410,6 +469,45 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
   });
   if (current.length > 0) segments.push(current);
 
+  const visibleTimes = useMemo(
+    () => visiblePoints.map((pt) => extractPointTimeMs(pt as TimestampedReturnPoint)),
+    [visiblePoints]
+  );
+
+  const xForBenchmark = (bIdx: number): number => {
+    const m = visibleBenchmarkPoints.length;
+    if (m <= 1) return padX + innerW / 2;
+    if (m === visiblePoints.length) return xAt(bIdx);
+    const bTime = extractPointTimeMs(visibleBenchmarkPoints[bIdx] as TimestampedReturnPoint);
+    if (bTime !== null && visiblePoints.length >= 2 && visibleTimes.every((t) => t !== null)) {
+      const vt = visibleTimes as number[];
+      if (bTime <= vt[0]) return xAt(0);
+      if (bTime >= vt[vt.length - 1]) return xAt(vt.length - 1);
+      for (let i = 0; i < vt.length - 1; i += 1) {
+        if (bTime >= vt[i] && bTime <= vt[i + 1]) {
+          const spanT = vt[i + 1] - vt[i];
+          const frac = spanT > 0 ? (bTime - vt[i]) / spanT : 0;
+          return xAt(i) + frac * (xAt(i + 1) - xAt(i));
+        }
+      }
+    }
+    return padX + (bIdx / Math.max(1, m - 1)) * innerW;
+  };
+
+  const benchmarkSegments: Array<Array<{ x: number; y: number; value: number; idx: number }>> = [];
+  let benchCur: Array<{ x: number; y: number; value: number; idx: number }> = [];
+  benchmarkValues.forEach((v, idx) => {
+    if (v === null || !Number.isFinite(v)) {
+      if (benchCur.length > 0) {
+        benchmarkSegments.push(benchCur);
+        benchCur = [];
+      }
+    } else {
+      benchCur.push({ x: xForBenchmark(idx), y: yAt(v), value: v, idx });
+    }
+  });
+  if (benchCur.length > 0) benchmarkSegments.push(benchCur);
+
   const fallbackIdx = useMemo(() => {
     for (let i = visiblePoints.length - 1; i >= 0; i -= 1) {
       if (values[i] !== null) return i;
@@ -421,6 +519,34 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
     activeIdx !== null && activeIdx < visiblePoints.length ? activeIdx : fallbackIdx;
   const inspectedPoint = inspectedIdx !== null ? visiblePoints[inspectedIdx] : null;
   const inspectedValue = inspectedIdx !== null ? values[inspectedIdx] : null;
+
+  const inspectedBenchmarkPoint = useMemo(() => {
+    if (!hasBenchmark || inspectedIdx === null || visibleBenchmarkPoints.length === 0) {
+      return null;
+    }
+    if (visibleBenchmarkPoints.length === visiblePoints.length) {
+      return visibleBenchmarkPoints[inspectedIdx] ?? null;
+    }
+    const targetTime = visibleTimes[inspectedIdx];
+    if (targetTime !== null) {
+      let best: ReturnPoint | null = null;
+      let bestDiff = Number.POSITIVE_INFINITY;
+      for (const bp of visibleBenchmarkPoints) {
+        const bt = extractPointTimeMs(bp as TimestampedReturnPoint);
+        if (bt === null) continue;
+        const diff = Math.abs(bt - targetTime);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          best = bp;
+        }
+      }
+      if (best) return best;
+    }
+    const ratio =
+      visiblePoints.length <= 1 ? 1 : inspectedIdx / Math.max(1, visiblePoints.length - 1);
+    const mappedIdx = Math.round(ratio * (visibleBenchmarkPoints.length - 1));
+    return visibleBenchmarkPoints[mappedIdx] ?? null;
+  }, [hasBenchmark, inspectedIdx, visibleBenchmarkPoints, visiblePoints.length, visibleTimes]);
 
   const prevValidIdx = useMemo(() => {
     if (inspectedIdx === null || inspectedValue === null) return null;
@@ -479,7 +605,7 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
     },
     {
       id: "nav",
-      label: "Sealed Paper NAV",
+      label: navColumnLabel,
       kind: "numeric",
       align: "end",
       sortValue: (row) => pointById.get(row.id)?.pt.nav_minor ?? null,
@@ -554,14 +680,27 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
     }
   };
 
+  const resolvedDescription =
+    unit === "pct"
+      ? subtitlePct ?? `0% baseline · Service-projected returns · ${asOfLabel}`
+      : subtitlePnl ?? `$0 baseline · Service-projected cumulative P&L · ${asOfLabel}`;
+
+  const driftDisplay = useMemo(() => {
+    if (
+      inspectedPoint &&
+      inspectedBenchmarkPoint &&
+      inspectedPoint.return_pct !== null &&
+      inspectedBenchmarkPoint.return_pct !== null
+    ) {
+      return inspectedPoint.return_pct - inspectedBenchmarkPoint.return_pct;
+    }
+    return benchmarkDriftPp ?? null;
+  }, [benchmarkDriftPp, inspectedBenchmarkPoint, inspectedPoint]);
+
   return (
     <Card
-      title="Paper Cumulative Performance"
-      description={
-        unit === "pct"
-          ? `0% baseline · Service-projected paper returns · ${asOfLabel}`
-          : `$0 baseline · Service-projected cumulative P&L · ${asOfLabel}`
-      }
+      title={title}
+      description={resolvedDescription}
       headerAction={
         <Inline gap={8} align="center" wrap>
           <SegmentedControl
@@ -604,6 +743,12 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
               >
                 {inspectedPoint.label}
               </Badge>
+              {primarySeriesLabel ? (
+                <Inline gap={6} align="center">
+                  <span className="sd-chart-legend-solid" aria-hidden="true" />
+                  <Text variant="meta">{primarySeriesLabel}</Text>
+                </Inline>
+              ) : null}
               <Text
                 variant="body"
                 className={`sd-tabular ${
@@ -631,6 +776,29 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
               </Text>
             </Inline>
             <Inline gap={12} align="center" wrap>
+              {hasBenchmark && benchmarkLabel && inspectedBenchmarkPoint ? (
+                <Inline gap={6} align="center" wrap>
+                  <span className="sd-chart-legend-dashed" aria-hidden="true" />
+                  <Text variant="meta" className="sd-tabular">
+                    {benchmarkLabel}:{" "}
+                    {unit === "pct"
+                      ? formatSignedPct(inspectedBenchmarkPoint.return_pct)
+                      : formatMinorCurrency(inspectedBenchmarkPoint.pnl_minor, currency, {
+                          signed: true,
+                        })}
+                  </Text>
+                  {driftDisplay !== null ? (
+                    <Badge
+                      tone={Math.abs(driftDisplay) <= 0.25 ? "success" : "warning"}
+                      variant="soft"
+                      dot={false}
+                    >
+                      Drift {driftDisplay > 0 ? "+" : ""}
+                      {driftDisplay.toFixed(2)} pp
+                    </Badge>
+                  ) : null}
+                </Inline>
+              ) : null}
               <Text variant="meta" className="sd-tabular">
                 NAV:{" "}
                 {inspectedPoint.nav_minor === null
@@ -643,9 +811,16 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
         ) : null}
 
         {!hasAny ? (
-          <Text variant="help">
-            No readings yet. Sealed paper valuations will plot here on a 0% baseline without inventing missing intervals.
-          </Text>
+          <div className="sd-chart-standby">
+            <Badge tone="neutral" variant="outline" dot={false}>
+              0.0% Baseline · Standby
+            </Badge>
+            <Text variant="help">
+              {emptyMessage ??
+                "No readings yet. Sealed valuations will plot here on a 0% baseline without inventing missing intervals."}
+            </Text>
+            {emptyAction ?? null}
+          </div>
         ) : (
           <div
             ref={wrapRef}
@@ -783,6 +958,37 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
                         );
                       })}
 
+                      {benchmarkSegments.map((seg, sIdx) => {
+                        if (seg.length === 1) {
+                          return (
+                            <circle
+                              key={`bpt-${sIdx}`}
+                              cx={seg[0].x}
+                              cy={seg[0].y}
+                              r={3.5}
+                              className="sd-chart-point-benchmark"
+                            />
+                          );
+                        }
+                        const d = seg
+                          .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
+                          .join(" ");
+                        return (
+                          <g key={`bseg-${sIdx}`}>
+                            <path d={d} className="sd-chart-line-benchmark" />
+                            {seg.map((p) => (
+                              <circle
+                                key={`bdot-${p.idx}`}
+                                cx={p.x}
+                                cy={p.y}
+                                r={3}
+                                className="sd-chart-point-benchmark"
+                              />
+                            ))}
+                          </g>
+                        );
+                      })}
+
                       {segments.map((seg, sIdx) => {
                         if (seg.length === 1) {
                           const isSelected = inspectedIdx === seg[0].idx;
@@ -854,7 +1060,7 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
                       <SliderIndicator className="sd-chart-scrubber-indicator" />
                       <SliderThumb
                         className="sd-chart-scrubber-thumb"
-                        aria-label="Inspect paper cumulative performance cut"
+                        aria-label={`Inspect ${title.toLowerCase()} cut`}
                         aria-describedby={readoutId}
                       />
                     </SliderTrack>
@@ -883,7 +1089,7 @@ export function PortfolioChart({ points, currency, asOfLabel }: PortfolioChartPr
 
         <DisclosureRow label="View readings" initiallyOpen={false}>
           <DataTable
-            caption="Paper cumulative return readings"
+            caption={`${title} readings`}
             columns={columns}
             rows={rows}
           />

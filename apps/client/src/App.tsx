@@ -16,7 +16,6 @@ import {
   RestrictionsView,
   StrategiesView,
 } from "./views/CompanyViews";
-import { LiveTradingHomeView } from "./views/LiveTradingHomeView";
 import { LiveTradingView } from "./views/LiveTradingView";
 import { MessagesView } from "./views/MessagesView";
 import { OrderTraceView } from "./views/OrderTraceView";
@@ -26,6 +25,7 @@ import {
   BootstrapView,
   SystemSafetyView,
 } from "./views/SystemViews";
+import { TradingDeskView } from "./views/TradingDeskView";
 
 function CompanyOverviewView({ modules }: { modules: DomainModuleDefinition[] }) {
   const { navigate, meta } = useApp();
@@ -92,12 +92,15 @@ function RouteSwitch() {
     if (homeMode === "core_only" && meta) {
       return <AgentsActivityView />;
     }
-    return <LiveTradingHomeView />;
+    return <TradingDeskView mode="live" />;
   }
   if (path === "/trading/live" || path === "/company/execution-tiers") {
-    return <LiveTradingHomeView />;
+    return <TradingDeskView mode="live" />;
   }
-  if (path === "/trading/paper" || path === "/paper" || path === "/performance") {
+  if (path === "/trading/paper" || path === "/paper") {
+    return <TradingDeskView mode="paper" />;
+  }
+  if (path === "/performance") {
     return <LiveTradingView />;
   }
   const orderId = decodeSingleSegment(path, "/orders/");

@@ -142,12 +142,15 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
 
   const agentApprovals = usePendingApprovals((q) => {
     const imp = q.impact as Record<string, unknown>;
+    const explicitTarget =
+      typeof imp.agent_id === "string" || typeof imp.target_agent_id === "string";
+    if (explicitTarget) {
+      return imp.agent_id === agentId || imp.target_agent_id === agentId;
+    }
     return (
-      imp.agent_id === agentId ||
-      imp.target_agent_id === agentId ||
-      (q.created_by_agent_id === agentId &&
-        q.kind !== "live_promotion" &&
-        q.kind !== "paper_to_live_migration")
+      q.created_by_agent_id === agentId &&
+      q.kind !== "live_promotion" &&
+      q.kind !== "paper_to_live_migration"
     );
   });
 

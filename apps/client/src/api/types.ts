@@ -60,6 +60,7 @@ export interface ReturnPoint {
   pnl_minor: number | null;
   nav_minor: number | null;
   source: string;
+  observed_at_ns?: number | null;
 }
 
 export interface PnlBridgeStep {
@@ -979,4 +980,155 @@ export interface ExecutionTiersProjection {
   promotion_history: EnvironmentPromotionRecordItem[];
   migration_history?: PaperLiveMigrationItem[];
   current_core_digest: string;
+}
+
+export interface TradingDeskBookSummary {
+  binding_id: string;
+  account_id: string;
+  book_name: string;
+  environment: "live" | "paper";
+  tier: "company_live" | "company_paper";
+  destination_id: string;
+  connector_revision: string;
+  strategy_release_id: string | null;
+  role: string;
+  status: string;
+  source_paper_binding_id: string | null;
+  shadow_of_live_binding_id: string | null;
+  nominated_question_id: string | null;
+  currency: string;
+  starting_minor_units: number;
+  exposure_limit_minor_units: number;
+  fee_bps: number;
+  slippage_bps: number;
+  quote_source: string;
+  nav_minor_units: number;
+  pnl_minor_units: number;
+  return_pct: number;
+  cash_minor_units: number;
+  gross_exposure_minor_units: number;
+  realized_pnl_minor_units: number;
+  unrealized_pnl_minor_units: number;
+  total_fees_minor_units: number;
+  fill_count: number;
+  open_positions_count: number;
+  open_orders_count: number;
+  soak_ready: boolean;
+}
+
+export interface TradingDeskPositionItem {
+  instrument_id: string;
+  quantity: number;
+  avg_entry_minor_units: number;
+  mark_price_minor_units: number;
+  notional_minor_units: number;
+  unrealized_pnl_minor_units: number;
+  realized_pnl_minor_units: number;
+  total_fees_minor_units: number;
+  updated_at_ns: number;
+}
+
+export interface TradingDeskOrderItem {
+  order_id: string;
+  action_id: string;
+  actor_id: string;
+  actor_name: string;
+  actor_role: string;
+  book_name: string;
+  binding_id: string;
+  external_order_id: string | null;
+  instrument_id: string;
+  side: "buy" | "sell" | string;
+  quantity: number;
+  limit_minor_units: number;
+  status: string;
+  filled_quantity: number;
+  fill_price_minor_units: number | null;
+  fee_minor_units: number;
+  created_at_ns: number;
+}
+
+export interface ShadowBenchmarkData {
+  binding_id: string;
+  book_name: string;
+  strategy_release_id: string | null;
+  role: string;
+  return_pct: number;
+  post_launch_return_pct: number;
+  execution_drift_pp: number;
+  nav_minor_units: number;
+  pnl_minor_units: number;
+  series: ReturnPoint[];
+}
+
+export interface TradingDeskProjection {
+  projection: string;
+  company_id: string;
+  charter_revision: string;
+  as_of_ns: number;
+  event_seq: number;
+  active_domains: string[];
+  paper_enabled: boolean;
+  environment: "live" | "paper";
+  selected_book_id: string | null;
+  selected_book: TradingDeskBookSummary | null;
+  books: TradingDeskBookSummary[];
+  kpis: {
+    portfolio_value: {
+      value_minor: number | null;
+      return_pct: number | null;
+      currency: string;
+      status: string;
+      source: string;
+    };
+    trading_pnl: {
+      value_minor: number | null;
+      realized_minor: number | null;
+      unrealized_minor: number | null;
+      fees_minor: number | null;
+      currency: string;
+      status: string;
+      source: string;
+    };
+    agent_llm_opex: {
+      value_minor: number | null;
+      currency: string;
+      status: string;
+      source: string;
+    };
+    company_net_pnl: {
+      value_minor: number | null;
+      currency: string;
+      status: string;
+      source: string;
+    };
+  };
+  cumulative_return_series: ReturnPoint[];
+  shadow_benchmark: ShadowBenchmarkData | null;
+  open_positions: TradingDeskPositionItem[];
+  execution_tape: TradingDeskOrderItem[];
+  pnl_reconciliation_bridge: PnlBridgeStep[];
+  exposure_cap: {
+    used_minor_units: number;
+    limit_minor_units: number | null;
+    currency: string;
+  };
+  close_count: number;
+  open_close_issues: Array<Record<string, unknown>>;
+  risk_gate: {
+    suspended: boolean;
+    effective_revision: number;
+    active_restriction_count: number;
+  };
+  governance: {
+    company_live: ExecutionTierBindingItem | null;
+    live_candidates: LiveCandidateBindingItem[];
+    qualification_receipts: QualificationReceiptItem[];
+    promotion_history: EnvironmentPromotionRecordItem[];
+    migration_history: PaperLiveMigrationItem[];
+    company_paper_soak_ready: boolean;
+    paper_books_count: number;
+    soak_ready_books_count: number;
+    current_core_digest: string;
+  };
 }
