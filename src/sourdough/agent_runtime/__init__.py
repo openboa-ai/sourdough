@@ -1,0 +1,78 @@
+"""Multi-provider Agent runtime adapters over Sourdough's Two-Plane Harness."""
+
+from .anthropic_api import AnthropicMessagesAdapter
+from .codex_cli import CodexCliAdapter
+from .cost_accounting import (
+    DEFAULT_MODEL_PRICING,
+    ModelPricing,
+    TurnCostSettlement,
+    compute_usage_cost_minor_units,
+    settle_shift_cost_to_ledger,
+)
+from .gemini_api import GeminiGenerateContentAdapter
+from .openai_api import OpenAiResponsesAdapter
+from .protocol import (
+    PROVIDER_ANTHROPIC,
+    PROVIDER_CODEX_CLI,
+    PROVIDER_GEMINI,
+    PROVIDER_OPENAI,
+    VALID_PROVIDERS,
+    AdapterEvent,
+    AdapterManifest,
+    AgentBudgetExceeded,
+    AgentProfileBinding,
+    AgentProfileMismatch,
+    AgentRuntimeAdapter,
+    AgentRuntimeRefused,
+    AgentTransportInterrupted,
+    ContextPack,
+    EnvSecretResolver,
+    InMemorySecretResolver,
+    MaskedSecret,
+    OuterToolBroker,
+    SecretHandleResolver,
+    ShiftRequest,
+    ShiftResult,
+    TokenUsage,
+    ToolSpec,
+    hydrate_shift_context,
+)
+from .registry import AgentAdapterRegistry, build_default_adapter_registry
+
+__all__ = [
+    "PROVIDER_ANTHROPIC",
+    "PROVIDER_CODEX_CLI",
+    "PROVIDER_GEMINI",
+    "PROVIDER_OPENAI",
+    "VALID_PROVIDERS",
+    "AdapterEvent",
+    "AdapterManifest",
+    "AgentAdapterRegistry",
+    "AgentBudgetExceeded",
+    "AgentProfileBinding",
+    "AgentProfileMismatch",
+    "AgentRuntimeAdapter",
+    "AgentRuntimeRefused",
+    "AgentTransportInterrupted",
+    "AnthropicMessagesAdapter",
+    "CodexCliAdapter",
+    "ContextPack",
+    "DEFAULT_MODEL_PRICING",
+    "EnvSecretResolver",
+    "GeminiGenerateContentAdapter",
+    "InMemorySecretResolver",
+    "MaskedSecret",
+    "ModelPricing",
+    "OpenAiResponsesAdapter",
+    "OuterToolBroker",
+    "SecretHandleResolver",
+    "ShiftRequest",
+    "ShiftResult",
+    "TokenUsage",
+    "ToolSpec",
+    "TurnCostSettlement",
+    "build_default_adapter_registry",
+    "compute_usage_cost_minor_units",
+    "hydrate_shift_context",
+    "settle_shift_cost_to_ledger",
+]
