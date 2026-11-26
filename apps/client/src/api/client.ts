@@ -39,14 +39,69 @@ async function parseJsonOrThrow(response: Response): Promise<unknown> {
   return data;
 }
 
-export async function fetchMeta(signal?: AbortSignal): Promise<ControlPlaneMeta> {
-  const res = await fetch("/api/v1/meta", {
-    method: "GET",
-    credentials: "same-origin",
-    cache: "no-store",
-    signal,
+const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504]);
+const PROJECTION_RETRY_DELAYS_MS = [250, 600, 1200] as const;
+const META_RETRY_DELAYS_MS = [250, 600] as const;
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException("Aborted", "AbortError"));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
-  return (await parseJsonOrThrow(res)) as ControlPlaneMeta;
+}
+
+function isTransientNetworkError(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false;
+  if (err instanceof DOMException && err.name === "AbortError") return false;
+  return err instanceof TypeError;
+}
+
+export async function fetchMeta(
+  signal?: AbortSignal,
+  opts?: { retryTransientNetwork?: boolean }
+): Promise<ControlPlaneMeta> {
+  for (let attempt = 0; ; attempt += 1) {
+    if (signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    try {
+      const res = await fetch("/api/v1/meta", {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+        signal,
+      });
+      if (
+        TRANSIENT_HTTP_STATUSES.has(res.status) &&
+        attempt < META_RETRY_DELAYS_MS.length
+      ) {
+        void res.body?.cancel().catch(() => undefined);
+        await sleepWithAbort(META_RETRY_DELAYS_MS[attempt], signal);
+        continue;
+      }
+      return (await parseJsonOrThrow(res)) as ControlPlaneMeta;
+    } catch (err) {
+      if (
+        opts?.retryTransientNetwork &&
+        isTransientNetworkError(err, signal) &&
+        attempt < META_RETRY_DELAYS_MS.length
+      ) {
+        await sleepWithAbort(META_RETRY_DELAYS_MS[attempt], signal);
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 export async function fetchProjection<T>(
@@ -57,19 +112,44 @@ export async function fetchProjection<T>(
   if (opts?.etag) {
     headers["If-None-Match"] = opts.etag;
   }
-  const res = await fetch(`/api/v1/projections/${path}`, {
-    method: "GET",
-    credentials: "same-origin",
-    cache: "no-store",
-    headers,
-    signal: opts?.signal,
-  });
-  const etag = res.headers.get("etag");
-  if (res.status === 304) {
-    return { status: 304, etag, data: null };
+  const url = `/api/v1/projections/${path}`;
+  for (let attempt = 0; ; attempt += 1) {
+    if (opts?.signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    try {
+      const res = await fetch(url, {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers,
+        signal: opts?.signal,
+      });
+      const etag = res.headers.get("etag");
+      if (res.status === 304) {
+        return { status: 304, etag, data: null };
+      }
+      if (
+        TRANSIENT_HTTP_STATUSES.has(res.status) &&
+        attempt < PROJECTION_RETRY_DELAYS_MS.length
+      ) {
+        void res.body?.cancel().catch(() => undefined);
+        await sleepWithAbort(PROJECTION_RETRY_DELAYS_MS[attempt], opts?.signal);
+        continue;
+      }
+      const data = (await parseJsonOrThrow(res)) as T;
+      return { status: 200, etag, data };
+    } catch (err) {
+      if (
+        isTransientNetworkError(err, opts?.signal) &&
+        attempt < PROJECTION_RETRY_DELAYS_MS.length
+      ) {
+        await sleepWithAbort(PROJECTION_RETRY_DELAYS_MS[attempt], opts?.signal);
+        continue;
+      }
+      throw err;
+    }
   }
-  const data = (await parseJsonOrThrow(res)) as T;
-  return { status: 200, etag, data };
 }
 
 export async function fetchEventsNdjson(
@@ -142,7 +222,28 @@ export async function lookupCommandReceiptApi(
     }
   );
   if (res.status === 404) {
-    return (await res.json()) as CommandReceiptResponse;
+    let data: Partial<CommandReceiptResponse> = {};
+    try {
+      const text = await res.text();
+      if (text) {
+        const parsed = JSON.parse(text) as unknown;
+        if (typeof parsed === "object" && parsed !== null) {
+          data = parsed as Partial<CommandReceiptResponse>;
+        }
+      }
+    } catch {
+      // Malformed or empty 404 body normalizes to not_found.
+    }
+    if (!data.state && data.status !== "found") {
+      return {
+        ...data,
+        status: "not_found",
+        company_id: typeof data.company_id === "string" ? data.company_id : "",
+        command_id: typeof data.command_id === "string" ? data.command_id : commandId,
+        command_type: typeof data.command_type === "string" ? data.command_type : operation,
+      };
+    }
+    return data as CommandReceiptResponse;
   }
   return (await parseJsonOrThrow(res)) as CommandReceiptResponse;
 }
@@ -240,6 +341,26 @@ export function formatNsClock(ns: number | null | undefined): string {
     second: "2-digit",
     hour12: false,
   });
+}
+
+export function formatDeadlineNs(ns: number | null | undefined): string {
+  if (!ns || !Number.isFinite(ns)) return "No deadline";
+  const deltaSec = Math.round((ns / 1_000_000 - Date.now()) / 1000);
+  if (deltaSec <= 0) {
+    const ago = Math.abs(deltaSec);
+    if (ago < 60) return "Expired just now";
+    const mins = Math.floor(ago / 60);
+    if (mins < 60) return `Expired ${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `Expired ${hrs}h ago`;
+    return `Expired ${Math.floor(hrs / 24)}d ago`;
+  }
+  if (deltaSec < 60) return `in ${deltaSec}s`;
+  const mins = Math.floor(deltaSec / 60);
+  if (mins < 60) return `in ${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `in ${hrs}h`;
+  return `in ${Math.floor(hrs / 24)}d`;
 }
 
 export function newCommandId(prefix = "cmd"): string {

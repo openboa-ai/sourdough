@@ -45,11 +45,29 @@ export interface ToastItem {
 
 interface AppContextValue {
   route: string;
-  navigate: (path: string, opts?: { contextRef?: ContextRef | null; focusReturnId?: string }) => void;
+  routePathname: string;
+  routeSearchParams: URLSearchParams;
+  performanceMode: boolean;
+  daemonMode: boolean;
+  activeApprovalQuestionId: string | null;
+  navigate: (
+    path: string,
+    opts?: { replace?: boolean; contextRef?: ContextRef | null; focusReturnId?: string }
+  ) => void;
   focusReturnId: string | null;
   clearFocusReturnId: () => void;
   pendingAskContext: ContextRef | null;
   setPendingAskContext: (ctx: ContextRef | null) => void;
+  askCeo: (context: ContextRef | null) => void;
+  registerEscapeBack: (targetPath: string, focusId?: string) => () => void;
+  getLastSeenSeq: (companyId: string, principalId?: string | null) => number;
+  markSeenSeq: (
+    companyId: string,
+    principalId: string | null | undefined,
+    seq: number
+  ) => void;
+  unreadCeoReply: boolean;
+  markMessagesVisited: (seq: number) => void;
   appearance: Appearance;
   setAppearance: (next: Appearance) => void;
   material: Material;
@@ -68,20 +86,187 @@ interface AppContextValue {
   controlsLocked: boolean;
   canWrite: boolean;
   outbox: CommandOutboxState;
-  dispatchCommand: (intent: LocalCommandIntent) => Promise<void>;
+  dispatchCommand: (intent: LocalCommandIntent) => Promise<CommandLifecycle>;
   lookupUnknownCommand: () => Promise<void>;
   retryNotFoundCommand: () => Promise<void>;
   discardPendingCommand: () => Promise<void>;
   dismissFinalOutbox: () => void;
   reportApiError: (err: unknown) => void;
-  forceRefresh: () => void;
+  forceRefresh: () => Promise<boolean>;
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
 
-function normalizeRoute(pathname: string): string {
-  if (!pathname || pathname === "/") return "/";
-  return pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+const ALLOWED_ASK_CONTEXT_KINDS = new Set([
+  "paper_order",
+  "agent",
+  "shared_publication",
+  "decision_question",
+  "strategy_release",
+  "challenger_trial",
+  "strategy_trial",
+  "restriction",
+  "restriction_cause",
+  "work_run",
+  "company",
+  "account_balance",
+  "audit_event",
+]);
+
+export function splitRoute(raw: string): { pathname: string; search: string } {
+  const hashIdx = raw.indexOf("#");
+  const noHash = hashIdx === -1 ? raw : raw.slice(0, hashIdx);
+  const qIdx = noHash.indexOf("?");
+  const rawPath = qIdx === -1 ? noHash : noHash.slice(0, qIdx);
+  const rawSearch = qIdx === -1 ? "" : noHash.slice(qIdx);
+  let pathname = rawPath || "/";
+  if (!pathname.startsWith("/")) {
+    pathname = `/${pathname}`;
+  }
+  while (pathname.length > 1 && pathname.endsWith("/")) {
+    pathname = pathname.slice(0, -1);
+  }
+  const search = rawSearch === "?" ? "" : rawSearch;
+  return { pathname, search };
+}
+
+function normalizeRoute(raw: string): string {
+  const { pathname, search } = splitRoute(raw);
+  return `${pathname}${search}`;
+}
+
+export function decodeSingleSegment(pathname: string, prefix: string): string | null {
+  if (!pathname.startsWith(prefix)) return null;
+  const rawSegment = pathname.slice(prefix.length);
+  if (!rawSegment || rawSegment.includes("/")) return null;
+  try {
+    const decoded = decodeURIComponent(rawSegment);
+    return decoded && !decoded.includes("/") ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeAskContext(
+  raw: { kind?: unknown; id?: unknown; label?: unknown } | null | undefined
+): ContextRef | null {
+  if (!raw || typeof raw.kind !== "string" || typeof raw.id !== "string") return null;
+  const kind = raw.kind.trim();
+  const id = raw.id.trim();
+  if (
+    !kind ||
+    kind.length > 64 ||
+    !ALLOWED_ASK_CONTEXT_KINDS.has(kind) ||
+    !id ||
+    id.length > 128 ||
+    /[\u0000-\u001f\u007f]/.test(id)
+  ) {
+    return null;
+  }
+  const rawLabel = typeof raw.label === "string" ? raw.label.trim() : "";
+  const label = (rawLabel || `${kind.replace(/_/g, " ")} · ${id}`).slice(0, 240);
+  return { kind, id, label };
+}
+
+function parseAskContextFromSearch(search: string): ContextRef | null {
+  if (!search) return null;
+  const params = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search);
+  const kind = params.get("context_kind");
+  const id = params.get("context_id");
+  if (!kind || !id) return null;
+  return sanitizeAskContext({ kind, id, label: params.get("context_label") });
+}
+
+function isMessagesPathname(pathname: string): boolean {
+  return pathname === "/messages" || pathname === "/ceo";
+}
+
+function isTier1Path(pathname: string): boolean {
+  return (
+    pathname.startsWith("/orders/") ||
+    pathname.startsWith("/office/agents/") ||
+    pathname.startsWith("/company/approvals/") ||
+    pathname === "/performance" ||
+    pathname === "/system/daemon"
+  );
+}
+
+function defaultEscapeBackTarget(pathname: string): string | null {
+  if (pathname.startsWith("/orders/") || pathname === "/performance") return "/";
+  if (pathname.startsWith("/office/agents/")) {
+    return "/office";
+  }
+  if (pathname.startsWith("/company/approvals/")) return "/company/approvals";
+  if (pathname === "/system/daemon") return "/system/audit";
+  return null;
+}
+
+function lastSeenStorageKey(companyId: string, principalId?: string | null): string {
+  return `sd.lastSeenSeq.${companyId}.${principalId || "unbound"}`;
+}
+
+function lastMessagesStorageKey(companyId: string, principalId?: string | null): string {
+  return `sd.lastMessagesSeq.${companyId}.${principalId || "unbound"}`;
+}
+
+function readStoredSeq(key: string): number {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return 0;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeStoredSeq(key: string, seq: number): void {
+  if (!Number.isFinite(seq) || seq < 0) return;
+  try {
+    window.localStorage.setItem(key, String(Math.floor(seq)));
+  } catch {
+    // Ignore storage failures in restricted contexts.
+  }
+}
+
+function isEditableElement(el: EventTarget | null): boolean {
+  if (!(el instanceof Element)) return false;
+  if (el instanceof HTMLElement && el.isContentEditable) return true;
+  return Boolean(
+    el.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"]')
+  );
+}
+
+const OPEN_OVERLAY_SELECTOR = [
+  '[role="dialog"]',
+  '[role="alertdialog"]',
+  '[role="listbox"]',
+  '[role="menu"]',
+  '[data-slot="popover-content"][data-open]',
+  '[data-slot="dialog-content"][data-open]',
+  '[data-slot="combobox-content"][data-open]',
+  ".yg-anchored-panel[data-open]",
+  ".yg-popup-menu[data-open]",
+  ".yg-popover[data-open]",
+  '.yg-inline-command[data-open="true"]',
+  '.yg-activity-island[data-open="true"]',
+  ".yg-decision-card",
+  ".sd-decision-inline",
+  '[data-decision-confirm="open"]',
+].join(", ");
+
+function hasOpenOverlay(): boolean {
+  const matches = document.querySelectorAll(OPEN_OVERLAY_SELECTOR);
+  for (const el of matches) {
+    if (el.closest('[inert], [hidden], [aria-hidden="true"], [data-closed]')) {
+      continue;
+    }
+    if (el instanceof HTMLDialogElement && !el.open) {
+      continue;
+    }
+    return true;
+  }
+  return false;
 }
 
 export function AppProvider({ children }: { children: ReactNode }) {
@@ -89,7 +274,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     normalizeRoute(window.location.pathname + window.location.search)
   );
   const [focusReturnId, setFocusReturnId] = useState<string | null>(null);
-  const [pendingAskContext, setPendingAskContext] = useState<ContextRef | null>(null);
+  const [pendingAskContext, setPendingAskContextState] = useState<ContextRef | null>(() => {
+    const initial = splitRoute(window.location.pathname + window.location.search);
+    return isMessagesPathname(initial.pathname)
+      ? parseAskContextFromSearch(initial.search)
+      : null;
+  });
   const [appearance, setAppearanceState] = useState<Appearance>(() => {
     try {
       const saved = window.localStorage.getItem("sd-yogurt-appearance");
@@ -147,6 +337,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [lastEventSeq, setLastEventSeq] = useState(0);
   const [recentEventTypes, setRecentEventTypes] = useState<string[]>([]);
   const [hostLocked, setHostLocked] = useState(false);
+  const [unreadCeoReply, setUnreadCeoReply] = useState(false);
 
   const [outbox, setOutbox] = useState<CommandOutboxState>({
     lifecycle: "idle",
@@ -162,7 +353,39 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const principalIdRef = useRef<string | null | undefined>(undefined);
   const lastSeqRef = useRef<number>(0);
   const submittingRef = useRef<boolean>(false);
+  const outboxRef = useRef<CommandOutboxState>(outbox);
+  outboxRef.current = outbox;
+  const routeRef = useRef<string>(route);
+  routeRef.current = route;
+  const hostLockedRef = useRef<boolean>(hostLocked);
+  hostLockedRef.current = hostLocked;
+  const linkStateRef = useRef<LinkState>(linkState);
+  linkStateRef.current = linkState;
+  const pendingReturnRef = useRef<{ path: string; focusId: string } | null>(null);
+  const focusTargetPathRef = useRef<string | null>(null);
+  const escapeRegRef = useRef<{ token: symbol; targetPath: string; focusId?: string } | null>(
+    null
+  );
+  const startupMsgCheckedRef = useRef<string | null>(null);
+  const prevBootstrapLockedRef = useRef<boolean | undefined>(undefined);
   const [metaReady, setMetaReady] = useState(false);
+  const metaReadyRef = useRef(false);
+  metaReadyRef.current = metaReady;
+
+  const { pathname: routePathname, search: routeSearch } = useMemo(
+    () => splitRoute(route),
+    [route]
+  );
+  const routeSearchParams = useMemo(
+    () => new URLSearchParams(routeSearch.startsWith("?") ? routeSearch.slice(1) : routeSearch),
+    [routeSearch]
+  );
+  const performanceMode = routePathname === "/performance";
+  const daemonMode = routePathname === "/system/daemon";
+  const activeApprovalQuestionId = useMemo(
+    () => decodeSingleSegment(routePathname, "/company/approvals/"),
+    [routePathname]
+  );
 
   // Mount Yogurt agent bridge disabled by default (allow: () => false).
   useEffect(() => {
@@ -173,10 +396,104 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const getLastSeenSeq = useCallback(
+    (companyId: string, principalId?: string | null): number => {
+      if (!companyId) return 0;
+      return readStoredSeq(lastSeenStorageKey(companyId, principalId));
+    },
+    []
+  );
+
+  const markSeenSeq = useCallback(
+    (companyId: string, principalId: string | null | undefined, seq: number): void => {
+      if (!companyId) return;
+      writeStoredSeq(lastSeenStorageKey(companyId, principalId), seq);
+    },
+    []
+  );
+
+  const markMessagesVisited = useCallback((seq: number): void => {
+    const companyId = companyIdRef.current;
+    if (companyId && Number.isFinite(seq) && seq >= 0) {
+      writeStoredSeq(
+        lastMessagesStorageKey(companyId, principalIdRef.current),
+        seq
+      );
+    }
+    setUnreadCeoReply(false);
+  }, []);
+
+  useEffect(() => {
+    if (!isMessagesPathname(routePathname)) return;
+    const channel = routeSearchParams.get("channel");
+    if (channel && channel !== "ceo-direct") return;
+    markMessagesVisited(lastSeqRef.current || meta?.event_seq || 0);
+  }, [
+    routePathname,
+    routeSearchParams,
+    unreadCeoReply,
+    meta?.event_seq,
+    markMessagesVisited,
+  ]);
+
+  const setPendingAskContext = useCallback((ctx: ContextRef | null) => {
+    const sanitized = ctx ? sanitizeAskContext(ctx) : null;
+    setPendingAskContextState(sanitized);
+    if (sanitized === null) {
+      const sp = splitRoute(routeRef.current);
+      if (isMessagesPathname(sp.pathname) && sp.search) {
+        const params = new URLSearchParams(
+          sp.search.startsWith("?") ? sp.search.slice(1) : sp.search
+        );
+        if (
+          params.has("context_kind") ||
+          params.has("context_id") ||
+          params.has("context_label")
+        ) {
+          params.delete("context_kind");
+          params.delete("context_id");
+          params.delete("context_label");
+          const s = params.toString();
+          const nextRoute = s ? `${sp.pathname}?${s}` : sp.pathname;
+          if (window.location.pathname + window.location.search !== nextRoute) {
+            window.history.replaceState({}, "", nextRoute);
+          }
+          setRoute(nextRoute);
+        }
+      }
+    }
+  }, []);
+
   // Browser history synchronization.
   useEffect(() => {
     const onPop = () => {
-      setRoute(normalizeRoute(window.location.pathname + window.location.search));
+      const prevPath = splitRoute(routeRef.current).pathname;
+      const next = normalizeRoute(window.location.pathname + window.location.search);
+      const { pathname: nextPath, search: nextSearch } = splitRoute(next);
+      setRoute(next);
+      if (isMessagesPathname(nextPath)) {
+        setPendingAskContextState(parseAskContextFromSearch(nextSearch));
+      } else {
+        setPendingAskContextState(null);
+      }
+      if (pendingReturnRef.current && pendingReturnRef.current.path === nextPath) {
+        focusTargetPathRef.current = nextPath;
+        setFocusReturnId(pendingReturnRef.current.focusId);
+        pendingReturnRef.current = null;
+      }
+      if (nextPath !== prevPath) {
+        setOutbox((prev) =>
+          prev.lifecycle === "applied"
+            ? {
+                lifecycle: "idle",
+                intent: null,
+                receipt: null,
+                errorMessage: null,
+                quarantineNotice: null,
+              }
+            : prev
+        );
+      }
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
@@ -185,45 +502,222 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const navigate = useCallback(
     (
       path: string,
-      opts?: { contextRef?: ContextRef | null; focusReturnId?: string }
+      opts?: { replace?: boolean; contextRef?: ContextRef | null; focusReturnId?: string }
     ) => {
-      const normalized = normalizeRoute(path);
+      const prevSplit = splitRoute(routeRef.current);
+      let { pathname: nextPath, search: nextSearch } = splitRoute(path);
+      const isMsgRoute = isMessagesPathname(nextPath);
+
       if (opts && "contextRef" in opts) {
-        setPendingAskContext(opts.contextRef ?? null);
+        const sanitized = opts.contextRef ? sanitizeAskContext(opts.contextRef) : null;
+        setPendingAskContextState(sanitized);
+        if (isMsgRoute) {
+          const params = new URLSearchParams(
+            nextSearch.startsWith("?") ? nextSearch.slice(1) : nextSearch
+          );
+          if (sanitized) {
+            if (!params.has("context_kind")) params.set("context_kind", sanitized.kind);
+            if (!params.has("context_id")) params.set("context_id", sanitized.id);
+          } else {
+            params.delete("context_kind");
+            params.delete("context_id");
+            params.delete("context_label");
+          }
+          const s = params.toString();
+          nextSearch = s ? `?${s}` : "";
+        }
+      } else if (isMsgRoute) {
+        const parsed = parseAskContextFromSearch(nextSearch);
+        if (parsed) {
+          setPendingAskContextState(parsed);
+        } else if (nextPath !== prevSplit.pathname && !nextSearch) {
+          setPendingAskContextState(null);
+        }
+      } else {
+        setPendingAskContextState(null);
       }
+
+      const normalized = `${nextPath}${nextSearch}`;
+
       if (opts?.focusReturnId) {
-        setFocusReturnId(opts.focusReturnId);
+        if (isTier1Path(nextPath) && !isTier1Path(prevSplit.pathname)) {
+          pendingReturnRef.current = {
+            path: prevSplit.pathname,
+            focusId: opts.focusReturnId,
+          };
+          focusTargetPathRef.current = null;
+          setFocusReturnId(null);
+        } else {
+          pendingReturnRef.current = null;
+          focusTargetPathRef.current = nextPath;
+          setFocusReturnId(opts.focusReturnId);
+        }
+      } else if (
+        !isTier1Path(nextPath) &&
+        isTier1Path(prevSplit.pathname) &&
+        pendingReturnRef.current?.path === nextPath
+      ) {
+        focusTargetPathRef.current = nextPath;
+        setFocusReturnId(pendingReturnRef.current.focusId);
+        pendingReturnRef.current = null;
+      } else if (nextPath !== prevSplit.pathname) {
+        if (!isTier1Path(nextPath)) {
+          pendingReturnRef.current = null;
+        }
+        focusTargetPathRef.current = null;
+        setFocusReturnId(null);
       }
+
       if (window.location.pathname + window.location.search !== normalized) {
-        window.history.pushState({}, "", normalized);
+        if (opts?.replace) {
+          window.history.replaceState({}, "", normalized);
+        } else {
+          window.history.pushState({}, "", normalized);
+        }
       }
       setRoute(normalized);
-      // Clear already-confirmed routine CEO chat receipts on navigation so
-      // non-blocking chat confirmations do not linger across unrelated screens.
-      setOutbox((prev) =>
-        prev.lifecycle === "applied" && prev.intent?.command_type === "send_ceo_message"
-          ? {
-              lifecycle: "idle",
-              intent: null,
-              receipt: null,
-              errorMessage: null,
-              quarantineNotice: null,
-            }
-          : prev
-      );
-      window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+
+      if (nextPath !== prevSplit.pathname) {
+        setOutbox((prev) =>
+          prev.lifecycle === "applied"
+            ? {
+                lifecycle: "idle",
+                intent: null,
+                receipt: null,
+                errorMessage: null,
+                quarantineNotice: null,
+              }
+            : prev
+        );
+        window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+      }
     },
     []
   );
 
-  const clearFocusReturnId = useCallback(() => setFocusReturnId(null), []);
+  const askCeo = useCallback(
+    (context: ContextRef | null) => {
+      if (!context) {
+        navigate("/messages", { contextRef: null });
+        return;
+      }
+      const sanitized = sanitizeAskContext(context);
+      if (!sanitized) {
+        navigate("/messages", { contextRef: null });
+        return;
+      }
+      navigate(
+        `/messages?context_kind=${encodeURIComponent(sanitized.kind)}&context_id=${encodeURIComponent(sanitized.id)}`,
+        { contextRef: sanitized }
+      );
+    },
+    [navigate]
+  );
+
+  const clearFocusReturnId = useCallback(() => {
+    focusTargetPathRef.current = null;
+    setFocusReturnId(null);
+  }, []);
+
+  const registerEscapeBack = useCallback((targetPath: string, focusId?: string) => {
+    const token = Symbol("escapeBack");
+    escapeRegRef.current = { token, targetPath, focusId };
+    return () => {
+      if (escapeRegRef.current?.token === token) {
+        escapeRegRef.current = null;
+      }
+    };
+  }, []);
+
+  // Deterministic [data-focus-id="..."] focus restoration on return to Tier 0.
+  useEffect(() => {
+    if (!focusReturnId) return;
+    if (focusTargetPathRef.current !== null && focusTargetPathRef.current !== routePathname) {
+      return;
+    }
+    const escaped =
+      typeof CSS !== "undefined" && typeof CSS.escape === "function"
+        ? CSS.escape(focusReturnId)
+        : focusReturnId.replace(/"/g, '\\"');
+    const selector = `[data-focus-id="${escaped}"]`;
+
+    const tryFocus = () => {
+      const target = document.querySelector<HTMLElement>(selector);
+      if (!target) return false;
+      target.focus();
+      focusTargetPathRef.current = null;
+      setFocusReturnId(null);
+      return true;
+    };
+
+    if (tryFocus()) return;
+
+    const root = document.querySelector(".sd-main") ?? document.body;
+    const observer = new MutationObserver(() => {
+      if (tryFocus()) {
+        observer.disconnect();
+        window.clearTimeout(timer);
+      }
+    });
+    observer.observe(root, { childList: true, subtree: true });
+    const timer = window.setTimeout(() => {
+      observer.disconnect();
+      focusTargetPathRef.current = null;
+      setFocusReturnId(null);
+    }, 1500);
+
+    return () => {
+      observer.disconnect();
+      window.clearTimeout(timer);
+    };
+  }, [focusReturnId, routePathname]);
+
+  // Global guarded Escape handler for Tier 1 -> Tier 0 navigation.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key !== "Escape" ||
+        event.defaultPrevented ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.shiftKey ||
+        hostLockedRef.current
+      ) {
+        return;
+      }
+      if (isEditableElement(event.target) || isEditableElement(document.activeElement)) {
+        return;
+      }
+      if (hasOpenOverlay()) {
+        return;
+      }
+      const currentPath = splitRoute(routeRef.current).pathname;
+      const reg = escapeRegRef.current;
+      const targetPath = reg?.targetPath ?? defaultEscapeBackTarget(currentPath);
+      if (!targetPath || targetPath === currentPath) return;
+
+      event.preventDefault();
+      const effFocusId =
+        reg?.focusId ??
+        (pendingReturnRef.current?.path === targetPath
+          ? pendingReturnRef.current.focusId
+          : undefined);
+      navigate(targetPath, effFocusId ? { focusReturnId: effFocusId } : undefined);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [navigate]);
 
   const clearData = useCallback((reason: string, state: LinkState = "unauthorized") => {
     setMeta(null);
+    setMetaReady(false);
     setLinkState(state);
     setLastError(reason);
     setRecentEventTypes([]);
-    setPendingAskContext(null);
+    setUnreadCeoReply(false);
+    startupMsgCheckedRef.current = null;
+    setPendingAskContextState(null);
     setOutbox({
       lifecycle: "idle",
       intent: null,
@@ -243,9 +737,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
 
   const loadMeta = useCallback(
-    async (signal?: AbortSignal) => {
+    async (signal?: AbortSignal, opts?: { retryTransientNetwork?: boolean }) => {
       try {
-        const nextMeta = await fetchMeta(signal);
+        const nextMeta = await fetchMeta(signal, opts);
         const nextPrincipal = nextMeta.board_access.principal_id;
         if (
           (companyIdRef.current !== null &&
@@ -272,6 +766,33 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setLinkState("live");
         setLastError(null);
         setMetaReady(true);
+
+        const scopeKey = `${nextMeta.company_id}:${nextPrincipal ?? "unbound"}`;
+        if (startupMsgCheckedRef.current !== scopeKey) {
+          startupMsgCheckedRef.current = scopeKey;
+          const savedMsgSeq = readStoredSeq(
+            lastMessagesStorageKey(nextMeta.company_id, nextPrincipal)
+          );
+          if (savedMsgSeq > 0 && savedMsgSeq < nextMeta.event_seq) {
+            void fetchEventsNdjson(savedMsgSeq, 0, signal)
+              .then((events) => {
+                if (signal?.aborted) return;
+                if (events.some((e) => e.event_type === "ceo.message_replied")) {
+                  const sp = splitRoute(routeRef.current);
+                  const ch = new URLSearchParams(
+                    sp.search.startsWith("?") ? sp.search.slice(1) : sp.search
+                  ).get("channel");
+                  if (isMessagesPathname(sp.pathname) && (!ch || ch === "ceo-direct")) {
+                    markMessagesVisited(nextMeta.event_seq);
+                  } else {
+                    setUnreadCeoReply(true);
+                  }
+                }
+              })
+              .catch(() => undefined);
+          }
+        }
+
         return nextMeta;
       } catch (err) {
         if (signal?.aborted) return null;
@@ -285,17 +806,54 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return null;
       }
     },
-    [clearData]
+    [clearData, markMessagesVisited]
   );
+
+  // Redirect away from /bootstrap once bootstrap_locked clears.
+  useEffect(() => {
+    const prevLocked = prevBootstrapLockedRef.current;
+    const isLocked = meta?.board_access.bootstrap_locked;
+    prevBootstrapLockedRef.current = isLocked;
+    if (
+      isLocked === false &&
+      (prevLocked === true || prevLocked === undefined) &&
+      splitRoute(routeRef.current).pathname === "/bootstrap"
+    ) {
+      navigate("/", { replace: true });
+    }
+  }, [meta?.board_access.bootstrap_locked, navigate]);
 
   // Startup bootstrap + pending outbox recovery.
   useEffect(() => {
+    let active = true;
     const controller = new AbortController();
+    const retryTimers: number[] = [];
+
+    const waitRetry = (ms: number) =>
+      new Promise<void>((resolve) => {
+        const id = window.setTimeout(resolve, ms);
+        retryTimers.push(id);
+      });
+
+    const shouldStopRetry = () =>
+      !active ||
+      controller.signal.aborted ||
+      linkStateRef.current === "unauthorized" ||
+      metaReadyRef.current;
+
     void (async () => {
-      const loaded = await loadMeta(controller.signal);
-      if (!loaded || controller.signal.aborted) return;
+      let loaded = await loadMeta(controller.signal, { retryTransientNetwork: true });
+      const retryDelays = [300, 800, 1600];
+      for (let i = 0; !loaded && i < retryDelays.length; i += 1) {
+        if (shouldStopRetry()) break;
+        await waitRetry(retryDelays[i]);
+        if (shouldStopRetry()) break;
+        loaded = await loadMeta(controller.signal, { retryTransientNetwork: true });
+      }
+      if (!loaded || !active) return;
       try {
         const pendingInfo = await readPendingOutboxApi();
+        if (!active) return;
         if (pendingInfo.quarantined_stale) {
           setOutbox({
             lifecycle: "idle",
@@ -329,6 +887,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           } else if (rec.state === "applied") {
             try {
               await deletePendingOutboxApi();
+              if (!active) return;
               setOutbox({
                 lifecycle: "applied",
                 intent: pendingInfo.pending,
@@ -337,6 +896,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 quarantineNotice: null,
               });
             } catch {
+              if (!active) return;
               setOutbox({
                 lifecycle: "unknown",
                 intent: pendingInfo.pending,
@@ -347,6 +907,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
             }
           } else if (rec.state === "denied") {
             await deletePendingOutboxApi().catch(() => undefined);
+            if (!active) return;
             setOutbox({
               lifecycle: "denied",
               intent: pendingInfo.pending,
@@ -368,7 +929,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
         // Ignore outbox recovery network hiccup; meta poll will retry.
       }
     })();
-    return () => controller.abort();
+    return () => {
+      active = false;
+      controller.abort();
+      for (const id of retryTimers) {
+        window.clearTimeout(id);
+      }
+    };
   }, [loadMeta]);
 
   // Coalesced NDJSON /api/v1/events long-poll stream (waits for initial meta load).
@@ -377,13 +944,54 @@ export function AppProvider({ children }: { children: ReactNode }) {
     let active = true;
     const controller = new AbortController();
     let coalesceTimer: number | null = null;
+    let settleTimer: number | null = null;
+    let pendingWaitResolve: (() => void) | null = null;
+
+    const waitMsDelay = (ms: number) =>
+      new Promise<void>((resolve) => {
+        if (!active) {
+          resolve();
+          return;
+        }
+        pendingWaitResolve = resolve;
+        settleTimer = window.setTimeout(() => {
+          settleTimer = null;
+          pendingWaitResolve = null;
+          resolve();
+        }, ms);
+      });
+
+    const cancelPendingWait = () => {
+      if (settleTimer !== null) {
+        window.clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+      if (pendingWaitResolve) {
+        const resolve = pendingWaitResolve;
+        pendingWaitResolve = null;
+        resolve();
+      }
+    };
+
+    const shutdown = () => {
+      active = false;
+      controller.abort();
+      cancelPendingWait();
+      if (coalesceTimer !== null) {
+        window.clearTimeout(coalesceTimer);
+        coalesceTimer = null;
+      }
+    };
+
+    window.addEventListener("pagehide", shutdown);
 
     async function loop() {
+      let waitMs = 0;
       while (active) {
         try {
           const events = await fetchEventsNdjson(
             lastSeqRef.current,
-            3000,
+            waitMs,
             controller.signal
           );
           if (!active) break;
@@ -392,14 +1000,35 @@ export function AppProvider({ children }: { children: ReactNode }) {
             lastSeqRef.current = Math.max(lastSeqRef.current, maxSeq);
             setLastEventSeq(lastSeqRef.current);
             setRecentEventTypes(events.map((e) => e.event_type));
+            const ceoReplies = events.filter(
+              (e) => e.event_type === "ceo.message_replied"
+            );
+            if (ceoReplies.length > 0) {
+              const sp = splitRoute(routeRef.current);
+              const ch = new URLSearchParams(
+                sp.search.startsWith("?") ? sp.search.slice(1) : sp.search
+              ).get("channel");
+              if (isMessagesPathname(sp.pathname) && (!ch || ch === "ceo-direct")) {
+                markMessagesVisited(ceoReplies[ceoReplies.length - 1].event_seq);
+              } else {
+                setUnreadCeoReply(true);
+              }
+            }
             if (coalesceTimer !== null) {
               window.clearTimeout(coalesceTimer);
             }
             coalesceTimer = window.setTimeout(() => {
               if (!active) return;
-              void loadMeta(controller.signal);
+              void loadMeta();
               setRefreshSeq((n) => n + 1);
             }, 150);
+          } else if (linkStateRef.current === "stale") {
+            void loadMeta();
+          }
+          if (waitMs === 0) {
+            waitMs = 3000;
+            await waitMsDelay(400);
+            if (!active) break;
           }
         } catch (err) {
           if (!active || controller.signal.aborted) break;
@@ -409,9 +1038,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
           }
           setLinkState("stale");
           setLastError(err instanceof Error ? err.message : "Live event stream disconnected");
-          await new Promise((r) => window.setTimeout(r, 1500));
+          await waitMsDelay(1500);
           if (active) {
-            await loadMeta(controller.signal);
+            await loadMeta();
           }
         }
       }
@@ -419,15 +1048,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     void loop();
     return () => {
-      active = false;
-      controller.abort();
-      if (coalesceTimer !== null) window.clearTimeout(coalesceTimer);
+      window.removeEventListener("pagehide", shutdown);
+      shutdown();
     };
-  }, [clearData, loadMeta, metaReady]);
+  }, [clearData, loadMeta, markMessagesVisited, metaReady]);
 
   const dispatchCommand = useCallback(
-    async (intent: LocalCommandIntent) => {
-      if (submittingRef.current) return;
+    async (intent: LocalCommandIntent): Promise<CommandLifecycle> => {
+      if (submittingRef.current) return outboxRef.current.lifecycle;
       submittingRef.current = true;
       try {
         setOutbox({
@@ -452,7 +1080,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 : "Failed to record local pending guard",
             quarantineNotice: null,
           });
-          return;
+          return "denied";
         }
 
         try {
@@ -468,7 +1096,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 errorMessage: "Command applied, but clearing local pending file failed.",
                 quarantineNotice: null,
               });
-              return;
+              return "unknown";
             }
             setOutbox({
               lifecycle: "applied",
@@ -479,7 +1107,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
             });
             await loadMeta();
             setRefreshSeq((n) => n + 1);
-          } else if (receipt.state === "denied") {
+            return "applied";
+          }
+          if (receipt.state === "denied") {
             await deletePendingOutboxApi().catch(() => undefined);
             setOutbox({
               lifecycle: "denied",
@@ -493,21 +1123,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
             });
             await loadMeta();
             setRefreshSeq((n) => n + 1);
-          } else {
-            setOutbox({
-              lifecycle: "accepted",
-              intent,
-              receipt,
-              errorMessage: null,
-              quarantineNotice: null,
-            });
+            return "denied";
           }
+          setOutbox({
+            lifecycle: "accepted",
+            intent,
+            receipt,
+            errorMessage: null,
+            quarantineNotice: null,
+          });
+          return "accepted";
         } catch (err) {
           if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
             await deletePendingOutboxApi().catch(() => undefined);
             if (err.status === 401) {
               clearData(err.message, "unauthorized");
-              return;
+              return "denied";
             }
             setOutbox({
               lifecycle: "denied",
@@ -516,7 +1147,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
               errorMessage: err.message,
               quarantineNotice: null,
             });
-            return;
+            return "denied";
           }
           // Transport timeout / 5xx -> request outcome is unknown; retain board-pending file!
           setOutbox({
@@ -529,6 +1160,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 : "Outcome unknown. Check original request before retrying.",
             quarantineNotice: null,
           });
+          return "unknown";
         }
       } finally {
         submittingRef.current = false;
@@ -545,7 +1177,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         intent.command_id,
         intent.command_type
       );
-      if (receipt.status === "not_found") {
+      if (receipt.status === "not_found" || (!receipt.state && receipt.status !== "found")) {
         setOutbox({
           lifecycle: "not_found_retry_choice",
           intent,
@@ -649,9 +1281,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
-  const forceRefresh = useCallback(() => {
-    void loadMeta();
+  const forceRefresh = useCallback(async (): Promise<boolean> => {
+    const loaded = await loadMeta();
     setRefreshSeq((n) => n + 1);
+    return loaded !== null;
   }, [loadMeta]);
 
   const controlsLocked =
@@ -671,11 +1304,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const value = useMemo<AppContextValue>(
     () => ({
       route,
+      routePathname,
+      routeSearchParams,
+      performanceMode,
+      daemonMode,
+      activeApprovalQuestionId,
       navigate,
       focusReturnId,
       clearFocusReturnId,
       pendingAskContext,
       setPendingAskContext,
+      askCeo,
+      registerEscapeBack,
+      getLastSeenSeq,
+      markSeenSeq,
+      unreadCeoReply,
+      markMessagesVisited,
       appearance,
       setAppearance,
       material,
@@ -704,10 +1348,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }),
     [
       route,
+      routePathname,
+      routeSearchParams,
+      performanceMode,
+      daemonMode,
+      activeApprovalQuestionId,
       navigate,
       focusReturnId,
       clearFocusReturnId,
       pendingAskContext,
+      setPendingAskContext,
+      askCeo,
+      registerEscapeBack,
+      getLastSeenSeq,
+      markSeenSeq,
+      unreadCeoReply,
+      markMessagesVisited,
       appearance,
       setAppearance,
       material,
@@ -744,4 +1400,12 @@ export function useApp(): AppContextValue {
     throw new Error("useApp must be used inside AppProvider");
   }
   return ctx;
+}
+
+export function useEscapeBack(targetPath: string, focusId?: string): void {
+  const { registerEscapeBack } = useApp();
+  useEffect(
+    () => registerEscapeBack(targetPath, focusId),
+    [registerEscapeBack, targetPath, focusId]
+  );
 }

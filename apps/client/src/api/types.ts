@@ -113,6 +113,12 @@ export interface ExecutionOrderItem {
   residual_position_qty: number | null;
   cancel_not_flat: boolean;
   fills: OrderFillItem[];
+  reconciliation?: {
+    attempts: number;
+    next_query_at: number | null;
+    fill_id: string | null;
+    sources: unknown[];
+  } | null;
 }
 
 export interface OpenPositionItem {
@@ -194,6 +200,7 @@ export interface LiveTradingProjection {
   } | null;
   active_restrictions: RestrictionItem[];
   open_close_issues?: Array<Record<string, unknown>>;
+  close_count?: number;
 }
 
 export interface OrderTraceProjection {
@@ -376,6 +383,8 @@ export interface ContextRef {
   id: string;
   label: string;
 }
+
+export type AskContext = ContextRef;
 
 export interface MessagesProjection {
   projection: string;
