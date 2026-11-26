@@ -899,6 +899,69 @@ export interface EnvironmentPromotionRecordItem {
   recorded_at_ns: number;
 }
 
+export interface CompanyPaperBookItem {
+  binding_id: string;
+  account_id: string;
+  book_name: string;
+  strategy_release_id: string | null;
+  role: "active" | "nominated" | "shadow" | "retired";
+  status: string;
+  shadow_of_live_binding_id: string | null;
+  nominated_question_id: string | null;
+  currency: string;
+  starting_minor_units: number;
+  exposure_limit_minor_units: number;
+  fee_bps: number;
+  slippage_bps: number;
+  quote_source: string;
+  cash_minor_units: number;
+  gross_exposure_minor_units: number;
+  realized_pnl_minor_units: number;
+  total_fees_minor_units: number;
+  fill_count: number;
+  open_positions_count: number;
+  open_orders_count: number;
+  soak_ready: boolean;
+  positions: Array<{
+    instrument_id: string;
+    quantity: number;
+    avg_entry_minor_units: number;
+    realized_pnl_minor_units: number;
+    total_fees_minor_units: number;
+    updated_at_ns: number;
+  }>;
+  orders: Array<{
+    order_id: string;
+    action_id: string;
+    instrument_id: string;
+    side: string;
+    quantity: number;
+    limit_minor_units: number;
+    status: string;
+    filled_quantity: number;
+    fill_price_minor_units: number | null;
+    fee_minor_units: number;
+    created_at_ns: number;
+  }>;
+}
+
+export interface PaperLiveMigrationItem {
+  migration_id: string;
+  question_id: string | null;
+  source_paper_binding_id: string;
+  source_book_name: string;
+  target_live_binding_id: string;
+  target_account_id: string;
+  replaced_live_binding_id: string | null;
+  qualification_receipt_id: string;
+  migration_mode: "clean_start" | "drain_incumbent";
+  source_paper_disposition: "keep_shadow" | "retire_source";
+  positions_copied: number;
+  pre_check_summary: Record<string, unknown>;
+  reason: string;
+  recorded_at_ns: number;
+}
+
 export interface ExecutionTiersProjection {
   projection: string;
   company_id: string;
@@ -907,11 +970,13 @@ export interface ExecutionTiersProjection {
   event_seq: number;
   paper_domain_installed: boolean;
   company_paper: ExecutionTierBindingItem | null;
+  company_paper_books?: CompanyPaperBookItem[];
   company_paper_soak_ready: boolean;
   company_live: ExecutionTierBindingItem | null;
   live_candidates: LiveCandidateBindingItem[];
   agent_sandboxes: AgentSandboxSummaryItem[];
   qualification_receipts: QualificationReceiptItem[];
   promotion_history: EnvironmentPromotionRecordItem[];
+  migration_history?: PaperLiveMigrationItem[];
   current_core_digest: string;
 }

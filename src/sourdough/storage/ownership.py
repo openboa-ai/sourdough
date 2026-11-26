@@ -151,13 +151,18 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "paper_funding_settlement": frozenset({"paper_funding.py"}),
     "paper_challenger_trial": frozenset({"strategy_comparison.py"}),
     "paper_strategy_deployment": frozenset({"strategy_comparison.py"}),
-    # Three-tier execution accounts, per-Agent sandboxes & promotion receipts
+    # Three-tier execution accounts, per-Agent sandboxes, multi-book paper & migration receipts
     "execution_environment_binding": frozenset({"execution_tiers.py"}),
     "agent_sandbox_order": frozenset({"execution_tiers.py"}),
     "agent_sandbox_fill": frozenset({"execution_tiers.py"}),
     "agent_sandbox_position": frozenset({"execution_tiers.py"}),
     "venue_qualification_receipt": frozenset({"execution_tiers.py"}),
     "environment_promotion_record": frozenset({"execution_tiers.py"}),
+    "company_paper_book": frozenset({"execution_tiers.py"}),
+    "company_paper_order": frozenset({"execution_tiers.py"}),
+    "company_paper_fill": frozenset({"execution_tiers.py"}),
+    "company_paper_position": frozenset({"execution_tiers.py"}),
+    "paper_live_migration_record": frozenset({"execution_tiers.py"}),
     # Separate venue / market SQLite databases (outside company store)
     "replay_decision_cut": frozenset({"nautilus_paper.py"}),
     "venue_account": frozenset({"paper_venue.py"}),

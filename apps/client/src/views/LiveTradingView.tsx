@@ -37,7 +37,9 @@ import {
   formatSignedPct,
 } from "../api/client";
 import type {
+  CompanyPaperBookItem,
   ExecutionOrderItem,
+  ExecutionTiersProjection,
   LiveTradingProjection,
   OpenPositionItem,
   ReturnPoint,
@@ -261,6 +263,7 @@ export function LiveTradingView() {
   const [burstLocked, setBurstLocked] = useState(false);
   const [localRefresh, setLocalRefresh] = useState(0);
   const [visitSinceSeq, setVisitSinceSeq] = useState<number | null>(null);
+  const [paperBooks, setPaperBooks] = useState<CompanyPaperBookItem[]>([]);
 
   const livePromotionApprovals = usePendingApprovals(
     (q) =>
@@ -268,6 +271,30 @@ export function LiveTradingView() {
       q.kind === "paper_to_live_migration" ||
       q.kind === "execution_promotion"
   );
+
+  useEffect(() => {
+    if (linkState === "unauthorized") return;
+    const controller = new AbortController();
+    let active = true;
+    void (async () => {
+      try {
+        const res = await fetchProjection<ExecutionTiersProjection>("execution-tiers", {
+          signal: controller.signal,
+        });
+        if (!active || controller.signal.aborted) return;
+        if (res.data?.company_paper_books) {
+          setPaperBooks(res.data.company_paper_books);
+        }
+      } catch (err) {
+        if (!active || controller.signal.aborted) return;
+        if (err instanceof DOMException && err.name === "AbortError") return;
+      }
+    })();
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [refreshSeq, localRefresh, linkState]);
 
   const etagRef = useRef<string | undefined>(undefined);
   const prevProjPathRef = useRef<string | null>(null);
@@ -908,6 +935,95 @@ export function LiveTradingView() {
   const domainEntries = Object.entries(data.since_last_visit.by_domain);
   const initialDisclosureOpen = readDisclosureOpen(scopeKey);
 
+  const bookCols: DataColumn[] = [
+    { id: "book", label: "Paper Book & Strategy", kind: "identity" },
+    { id: "role", label: "Status", kind: "role" },
+    { id: "cash", label: "Virtual Cash", kind: "numeric", align: "end" },
+    { id: "exposure", label: "Exposure / Cap", kind: "numeric", align: "end" },
+    { id: "pnl", label: "Realized P&L", kind: "numeric", align: "end" },
+    { id: "terms", label: "Fee / Slippage", kind: "numeric", align: "end" },
+    { id: "soak", label: "Activity & Soak", kind: "numeric", align: "end" },
+  ];
+
+  const bookRows: DataRow[] = paperBooks.map((book) => ({
+    id: book.binding_id,
+    cells: {
+      book: (
+        <Stack gap={2}>
+          <Text variant="body">{book.book_name}</Text>
+          <Text variant="meta" className="sd-mono">
+            {book.account_id}
+            {book.strategy_release_id ? ` · ${book.strategy_release_id}` : ""}
+          </Text>
+        </Stack>
+      ),
+      role: (
+        <Badge
+          tone={
+            book.role === "shadow"
+              ? "success"
+              : book.role === "nominated"
+                ? "brand"
+                : book.role === "retired"
+                  ? "neutral"
+                  : "neutral"
+          }
+          variant={book.role === "retired" ? "outline" : "soft"}
+          dot={false}
+        >
+          {book.role === "shadow"
+            ? "Shadow Benchmark"
+            : book.role === "nominated"
+              ? "Recommended for Live"
+              : book.role === "retired"
+                ? "Retired"
+                : "Active"}
+        </Badge>
+      ),
+      cash: (
+        <Text className="sd-tabular">
+          {formatMinorCurrency(book.cash_minor_units, book.currency)}
+        </Text>
+      ),
+      exposure: (
+        <Text className="sd-tabular">
+          {formatMinorCurrency(book.gross_exposure_minor_units, book.currency)} /{" "}
+          {formatMinorCurrency(book.exposure_limit_minor_units, book.currency)}
+        </Text>
+      ),
+      pnl: (
+        <Text
+          className={`sd-tabular ${
+            book.realized_pnl_minor_units > 0
+              ? "sd-tone-pos"
+              : book.realized_pnl_minor_units < 0
+                ? "sd-tone-neg"
+                : ""
+          }`}
+        >
+          {formatMinorCurrency(book.realized_pnl_minor_units, book.currency, { signed: true })}
+        </Text>
+      ),
+      terms: (
+        <Text variant="help" className="sd-tabular">
+          {book.fee_bps} bps / {book.slippage_bps} bps
+        </Text>
+      ),
+      soak: (
+        <Inline gap={6} align="center" justify="end" wrap>
+          <Text variant="help" className="sd-tabular">
+            {book.fill_count} fills · {book.open_positions_count} open
+          </Text>
+          <Badge tone={book.soak_ready ? "success" : "warning"} variant="soft" dot={false}>
+            {book.soak_ready ? "Soak Ready" : "Pending"}
+          </Badge>
+        </Inline>
+      ),
+    },
+  }));
+
+  const shadowBooksCount = paperBooks.filter((b) => b.role === "shadow").length;
+
   return (
     <Stack gap={16}>
       {performanceMode ? (
@@ -983,6 +1099,29 @@ export function LiveTradingView() {
       />
 
       <ContextualApprovalList questions={livePromotionApprovals} />
+
+      {!performanceMode && bookRows.length > 0 ? (
+        <Card
+          title="Company Paper Books"
+          description="Concurrent simulated trading books competing for Live migration — each with isolated virtual cash, fees, and slippage"
+          variant="raised"
+          className="sd-ledger-card"
+          headerAction={
+            <Inline gap={6} align="center" wrap>
+              <Badge tone="neutral" variant="soft" dot={false}>
+                {bookRows.length} {bookRows.length === 1 ? "book" : "books"}
+              </Badge>
+              {shadowBooksCount > 0 ? (
+                <Badge tone="success" variant="soft" dot={false}>
+                  {shadowBooksCount} shadow
+                </Badge>
+              ) : null}
+            </Inline>
+          }
+        >
+          <DataTable caption="Concurrent company paper books" columns={bookCols} rows={bookRows} />
+        </Card>
+      ) : null}
 
       <div className="sd-kpi-grid">
         <Card

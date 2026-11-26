@@ -31,8 +31,8 @@ CREATE TABLE execution_environment_binding (
     CHECK (environment != 'live' OR credential_handle_ref IS NOT NULL)
 ) STRICT;
 
-CREATE UNIQUE INDEX idx_exec_binding_single_active_company_paper
-    ON execution_environment_binding(company_id)
+CREATE UNIQUE INDEX idx_exec_binding_unique_active_company_paper_account
+    ON execution_environment_binding(company_id, account_id)
     WHERE tier = 'company_paper' AND status = 'active';
 
 CREATE UNIQUE INDEX idx_exec_binding_single_active_company_live
