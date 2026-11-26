@@ -91,7 +91,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
     activeData ? activeData.order.order_id : orderId
   );
 
-  useEscapeBack("/", resolvedFocusReturnId);
+  useEscapeBack("/trading/paper", resolvedFocusReturnId);
 
   useEffect(() => {
     if (prevOrderIdRef.current !== orderId) {
@@ -157,9 +157,9 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
             <Button
               emphasis="soft"
               shape="pill"
-              onClick={() => navigate("/", { focusReturnId: resolvedFocusReturnId })}
+              onClick={() => navigate("/trading/paper", { focusReturnId: resolvedFocusReturnId })}
             >
-              Back to Live Trading
+              Back to Paper Trading
             </Button>
           </Inline>
         }
@@ -271,7 +271,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
       <SpaBreadcrumb
         focusReturnId={focusReturnId}
         items={[
-          { id: "home", label: "Live Trading", href: "/" },
+          { id: "paper", label: "Paper Trading", href: "/trading/paper" },
           { id: "order", label: `Order ${order.order_id}`, href: `/orders/${order.order_id}` },
         ]}
       />
@@ -287,7 +287,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                 size="compact"
                 shape="pill"
                 onClick={() =>
-                  navigate(`/office/agents/${encodeURIComponent(order.agent_id!)}`)
+                  navigate(`/agents/${encodeURIComponent(order.agent_id!)}`)
                 }
               >
                 Inspect {order.agent_name}

@@ -40,6 +40,10 @@ import {
   type Material,
 } from "@openboa/yogurt";
 import { newCommandId } from "../api/client";
+import {
+  resolveActiveDomainModules,
+  resolveHomeMode,
+} from "../domains/registry";
 import { splitRoute, useApp } from "../state/store";
 import { CommandOutboxPanel } from "./CommandOutboxPanel";
 import { ControlledInlineConfirm } from "./ControlledInlineConfirm";
@@ -270,6 +274,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const wasShieldActiveRef = useRef(false);
 
   const { pathname: path } = splitRoute(route);
+  const activeModules = resolveActiveDomainModules(meta?.active_domains);
+  const homeMode = resolveHomeMode(activeModules);
   const paperActive = meta?.active_domains.includes("paper") ?? false;
   const paperRiskSuspended = Boolean(meta?.paper_risk_suspended);
   const activeRestrictions = meta?.active_restrictions_count ?? 0;
@@ -543,12 +549,13 @@ export function AppShell({ children }: { children: ReactNode }) {
         gArmedUntilRef.current = 0;
         const chordTargets: Record<string, string> = {
           l: "/",
-          a: "/office",
+          p: "/trading/paper",
+          s: "/trading/strategies",
+          a: "/agents",
           m: "/messages",
-          p: "/company/approvals",
-          s: "/company/strategy-trials",
-          e: "/company/execution-tiers",
-          r: "/restrictions",
+          v: "/approvals",
+          c: "/controls",
+          ",": "/settings",
         };
         const dest = chordTargets[key];
         if (dest) {
@@ -576,119 +583,99 @@ export function AppShell({ children }: { children: ReactNode }) {
     shortcut?: string;
     keywords?: string[];
   }> = [
-    {
-      id: "nav:/",
-      label: "Live Trading & Portfolio",
-      hint: "Core",
-      icon: "chart",
-      shortcut: "G L",
-      keywords: ["Live", "Trading", "Portfolio", "Home", "Dashboard", "Orders", "Positions"],
-    },
-    ...(paperActive
+    ...(homeMode === "multi_overview"
       ? [
           {
-            id: "nav:/performance",
-            label: "Performance & Two-Layer P&L",
-            hint: "Core",
-            icon: "chart" as const,
-            keywords: ["Performance", "PnL", "P&L", "Returns", "Two-Layer"],
+            id: "nav:/",
+            label: "Overview",
+            hint: "Home",
+            icon: "home" as const,
+            keywords: ["Overview", "Home", "Modules", "Summary"],
           },
         ]
       : []),
     {
-      id: "nav:/office",
-      label: "Agents & Activity Graph",
-      hint: "Core",
+      id: "nav:/approvals",
+      label: pendingApprovals > 0 ? `Approvals (${pendingApprovals} pending)` : "Approvals",
+      hint: "Inbox",
+      icon: "check",
+      shortcut: "G V",
+      keywords: ["Approvals", "Decisions", "Notifications", "Pending", "Governance"],
+    },
+    ...activeModules.flatMap((mod) =>
+      mod.navItems.map((item) => ({
+        id: `nav:${item.path}`,
+        label: item.label,
+        hint: mod.label,
+        icon: item.icon,
+        shortcut: item.shortcut,
+        keywords: item.keywords,
+      }))
+    ),
+    {
+      id: "nav:/agents",
+      label: "Agents",
+      hint: "Company",
       icon: "workflow",
       shortcut: "G A",
-      keywords: ["Agents", "Activity", "Office", "Graph", "Workers", "Roster"],
+      keywords: ["Agents", "Activity", "Office", "Graph", "Workers", "Roster", "Sandbox"],
     },
     {
       id: "nav:/messages",
-      label: "Company Messages (Founder · CEO)",
-      hint: "Core",
+      label: "Messages",
+      hint: "Company",
       icon: "chat",
       shortcut: "G M",
       keywords: ["Messages", "CEO", "Founder", "Chat", "Direct", "Threads"],
     },
     {
-      id: "nav:/company/approvals",
-      label: pendingApprovals > 0 ? `Board Approvals (${pendingApprovals} pending)` : "Board Approvals",
-      hint: "Company",
-      icon: "check",
-      shortcut: "G P",
-      keywords: ["Approvals", "Decisions", "Questions", "Pending", "Governance"],
-    },
-    {
-      id: "nav:/company/strategy-trials",
-      label: "Strategies & Challenger Trials",
-      hint: "Company",
-      icon: "sliders",
-      shortcut: "G S",
-      keywords: ["Strategy Trials", "Strategies", "Trials", "Challenger", "Releases", "Deployments"],
-    },
-    {
-      id: "nav:/company/execution-tiers",
-      label: "Execution Tiers & Live Promotion",
-      hint: "Company",
-      icon: "sliders",
-      shortcut: "G E",
-      keywords: ["Execution Tiers", "Sandbox", "Paper", "Live", "Promotion", "Binance", "Qualification"],
-    },
-    {
-      id: "nav:/company/finance",
-      label: "Finance & Operating Costs",
+      id: "nav:/finance",
+      label: "Finance",
       hint: "Company",
       icon: "bookmark",
       keywords: ["Finance", "Costs", "Accounting", "Journals", "Statements", "Budget"],
     },
     {
-      id: "nav:/company/org",
-      label: "Organization & Published Reports",
+      id: "nav:/reports",
+      label: "Reports",
       hint: "Company",
       icon: "person",
-      keywords: ["Org", "Organization", "Reports", "Publications", "Custody", "Team"],
+      keywords: ["Reports", "Org", "Organization", "Publications", "Custody", "Team"],
     },
     {
-      id: "nav:/restrictions",
-      label: "Active Restrictions & Risk Gates",
-      hint: "Company",
+      id: "nav:/controls",
+      label: "Controls",
+      hint: "System",
       icon: "info",
-      shortcut: "G R",
-      keywords: ["Restrictions", "Risk", "Stops", "Pause", "Resume", "Gates"],
+      shortcut: "G C",
+      keywords: ["Controls", "Restrictions", "Risk", "Stops", "Pause", "Resume", "Gates"],
     },
     {
-      id: "nav:/system/checkpoints",
-      label: "Safety, Checkpoints & Restore",
+      id: "nav:/backups",
+      label: "Backups",
       hint: "System",
-      icon: "clock",
-      keywords: ["Checkpoints", "Safety", "Restore", "Snapshot"],
+      icon: "calendar",
+      keywords: ["Backups", "Checkpoints", "Safety", "Restore", "Snapshot"],
     },
     {
-      id: "nav:/system/evaluations",
-      label: "Evaluations & Tool Lineage",
-      hint: "System",
-      icon: "puzzle",
-      keywords: ["Evaluations", "Evals", "Lineage", "Qualifications", "DAG"],
-    },
-    {
-      id: "nav:/system/audit",
-      label: "Audit Log & Diagnostics",
+      id: "nav:/audit",
+      label: "Audit",
       hint: "System",
       icon: "folder",
-      keywords: ["Audit", "Log", "Diagnostics", "Events"],
+      keywords: ["Audit", "Log", "Evaluations", "Lineage", "Daemon", "Diagnostics", "Events"],
     },
     {
-      id: "nav:/system/daemon",
-      label: "Daemon & Adapter Diagnostics",
+      id: "nav:/settings",
+      label: "Settings",
       hint: "System",
-      icon: "folder",
-      keywords: ["Daemon", "Adapter", "Diagnostics", "Runtime", "System"],
+      icon: "sliders",
+      shortcut: "G ,",
+      keywords: ["Settings", "Appearance", "Material", "Modules", "RBAC", "Privacy"],
     },
     {
       id: "action:theme",
       label: isDark ? "Switch to Light Appearance" : "Switch to Dark Appearance",
-      hint: "Yogurt",
+      hint: "Appearance",
       icon: isDark ? "sun" : "moon",
       keywords: ["Theme", "Appearance", "Light", "Dark"],
     },
@@ -731,18 +718,71 @@ export function AppShell({ children }: { children: ReactNode }) {
       </SidebarHeader>
 
       <SidebarContent label="Board navigation">
-        <SidebarGroup label="Core">
+        <SidebarGroup>
+          {homeMode === "multi_overview" ? (
+            <SidebarItem
+              label="Overview"
+              icon={<Icon name="home" />}
+              active={path === "/"}
+              onSelect={() => navigate("/")}
+            />
+          ) : null}
           <SidebarItem
-            label="Live Trading"
-            icon={<Icon name="chart" />}
-            active={path === "/" || path.startsWith("/orders/") || path === "/performance"}
-            onSelect={() => navigate("/")}
+            label="Approvals"
+            icon={<Icon name="check" />}
+            active={
+              path === "/approvals" ||
+              path.startsWith("/approvals/") ||
+              path === "/company/approvals" ||
+              path.startsWith("/company/approvals/")
+            }
+            badge={
+              pendingApprovals > 0 ? (
+                <Badge tone="brand" dot={false}>
+                  {pendingApprovals}
+                </Badge>
+              ) : undefined
+            }
+            onSelect={() => navigate("/approvals")}
           />
+        </SidebarGroup>
+
+        {activeModules.map((mod) => (
+          <SidebarGroup key={mod.id} label={mod.label}>
+            {mod.navItems.map((item) => (
+              <SidebarItem
+                key={item.id}
+                label={item.label}
+                icon={<Icon name={item.icon} />}
+                active={
+                  homeMode === "multi_overview" && item.path === "/"
+                    ? path === "/trading/live" || path === "/company/execution-tiers"
+                    : item.matches(path)
+                }
+                onSelect={() =>
+                  navigate(
+                    homeMode === "multi_overview" && item.path === "/"
+                      ? "/trading/live"
+                      : item.path
+                  )
+                }
+              />
+            ))}
+          </SidebarGroup>
+        ))}
+
+        <SidebarGroup label="Company">
           <SidebarItem
-            label="Agents & Activity"
+            label="Agents"
             icon={<Icon name="workflow" />}
-            active={path === "/office" || path.startsWith("/office/")}
-            onSelect={() => navigate("/office")}
+            active={
+              path === "/agents" ||
+              path.startsWith("/agents/") ||
+              path === "/office" ||
+              path.startsWith("/office/") ||
+              (homeMode === "core_only" && path === "/")
+            }
+            onSelect={() => navigate("/agents")}
           />
           <SidebarItem
             label="Messages"
@@ -758,45 +798,21 @@ export function AppShell({ children }: { children: ReactNode }) {
             }
             onSelect={() => navigate("/messages")}
           />
-        </SidebarGroup>
-
-        <SidebarGroup label="Company">
           <SidebarItem
-            label="Approvals"
-            icon={<Icon name="check" />}
-            active={path === "/company/approvals" || path.startsWith("/company/approvals/")}
-            badge={
-              pendingApprovals > 0 ? (
-                <Badge tone="brand" dot={false}>
-                  {pendingApprovals}
-                </Badge>
-              ) : undefined
-            }
-            onSelect={() => navigate("/company/approvals")}
-          />
-          <SidebarItem
-            label="Strategies"
-            icon={<Icon name="sliders" />}
-            active={path === "/company/strategy-trials"}
-            onSelect={() => navigate("/company/strategy-trials")}
-          />
-          <SidebarItem
-            label="Execution Tiers"
-            icon={<Icon name="chart" />}
-            active={path === "/company/execution-tiers"}
-            onSelect={() => navigate("/company/execution-tiers")}
-          />
-          <SidebarItem
-            label="Finance & Costs"
+            label="Finance"
             icon={<Icon name="bookmark" />}
-            active={path === "/company/finance"}
-            onSelect={() => navigate("/company/finance")}
+            active={path === "/finance" || path === "/company/finance"}
+            onSelect={() => navigate("/finance")}
           />
           <SidebarItem
-            label="Org & Reports"
+            label="Reports"
             icon={<Icon name="person" />}
-            active={path === "/company/org" || path.startsWith("/company/org/")}
-            onSelect={() => navigate("/company/org")}
+            active={
+              path === "/reports" ||
+              path === "/company/org" ||
+              path.startsWith("/company/org/")
+            }
+            onSelect={() => navigate("/reports")}
           />
         </SidebarGroup>
 
@@ -804,29 +820,40 @@ export function AppShell({ children }: { children: ReactNode }) {
 
         <SidebarGroup label="System">
           <SidebarItem
-            label="Safety & Restore"
-            icon={<Icon name="clock" />}
-            active={path === "/system/checkpoints" || path === "/restrictions"}
+            label="Controls"
+            icon={<Icon name="info" />}
+            active={path === "/controls" || path === "/restrictions"}
             badge={
-              (meta?.active_restrictions_count ?? 0) > 0 ? (
+              activeRestrictions > 0 ? (
                 <Badge tone="warning" dot={false}>
-                  {meta?.active_restrictions_count}
+                  {activeRestrictions}
                 </Badge>
               ) : undefined
             }
-            onSelect={() => navigate("/system/checkpoints")}
+            onSelect={() => navigate("/controls")}
           />
           <SidebarItem
-            label="Evaluations"
-            icon={<Icon name="puzzle" />}
-            active={path === "/system/evaluations"}
-            onSelect={() => navigate("/system/evaluations")}
+            label="Backups"
+            icon={<Icon name="calendar" />}
+            active={path === "/backups" || path === "/system/checkpoints"}
+            onSelect={() => navigate("/backups")}
           />
           <SidebarItem
-            label="Audit Log"
+            label="Audit"
             icon={<Icon name="folder" />}
-            active={path === "/system/audit" || path === "/system/daemon"}
-            onSelect={() => navigate("/system/audit")}
+            active={
+              path === "/audit" ||
+              path === "/system/audit" ||
+              path === "/system/evaluations" ||
+              path === "/system/daemon"
+            }
+            onSelect={() => navigate("/audit")}
+          />
+          <SidebarItem
+            label="Settings"
+            icon={<Icon name="sliders" />}
+            active={path === "/settings"}
+            onSelect={() => navigate("/settings")}
           />
         </SidebarGroup>
       </SidebarContent>
@@ -842,11 +869,15 @@ export function AppShell({ children }: { children: ReactNode }) {
                   ? "Bootstrap Locked"
                   : "Unbound"}
           </Text>
-          {paperActive ? (
+          {activeModules.length > 0 ? (
             <Badge tone="neutral" variant="outline" dot={false}>
-              Paper
+              {activeModules.map((m) => m.label).join(" · ")}
             </Badge>
-          ) : null}
+          ) : (
+            <Badge tone="neutral" variant="outline" dot={false}>
+              Core OS
+            </Badge>
+          )}
         </Inline>
       </SidebarFooter>
     </>
@@ -936,6 +967,17 @@ export function AppShell({ children }: { children: ReactNode }) {
             </Inline>
 
             <Inline gap={8} align="center" wrap>
+              {pendingApprovals > 0 ? (
+                <Button
+                  emphasis="soft"
+                  tone="brand"
+                  size="compact"
+                  shape="pill"
+                  onClick={() => navigate("/approvals")}
+                >
+                  Approvals ({pendingApprovals})
+                </Button>
+              ) : null}
               <Button
                 emphasis="soft"
                 size="compact"
@@ -1111,9 +1153,9 @@ export function AppShell({ children }: { children: ReactNode }) {
                       emphasis="quiet"
                       size="compact"
                       shape="pill"
-                      onClick={() => navigate("/system/audit")}
+                      onClick={() => navigate("/audit")}
                     >
-                      System Diagnostics
+                      Open Audit
                     </Button>
                   </Inline>
                 </Stack>
@@ -1158,7 +1200,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                             aria-label={`Resume Trading (${resumeEngineNote})`}
                             onClick={() => {
                               pushToast(resumeEngineNote);
-                              navigate("/restrictions");
+                              navigate("/controls");
                             }}
                           >
                             Resume Trading
@@ -1183,7 +1225,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                     tone="danger"
                     size="compact"
                     shape="pill"
-                    onClick={() => navigate("/restrictions")}
+                    onClick={() => navigate("/controls")}
                   >
                     Active Stops ({activeRestrictions})
                   </Button>
@@ -1340,9 +1382,9 @@ export function AppShell({ children }: { children: ReactNode }) {
                       emphasis="quiet"
                       size="compact"
                       shape="pill"
-                      onClick={() => navigate("/restrictions")}
+                      onClick={() => navigate("/controls")}
                     >
-                      Inspect Restrictions
+                      Inspect Controls
                     </Button>
                   }
                 >

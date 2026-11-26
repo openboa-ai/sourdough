@@ -223,6 +223,15 @@ export interface OrderTraceProjection {
   }>;
 }
 
+export interface AgentSandboxActivitySummary {
+  account_id: string;
+  currency: string;
+  fill_count: number;
+  open_positions_count: number;
+  cash_minor_units: number;
+  gross_exposure_minor_units: number;
+}
+
 export interface AgentNodeItem {
   agent_id: string;
   display_name: string;
@@ -246,6 +255,8 @@ export interface AgentNodeItem {
   private_draft_count: number;
   published_count: number;
   grant_scope: string;
+  sandbox_authorized?: boolean;
+  sandbox_activity?: AgentSandboxActivitySummary | null;
 }
 
 export interface AgentEdgeItem {
@@ -287,6 +298,7 @@ export interface AgentDetailProjection {
     onboarding_attempts: number;
     allocated_turns: number | null;
   };
+  sandbox_authorized?: boolean;
   agent_sandbox?: AgentSandboxPortfolioDetail | null;
   desk_workspace: {
     execution_profile: string;

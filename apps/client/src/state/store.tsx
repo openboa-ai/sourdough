@@ -184,7 +184,9 @@ function isMessagesPathname(pathname: string): boolean {
 function isTier1Path(pathname: string): boolean {
   return (
     pathname.startsWith("/orders/") ||
+    pathname.startsWith("/agents/") ||
     pathname.startsWith("/office/agents/") ||
+    pathname.startsWith("/approvals/") ||
     pathname.startsWith("/company/approvals/") ||
     pathname === "/performance" ||
     pathname === "/system/daemon"
@@ -192,12 +194,14 @@ function isTier1Path(pathname: string): boolean {
 }
 
 function defaultEscapeBackTarget(pathname: string): string | null {
-  if (pathname.startsWith("/orders/") || pathname === "/performance") return "/";
-  if (pathname.startsWith("/office/agents/")) {
-    return "/office";
+  if (pathname.startsWith("/orders/") || pathname === "/performance") return "/trading/paper";
+  if (pathname.startsWith("/agents/") || pathname.startsWith("/office/agents/")) {
+    return "/agents";
   }
-  if (pathname.startsWith("/company/approvals/")) return "/company/approvals";
-  if (pathname === "/system/daemon") return "/system/audit";
+  if (pathname.startsWith("/approvals/") || pathname.startsWith("/company/approvals/")) {
+    return "/approvals";
+  }
+  if (pathname === "/system/daemon") return "/audit";
   return null;
 }
 
@@ -383,7 +387,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const performanceMode = routePathname === "/performance";
   const daemonMode = routePathname === "/system/daemon";
   const activeApprovalQuestionId = useMemo(
-    () => decodeSingleSegment(routePathname, "/company/approvals/"),
+    () =>
+      decodeSingleSegment(routePathname, "/approvals/") ??
+      decodeSingleSegment(routePathname, "/company/approvals/"),
     [routePathname]
   );
 

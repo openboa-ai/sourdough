@@ -45,6 +45,10 @@ import type {
   RestrictionsProjection,
   StrategiesProjection,
 } from "../api/types";
+import {
+  ContextualApprovalList,
+  usePendingApprovals,
+} from "../components/ContextualApprovalCard";
 import { ControlledInlineConfirm } from "../components/ControlledInlineConfirm";
 import { useApp } from "../state/store";
 
@@ -300,6 +304,13 @@ export function StrategiesView() {
     releaseId: string;
     comparisonId?: string | null;
   } | null>(null);
+
+  const strategyApprovals = usePendingApprovals(
+    (q) =>
+      q.kind === "strategy_promotion" ||
+      q.kind === "strategy_release" ||
+      q.kind === "challenger_promotion"
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -564,9 +575,11 @@ export function StrategiesView() {
   return (
     <Stack gap={16}>
       <PageHeader
-        title="Strategies & Challenger Trials"
-        detail="Paired incumbent-vs-challenger evaluation, release lineage, forward rollbacks, and PaperExecution adapter"
+        title="Strategies"
+        detail="Release versions, paired challenger trials, forward rollbacks, and historical performance lineage"
       />
+
+      <ContextualApprovalList questions={strategyApprovals} />
 
       {selfOwnedReleases.length > 0 ? (
         <Notice title="Self-activation guard active" tone="neutral">
@@ -1408,8 +1421,8 @@ export function FinanceView() {
   return (
     <Stack gap={16}>
       <PageHeader
-        title="Finance & Operating Costs"
-        detail="Double-entry general ledger, period accounting closes, retained statements, and 8h funding settlements"
+        title="Finance"
+        detail="Double-entry general ledger, period accounting closes, retained statements, and funding settlements"
       />
 
       {data.open_close_issues.length > 0 ? (
@@ -1748,13 +1761,13 @@ export function FinanceView() {
 }
 
 export function OrgReportsView() {
-  const { navigate, askCeo, refreshSeq, reportApiError, meta } = useApp();
+  const { navigate, askCeo, refreshSeq, reportApiError, meta, routePathname } = useApp();
   const [data, setData] = useState<OrgProjection | null>(null);
   const [graph, setGraph] = useState<AgentsGraphProjection | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retrySeq, setRetrySeq] = useState(0);
-  const [tab, setTab] = useState("roster");
+  const [tab, setTab] = useState(() => (routePathname === "/company/org" ? "roster" : "reports"));
   const [rosterQuery, setRosterQuery] = useState("");
   const [showArchived, setShowArchived] = useState(false);
   const [reportsQuery, setReportsQuery] = useState("");
@@ -1945,8 +1958,8 @@ export function OrgReportsView() {
   return (
     <Stack gap={16}>
       <PageHeader
-        title="Organization & Published Reports"
-        detail="Company roster, onboarding status, selective publications, and CEO-delegated HR custody audit"
+        title="Reports"
+        detail="Published company assets, employee roster, onboarding status, and delegated HR custody audit"
       />
 
       <Tabs
@@ -2202,6 +2215,14 @@ export function RestrictionsView() {
   const [addPauseOpen, setAddPauseOpen] = useState(false);
   const [paperRiskConfirmOpen, setPaperRiskConfirmOpen] = useState(false);
 
+  const controlApprovals = usePendingApprovals(
+    (q) =>
+      q.kind === "risk_release" ||
+      q.kind === "restriction_approval" ||
+      q.kind === "restriction_release" ||
+      q.kind === "pause_company"
+  );
+
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
@@ -2352,8 +2373,8 @@ export function RestrictionsView() {
   return (
     <Stack gap={16}>
       <PageHeader
-        title="Active Restrictions & Risk Gates"
-        detail="Each restriction cause is tracked independently; clearing one never clears another active stop"
+        title="Controls"
+        detail="Operational stops, risk gates, and cause-scoped restrictions tracked independently"
         action={
           <Inline gap={8} align="center">
             <Button
@@ -2369,6 +2390,8 @@ export function RestrictionsView() {
           </Inline>
         }
       />
+
+      <ContextualApprovalList questions={controlApprovals} />
 
       {meta ? (
         <ControlledInlineConfirm

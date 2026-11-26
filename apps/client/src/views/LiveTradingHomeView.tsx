@@ -31,6 +31,10 @@ import type {
   ExecutionTiersProjection,
   LiveCandidateBindingItem,
 } from "../api/types";
+import {
+  ContextualApprovalList,
+  usePendingApprovals,
+} from "../components/ContextualApprovalCard";
 import { ControlledInlineConfirm } from "../components/ControlledInlineConfirm";
 import { useApp } from "../state/store";
 
@@ -44,7 +48,7 @@ function formatTs(ns: number | null | undefined): string {
   return `${formatNsClock(ns)} (${formatRelativeNs(ns)})`;
 }
 
-export function ExecutionTiersView() {
+export function LiveTradingHomeView() {
   const {
     navigate,
     refreshSeq,
@@ -65,6 +69,13 @@ export function ExecutionTiersView() {
     null
   );
 
+  const livePromotionApprovals = usePendingApprovals(
+    (q) =>
+      q.kind === "live_promotion" ||
+      q.kind === "paper_to_live_migration" ||
+      q.kind === "execution_promotion"
+  );
+
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
@@ -80,7 +91,7 @@ export function ExecutionTiersView() {
         if (!active || controller.signal.aborted) return;
         if (err instanceof DOMException && err.name === "AbortError") return;
         reportApiError(err);
-        setError(err instanceof Error ? err.message : "Failed to load execution tiers");
+        setError(err instanceof Error ? err.message : "Failed to load live trading status");
       } finally {
         if (active && !controller.signal.aborted) setLoading(false);
       }
@@ -95,10 +106,10 @@ export function ExecutionTiersView() {
     return (
       <Stack gap={16}>
         <PageHeader
-          title="Execution Tiers & Live Promotion"
-          detail="Loading Tier 1 agent sandboxes, Tier 2 company paper, and Tier 3 live gate..."
+          title="Live Trading"
+          detail="Loading production capital status, qualification receipts, and Board gates..."
         />
-        <Skeleton label="Loading execution tiers" lines={5} />
+        <Skeleton label="Loading live trading" lines={5} />
       </Stack>
     );
   }
@@ -106,7 +117,7 @@ export function ExecutionTiersView() {
   if (!data) {
     return (
       <Result
-        title="Execution tiers unavailable"
+        title="Live Trading unavailable"
         action={
           <Button
             emphasis="soft"
@@ -139,89 +150,21 @@ export function ExecutionTiersView() {
       meta?.supported_commands?.demote_live_environment?.includes("execution-tier-command-v1")
     );
   const charterRevision = data.charter_revision || meta?.charter_revision || "";
-  const totalSandboxFills = data.agent_sandboxes.reduce((acc, s) => acc + s.fill_count, 0);
   const liveActive = data.company_live !== null;
-
-  const sandboxCols: DataColumn[] = [
-    { id: "agent", label: "Agent", kind: "identity" },
-    { id: "account", label: "Sandbox Account", kind: "text" },
-    { id: "cash", label: "Virtual Cash", kind: "numeric", align: "end" },
-    { id: "exposure", label: "Gross Exposure", kind: "numeric", align: "end" },
-    { id: "pnl", label: "Realized P&L", kind: "numeric", align: "end" },
-    { id: "terms", label: "Fee / Slippage", kind: "numeric", align: "end" },
-    { id: "activity", label: "Fills / Open Pos", kind: "numeric", align: "end" },
-    { id: "action", label: "Inspect", kind: "actions", align: "end" },
-  ];
-
-  const sandboxRows: DataRow[] = data.agent_sandboxes.map((sbx) => ({
-    id: sbx.binding_id,
-    cells: {
-      agent: (
-        <Stack gap={2}>
-          <Text variant="body">{sbx.agent_display_name ?? sbx.agent_id}</Text>
-          <Text variant="meta">{sbx.agent_role_label ?? sbx.agent_id}</Text>
-        </Stack>
-      ),
-      account: (
-        <Stack gap={2}>
-          <Text variant="body" className="sd-mono">
-            {sbx.account_id}
-          </Text>
-          <Text variant="meta">{sbx.quote_source}</Text>
-        </Stack>
-      ),
-      cash: (
-        <Text className="sd-tabular">
-          {formatMinorCurrency(sbx.cash_minor_units, sbx.currency)}
-        </Text>
-      ),
-      exposure: (
-        <Text className="sd-tabular">
-          {formatMinorCurrency(sbx.gross_exposure_minor_units, sbx.currency)}
-        </Text>
-      ),
-      pnl: (
-        <Text
-          className={`sd-tabular ${
-            sbx.realized_pnl_minor_units > 0
-              ? "sd-tone-pos"
-              : sbx.realized_pnl_minor_units < 0
-                ? "sd-tone-neg"
-                : ""
-          }`}
-        >
-          {formatMinorCurrency(sbx.realized_pnl_minor_units, sbx.currency, { signed: true })}
-        </Text>
-      ),
-      terms: (
-        <Text variant="help" className="sd-tabular">
-          {sbx.fee_bps} bps / {sbx.slippage_bps} bps
-        </Text>
-      ),
-      activity: (
-        <Text variant="help" className="sd-tabular">
-          {sbx.fill_count} fills · {sbx.open_positions_count} open
-        </Text>
-      ),
-      action: (
-        <Button
-          emphasis="quiet"
-          size="compact"
-          shape="pill"
-          onClick={() => navigate(`/office/agents/${encodeURIComponent(sbx.agent_id)}`)}
-        >
-          Agent Desk
-        </Button>
-      ),
-    },
-  }));
+  const passingReceiptsCount = data.qualification_receipts.filter(
+    (q) =>
+      q.verdict === "PASS" &&
+      q.cases_failed === 0 &&
+      q.cases_unrun === 0 &&
+      q.core_digest === data.current_core_digest
+  ).length;
 
   const qualCols: DataColumn[] = [
     { id: "receipt", label: "Receipt ID", kind: "identity" },
     { id: "adapter", label: "Adapter & Destination", kind: "text" },
     { id: "verdict", label: "Verdict", kind: "role" },
     { id: "cases", label: "Cases (Pass / Fail / Unrun)", kind: "numeric", align: "end" },
-    { id: "core", label: "Core Digest Match", kind: "text" },
+    { id: "core", label: "Core Digest", kind: "text" },
     { id: "recorded", label: "Recorded", kind: "numeric", align: "end" },
   ];
 
@@ -282,36 +225,34 @@ export function ExecutionTiersView() {
     const prereqFacts: Fact[] = [
       {
         id: "soak",
-        label: "Tier 2 Company Paper Soak",
+        label: "Paper Soak Readiness",
         value: (
           <Badge tone={data.company_paper_soak_ready ? "success" : "warning"} dot={false}>
-            {data.company_paper_soak_ready ? "Verified" : "Missing paper fills/valuations"}
+            {data.company_paper_soak_ready ? "Verified" : "Pending paper fills"}
           </Badge>
         ),
       },
       {
         id: "qual",
-        label: "Matching PASS Qualification",
+        label: "Venue Qualification",
         value: hasQual ? (
           <Badge tone="success" dot={false}>
             {cand.matching_qualification_receipt_id}
           </Badge>
         ) : (
           <Badge tone="warning" dot={false}>
-            No matching PASS receipt for current core
+            No PASS receipt for current core
           </Badge>
         ),
       },
       {
         id: "cred",
         label: "Host Credential Handle",
-        value: (
-          <Text className="sd-mono">{cand.credential_handle_ref ?? "Unbound"}</Text>
-        ),
+        value: <Text className="sd-mono">{cand.credential_handle_ref ?? "Unbound"}</Text>,
       },
       {
         id: "cap",
-        label: "Exposure Cap",
+        label: "Exposure Ceiling",
         value: (
           <Text className="sd-tabular">
             {formatMinorCurrency(cand.exposure_limit_minor_units, cand.currency)}
@@ -370,7 +311,7 @@ export function ExecutionTiersView() {
               decision={{
                 id: `promote-${cand.binding_id}`,
                 revision: `${cand.binding_id}:${cand.matching_qualification_receipt_id ?? "none"}:${cand.promotion_payload_hash ?? "none"}`,
-                title: `Promote ${cand.account_id} to Tier 3 Company Live`,
+                title: `Promote ${cand.account_id} to Live Trading`,
                 consequence:
                   "Activates real-capital external venue execution under this binding's exposure ceiling and host credential handle. Requires Board Control authority and verified qualification.",
                 confirmLabel: "Confirm Promote to Live",
@@ -379,19 +320,19 @@ export function ExecutionTiersView() {
                 unavailableNotice: !allGatesGreen ? (
                   <Notice title="Live promotion gate locked" tone="warning">
                     {liveActive
-                      ? "Another Tier 3 live binding is already active. Demote the current live binding before promoting a replacement."
+                      ? "Another live venue binding is already active. Demote the current live binding before promoting a replacement."
                       : !data.company_paper_soak_ready
-                        ? "Tier 2 company_paper must record fills, valuations, or retained statements before promoting to live."
+                        ? "Company paper trading must record fills, valuations, or retained statements before promoting to live."
                         : !hasQual
-                          ? "A passing venue_qualification_receipt matching this connector revision, instrument rules, and current trading core digest is required."
-                          : "Board Control authority is required to activate Tier 3 company_live."}
+                          ? "A passing venue qualification receipt matching this connector revision, instrument rules, and current trading core digest is required."
+                          : "Board Control authority is required to activate live trading."}
                   </Notice>
                 ) : undefined,
                 requireReason: true,
-                defaultReason: `Board approved Tier 3 live promotion for ${cand.account_id}`,
+                defaultReason: `Board approved live promotion for ${cand.account_id}`,
                 whatChanges: [
                   {
-                    label: "Active Tier 3 Live",
+                    label: "Active Live Venue",
                     value: `${cand.account_id} (${cand.destination_id}) transitions to active`,
                   },
                   {
@@ -401,8 +342,8 @@ export function ExecutionTiersView() {
                 ],
                 whatStaysUntouched: [
                   {
-                    label: "Tier 1 Agent Sandboxes",
-                    value: "Personal per-Agent simulated accounts stay strictly isolated",
+                    label: "Paper Books & Agent Sandboxes",
+                    value: "Simulated accounts stay strictly isolated from real funds",
                   },
                   {
                     label: "Host API Secrets",
@@ -444,7 +385,7 @@ export function ExecutionTiersView() {
                 });
                 if (lifecycle === "applied") {
                   setPromoteTargetId(null);
-                  pushToast(`Promoted ${cand.account_id} to Tier 3 company_live.`);
+                  pushToast(`Promoted ${cand.account_id} to Live Trading.`);
                 }
               }}
             />
@@ -457,100 +398,44 @@ export function ExecutionTiersView() {
   return (
     <Stack gap={16}>
       <PageHeader
-        title="Execution Tiers & Live Promotion"
-        detail={`Three-tier isolation · Charter ${charterRevision || "unknown"} · seq #${data.event_seq}`}
+        title="Live Trading"
+        detail={`Production capital & venue promotion gate · Charter ${charterRevision || "unknown"} · seq #${data.event_seq}`}
         action={
           <Inline gap={8} align="center" wrap>
             <Status tone={liveActive ? "brand" : "success"}>
-              {liveActive ? "Tier 3 Live Active" : "Paper-Only Safe Mode"}
+              {liveActive ? "Live Active" : "Paper-Only Safe Mode"}
             </Status>
+            <Button
+              emphasis="soft"
+              size="compact"
+              shape="pill"
+              onClick={() => navigate("/trading/paper")}
+            >
+              Paper Trading
+            </Button>
             <Button
               emphasis="quiet"
               size="compact"
               shape="pill"
-              onClick={() => navigate("/")}
+              onClick={() => navigate("/trading/strategies")}
             >
-              Live Trading
+              Strategies
             </Button>
           </Inline>
         }
       />
 
+      <ContextualApprovalList questions={livePromotionApprovals} />
+
       <div className="sd-tier-grid">
         <Card
           variant="raised"
           density="compact"
-          title="Tier 1 · Agent Sandboxes"
-          description="Isolated per-Agent virtual testing accounts"
-          headerAction={
-            <Badge tone="neutral" variant="soft" dot={false}>
-              {data.agent_sandboxes.length} active
-            </Badge>
-          }
-        >
-          <Stack gap={8}>
-            <Text className="sd-kpi-value sd-tabular">
-              {totalSandboxFills} {totalSandboxFills === 1 ? "fill" : "fills"}
-            </Text>
-            <Text variant="help">
-              Each Agent tests strategies privately with configurable fee &amp; slippage bps.
-              Zero access to company paper or real funds.
-            </Text>
-          </Stack>
-        </Card>
-
-        <Card
-          variant="raised"
-          density="compact"
-          title="Tier 2 · Company Paper"
-          description="Shared company-wide simulated operations"
-          headerAction={
-            <Badge
-              tone={data.company_paper ? (data.company_paper_soak_ready ? "success" : "warning") : "neutral"}
-              variant="soft"
-              dot={false}
-            >
-              {data.company_paper
-                ? data.company_paper_soak_ready
-                  ? "Soak Ready"
-                  : "Soak Pending"
-                : "Unbound"}
-            </Badge>
-          }
-        >
-          {data.company_paper ? (
-            <Stack gap={6}>
-              <Text className="sd-kpi-value sd-tabular">
-                {formatMinorCurrency(
-                  data.company_paper.starting_minor_units,
-                  data.company_paper.currency
-                )}
-              </Text>
-              <Text variant="help" className="sd-tabular">
-                {data.company_paper.account_id} · Cap{" "}
-                {formatMinorCurrency(
-                  data.company_paper.exposure_limit_minor_units,
-                  data.company_paper.currency
-                )}{" "}
-                · {data.company_paper.fee_bps} bps fee / {data.company_paper.slippage_bps} bps slip
-              </Text>
-            </Stack>
-          ) : (
-            <Text variant="help">
-              No company paper binding registered yet. Bind Tier 2 company paper before live
-              promotion.
-            </Text>
-          )}
-        </Card>
-
-        <Card
-          variant="raised"
-          density="compact"
-          title="Tier 3 · Company Live"
-          description="Board-gated external venue production capital"
+          title="Live Capital Status"
+          description="External venue production execution"
           headerAction={
             <Badge tone={liveActive ? "brand" : "neutral"} variant="outline" dot={false}>
-              {liveActive ? "Active" : "Gated"}
+              {liveActive ? "Active" : "Standby"}
             </Badge>
           }
         >
@@ -598,14 +483,89 @@ export function ExecutionTiersView() {
             </Stack>
           ) : (
             <Stack gap={6}>
-              <Text className="sd-kpi-value">Locked</Text>
+              <Text className="sd-kpi-value">Gated</Text>
               <Text variant="help">
                 {data.live_candidates.length} candidate{" "}
-                {data.live_candidates.length === 1 ? "binding" : "bindings"} registered. Explicit
-                Board promotion required.
+                {data.live_candidates.length === 1 ? "venue" : "venues"} registered. Explicit Board
+                approval required before live orders run.
               </Text>
             </Stack>
           )}
+        </Card>
+
+        <Card
+          variant="raised"
+          density="compact"
+          title="Company Paper Readiness"
+          description="Verified simulated track record before live"
+          headerAction={
+            <Badge
+              tone={
+                data.company_paper
+                  ? data.company_paper_soak_ready
+                    ? "success"
+                    : "warning"
+                  : "neutral"
+              }
+              variant="soft"
+              dot={false}
+            >
+              {data.company_paper
+                ? data.company_paper_soak_ready
+                  ? "Soak Ready"
+                  : "Soak Pending"
+                : "Unbound"}
+            </Badge>
+          }
+        >
+          {data.company_paper ? (
+            <Stack gap={8}>
+              <Text className="sd-kpi-value sd-tabular">
+                {formatMinorCurrency(
+                  data.company_paper.starting_minor_units,
+                  data.company_paper.currency
+                )}
+              </Text>
+              <Text variant="help" className="sd-tabular">
+                {data.company_paper.account_id} · Cap{" "}
+                {formatMinorCurrency(
+                  data.company_paper.exposure_limit_minor_units,
+                  data.company_paper.currency
+                )}{" "}
+                · {data.company_paper.fee_bps} bps fee / {data.company_paper.slippage_bps} bps slip
+              </Text>
+            </Stack>
+          ) : (
+            <Text variant="help">
+              No company paper book active yet. Run strategies in Paper Trading first.
+            </Text>
+          )}
+        </Card>
+
+        <Card
+          variant="raised"
+          density="compact"
+          title="Venue Qualification"
+          description="Testnet & wire harness verification"
+          headerAction={
+            <Badge
+              tone={passingReceiptsCount > 0 ? "success" : "warning"}
+              variant="soft"
+              dot={false}
+            >
+              {passingReceiptsCount} passing
+            </Badge>
+          }
+        >
+          <Stack gap={6}>
+            <Text className="sd-kpi-value sd-tabular">
+              {data.qualification_receipts.length}{" "}
+              {data.qualification_receipts.length === 1 ? "receipt" : "receipts"}
+            </Text>
+            <Text variant="help" className="sd-mono">
+              Core {formatShortHash(data.current_core_digest)}
+            </Text>
+          </Stack>
         </Card>
       </div>
 
@@ -623,9 +583,9 @@ export function ExecutionTiersView() {
             title:
               demoteAction === "demote_to_paper"
                 ? `Demote ${data.company_live.account_id} Back to Paper-Only`
-                : `Suspend Tier 3 Live Binding ${data.company_live.account_id}`,
+                : `Suspend Live Venue ${data.company_live.account_id}`,
             consequence:
-              "Immediately deactivates Tier 3 live order authority and returns the company to safe Tier 2 paper operations. Preserves full audit history and Tier 1 sandboxes.",
+              "Immediately deactivates live order authority and returns the company to safe Paper Trading. Preserves full audit history and isolated agent sandboxes.",
             confirmLabel:
               demoteAction === "demote_to_paper"
                 ? "Confirm Demote to Paper"
@@ -635,24 +595,24 @@ export function ExecutionTiersView() {
             requireReason: true,
             defaultReason:
               demoteAction === "demote_to_paper"
-                ? "Board demoted execution back to Tier 2 company_paper"
-                : "Board suspended Tier 3 company_live execution",
+                ? "Board demoted execution back to Paper Trading"
+                : "Board suspended Live Trading execution",
             whatChanges: [
               {
-                label: "Tier 3 Live Binding",
+                label: "Live Venue Binding",
                 value: `${data.company_live.binding_id} transitions to ${
                   demoteAction === "demote_to_paper" ? "demoted" : "suspended"
                 }`,
               },
               {
-                label: "Active Execution Tier",
-                value: "Falls back cleanly to Tier 2 company_paper",
+                label: "Execution Posture",
+                value: "Falls back cleanly to Paper-Only Safe Mode",
               },
             ],
             whatStaysUntouched: [
               {
-                label: "Tier 1 Agent Sandboxes",
-                value: "Continue operating privately without disruption",
+                label: "Paper Books & Agent Sandboxes",
+                value: "Continue operating without disruption",
               },
               {
                 label: "Audit & Ledger History",
@@ -686,15 +646,15 @@ export function ExecutionTiersView() {
             });
             if (lifecycle === "applied") {
               setDemoteAction(null);
-              pushToast("Tier 3 company_live deactivated; returned to paper-only mode.");
+              pushToast("Live Trading deactivated; returned to Paper-Only Safe Mode.");
             }
           }}
         />
       ) : null}
 
       <Card
-        title="Tier 3 Live Candidates & Promotion Gate"
-        description="Server-enforced checklist: paper soak + passing venue qualification + current core digest + Board Control signature"
+        title="Live Venue Candidates & Promotion Gate"
+        description="Server-enforced checklist: paper soak + passing venue qualification + current core digest + Board approval"
         variant="raised"
         headerAction={
           <Text variant="meta" className="sd-mono">
@@ -705,8 +665,8 @@ export function ExecutionTiersView() {
         {data.live_candidates.length === 0 ? (
           <Text variant="help">
             {liveActive
-              ? "No standby live candidates registered; current live binding is active above."
-              : "No Tier 3 live candidate bindings registered yet. Company operates strictly in Tier 1/2 simulated mode."}
+              ? "No standby live venue bindings registered; current live binding is active above."
+              : "No live venue candidates registered yet. Company operates strictly in simulated paper mode."}
           </Text>
         ) : (
           <Stack gap={16}>
@@ -716,73 +676,54 @@ export function ExecutionTiersView() {
       </Card>
 
       <Card
-        title="Tier 1 · Per-Agent Paper Sandboxes"
-        description="Each employee Agent maintains its own isolated simulated cash, fills, fees, and positions"
+        title="Venue Qualification Receipts"
+        description="External testnet and wire-harness qualification runs required before live promotion"
         variant="raised"
         className="sd-ledger-card"
       >
-        {sandboxRows.length === 0 ? (
-          <Text variant="help">No Agents have opened a personal Tier 1 paper sandbox yet.</Text>
+        {qualRows.length === 0 ? (
+          <Text variant="help">No venue qualification receipts recorded yet.</Text>
         ) : (
           <DataTable
-            caption="Per-Agent Tier 1 paper sandboxes"
-            columns={sandboxCols}
-            rows={sandboxRows}
+            caption="Venue qualification receipts"
+            columns={qualCols}
+            rows={qualRows}
           />
         )}
       </Card>
 
-      <div className="sd-split-equal">
-        <Card
-          title="Venue Qualification Receipts"
-          description="External testnet/wire qualification runs required before Tier 3 live promotion"
-          variant="raised"
-          className="sd-ledger-card"
-        >
-          {qualRows.length === 0 ? (
-            <Text variant="help">No venue qualification receipts recorded yet.</Text>
-          ) : (
-            <DataTable
-              caption="Venue qualification receipts"
-              columns={qualCols}
-              rows={qualRows}
-            />
-          )}
-        </Card>
-
-        <Card
-          title="Promotion & Demotion Ledger"
-          description="Immutable Board governance record of every Tier 3 state transition"
-          variant="raised"
-        >
-          {data.promotion_history.length === 0 ? (
-            <Text variant="help">
-              No live promotions or demotions recorded. Company remains paper-only.
-            </Text>
-          ) : (
-            <List label="Execution tier promotion history" divided>
-              {data.promotion_history.map((item) => (
-                <li key={item.promotion_id} className="yg-list-item">
-                  <WorkEvent
-                    event={{
-                      id: item.promotion_id,
-                      kind: item.action === "promote_to_live" ? "review" : "task",
-                      title: `${item.action} → ${item.to_binding_id}`,
-                      detail: `${item.reason}${
-                        item.qualification_receipt_id
-                          ? ` · Qual ${item.qualification_receipt_id}`
-                          : ""
-                      } · Hash ${formatShortHash(item.payload_hash)}`,
-                      time: formatTs(item.recorded_at_ns),
-                      state: item.action === "promote_to_live" ? "ready" : "done",
-                    }}
-                  />
-                </li>
-              ))}
-            </List>
-          )}
-        </Card>
-      </div>
+      <Card
+        title="Promotion & Demotion Ledger"
+        description="Immutable Board governance record of every live production state transition"
+        variant="raised"
+      >
+        {data.promotion_history.length === 0 ? (
+          <Text variant="help">
+            No live promotions or demotions recorded. Company remains paper-only.
+          </Text>
+        ) : (
+          <List label="Live promotion history" divided>
+            {data.promotion_history.map((item) => (
+              <li key={item.promotion_id} className="yg-list-item">
+                <WorkEvent
+                  event={{
+                    id: item.promotion_id,
+                    kind: item.action === "promote_to_live" ? "review" : "task",
+                    title: `${item.action} → ${item.to_binding_id}`,
+                    detail: `${item.reason}${
+                      item.qualification_receipt_id
+                        ? ` · Qual ${item.qualification_receipt_id}`
+                        : ""
+                    } · Hash ${formatShortHash(item.payload_hash)}`,
+                    time: formatTs(item.recorded_at_ns),
+                    state: item.action === "promote_to_live" ? "ready" : "done",
+                  }}
+                />
+              </li>
+            ))}
+          </List>
+        )}
+      </Card>
     </Stack>
   );
 }
