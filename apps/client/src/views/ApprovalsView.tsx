@@ -219,7 +219,7 @@ export function ApprovalsView() {
   useEffect(() => {
     if (!activeApprovalQuestionId) return;
     return registerEscapeBack(
-      "/company/approvals",
+      "/approvals",
       `approval-${activeApprovalQuestionId}`
     );
   }, [activeApprovalQuestionId, registerEscapeBack]);
@@ -441,9 +441,9 @@ export function ApprovalsView() {
         <Fragment>
           <Navbar
             variant="back"
-            label="Back to Board Approvals"
+            label="Back to Approvals"
             onBack={() =>
-              navigate("/company/approvals", {
+              navigate("/approvals", {
                 focusReturnId: `approval-${activeApprovalQuestionId}`,
               })
             }
@@ -451,11 +451,11 @@ export function ApprovalsView() {
           <SpaBreadcrumb
             focusReturnId={`approval-${activeApprovalQuestionId}`}
             items={[
-              { id: "approvals", label: "Board Approvals", href: "/company/approvals" },
+              { id: "approvals", label: "Approvals", href: "/approvals" },
               {
                 id: activeApprovalQuestionId,
                 label: matchedItem?.title ?? activeApprovalQuestionId,
-                href: `/company/approvals/${encodeURIComponent(activeApprovalQuestionId)}`,
+                href: `/approvals/${encodeURIComponent(activeApprovalQuestionId)}`,
               },
             ]}
           />
@@ -463,8 +463,8 @@ export function ApprovalsView() {
       ) : null}
 
       <PageHeader
-        title="Board Approvals"
-        detail={`${data.pending_count} pending decisions · Click any card to review and confirm inline (no popups)`}
+        title="Approvals"
+        detail={`${data.pending_count} pending decisions · Unified action queue synced live with every screen`}
       />
 
       {activeApprovalQuestionId && !matchedItem ? (
@@ -476,7 +476,7 @@ export function ApprovalsView() {
               emphasis="soft"
               size="compact"
               shape="pill"
-              onClick={() => navigate("/company/approvals")}
+              onClick={() => navigate("/approvals")}
             >
               Show all approvals
             </Button>

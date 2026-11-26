@@ -1088,7 +1088,7 @@ export function AgentsActivityView() {
   const nameFor = (id: string) => nodeById.get(id)?.display_name ?? id;
 
   const openAgent = (agentId: string) => {
-    navigate(`/office/agents/${encodeURIComponent(agentId)}`, {
+    navigate(`/agents/${encodeURIComponent(agentId)}`, {
       focusReturnId: agentId,
     });
   };
@@ -1222,6 +1222,14 @@ export function AgentsActivityView() {
         task: (
           <Stack gap={4}>
             <Text variant="help">{node.current_task}</Text>
+            {node.sandbox_activity ? (
+              <Badge tone="neutral" variant="outline" dot={false}>
+                Paper Sandbox ·{" "}
+                {node.sandbox_activity.fill_count > 0
+                  ? `${node.sandbox_activity.fill_count} ${node.sandbox_activity.fill_count === 1 ? "fill" : "fills"}`
+                  : "active"}
+              </Badge>
+            ) : null}
             {node.live_status === "working" ? (
               <Inline gap={6} align="center" wrap={false}>
                 <ThinkingIndicator active={!prefersReducedMotion} label={dutyLabel} />
@@ -1429,6 +1437,17 @@ export function AgentsActivityView() {
 
             <Text variant="help">{node.current_task}</Text>
 
+            {node.sandbox_activity ? (
+              <Inline gap={6} align="center" wrap>
+                <Badge tone="neutral" variant="outline" dot={false}>
+                  Paper Sandbox ·{" "}
+                  {node.sandbox_activity.fill_count > 0
+                    ? `${node.sandbox_activity.fill_count} ${node.sandbox_activity.fill_count === 1 ? "fill" : "fills"}`
+                    : "active"}
+                </Badge>
+              </Inline>
+            ) : null}
+
             {node.live_status === "working" ? (
               <Inline gap={6} align="center" wrap={false}>
                 <ThinkingIndicator active={!prefersReducedMotion} label={dutyLabel} />
@@ -1500,8 +1519,8 @@ export function AgentsActivityView() {
   return (
     <Stack gap={16}>
       <PageHeader
-        title="Agents & Activity"
-        detail={`${data.nodes.length} ${data.nodes.length === 1 ? "agent" : "agents"} · ${data.edges.length} ${data.edges.length === 1 ? "active interaction" : "active interactions"} · Click any agent for Desk, Authority & Activity`}
+        title="Agents"
+        detail={`${data.nodes.length} ${data.nodes.length === 1 ? "agent" : "agents"} · ${data.edges.length} ${data.edges.length === 1 ? "active interaction" : "active interactions"} · Select any agent to inspect Desk, Authority & Activity`}
         action={
           <div className="sd-intrinsic">
             <SegmentedControl

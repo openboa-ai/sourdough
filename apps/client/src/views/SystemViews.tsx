@@ -221,17 +221,17 @@ export function SystemSafetyView() {
   return (
     <Stack gap={16}>
       <PageHeader
-        title="Safety, Checkpoints & Restore"
-        detail="Verified SQLite checkpoint archives, 5-step Safe Custody Hold, restore receipts, and active restrictions"
+        title="Backups"
+        detail="Verified SQLite checkpoint archives, 5-step Safe Custody Hold, and restore receipts"
         action={
           <Inline gap={8} align="center">
             <Button
               emphasis="soft"
               size="compact"
               shape="pill"
-              onClick={() => navigate("/restrictions")}
+              onClick={() => navigate("/controls")}
             >
-              Active Restrictions ({data.active_restrictions.length})
+              Controls ({data.active_restrictions.length})
             </Button>
             <Button
               emphasis="filled"
@@ -384,9 +384,9 @@ export function SystemSafetyView() {
             emphasis="soft"
             size="compact"
             shape="pill"
-            onClick={() => navigate("/restrictions")}
+            onClick={() => navigate("/controls")}
           >
-            Manage in Restrictions
+            Manage in Controls
           </Button>
         }
       >
@@ -426,7 +426,7 @@ export function SystemSafetyView() {
   );
 }
 
-export function SystemEvalsView() {
+export function SystemEvalsView({ embedded = false }: { embedded?: boolean } = {}) {
   const { refreshSeq, reportApiError } = useApp();
   const [data, setData] = useState<SystemEvalsProjection | null>(null);
   const [loading, setLoading] = useState(true);
@@ -643,10 +643,12 @@ export function SystemEvalsView() {
 
   return (
     <Stack gap={16}>
-      <PageHeader
-        title="Evaluations & Tool Lineage"
-        detail="Non-self-evaluated pass^3 tool qualifications, DAG blast-radius lineage, and isolated offline suites"
-      />
+      {!embedded ? (
+        <PageHeader
+          title="Evaluations"
+          detail="Non-self-evaluated pass^3 tool qualifications, DAG blast-radius lineage, and isolated offline suites"
+        />
+      ) : null}
 
       <Notice title="Isolated Offline Evaluator Boundary (offline-trial-registry-v1)" tone="neutral">
         <Stack gap={4}>
@@ -799,8 +801,15 @@ const AUDIT_DOMAINS = [
   "messages",
 ] as const;
 
-export function SystemAuditView() {
+export function SystemAuditView({
+  embedded = false,
+  mode,
+}: {
+  embedded?: boolean;
+  mode?: "audit" | "daemon";
+} = {}) {
   const { refreshSeq, meta, daemonMode, navigate, reportApiError, registerEscapeBack } = useApp();
+  const effectiveDaemon = mode ? mode === "daemon" : daemonMode;
   const [data, setData] = useState<SystemAuditProjection | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -809,9 +818,9 @@ export function SystemAuditView() {
   const [selectedDomain, setSelectedDomain] = useState<string>("all");
 
   useEffect(() => {
-    if (!daemonMode) return;
-    return registerEscapeBack("/system/audit", "system-daemon-entry");
-  }, [daemonMode, registerEscapeBack]);
+    if (!effectiveDaemon || embedded) return;
+    return registerEscapeBack("/audit", "system-daemon-entry");
+  }, [effectiveDaemon, embedded, registerEscapeBack]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1128,24 +1137,33 @@ export function SystemAuditView() {
 
   return (
     <Stack gap={16}>
-      {daemonMode ? (
+      {embedded ? (
+        effectiveDaemon ? (
+          <>
+            <div className="sd-split-equal">
+              {runtimeCard}
+              {fencesCard}
+            </div>
+            {bindingsCard}
+            {conditionsCard}
+          </>
+        ) : null
+      ) : effectiveDaemon ? (
         <>
           <Navbar
             variant="back"
-            label="Back to Audit Log"
-            onBack={() =>
-              navigate("/system/audit", { focusReturnId: "system-daemon-entry" })
-            }
+            label="Back to Audit"
+            onBack={() => navigate("/audit", { focusReturnId: "system-daemon-entry" })}
           />
           <SpaBreadcrumb
             focusReturnId="system-daemon-entry"
             items={[
-              { id: "system", label: "System", href: "/system/audit" },
+              { id: "audit", label: "Audit", href: "/audit" },
               { id: "daemon", label: "Daemon Diagnostics", href: "/system/daemon" },
             ]}
           />
           <PageHeader
-            title="Daemon & Control Plane Diagnostics"
+            title="Daemon Diagnostics"
             detail="Single-writer UDS runtime identity, installed domains, Board authority bindings, and active fencing leases"
           />
           <div className="sd-split-equal">
@@ -1158,7 +1176,7 @@ export function SystemAuditView() {
       ) : (
         <>
           <PageHeader
-            title="Audit Log & System Diagnostics"
+            title="Audit"
             detail="Append-only redacted audit stream, armed work conditions, active fencing leases, and Board authority bindings"
             action={
               <Inline gap={8} align="center">
@@ -1185,48 +1203,94 @@ export function SystemAuditView() {
         </>
       )}
 
-      <Card
-        title="Append-Only Redacted Audit Events"
-        variant="raised"
-        className="sd-ledger-card"
-      >
-        <Stack gap={12}>
-          <Inline gap={6} wrap>
-            {AUDIT_DOMAINS.map((domain) => (
-              <Button
-                key={domain}
-                size="compact"
-                shape="pill"
-                emphasis={selectedDomain === domain ? "filled" : "soft"}
-                onClick={() => setSelectedDomain(domain)}
-              >
-                {domain === "all" ? "All" : domain}
-              </Button>
-            ))}
-          </Inline>
-          <FilterBar
-            label="Filter audit log"
-            hiddenLabel
-            placeholder="Filter by domain, event type, or entity..."
-            size="compact"
-            query={auditQuery}
-            onQueryChange={setAuditQuery}
-          />
-          {data.events.length === 0 ? (
-            <Text variant="help">No audit events recorded yet.</Text>
-          ) : evRows.length === 0 ? (
-            <EmptyResult
-              query={auditQuery || selectedDomain}
-              onClear={() => {
-                setAuditQuery("");
-                setSelectedDomain("all");
-              }}
+      {!embedded || !effectiveDaemon ? (
+        <Card
+          title="Append-Only Redacted Audit Events"
+          variant="raised"
+          className="sd-ledger-card"
+        >
+          <Stack gap={12}>
+            <Inline gap={6} wrap>
+              {AUDIT_DOMAINS.map((domain) => (
+                <Button
+                  key={domain}
+                  size="compact"
+                  shape="pill"
+                  emphasis={selectedDomain === domain ? "filled" : "soft"}
+                  onClick={() => setSelectedDomain(domain)}
+                >
+                  {domain === "all" ? "All" : domain}
+                </Button>
+              ))}
+            </Inline>
+            <FilterBar
+              label="Filter audit log"
+              hiddenLabel
+              placeholder="Filter by domain, event type, or entity..."
+              size="compact"
+              query={auditQuery}
+              onQueryChange={setAuditQuery}
             />
-          ) : (
-            <DataTable caption="Audit events" columns={evCols} rows={evRows} />
-          )}
-        </Stack>
-      </Card>
+            {data.events.length === 0 ? (
+              <Text variant="help">No audit events recorded yet.</Text>
+            ) : evRows.length === 0 ? (
+              <EmptyResult
+                query={auditQuery || selectedDomain}
+                onClear={() => {
+                  setAuditQuery("");
+                  setSelectedDomain("all");
+                }}
+              />
+            ) : (
+              <DataTable caption="Audit events" columns={evCols} rows={evRows} />
+            )}
+          </Stack>
+        </Card>
+      ) : null}
+    </Stack>
+  );
+}
+
+export function AuditHubView({
+  initialTab = "log",
+}: {
+  initialTab?: "log" | "evals" | "daemon";
+}) {
+  const [tab, setTab] = useState<"log" | "evals" | "daemon">(initialTab);
+
+  useEffect(() => {
+    setTab(initialTab);
+  }, [initialTab]);
+
+  return (
+    <Stack gap={16}>
+      <PageHeader
+        title="Audit"
+        detail="Append-only event log, offline tool evaluations, and single-writer daemon diagnostics"
+      />
+      <Tabs
+        label="Audit sections"
+        presentation="pill"
+        value={tab}
+        onValueChange={(next) => setTab(next as "log" | "evals" | "daemon")}
+        items={[
+          {
+            id: "log",
+            label: "Audit Log",
+            panel: tab === "log" ? <SystemAuditView embedded mode="audit" /> : null,
+          },
+          {
+            id: "evals",
+            label: "Evaluations",
+            panel: tab === "evals" ? <SystemEvalsView embedded /> : null,
+          },
+          {
+            id: "daemon",
+            label: "Daemon",
+            panel: tab === "daemon" ? <SystemAuditView embedded mode="daemon" /> : null,
+          },
+        ]}
+      />
     </Stack>
   );
 }

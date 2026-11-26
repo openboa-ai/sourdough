@@ -42,6 +42,10 @@ import type {
   OpenPositionItem,
   ReturnPoint,
 } from "../api/types";
+import {
+  ContextualApprovalList,
+  usePendingApprovals,
+} from "../components/ContextualApprovalCard";
 import { PortfolioChart } from "../components/PortfolioChart";
 import { SpaBreadcrumb } from "../components/SpaBreadcrumb";
 import { useApp } from "../state/store";
@@ -258,6 +262,13 @@ export function LiveTradingView() {
   const [localRefresh, setLocalRefresh] = useState(0);
   const [visitSinceSeq, setVisitSinceSeq] = useState<number | null>(null);
 
+  const livePromotionApprovals = usePendingApprovals(
+    (q) =>
+      q.kind === "live_promotion" ||
+      q.kind === "paper_to_live_migration" ||
+      q.kind === "execution_promotion"
+  );
+
   const etagRef = useRef<string | undefined>(undefined);
   const prevProjPathRef = useRef<string | null>(null);
   const prevOrdersRef = useRef<Map<string, OrderSnapshot>>(new Map());
@@ -291,7 +302,7 @@ export function LiveTradingView() {
 
   useEffect(() => {
     if (!performanceMode) return;
-    return registerEscapeBack("/", "perf-adapter-entry");
+    return registerEscapeBack("/trading/paper", "perf-adapter-entry");
   }, [performanceMode, registerEscapeBack]);
 
   useEffect(() => {
@@ -563,8 +574,8 @@ export function LiveTradingView() {
     return (
       <Stack gap={16}>
         <PageHeader
-          title={performanceMode ? "Performance & Two-Layer P&L" : "Live Trading & Portfolio"}
-          detail="Loading authoritative paper state..."
+          title={performanceMode ? "Paper Performance" : "Paper Trading"}
+          detail="Loading authoritative company paper trading books..."
         />
         <Skeleton label="Loading portfolio metrics" lines={4} />
       </Stack>
@@ -574,7 +585,7 @@ export function LiveTradingView() {
   if (!data) {
     return (
       <Result
-        title="Live trading view unavailable"
+        title="Paper Trading unavailable"
         action={
           <Button
             emphasis="soft"
@@ -903,13 +914,13 @@ export function LiveTradingView() {
         <Fragment>
           <Navbar
             variant="back"
-            label="Back to Live Trading"
-            onBack={() => navigate("/", { focusReturnId: "perf-adapter-entry" })}
+            label="Back to Paper Trading"
+            onBack={() => navigate("/trading/paper", { focusReturnId: "perf-adapter-entry" })}
           />
           <SpaBreadcrumb
             focusReturnId="perf-adapter-entry"
             items={[
-              { id: "home", label: "Live Trading", href: "/" },
+              { id: "paper", label: "Paper Trading", href: "/trading/paper" },
               { id: "performance", label: "Performance", href: "/performance" },
             ]}
           />
@@ -917,12 +928,12 @@ export function LiveTradingView() {
       ) : null}
 
       <PageHeader
-        title={performanceMode ? "Performance & Two-Layer P&L" : "Live Trading & Portfolio"}
+        title={performanceMode ? "Paper Performance" : "Paper Trading"}
         detail={asOfLabel}
         action={
           <Inline gap={8} align="center" wrap>
             <ActivityIsland
-              label={linkState === "live" ? "Live Tape" : "Snapshot"}
+              label={linkState === "live" ? "Paper Tape" : "Snapshot"}
               summary={`${data.execution_tape.length} orders · #${data.event_seq}`}
             >
               <Stack gap={8}>
@@ -947,12 +958,12 @@ export function LiveTradingView() {
             {!performanceMode ? (
               <Inline gap={6} align="center">
                 <Button
-                  emphasis="quiet"
+                  emphasis="soft"
                   size="compact"
                   shape="pill"
-                  onClick={() => navigate("/company/execution-tiers")}
+                  onClick={() => navigate("/")}
                 >
-                  Execution Tiers
+                  Live Trading
                 </Button>
                 <Button
                   emphasis="quiet"
@@ -963,13 +974,15 @@ export function LiveTradingView() {
                     navigate("/performance", { focusReturnId: "perf-adapter-entry" })
                   }
                 >
-                  Performance &amp; Adapter
+                  Performance
                 </Button>
               </Inline>
             ) : null}
           </Inline>
         }
       />
+
+      <ContextualApprovalList questions={livePromotionApprovals} />
 
       <div className="sd-kpi-grid">
         <Card

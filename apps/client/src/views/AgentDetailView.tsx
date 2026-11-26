@@ -40,6 +40,10 @@ import {
   newCommandId,
 } from "../api/client";
 import type { AgentDetailProjection } from "../api/types";
+import {
+  ContextualApprovalList,
+  usePendingApprovals,
+} from "../components/ContextualApprovalCard";
 import { ControlledInlineConfirm } from "../components/ControlledInlineConfirm";
 import { SpaBreadcrumb } from "../components/SpaBreadcrumb";
 import { useApp, useEscapeBack } from "../state/store";
@@ -134,7 +138,18 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
 
   const activeData = data && data.profile.agent_id === agentId ? data : null;
   const isSwitchingAgent = prevAgentIdRef.current !== agentId;
-  useEscapeBack("/office", activeData ? activeData.profile.agent_id : agentId);
+  useEscapeBack("/agents", activeData ? activeData.profile.agent_id : agentId);
+
+  const agentApprovals = usePendingApprovals((q) => {
+    const imp = q.impact as Record<string, unknown>;
+    return (
+      imp.agent_id === agentId ||
+      imp.target_agent_id === agentId ||
+      (q.created_by_agent_id === agentId &&
+        q.kind !== "live_promotion" &&
+        q.kind !== "paper_to_live_migration")
+    );
+  });
 
   useEffect(() => {
     if (prevAgentIdRef.current !== agentId) {
@@ -199,8 +214,8 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                 Retry
               </Button>
             ) : null}
-            <Button emphasis="soft" shape="pill" onClick={() => navigate("/office")}>
-              Back to Agents &amp; Activity
+            <Button emphasis="soft" shape="pill" onClick={() => navigate("/agents")}>
+              Back to Agents
             </Button>
           </Inline>
         }
@@ -631,6 +646,15 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
   );
 
   const sandbox = activeData.agent_sandbox ?? null;
+  const hasSandboxActivity = Boolean(
+    sandbox &&
+      (sandbox.fill_count > 0 ||
+        sandbox.orders.length > 0 ||
+        sandbox.positions.some((p) => Math.abs(p.quantity) > 0) ||
+        activeRun?.duty_kind === "quant.agent_sandbox")
+  );
+  const showSandboxTab = Boolean(activeData.sandbox_authorized && hasSandboxActivity);
+  const effectiveTab = activeTab === "sandbox" && !showSandboxTab ? "work" : activeTab;
   const sandboxCurrency = sandbox?.binding.currency || "USD";
   const sandboxFacts: Fact[] = sandbox
     ? [
@@ -770,18 +794,18 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
     <Stack gap={16}>
       <Navbar
         variant="back"
-        label="Back to Agents & Activity"
-        onBack={() => navigate("/office", { focusReturnId: profile.agent_id })}
+        label="Back to Agents"
+        onBack={() => navigate("/agents", { focusReturnId: profile.agent_id })}
       />
 
       <SpaBreadcrumb
         focusReturnId={profile.agent_id}
         items={[
-          { id: "office", label: "Agents & Activity", href: "/office" },
+          { id: "agents", label: "Agents", href: "/agents" },
           {
             id: profile.agent_id,
             label: profile.display_name,
-            href: `/office/agents/${encodeURIComponent(profile.agent_id)}`,
+            href: `/agents/${encodeURIComponent(profile.agent_id)}`,
           },
         ]}
       />
@@ -916,6 +940,8 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
         />
       ) : null}
 
+      <ContextualApprovalList questions={agentApprovals} />
+
       <div className="sd-split-equal">
         {profile.archived ? (
           <Stack gap={12}>
@@ -973,7 +999,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
       <Tabs
         label="Agent individual activity"
         presentation="pill"
-        value={activeTab}
+        value={effectiveTab}
         onValueChange={setActiveTab}
         items={[
           {
@@ -1285,92 +1311,75 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
               </Stack>
             ),
           },
-          {
-            id: "sandbox",
-            label: sandbox
-              ? `Tier 1 Sandbox (${sandbox.fill_count} ${sandbox.fill_count === 1 ? "fill" : "fills"})`
-              : "Tier 1 Sandbox",
-            panel: (
-              <Stack gap={12}>
-                <Notice title="Isolated Tier 1 personal paper sandbox" tone="neutral">
-                  This virtual account belongs exclusively to {profile.display_name} for
-                  strategy testing. Orders here never touch company paper capital or Tier 3 live
-                  venues.
-                </Notice>
-                {!sandbox ? (
-                  <Card
-                    title="No active Tier 1 sandbox"
-                    variant="raised"
-                    headerAction={
-                      <Button
-                        emphasis="quiet"
-                        size="compact"
-                        shape="pill"
-                        onClick={() => navigate("/company/execution-tiers")}
-                      >
-                        Execution Tiers
-                      </Button>
-                    }
-                  >
-                    <Text variant="help">
-                      {profile.display_name} has not opened an isolated Tier 1 sandbox account
-                      yet.
-                    </Text>
-                  </Card>
-                ) : (
-                  <Stack gap={12}>
-                    <Card
-                      title="Sandbox Portfolio Summary"
-                      description={`Binding ${sandbox.binding.binding_id} · Quote source ${sandbox.binding.quote_source}`}
-                      variant="raised"
-                      headerAction={
-                        <Button
-                          emphasis="quiet"
-                          size="compact"
-                          shape="pill"
-                          onClick={() => navigate("/company/execution-tiers")}
+          ...(showSandboxTab && sandbox
+            ? [
+                {
+                  id: "sandbox",
+                  label:
+                    sandbox.fill_count > 0
+                      ? `Paper Sandbox (${sandbox.fill_count} ${sandbox.fill_count === 1 ? "fill" : "fills"})`
+                      : "Paper Sandbox",
+                  panel: (
+                    <Stack gap={12}>
+                      <Notice title="Isolated personal paper sandbox" tone="neutral">
+                        This virtual account belongs exclusively to {profile.display_name} for
+                        strategy testing. Orders here never touch shared company paper books or
+                        live venues.
+                      </Notice>
+                      <Stack gap={12}>
+                        <Card
+                          title="Sandbox Portfolio Summary"
+                          description={`Binding ${sandbox.binding.binding_id} · Quote source ${sandbox.binding.quote_source}`}
+                          variant="raised"
+                          headerAction={
+                            <Button
+                              emphasis="quiet"
+                              size="compact"
+                              shape="pill"
+                              onClick={() => navigate("/trading/paper")}
+                            >
+                              Paper Trading
+                            </Button>
+                          }
                         >
-                          All Execution Tiers
-                        </Button>
-                      }
-                    >
-                      <div className="sd-facts-wrap">
-                        <RecordFacts
-                          source="agent_sandbox"
-                          asOf={`seq #${activeData.event_seq}`}
-                          facts={sandboxFacts}
-                        />
-                      </div>
-                    </Card>
-                    <div className="sd-split-equal">
-                      <Card title="Sandbox Positions" variant="raised">
-                        {sandboxPosRows.length === 0 ? (
-                          <Text variant="help">No sandbox positions recorded yet.</Text>
-                        ) : (
-                          <DataTable
-                            caption="Agent Tier 1 sandbox positions"
-                            columns={sandboxPosCols}
-                            rows={sandboxPosRows}
-                          />
-                        )}
-                      </Card>
-                      <Card title="Recent Sandbox Orders" variant="raised">
-                        {sandboxOrderRows.length === 0 ? (
-                          <Text variant="help">No sandbox orders recorded yet.</Text>
-                        ) : (
-                          <DataTable
-                            caption="Agent Tier 1 sandbox orders"
-                            columns={sandboxOrderCols}
-                            rows={sandboxOrderRows}
-                          />
-                        )}
-                      </Card>
-                    </div>
-                  </Stack>
-                )}
-              </Stack>
-            ),
-          },
+                          <div className="sd-facts-wrap">
+                            <RecordFacts
+                              source="agent_sandbox"
+                              asOf={`seq #${activeData.event_seq}`}
+                              facts={sandboxFacts}
+                            />
+                          </div>
+                        </Card>
+                        <div className="sd-split-equal">
+                          <Card title="Sandbox Positions" variant="raised">
+                            {sandboxPosRows.length === 0 ? (
+                              <Text variant="help">No sandbox positions recorded yet.</Text>
+                            ) : (
+                              <DataTable
+                                caption="Agent personal paper sandbox positions"
+                                columns={sandboxPosCols}
+                                rows={sandboxPosRows}
+                              />
+                            )}
+                          </Card>
+                          <Card title="Recent Sandbox Orders" variant="raised">
+                            {sandboxOrderRows.length === 0 ? (
+                              <Text variant="help">No sandbox orders recorded yet.</Text>
+                            ) : (
+                              <DataTable
+                                caption="Agent personal paper sandbox orders"
+                                columns={sandboxOrderCols}
+                                rows={sandboxOrderRows}
+                              />
+                            )}
+                          </Card>
+                        </div>
+                      </Stack>
+                    </Stack>
+                  ),
+                },
+              ]
+            : []),
         ]}
       />
     </Stack>

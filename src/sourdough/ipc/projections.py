@@ -891,6 +891,14 @@ def read_order_trace_projection(
         )
 
 
+def _is_sandbox_authorized(info: dict[str, Any]) -> bool:
+    """Return True iff the agent is active (unarchived) and holds a trading/paper standing grant."""
+    if info.get("archived"):
+        return False
+    scope = str(info.get("grant_scope") or "").strip().lower()
+    return scope in ("paper", "trading", "live")
+
+
 def read_agents_graph_projection(
     store: Path, company_id: str
 ) -> tuple[dict[str, Any], int]:
@@ -989,6 +997,37 @@ def read_agents_graph_projection(
                     else "Standing watch"
                 )
             )
+            sandbox_authorized = _is_sandbox_authorized(info)
+            sandbox_activity: dict[str, Any] | None = None
+            if sandbox_authorized:
+                portfolio = read_agent_sandbox_portfolio_from_db(db, company_id, aid)
+                if portfolio is not None:
+                    open_pos = sum(
+                        1 for p in portfolio["positions"] if p["quantity"] != 0
+                    )
+                    is_running_sandbox = (
+                        run is not None
+                        and run["status"] in ("running", "waiting")
+                        and run["duty_kind"] == "quant.agent_sandbox"
+                    )
+                    if (
+                        portfolio["fill_count"] > 0
+                        or len(portfolio["orders"]) > 0
+                        or open_pos > 0
+                        or is_running_sandbox
+                    ):
+                        binding = portfolio["binding"]
+                        sandbox_activity = {
+                            "account_id": binding["account_id"],
+                            "currency": binding["currency"],
+                            "fill_count": portfolio["fill_count"],
+                            "open_positions_count": open_pos,
+                            "cash_minor_units": portfolio["cash_minor_units"],
+                            "gross_exposure_minor_units": portfolio[
+                                "gross_exposure_minor_units"
+                            ],
+                        }
+
             nodes.append(
                 {
                     "agent_id": aid,
@@ -1005,6 +1044,8 @@ def read_agents_graph_projection(
                     "private_draft_count": _count_private_drafts(store, aid),
                     "published_count": pub_counts.get(aid, 0),
                     "grant_scope": info["grant_scope"],
+                    "sandbox_authorized": sandbox_authorized,
+                    "sandbox_activity": sandbox_activity,
                 }
             )
 
@@ -1360,6 +1401,7 @@ def read_agent_detail_projection(
         )
 
         agent_sandbox = read_agent_sandbox_portfolio_from_db(db, company_id, agent_id)
+        sandbox_authorized = _is_sandbox_authorized(info)
         return (
             {
                 "projection": PROJECTION_AGENT_DETAIL,
@@ -1367,6 +1409,7 @@ def read_agent_detail_projection(
                 "as_of_ns": as_of_ns,
                 "event_seq": event_seq,
                 "profile": info | {"active_run": active_run},
+                "sandbox_authorized": sandbox_authorized,
                 "agent_sandbox": agent_sandbox,
                 "desk_workspace": {
                     "execution_profile": info["execution_profile"],
