@@ -6,23 +6,27 @@ from tempfile import TemporaryDirectory
 from time import time_ns
 from unittest.mock import patch
 
-from sourdough.trading.cli import _run_paper_window
 from sourdough.company import FoundingTerms, found
 from sourdough.general_ledger import JournalRefused
-from sourdough.market_worker import SpotInstrumentTerms
-from sourdough.nautilus_paper import NautilusPaperVenue, SandboxFeeEvidence, SandboxPlan
-from sourdough.nautilus_runtime import paper_venue
-from sourdough.paper_account import PaperMandate, bind
-from sourdough.paper_fee_bridge import FeeChart, deliver_managed_paper_fee
-from sourdough.paper_valuation import (
+from sourdough.runtime.registry import DutyContext, DutyRegistry
+from sourdough.runtime.work_kernel import WorkItem, WorkRun
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.cli import _run_paper_window
+from sourdough.trading.fee_bridge import FeeChart, deliver_managed_paper_fee
+from sourdough.trading.market_worker import SpotInstrumentTerms
+from sourdough.trading.nautilus_paper import (
+    NautilusPaperVenue,
+    SandboxFeeEvidence,
+    SandboxPlan,
+)
+from sourdough.trading.nautilus_runtime import paper_venue
+from sourdough.trading.valuation import (
     BEST_BID_POLICY,
     ValuationRefused,
     ValuationRequest,
 )
-from sourdough.paper_window import WindowPlan, WindowRefused
-from sourdough.runtime.registry import DutyContext, DutyRegistry
-from sourdough.runtime.work_kernel import WorkItem, WorkRun
-from sourdough.window_run import (
+from sourdough.trading.window import WindowPlan, WindowRefused
+from sourdough.trading.window_run import (
     RECONCILE_DUTY_KIND,
     WINDOW_CLOSE_DUTY_KIND,
     register_window_duties,
@@ -52,13 +56,22 @@ class WindowRunDutiesTests(unittest.TestCase):
             "original", "BINANCE-001", "USDT", self.venue.start_generation()
         )
         self.account = self.venue.observe_account("paper")
-        self.binding = bind(
-            self.store,
-            PaperMandate(
-                "binding-1", self.company, "charter", self.account, 10_000_000_000
-            ),
-            self.venue,
-        )
+        with hold_company_writer(
+            self.store, self.company, lease_directory=self.leases
+        ) as writer:
+            self.binding = register_company_paper_tier(
+                writer,
+                account_id="paper",
+                destination_id=self.account.destination_id,
+                connector_revision=self.account.connector_revision,
+                instrument_rules_digest=self.account.instrument_rules_digest,
+                currency=self.account.currency,
+                starting_minor_units=self.account.starting_minor_units,
+                exposure_limit_minor_units=10_000_000_000,
+                fee_bps=0,
+                slippage_bps=0,
+                binding_revision="binding-1",
+            )
 
     def _context(self, writer, duty_kind: str, payload_json: str) -> DutyContext:
         now = time_ns()

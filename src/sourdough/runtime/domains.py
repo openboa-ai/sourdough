@@ -12,17 +12,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from ..agent_runtime.protocol import AgentProfileBinding, ToolHandler, ToolSpec
 from ..writer_lease import WriterLease
 from .registry import DutyDescriptor, RuntimeRefused
 
 if TYPE_CHECKING:
+    from ..agent_runtime.protocol import AgentProfileBinding, ToolHandler, ToolSpec
     from ..agent_runtime.registry import AgentAdapterRegistry
     from ..board_control import AuthorizeBoard, BoardCommandOutcome
 
-ProfileBindingLookup = (
-    Mapping[str, AgentProfileBinding] | Callable[[str], AgentProfileBinding]
-)
+    ProfileBindingLookup = (
+        Mapping[str, AgentProfileBinding] | Callable[[str], AgentProfileBinding]
+    )
+else:
+    ProfileBindingLookup = Any
 
 
 class DomainActionRefused(Exception):
@@ -275,9 +277,49 @@ class ProjectionDescriptor:
     name: str
     route_prefix: str
     read: Callable[
-        [Path, str, Mapping[str, list[str]], AuthorizeBoard | None, str | None],
+        [Path, str, str, Mapping[str, list[str]], AuthorizeBoard | None, str | None],
         tuple[dict[str, Any] | None, int],
     ]
+    requires_domain: str | None = None
+
+
+@dataclass(frozen=True)
+class RestrictionClearContext:
+    connection: sqlite3.Connection
+    company_id: str
+    restriction_id: str
+    cause_category: str
+    scope_ref: str
+    engine_directory: Path | None = None
+    now_ns: int = 0
+
+
+RestrictionClearHook = Callable[[RestrictionClearContext], None]
+
+
+@runtime_checkable
+class RestrictionGuard(Protocol):
+    def handles_scope(self, scope_ref: str) -> bool: ...
+
+    def validate_apply(
+        self,
+        db: sqlite3.Connection,
+        *,
+        company_id: str,
+        scope_ref: str,
+        cause_category: str,
+    ) -> None: ...
+
+    def validate_clear(
+        self,
+        db: sqlite3.Connection,
+        *,
+        company_id: str,
+        scope_ref: str,
+        cause_category: str,
+        now_ns: int,
+        engine_directory: Path | None = None,
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -298,6 +340,20 @@ class DomainPlugin(Protocol):
     def restore_guard(self) -> RestoreDomainGuard | None: ...
 
     def committed_result_predicate(self) -> CommittedResultPredicate | None: ...
+
+    def restriction_guard(self) -> RestrictionGuard | None: ...
+
+    def restriction_clear_hook(self) -> RestrictionClearHook | None: ...
+
+    def enrich_core_projection(
+        self,
+        projection_name: str,
+        db: sqlite3.Connection,
+        company_id: str,
+        payload: dict[str, Any],
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> None: ...
 
     def contribute_work_timeline(
         self, connection: sqlite3.Connection, company_id: str
@@ -339,6 +395,23 @@ class BaseDomainPlugin:
     def committed_result_predicate(self) -> CommittedResultPredicate | None:
         return None
 
+    def restriction_guard(self) -> RestrictionGuard | None:
+        return None
+
+    def restriction_clear_hook(self) -> RestrictionClearHook | None:
+        return None
+
+    def enrich_core_projection(
+        self,
+        projection_name: str,
+        db: sqlite3.Connection,
+        company_id: str,
+        payload: dict[str, Any],
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        return None
+
     def contribute_work_timeline(
         self, connection: sqlite3.Connection, company_id: str
     ) -> WorkTimelineContribution | None:
@@ -368,9 +441,12 @@ class DomainPluginRegistry:
             self.register(plugin)
 
     def register(self, plugin: DomainPlugin) -> None:
-        name = plugin.domain_name.strip()
+        raw_name = getattr(plugin, "domain_name", None)
+        if not isinstance(raw_name, str):
+            raise RuntimeRefused(f"Invalid domain plugin name: {raw_name!r}")
+        name = raw_name.strip()
         if not name or name == "core":
-            raise RuntimeRefused(f"Invalid domain plugin name: {plugin.domain_name!r}")
+            raise RuntimeRefused(f"Invalid domain plugin name: {raw_name!r}")
         if name in self._plugins:
             raise RuntimeRefused(f"Duplicate domain plugin registration: {name}")
         self._plugins[name] = plugin
@@ -398,6 +474,22 @@ class DomainPluginRegistry:
                 preds.append(pred)
         return tuple(preds)
 
+    def restriction_guards(self) -> tuple[RestrictionGuard, ...]:
+        guards: list[RestrictionGuard] = []
+        for plugin in self._plugins.values():
+            guard = plugin.restriction_guard()
+            if guard is not None:
+                guards.append(guard)
+        return tuple(guards)
+
+    def restriction_clear_hooks(self) -> tuple[RestrictionClearHook, ...]:
+        hooks: list[RestrictionClearHook] = []
+        for plugin in self._plugins.values():
+            hook = plugin.restriction_clear_hook()
+            if hook is not None:
+                hooks.append(hook)
+        return tuple(hooks)
+
 
 def load_domain_plugins(
     specs: Sequence[str] | None = None,
@@ -416,8 +508,16 @@ def load_domain_plugins(
 
     if specs is not None:
         for spec in specs:
+            if not isinstance(spec, str) or ":" not in spec:
+                raise RuntimeRefused(f"Invalid domain plugin spec: {spec!r}")
             module_path, attr_name = spec.split(":", 1)
+            if not module_path.strip() or not attr_name.strip():
+                raise RuntimeRefused(f"Invalid domain plugin spec: {spec!r}")
             module = importlib.import_module(module_path)
+            if not hasattr(module, attr_name):
+                raise RuntimeRefused(
+                    f"Domain plugin spec attribute not found: {spec!r}"
+                )
             _add(getattr(module, attr_name))
         return tuple(loaded)
 

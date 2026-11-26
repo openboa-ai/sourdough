@@ -16,7 +16,7 @@ from pathlib import Path
 from time import sleep
 from uuid import uuid4
 
-from .storage.db import ManagedConnection
+from .storage.db import ManagedConnection, connect_sqlite
 
 _FORMAT = "offline-trial-registry-v1"
 _REQUIRED_TABLES = frozenset(
@@ -482,7 +482,7 @@ def _open(
     _verify_wal_sidecars(path)
     mode = "ro" if read_only else "rw"
     try:
-        database = sqlite3.connect(
+        database = connect_sqlite(
             path.absolute().as_uri() + f"?mode={mode}",
             uri=True,
             timeout=5.0,

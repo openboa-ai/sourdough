@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, Literal
 
@@ -17,6 +18,7 @@ SCHEMA_VERSION = 1
 RETIRED_SCHEMA_REVISION = -1
 BUSY_TIMEOUT_MS = 5000
 JOURNAL_SIZE_LIMIT_BYTES = 67_108_864
+_SQLITE_LIFECYCLE_LOCK = RLock()
 
 
 class StorageRefused(Exception):
@@ -35,6 +37,7 @@ class ManagedConnection(sqlite3.Connection):
 
     _allow_retired: bool = False
     _allow_initialize: bool = False
+    _lifecycle_lock: RLock = _SQLITE_LIFECYCLE_LOCK
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> Literal[False]:
         if self.in_transaction:
@@ -43,6 +46,39 @@ class ManagedConnection(sqlite3.Connection):
             else:
                 self.execute("ROLLBACK")
         return False
+
+    def close(self) -> None:
+        lock = getattr(self, "_lifecycle_lock", None)
+        if lock is not None:
+            with lock:
+                super().close()
+        else:
+            super().close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def connect_sqlite(
+    database: str | Path,
+    *,
+    uri: bool = False,
+    timeout: float = BUSY_TIMEOUT_MS / 1000.0,
+    autocommit: bool = True,
+    factory: type[sqlite3.Connection] = ManagedConnection,
+) -> sqlite3.Connection:
+    """Open a SQLite connection while serializing open/close against libsqlite3 mutex races."""
+    with _SQLITE_LIFECYCLE_LOCK:
+        return sqlite3.connect(
+            database,
+            uri=uri,
+            timeout=timeout,
+            autocommit=autocommit,
+            factory=factory,
+        )
 
 
 def _has_table(connection: sqlite3.Connection, table: str) -> bool:
@@ -107,9 +143,14 @@ def _set_journal_mode_with_retry(connection: sqlite3.Connection, mode: str) -> N
     """Retry journal_mode transition across concurrent cold-start initialization."""
     deadline = monotonic() + (BUSY_TIMEOUT_MS / 1000.0)
     delay = 0.01
+    target = mode.upper()
     while True:
         try:
-            connection.execute(f"PRAGMA journal_mode = {mode}")
+            current = str(
+                connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).upper()
+            if current != target:
+                connection.execute(f"PRAGMA journal_mode = {target}")
             return
         except sqlite3.OperationalError as error:
             message = str(error).lower()
@@ -136,9 +177,10 @@ def open_writer(
         lease.verify()
     mode = "rwc" if create else "rw"
     try:
-        connection = sqlite3.connect(
+        connection = connect_sqlite(
             f"{store.absolute().as_uri()}?mode={mode}",
             uri=True,
+            timeout=BUSY_TIMEOUT_MS / 1000.0,
             autocommit=True,
             factory=ManagedConnection,
         )
@@ -173,26 +215,53 @@ def open_writer(
 
 def open_reader(store: Path) -> ManagedConnection:
     """Open the company SQLite store strictly read-only with query_only enforced."""
-    try:
-        connection = sqlite3.connect(
-            f"{store.absolute().as_uri()}?mode=ro",
-            uri=True,
-            autocommit=True,
-            factory=ManagedConnection,
-        )
-    except sqlite3.OperationalError as error:
-        raise StorageRefused("Expected company store could not be opened") from error
-    try:
-        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("PRAGMA trusted_schema = OFF")
-        connection.execute("PRAGMA foreign_keys = ON")
-        with read_tx(connection):
-            _verify_store_schema(connection, allow_empty=False)
-    except BaseException:
-        connection.close()
-        raise
-    return connection
+    if not store.exists():
+        raise StorageRefused("Expected company store could not be opened")
+    deadline = monotonic() + (BUSY_TIMEOUT_MS / 1000.0)
+    delay = 0.01
+    uri = f"{store.absolute().as_uri()}?mode=ro"
+    while True:
+        try:
+            connection = connect_sqlite(
+                uri,
+                uri=True,
+                timeout=BUSY_TIMEOUT_MS / 1000.0,
+                autocommit=True,
+                factory=ManagedConnection,
+            )
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            if (
+                "locked" not in message
+                and "busy" not in message
+                and "unable to open" not in message
+            ) or monotonic() >= deadline:
+                raise StorageRefused(
+                    "Expected company store could not be opened"
+                ) from error
+            sleep(min(delay, max(0.0, deadline - monotonic())))
+            delay = min(delay * 1.5, 0.1)
+            continue
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            connection.execute("PRAGMA foreign_keys = ON")
+            with read_tx(connection):
+                _verify_store_schema(connection, allow_empty=False)
+            return connection
+        except sqlite3.OperationalError as error:
+            connection.close()
+            message = str(error).lower()
+            if (
+                "locked" not in message and "busy" not in message
+            ) or monotonic() >= deadline:
+                raise
+            sleep(min(delay, max(0.0, deadline - monotonic())))
+            delay = min(delay * 1.5, 0.1)
+        except BaseException:
+            connection.close()
+            raise
 
 
 @contextmanager

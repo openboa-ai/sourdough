@@ -1,4 +1,4 @@
-"""Trading domain module (M2 bridge into Core Company OS extension seams)."""
+"""Trading domain module plugging Trading capabilities into Core Company OS."""
 
 from __future__ import annotations
 

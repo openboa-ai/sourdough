@@ -120,13 +120,23 @@ def restore_core_checkpoint(
     external_scope: tuple[object, ...] | None = None
     reconcile_fn: Callable[[Path], None] | None = None
     if domain_guards:
-        scopes = tuple(
-            (name, guard.external_scope())
-            for name, guard in sorted(domain_guards.items())
-            if guard.external_scope() is not None
-        )
-        if scopes:
-            external_scope = scopes
+        scopes_list: list[tuple[str, tuple[object, ...]]] = []
+        for name, guard in sorted(domain_guards.items()):
+            if guard is None:
+                raise CheckpointRefused(
+                    f"Domain '{name}' requires a valid restore guard"
+                )
+            ext_fn = getattr(guard, "external_scope", None)
+            if ext_fn is not None:
+                if not callable(ext_fn):
+                    raise CheckpointRefused(
+                        f"Domain '{name}' has invalid external_scope hook"
+                    )
+                scope_val = ext_fn()
+                if scope_val is not None:
+                    scopes_list.append((name, scope_val))
+        if scopes_list:
+            external_scope = tuple(scopes_list)
 
         def _reconcile(shadow: Path) -> None:
             _reconcile_active_domains(shadow, domain_guards)

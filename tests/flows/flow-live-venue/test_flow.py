@@ -7,27 +7,30 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sourdough.binance_emulator import BinanceWireEmulator
-from sourdough.binance_venue import (
-    MARKET_USDM_FUTURES,
-    BinanceVenueAdapter,
-    BinanceVenueConfig,
-)
 from sourdough.board_control import BOARD_CONTROL_ROLE, bind_board_principal
 from sourdough.company import FoundingTerms, found
-from sourdough.credentials import InMemoryTestCredentialProvider
-from sourdough.execution_tiers import (
-    ENV_EXTERNAL_TEST,
-    EXECUTION_TIER_COMMAND,
-    PROMOTE_EXECUTION_ENVIRONMENT,
-    build_promotion_payload_hash,
+from sourdough.ipc import CompanyDaemon, ControlPlaneClient
+from sourdough.storage.db import open_reader, read_tx
+from sourdough.trading.accounts import (
     open_agent_sandbox,
     register_company_paper_tier,
     register_live_candidate_binding,
 )
-from sourdough.ipc import CompanyDaemon, ControlPlaneClient
-from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
-from sourdough.venue_qualification import run_binance_testnet_qualification
+from sourdough.trading.binance_emulator import BinanceWireEmulator
+from sourdough.trading.binance_venue import (
+    MARKET_USDM_FUTURES,
+    BinanceVenueAdapter,
+    BinanceVenueConfig,
+)
+from sourdough.trading.commands import (
+    EXECUTION_TIER_COMMAND,
+    PROMOTE_EXECUTION_ENVIRONMENT,
+)
+from sourdough.trading.migration import build_promotion_payload_hash
+from sourdough.trading.credentials import InMemoryTestCredentialProvider
+from sourdough.trading.domain import ENV_EXTERNAL_TEST
+from sourdough.trading.ledger import record_trading_book_valuation
+from sourdough.trading.venue_qualification import run_binance_testnet_qualification
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -73,7 +76,7 @@ class ConnectedFlow(unittest.TestCase):
                 open_agent_sandbox(
                     writer, agent_id=founder_id, account_id="founder-sbx-01"
                 )
-                register_company_paper_tier(
+                paper_binding = register_company_paper_tier(
                     writer,
                     account_id="company-paper-usdm-01",
                     destination_id="nautilus-usdm-paper",
@@ -85,14 +88,12 @@ class ConnectedFlow(unittest.TestCase):
                     fee_bps=4,
                     slippage_bps=2,
                 )
-                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
-                    db.execute(
-                        """INSERT INTO paper_valuation (
-                               capture_id, binding_revision, policy, evidence,
-                               trading_nav_atoms, revision
-                           ) VALUES ('val-1', 'paper-rev-1', 'mid',
-                                     '{"label":"Soak"}', 100500000, 'vrev-1')"""
-                    )
+                record_trading_book_valuation(
+                    writer,
+                    binding_id=paper_binding.binding_id,
+                    label="Soak",
+                    mark_prices={},
+                )
 
                 # Run full 6-case Binance USD-M Futures testnet qualification against wire emulator!
                 adapter = BinanceVenueAdapter(
@@ -162,14 +163,26 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(code, 200)
                 self.assertEqual(resp["state"], "applied")
 
-                _, _, tiers = client.projection(
-                    "execution-tiers", expected_company_id=company_id
+                _, _, desk = client.projection(
+                    "trading-desk", expected_company_id=company_id
                 )
-                assert tiers is not None
-                self.assertEqual(tiers["company_live"]["status"], "active")
-                self.assertEqual(tiers["company_paper"]["status"], "active")
-                self.assertEqual(len(tiers["agent_sandboxes"]), 1)
-                self.assertEqual(tiers["qualification_receipts"][0]["verdict"], "PASS")
+                assert desk is not None
+                gov = desk["governance"]
+                self.assertEqual(gov["company_live"]["status"], "active")
+                self.assertEqual(gov["qualification_receipts"][0]["verdict"], "PASS")
+                _, _, desk_paper = client.projection(
+                    "trading-desk?environment=paper", expected_company_id=company_id
+                )
+                assert desk_paper is not None
+                self.assertEqual(desk_paper["selected_book"]["status"], "active")
+                _, _, founder_detail = client.projection(
+                    f"agents/{founder_id}", expected_company_id=company_id
+                )
+                assert founder_detail is not None
+                self.assertEqual(
+                    founder_detail["agent_sandbox"]["binding"]["account_id"],
+                    "founder-sbx-01",
+                )
 
             # Verify zero raw secret leakage anywhere in company.sqlite!
             raw_db_bytes = store.read_bytes()

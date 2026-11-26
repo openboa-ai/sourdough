@@ -12,7 +12,7 @@ import hmac
 import json
 import os
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
@@ -23,6 +23,11 @@ from typing import Any
 from uuid import uuid4
 
 from .company import _identity
+from .runtime.domains import (
+    RestrictionClearContext,
+    RestrictionClearHook,
+    RestrictionGuard,
+)
 from .runtime.work_kernel import (
     WorkKernelRefused,
     cancel_work_item,
@@ -1136,6 +1141,7 @@ def apply_company_restriction(
     principal_hint: str | None = None,
     peer_pid: int | None = None,
     now_ns: int | None = None,
+    restriction_guards: Sequence[RestrictionGuard] = (),
 ) -> BoardCommandOutcome:
     """Activate a distinct cause-scoped restriction without altering other active stops."""
     safe_cmd = _require_text(command_id, "command_id", max_len=128)
@@ -1144,8 +1150,8 @@ def apply_company_restriction(
     safe_rev = _require_nonneg_int(
         expected_restriction_revision, "expected_restriction_revision"
     )
-    safe_cat = _require_text(cause_category, "cause_category", max_len=64)
-    safe_scope = _require_text(scope_ref, "scope_ref", max_len=128)
+    safe_cat = _require_text(cause_category, "cause_category", max_len=64).lower()
+    safe_scope = _require_text(scope_ref, "scope_ref", max_len=128).lower()
     safe_reason = _require_text(reason, "reason", max_len=2000)
     if not isinstance(operator_releasable, bool):
         raise BoardControlRefused("operator_releasable must be a boolean")
@@ -1218,6 +1224,23 @@ def apply_company_restriction(
             return _outcome_from_receipt(receipt)
 
         next_rev = current_rev + 1
+        matching_guards = [
+            guard for guard in restriction_guards if guard.handles_scope(safe_scope)
+        ]
+        if (
+            safe_scope.startswith("execution:") or safe_cat == "trading_risk_pause"
+        ) and not matching_guards:
+            raise BoardControlRefused(
+                f"No domain guard registered for scoped restriction '{safe_scope}'"
+            )
+        for guard in matching_guards:
+            guard.validate_apply(
+                db,
+                company_id=writer.company_id,
+                scope_ref=safe_scope,
+                cause_category=safe_cat,
+            )
+
         if existing is None:
             db.execute(
                 """INSERT INTO restriction_cause (
@@ -1308,6 +1331,9 @@ def clear_company_restriction(
     principal_hint: str | None = None,
     peer_pid: int | None = None,
     now_ns: int | None = None,
+    restriction_guards: Sequence[RestrictionGuard] = (),
+    pre_clear_hooks: Sequence[RestrictionClearHook] = (),
+    engine_directory: Path | None = None,
 ) -> BoardCommandOutcome:
     """Clear strictly one restriction_id, leaving all other active stops untouched."""
     safe_cmd = _require_text(command_id, "command_id", max_len=128)
@@ -1349,7 +1375,8 @@ def clear_company_restriction(
 
         current_charter = _current_charter_revision(db, writer.company_id)
         existing = db.execute(
-            """SELECT restriction_revision, active, operator_releasable
+            """SELECT restriction_revision, active, operator_releasable,
+                      cause_category, scope_ref
                FROM restriction_cause
                WHERE company_id = ? AND restriction_id = ?""",
             (writer.company_id, safe_rid),
@@ -1361,6 +1388,8 @@ def clear_company_restriction(
             int(existing[1]),
             int(existing[2]),
         )
+        cause_cat = str(existing[3]).strip().lower()
+        scope_ref = str(existing[4]).strip().lower()
         if releasable == 0:
             raise BoardControlForbidden(
                 "This restriction cause is system-held and cannot be cleared directly"
@@ -1387,6 +1416,39 @@ def clear_company_restriction(
                 now_ns=timestamp,
             )
             return _outcome_from_receipt(receipt)
+
+        matching_guards = [
+            guard for guard in restriction_guards if guard.handles_scope(scope_ref)
+        ]
+        if (
+            (scope_ref.startswith("execution:") or cause_cat == "trading_risk_pause")
+            and not matching_guards
+            and not pre_clear_hooks
+        ):
+            raise BoardControlRefused(
+                f"No domain guard loaded for scoped restriction '{scope_ref}'"
+            )
+        for guard in matching_guards:
+            guard.validate_clear(
+                db,
+                company_id=writer.company_id,
+                scope_ref=scope_ref,
+                cause_category=cause_cat,
+                now_ns=timestamp,
+                engine_directory=engine_directory,
+            )
+        if pre_clear_hooks:
+            ctx = RestrictionClearContext(
+                connection=db,
+                company_id=writer.company_id,
+                restriction_id=safe_rid,
+                cause_category=cause_cat,
+                scope_ref=scope_ref,
+                engine_directory=engine_directory,
+                now_ns=timestamp,
+            )
+            for hook in pre_clear_hooks:
+                hook(ctx)
 
         next_rev = current_rev + 1
         db.execute(

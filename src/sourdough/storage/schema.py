@@ -12,7 +12,7 @@ from time import time_ns
 from .db import SCHEMA_VERSION, StorageRefused
 from .kernel import append_audit_event
 
-VALID_DOMAINS: tuple[str, ...] = ("core", "trading", "paper")
+VALID_DOMAINS: tuple[str, ...] = ("core", "trading")
 _SCHEMA_ROOT = Path(__file__).resolve().parent / "schema" / "v1"
 
 
@@ -61,10 +61,6 @@ def load_domain_pack(domain: str) -> SchemaPack:
     if domain not in VALID_DOMAINS:
         raise StorageRefused(f"Unsupported schema domain: {domain}")
     domain_dir = _SCHEMA_ROOT / domain
-    if domain == "trading" and not domain_dir.is_dir():
-        fallback_dir = _SCHEMA_ROOT / "paper"
-        if fallback_dir.is_dir():
-            domain_dir = fallback_dir
     if not domain_dir.is_dir():
         raise StorageRefused(f"Missing canonical v1 schema directory for {domain}")
     files: list[tuple[str, str]] = []
@@ -103,11 +99,7 @@ def compute_sqlite_schema_sha256(connection: sqlite3.Connection) -> str:
 
 def _canonical_domain_order(domains: frozenset[str]) -> tuple[str, ...]:
     invalid = set(domains) - set(VALID_DOMAINS)
-    if (
-        invalid
-        or "core" not in domains
-        or ("trading" in domains and "paper" in domains)
-    ):
+    if invalid or "core" not in domains:
         raise StorageRefused(f"Invalid active schema domain set: {sorted(domains)}")
     return tuple(domain for domain in VALID_DOMAINS if domain in domains)
 
@@ -185,9 +177,7 @@ def installed_domains(
 def is_domain_installed(connection: sqlite3.Connection, domain: str) -> bool:
     canonical = canonical_domain_name(domain)
     installed = installed_domains(connection)
-    if canonical == "core":
-        return "core" in installed
-    return "trading" in installed or "paper" in installed
+    return canonical in installed
 
 
 def require_domain(connection: sqlite3.Connection, domain: str) -> None:
@@ -205,11 +195,7 @@ def verify_v1_schema(connection: sqlite3.Connection) -> frozenset[str]:
         )
     records = installed_domains(connection)
     active = frozenset(records)
-    if (
-        "core" not in active
-        or not active.issubset(set(VALID_DOMAINS))
-        or ("trading" in active and "paper" in active)
-    ):
+    if "core" not in active or not active.issubset(set(VALID_DOMAINS)):
         raise StorageRefused(
             f"Invalid installed schema domains in company store: {sorted(active)}"
         )
@@ -288,17 +274,13 @@ def enable_domain_v1(
         raise StorageRefused(
             "enable_domain_v1 requires an active BEGIN IMMEDIATE transaction"
         )
-    if domain not in VALID_DOMAINS or domain == "core":
+    target_domain = canonical_domain_name(domain)
+    if target_domain == "core":
         raise StorageRefused(f"Unsupported opt-in schema domain: {domain}")
-    target_domain = (
-        canonical_domain_name(domain) if (_SCHEMA_ROOT / "trading").is_dir() else domain
-    )
     active = verify_v1_schema(connection)
-    pack = load_domain_pack(target_domain)
-    if canonical_domain_name(target_domain) == "trading" and (
-        "trading" in active or "paper" in active
-    ):
+    if target_domain in active:
         return False
+    pack = load_domain_pack(target_domain)
     for _name, sql in pack.files:
         _execute_sql_script_in_tx(connection, sql)
     new_active = frozenset(active | {target_domain})

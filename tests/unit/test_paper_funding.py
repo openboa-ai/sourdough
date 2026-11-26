@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
-from sourdough.paper_funding import (
+from sourdough.trading.funding import (
     FUNDING_INTERVAL_NS,
     FundingChart,
     FundingRateEvidence,
@@ -59,10 +59,10 @@ class PaperFundingTests(unittest.TestCase):
             quote_units_per_whole=100_000_000,
             source_revision="binance-mark-1",
         )
-        # Fault injection mid-tx rolls back BOTH journal_entry and paper_funding_settlement.
+        # Fault injection mid-tx rolls back BOTH journal_entry and trading_funding_settlement.
         with (
             patch(
-                "sourdough.paper_funding.append_audit_event",
+                "sourdough.trading.funding.append_audit_event",
                 side_effect=OSError("cut before commit"),
             ),
             self.assertRaisesRegex(OSError, "before commit"),

@@ -1403,12 +1403,18 @@ class StorageCheckpointAndRestore(unittest.TestCase):
 
         with closing(open_writer(self.store)) as writer, write_tx(writer):
             enable_domain_v1(
-                writer, "paper", company_id=self.company_id, actor_id="test"
+                writer, "trading", company_id=self.company_id, actor_id="test"
             )
             writer.execute(
-                """INSERT INTO paper_binding VALUES (
-                       1, 'mandate-1', ?, 'charter-v1', 500, 'acct-1',
-                       'conn-1', 'rules-1', 'USD', 1000, 'paper', 'dest-1'
+                """INSERT INTO execution_environment_binding (
+                       binding_id, company_id, tier, environment, account_id,
+                       destination_id, connector_revision, instrument_rules_digest,
+                       currency, starting_minor_units, exposure_limit_minor_units,
+                       binding_revision, status, created_at_ns, updated_at_ns
+                   ) VALUES (
+                       'bind-1', ?, 'company_paper', 'paper', 'acct-1',
+                       'dest-1', 'conn-1', 'rules-1', 'USD', 1000, 500,
+                       'mandate-1', 'active', 1, 1
                    )""",
                 (self.company_id,),
             )
@@ -1428,10 +1434,10 @@ class StorageCheckpointAndRestore(unittest.TestCase):
         )
         verify_no_wal_sidecars(restored)
         with closing(open_reader(restored)) as reader, read_tx(reader):
-            self.assertTrue(is_domain_installed(reader, "paper"))
+            self.assertTrue(is_domain_installed(reader, "trading"))
             self.assertEqual(
                 reader.execute(
-                    "SELECT revision, account_id FROM paper_binding WHERE singleton = 1"
+                    "SELECT binding_revision, account_id FROM execution_environment_binding WHERE binding_id = 'bind-1'"
                 ).fetchone(),
                 ("mandate-1", "acct-1"),
             )

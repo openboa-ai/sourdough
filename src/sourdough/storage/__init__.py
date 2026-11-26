@@ -20,6 +20,7 @@ from .db import (
     ManagedConnection,
     StorageRefused,
     StoreRetirement,
+    connect_sqlite,
     open_reader,
     open_writer,
     read_retirement,
@@ -46,6 +47,10 @@ from .kernel import (
 from .ownership import (
     DOMAIN_TABLE_OWNERS,
     audit_domain_write_ownership,
+)
+from .migration import (
+    migrate_v1_store_to_canonical,
+    rebuild_core_v1_tables,
 )
 from .schema import (
     VALID_DOMAINS,
@@ -93,6 +98,7 @@ __all__ = [
     "checkpoint_store",
     "compute_logical_watermark",
     "compute_sqlite_schema_sha256",
+    "connect_sqlite",
     "enable_domain_v1",
     "expected_sqlite_schema_sha256",
     "finalize_command_receipt",
@@ -101,12 +107,14 @@ __all__ = [
     "is_domain_installed",
     "load_domain_pack",
     "max_event_seq",
+    "migrate_v1_store_to_canonical",
     "open_reader",
     "open_writer",
     "prepare_external_action",
     "read_command_receipt",
     "read_retirement",
     "read_tx",
+    "rebuild_core_v1_tables",
     "require_domain",
     "restore_store",
     "settle_external_action",

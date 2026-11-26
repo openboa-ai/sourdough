@@ -26,8 +26,10 @@ class StorageDomainOwnership(unittest.TestCase):
     def test_checker_flags_inline_ddl_in_company_store_module(self):
         with TemporaryDirectory() as directory:
             fake_root = Path(directory)
-            (fake_root / "paper_order.py").write_text(
-                'def bad(conn):\n    conn.execute("CREATE TABLE IF NOT EXISTS paper_order (order_id TEXT)")\n',
+            ledger_dir = fake_root / "trading"
+            ledger_dir.mkdir(parents=True, exist_ok=True)
+            (ledger_dir / "ledger.py").write_text(
+                'def bad(conn):\n    conn.execute("CREATE TABLE IF NOT EXISTS trading_book_order (order_id TEXT)")\n',
                 encoding="utf-8",
             )
             violations = audit_domain_write_ownership(fake_root)

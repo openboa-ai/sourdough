@@ -10,6 +10,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from sourdough.board_control import (
+    PAUSE_COMPANY,
+    RESTRICTION_COMMAND,
+    RESUME_COMPANY,
+)
 from sourdough.company import FoundingTerms, found
 from sourdough.ipc import (
     CONTROL_PLANE_VERSION,
@@ -20,10 +25,6 @@ from sourdough.ipc import (
     IpcRefused,
     PeerCredentials,
     default_socket_path,
-)
-from sourdough.paper_risk import (
-    PAPER_RISK_COMMAND,
-    SUSPEND_NEW_RISK,
 )
 from sourdough.trading import TradingDomainPlugin
 from sourdough.writer_lease import WriterRefused, hold_company_writer
@@ -150,16 +151,20 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             before_seq = timeline_v2["event_seq"]
 
             # Unknown receipt returns 404 status='not_found'.
-            missing = client.command_receipt("cmd-1", operation=SUSPEND_NEW_RISK)
+            missing = client.command_receipt("cmd-1", operation=PAUSE_COMPANY)
             self.assertEqual(missing["status"], "not_found")
 
             # Unsupported contract version rejected with 422 before any domain write.
             bad_status, _ = client.submit_command(
                 company_id=self.company,
                 command_id="cmd-bad-ver",
-                command_type=SUSPEND_NEW_RISK,
-                contract_version="paper-risk-command-v999",
-                preconditions={"charter_revision": "charter-1", "expected_revision": 0},
+                command_type=PAUSE_COMPANY,
+                contract_version="restriction-command-v999",
+                preconditions={
+                    "charter_revision": "charter-1",
+                    "restriction_id": "rest-bad",
+                    "expected_restriction_revision": 0,
+                },
                 payload={"reason": "bad version"},
             )
             self.assertEqual(bad_status, 422)
@@ -169,9 +174,13 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             denied_status, _ = client.submit_command(
                 company_id=self.company,
                 command_id="cmd-denied",
-                command_type=SUSPEND_NEW_RISK,
-                contract_version=PAPER_RISK_COMMAND,
-                preconditions={"charter_revision": "charter-1", "expected_revision": 0},
+                command_type=PAUSE_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter-1",
+                    "restriction_id": "rest-denied",
+                    "expected_restriction_revision": 0,
+                },
                 payload={"reason": "unauthorized"},
             )
             self.assertEqual(denied_status, 403)
@@ -188,13 +197,17 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             waiter = threading.Thread(target=wait_for_events)
             waiter.start()
 
-            # Submit suspend_new_risk (including a spoofed peer_pid in payload which MUST be ignored).
+            # Submit pause_company (including a spoofed peer_pid in payload which MUST be ignored).
             code, receipt = client.submit_command(
                 company_id=self.company,
                 command_id="cmd-suspend-1",
-                command_type=SUSPEND_NEW_RISK,
-                contract_version=PAPER_RISK_COMMAND,
-                preconditions={"charter_revision": "charter-1", "expected_revision": 0},
+                command_type=PAUSE_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter-1",
+                    "restriction_id": "rest-1",
+                    "expected_restriction_revision": 0,
+                },
                 payload={"reason": "private board note", "peer_pid": 999999},
             )
             self.assertEqual(code, 200)
@@ -208,9 +221,13 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             code_replay, replay = client.submit_command(
                 company_id=self.company,
                 command_id="cmd-suspend-1",
-                command_type=SUSPEND_NEW_RISK,
-                contract_version=PAPER_RISK_COMMAND,
-                preconditions={"charter_revision": "charter-1", "expected_revision": 0},
+                command_type=PAUSE_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter-1",
+                    "restriction_id": "rest-1",
+                    "expected_restriction_revision": 0,
+                },
                 payload={"reason": "private board note", "peer_pid": 999999},
             )
             self.assertEqual(code_replay, 200)
@@ -219,46 +236,54 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             code_conflict, _ = client.submit_command(
                 company_id=self.company,
                 command_id="cmd-suspend-1",
-                command_type=SUSPEND_NEW_RISK,
-                contract_version=PAPER_RISK_COMMAND,
-                preconditions={"charter_revision": "charter-1", "expected_revision": 0},
+                command_type=PAUSE_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter-1",
+                    "restriction_id": "rest-1",
+                    "expected_restriction_revision": 0,
+                },
                 payload={"reason": "mutated reason"},
             )
             self.assertEqual(code_conflict, 409)
 
-            # Stale expected_revision records conflicting_revision cleanly.
+            # Stale expected_restriction_revision records conflicting_revision cleanly.
             code_stale, stale_receipt = client.submit_command(
                 company_id=self.company,
                 command_id="cmd-stale",
-                command_type=SUSPEND_NEW_RISK,
-                contract_version=PAPER_RISK_COMMAND,
-                preconditions={"charter_revision": "charter-1", "expected_revision": 0},
+                command_type=PAUSE_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter-1",
+                    "restriction_id": "rest-1",
+                    "expected_restriction_revision": 0,
+                },
                 payload={"reason": "stale retry"},
             )
             self.assertEqual(code_stale, 200)
             self.assertEqual(stale_receipt["state"], "denied")
             self.assertEqual(stale_receipt["denial_code"], "conflicting_revision")
 
-            # Verify long-poll waiter received paper.risk_suspended without private reason/actor.
+            # Verify long-poll waiter received restriction.applied without private reason/actor.
             waiter.join(timeout=4.0)
             self.assertFalse(waiter.is_alive())
             self.assertEqual(len(polled), 1)
             event_types = [ev["event_type"] for ev in polled[0]]
-            self.assertIn("paper.risk_suspended", event_types)
+            self.assertIn("governance.restriction_applied", event_types)
             for ev in polled[0]:
                 self.assertNotIn("actor_id", ev)
                 self.assertNotIn("payload", ev)
                 self.assertNotIn("private board note", json.dumps(ev))
 
             # GET /v1/commands/{id} returns redacted receipt; wrong operation returns 403 error.
-            saved = client.command_receipt("cmd-suspend-1", operation=SUSPEND_NEW_RISK)
+            saved = client.command_receipt("cmd-suspend-1", operation=PAUSE_COMPANY)
             self.assertEqual(saved["status"], "found")
             self.assertEqual(saved["state"], "applied")
             self.assertEqual(saved["effective_revision"], 1)
             self.assertNotIn("principal", saved)
             self.assertNotIn("reason", saved)
             with self.assertRaises(IpcRefused):
-                client.command_receipt("cmd-suspend-1", operation="resume_new_risk")
+                client.command_receipt("cmd-suspend-1", operation=RESUME_COMPANY)
 
             # Projection ETag updated after mutation (no longer 304 for old ETag).
             status_after, etag_after, timeline_after = client.work_timeline(
@@ -298,8 +323,11 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
                 with closing(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as raw:
                     raw.settimeout(2.0)
                     raw.connect(str(daemon.socket_path))
-                    raw.sendall(b"GET /v1/meta HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                    self.assertEqual(raw.recv(1024), b"")
+                    try:
+                        raw.sendall(b"GET /v1/meta HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        self.assertEqual(raw.recv(1024), b"")
+                    except BrokenPipeError:
+                        pass
 
             # Transfer-Encoding smuggling attempt rejected with 400.
             with closing(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as raw:
@@ -416,11 +444,12 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
             code_extra, _ = client.submit_command(
                 company_id=self.company,
                 command_id="extra-pre",
-                command_type=SUSPEND_NEW_RISK,
-                contract_version=PAPER_RISK_COMMAND,
+                command_type=PAUSE_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
                 preconditions={
                     "charter_revision": "charter-1",
-                    "expected_revision": 0,
+                    "restriction_id": "rest-extra",
+                    "expected_restriction_revision": 0,
                     "unexpected": 1,
                 },
                 payload={"reason": "extra key"},
@@ -451,3 +480,137 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
         # WriterLease must still be unheld.
         with hold_company_writer(self.store, self.company, lease_directory=self.leases):
             pass
+
+    def test_concurrent_readers_and_long_poll_survive_rapid_daemon_restart_cycles(self):
+        import threading
+        from sourdough.agent_runtime import build_default_adapter_registry
+        from sourdough.runtime import (
+            ResidentCompanyService,
+            build_production_duty_registry,
+            load_domain_plugins,
+        )
+        from sourdough.storage.db import open_reader, read_tx
+
+        plugins = load_domain_plugins()
+        adapters = build_default_adapter_registry()
+        for cycle in range(6):
+            duties = build_production_duty_registry(
+                adapter_registry=adapters,
+                profile_bindings={},
+                domain_plugins=plugins,
+            )
+            with ResidentCompanyService(
+                self.store,
+                self.company,
+                duties,
+                socket_dir=self.sock_dir,
+                lease_directory=self.leases,
+                tick_interval_seconds=0.02,
+                domain_plugins=plugins,
+            ) as service:
+                client = ControlPlaneClient(service.socket_path, timeout_seconds=3.0)
+                errors: list[str] = []
+
+                def reader_worker() -> None:
+                    for _ in range(10):
+                        try:
+                            client.meta()
+                            with closing(open_reader(self.store)) as db, read_tx(db):
+                                db.execute("SELECT COUNT(*) FROM company").fetchone()
+                        except Exception as exc:
+                            errors.append(repr(exc))
+
+                def waiter_worker() -> None:
+                    try:
+                        client.events(
+                            after_seq=9999,
+                            wait_ms=1500,
+                            expected_company_id=self.company,
+                        )
+                    except IpcRefused:
+                        pass
+
+                readers = [threading.Thread(target=reader_worker) for _ in range(3)]
+                waiter = threading.Thread(target=waiter_worker)
+                waiter.start()
+                for t in readers:
+                    t.start()
+                for t in readers:
+                    t.join(timeout=5.0)
+                    self.assertFalse(t.is_alive(), f"cycle {cycle}: reader hung")
+                # Stop service while event waiter may still be blocking -> must not hang.
+            waiter.join(timeout=5.0)
+            self.assertFalse(waiter.is_alive(), f"cycle {cycle}: waiter hung")
+            self.assertEqual(errors, [], f"cycle {cycle}: {errors}")
+
+    def test_continuous_open_reader_threads_survive_company_daemon_restart_cycles(
+        self,
+    ):
+        import threading
+        from time import sleep
+        from sourdough.storage.db import open_reader, read_tx
+
+        stop_readers = threading.Event()
+        reader_errors: list[str] = []
+
+        def continuous_reader() -> None:
+            while not stop_readers.is_set():
+                try:
+                    with closing(open_reader(self.store)) as db, read_tx(db):
+                        db.execute("SELECT COUNT(*) FROM company").fetchone()
+                except Exception as exc:
+                    reader_errors.append(repr(exc))
+                sleep(0.002)
+
+        readers = [threading.Thread(target=continuous_reader) for _ in range(3)]
+        for t in readers:
+            t.start()
+
+        try:
+            for cycle in range(12):
+                with CompanyDaemon(
+                    self.store,
+                    self.company,
+                    socket_dir=self.sock_dir,
+                    lease_directory=self.leases,
+                ) as daemon:
+                    client = ControlPlaneClient(daemon.socket_path, timeout_seconds=3.0)
+                    client_errors: list[str] = []
+
+                    def ipc_worker() -> None:
+                        for _ in range(5):
+                            try:
+                                client.meta()
+                            except Exception as exc:
+                                client_errors.append(repr(exc))
+
+                    def waiter_worker() -> None:
+                        try:
+                            client.events(
+                                after_seq=9999,
+                                wait_ms=150,
+                                expected_company_id=self.company,
+                            )
+                        except IpcRefused:
+                            pass
+
+                    ipc_threads = [
+                        threading.Thread(target=ipc_worker) for _ in range(4)
+                    ]
+                    waiter = threading.Thread(target=waiter_worker)
+                    waiter.start()
+                    for t in ipc_threads:
+                        t.start()
+                    for t in ipc_threads:
+                        t.join(timeout=5.0)
+                        self.assertFalse(t.is_alive(), f"cycle {cycle}: ipc hung")
+                    # Stop daemon while continuous_reader threads remain actively running.
+                waiter.join(timeout=5.0)
+                self.assertFalse(waiter.is_alive(), f"cycle {cycle}: waiter hung")
+                self.assertEqual(client_errors, [], f"cycle {cycle}: {client_errors}")
+        finally:
+            stop_readers.set()
+            for t in readers:
+                t.join(timeout=5.0)
+                self.assertFalse(t.is_alive(), "continuous reader hung")
+        self.assertEqual(reader_errors, [])

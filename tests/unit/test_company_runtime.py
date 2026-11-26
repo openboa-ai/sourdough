@@ -5,8 +5,8 @@ from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found
 from sourdough.duty_run import count_company_runs, has_turn_capacity
-from sourdough.paper_execution import VenueRefused
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.execution import VenueRefused
+from sourdough.trading.venue import FixedQuoteVenue
 from sourdough.runtime.engine import CompanyRuntime, build_default_registry
 from sourdough.runtime.registry import (
     DutyContext,

@@ -16,7 +16,6 @@ from sourdough.company_checkpoint import checkpoint_company
 from sourdough.company_restore import CheckpointRefused, restore_core_checkpoint
 from sourdough.employee_process import EmployeeProcessRefused
 from sourdough.first_duty import claim_first_duty
-from sourdough.first_trade import TradeRefused
 from sourdough.runtime.domains import DomainPluginRegistry, load_domain_plugins
 from sourdough.runtime.handlers import (
     DUTY_BOARD_APPLY_DECISION,
@@ -25,10 +24,12 @@ from sourdough.runtime.handlers import (
 )
 from sourdough.storage.db import open_writer, write_tx
 from sourdough.storage.schema import enable_domain_v1
+from sourdough.trading.accounts import open_company_paper_book
 from sourdough.trading.duty import (
     PAPER_EXECUTION,
     has_trading_committed_result,
 )
+from sourdough.trading.ledger import submit_company_paper_book_order
 from sourdough.work_projection import read_local_board_timeline_with_seq
 from sourdough.writer_lease import hold_company_writer
 
@@ -37,34 +38,50 @@ _SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "sourdough"
 _FORBIDDEN_TRADING_ROOTS = frozenset(
     {
         "trading",
+        "binance_emulator",
+        "binance_venue",
+        "company_run",
+        "credentials",
         "execution_tiers",
+        "external_venue",
+        "first_trade",
+        "fund_returns",
+        "hired_paper_run",
+        "market_runtime",
+        "market_worker",
+        "nautilus_paper",
+        "nautilus_paper_worker",
+        "nautilus_replay_worker",
+        "nautilus_runtime",
         "paper_account",
         "paper_books",
         "paper_decision",
         "paper_execution",
-        "paper_fees",
+        "paper_fee_bridge",
+        "paper_funding",
         "paper_order",
         "paper_reconcile",
         "paper_research",
         "paper_restore",
         "paper_resume",
+        "paper_review",
         "paper_risk",
         "paper_statement_store",
         "paper_valuation",
         "paper_venue",
         "paper_window",
-        "first_trade",
-        "hired_paper_run",
+        "replay_tape",
+        "sender_lease",
+        "spot_cash",
         "strategy_comparison",
         "trading_engine",
-        "nautilus_paper",
-        "nautilus_runtime",
-        "market_worker",
-        "binance_venue",
+        "venue_coordinator",
         "venue_qualification",
-        "company_run",
+        "window_costs",
+        "window_movement",
         "window_run",
-        "credentials",
+        "window_sampler",
+        "window_statement",
     }
 )
 
@@ -107,7 +124,7 @@ _CORE_SINGLE_MODULES = (
 
 def _core_module_paths() -> list[Path]:
     paths = [_SRC_ROOT / name for name in _CORE_SINGLE_MODULES]
-    for package_dir in ("agent_runtime", "runtime", "storage"):
+    for package_dir in ("agent_runtime", "ipc", "runtime", "storage"):
         paths.extend(sorted((_SRC_ROOT / package_dir).rglob("*.py")))
     return paths
 
@@ -132,6 +149,15 @@ class CoreDomainIsolationTests(unittest.TestCase):
     def test_core_modules_have_no_trading_imports_and_retired_files_removed(self):
         self.assertFalse((_SRC_ROOT / "company_run.py").exists())
         self.assertFalse((_SRC_ROOT / "runtime" / "venue_coordinator.py").exists())
+        self.assertFalse((_SRC_ROOT / "trading" / "company_run.py").exists())
+        self.assertFalse((_SRC_ROOT / "storage" / "schema" / "v1" / "paper").exists())
+
+        root_trading_files = [
+            path.name
+            for path in _SRC_ROOT.glob("*.py")
+            if path.stem in _FORBIDDEN_TRADING_ROOTS
+        ]
+        self.assertEqual(root_trading_files, [])
 
         violations: list[str] = []
         for path in _core_module_paths():
@@ -222,7 +248,7 @@ class CoreDomainIsolationTests(unittest.TestCase):
             )
             with closing(open_writer(store)) as conn, write_tx(conn):
                 enable_domain_v1(
-                    conn, "paper", company_id=receipt.company_id, actor_id="test"
+                    conn, "trading", company_id=receipt.company_id, actor_id="test"
                 )
             claim = claim_first_duty(
                 store,
@@ -231,16 +257,28 @@ class CoreDomainIsolationTests(unittest.TestCase):
                 scope="paper",
                 purpose=PAPER_EXECUTION,
             )
-            with closing(open_writer(store)) as conn, write_tx(conn):
-                conn.execute(
-                    "INSERT INTO paper_research_finding VALUES (?, ?, ?, ?, ?)",
-                    (claim.run_id, "find-1", "rev-1", 2, "hold position"),
-                )
-                conn.execute(
-                    "INSERT INTO paper_research_decision VALUES (?, ?, ?, ?, ?, ?)",
-                    (claim.duty_id, claim.run_id, "find-1", "dec-1", 3, "hold"),
-                )
             with hold_company_writer(store, receipt.company_id) as writer:
+                binding = open_company_paper_book(
+                    writer,
+                    binding_id="paper-main",
+                    book_name="Main Paper",
+                    account_id="acct-paper",
+                    currency="USD",
+                    starting_minor_units=10_000,
+                    exposure_limit_minor_units=5_000,
+                )
+                submit_company_paper_book_order(
+                    writer,
+                    binding_id=binding.binding_id,
+                    actor_id=claim.founder_id,
+                    action_id="act-abandoned-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=100,
+                    market_price_minor_units=100,
+                    run_id=claim.run_id,
+                )
                 # With trading predicate registered, committed domain result prevents requeue.
                 self.assertEqual(
                     requeue_uncommitted_work(
@@ -259,7 +297,7 @@ class CoreDomainIsolationTests(unittest.TestCase):
         self.assertEqual(
             EmployeeProcessRefused.__module__, "sourdough.employee_process"
         )
-        self.assertTrue(issubclass(TradeRefused, EmployeeProcessRefused))
+        self.assertFalse((_SRC_ROOT / "first_trade.py").exists())
 
     def test_load_domain_plugins_discovers_trading_plugin(self):
         plugins = load_domain_plugins()
@@ -268,6 +306,23 @@ class CoreDomainIsolationTests(unittest.TestCase):
         registry = DomainPluginRegistry(plugins)
         self.assertIsNotNone(registry.get("trading"))
         self.assertIsNone(registry.get("core"))
+
+    def test_standalone_employee_process_import_has_no_circular_import(self):
+        import subprocess
+        import sys
+
+        for stmt in (
+            "import sourdough.employee_process, sourdough.harness, sourdough.agent_runtime, sourdough.runtime",
+            "import sourdough.agent_runtime, sourdough.harness, sourdough.employee_process",
+        ):
+            with self.subTest(stmt=stmt):
+                proc = subprocess.run(
+                    [sys.executable, "-I", "-c", stmt],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":

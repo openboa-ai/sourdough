@@ -208,21 +208,23 @@ def settle_paper_review(
 def has_trading_committed_result(
     connection: sqlite3.Connection, tables: set[str], duty_id: str
 ) -> bool:
-    for table in ("paper_research_decision", "paper_decision"):
-        if table in tables:
+    if "trading_book_order" in tables:
+        if "work_runs" in tables:
             row = connection.execute(
-                f"SELECT 1 FROM {table} WHERE duty_id = ? LIMIT 1",
+                """SELECT 1 FROM trading_book_order o
+                   JOIN work_runs wr ON wr.run_id = o.run_id
+                   WHERE wr.work_item_id = ? LIMIT 1""",
                 (duty_id,),
             ).fetchone()
             if row is not None:
                 return True
-    if "paper_order" in tables:
-        row = connection.execute(
-            """SELECT 1 FROM paper_order o
-               JOIN duty_run original ON original.run_id = o.run_id
-               WHERE original.duty_id = ? LIMIT 1""",
-            (duty_id,),
-        ).fetchone()
-        if row is not None:
-            return True
+        if "duty_run" in tables:
+            row = connection.execute(
+                """SELECT 1 FROM trading_book_order o
+                   JOIN duty_run dr ON dr.run_id = o.run_id
+                   WHERE dr.duty_id = ? LIMIT 1""",
+                (duty_id,),
+            ).fetchone()
+            if row is not None:
+                return True
     return False

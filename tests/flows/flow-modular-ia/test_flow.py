@@ -20,7 +20,7 @@ from sourdough.board_control import (
     upsert_agent_profile,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import AgentSandboxTools
+from sourdough.trading.sandbox_tools import AgentSandboxTools
 from sourdough.ipc import ClientWebBridge, CompanyDaemon
 from sourdough.storage.db import open_writer, write_tx
 from sourdough.writer_lease import hold_company_writer
@@ -175,7 +175,7 @@ class ConnectedFlow(unittest.TestCase):
                 # 1. Verify /api/v1/meta exposes active_domains for modular sidebar & pending approvals count.
                 st_m, meta = _bridge_json(f"{base}/api/v1/meta", tok)
                 self.assertEqual(st_m, 200)
-                self.assertIn("paper", meta["active_domains"])
+                self.assertIn("trading", meta["active_domains"])
                 self.assertEqual(meta["pending_approvals_count"], 1)
 
                 # 2. Verify conditional sandbox gating in /projections/agents-graph & /projections/agents/{id}.

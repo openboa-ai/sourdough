@@ -26,17 +26,21 @@ from sourdough.board_control import (
     bind_board_principal,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
-    ENV_EXTERNAL_TEST,
-    compute_trading_core_digest,
+from sourdough.trading.accounts import (
     open_company_paper_book,
-    propose_paper_to_live_migration,
-    record_live_book_order_fill,
-    record_trading_book_valuation,
     record_venue_qualification_receipt,
     register_live_candidate_binding,
+)
+from sourdough.trading.domain import (
+    ENV_EXTERNAL_TEST,
+    compute_trading_core_digest,
+)
+from sourdough.trading.ledger import (
+    record_live_book_order_fill,
+    record_trading_book_valuation,
     submit_company_paper_book_order,
 )
+from sourdough.trading.migration import propose_paper_to_live_migration
 from sourdough.ipc import ClientWebBridge
 from sourdough.runtime.handlers import build_production_duty_registry
 from sourdough.runtime.resident import ResidentCompanyService

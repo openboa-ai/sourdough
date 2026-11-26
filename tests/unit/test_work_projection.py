@@ -1,6 +1,5 @@
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 import unittest
@@ -9,9 +8,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from sourdough.board_control import apply_company_restriction, clear_company_restriction
 from sourdough.company import FoundingRefused, FoundingTerms, found
-from sourdough.paper_risk import PaperSuspension, suspend_paper_risk
 from sourdough.trading import TradingDomainPlugin
+from sourdough.trading.risk import TRADING_RISK_CAUSE_CATEGORY, TradingRestrictionGuard
 from sourdough.work_projection import read_local_board_timeline
 from sourdough.writer_lease import hold_company_writer
 
@@ -48,7 +48,12 @@ class BoardTimeline(unittest.TestCase):
         self.assertEqual(self.store.read_bytes(), before)
 
     def test_risk_projection_reports_only_the_effective_receipt_without_writes(self):
+        from sourdough.storage.db import open_writer, write_tx
+        from sourdough.storage.schema import enable_domain_v1
+
         company_id = self.receipt.company_id
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            enable_domain_v1(conn, "trading", company_id=company_id, actor_id="test")
         plugins = (TradingDomainPlugin(),)
         original = read_local_board_timeline(
             self.store, company_id, domain_plugins=plugins
@@ -60,13 +65,29 @@ class BoardTimeline(unittest.TestCase):
         with hold_company_writer(
             self.store, company_id, lease_directory=self.store.parent / "leases"
         ) as writer:
-            applied = suspend_paper_risk(
+            applied = apply_company_restriction(
                 writer,
-                PaperSuspension("hold", "charter", 0, "Private review"),
-                authorize,
+                command_id="hold",
+                restriction_id="rest-hold",
+                charter_revision="charter",
+                expected_restriction_revision=0,
+                cause_category=TRADING_RISK_CAUSE_CATEGORY,
+                scope_ref="execution:all",
+                reason="Private review",
+                authorize=authorize,
+                restriction_guards=(TradingRestrictionGuard(),),
             )
-            conflict = suspend_paper_risk(
-                writer, PaperSuspension("stale", "charter", 0, "Not applied"), authorize
+            conflict = apply_company_restriction(
+                writer,
+                command_id="stale",
+                restriction_id="rest-hold",
+                charter_revision="charter",
+                expected_restriction_revision=0,
+                cause_category=TRADING_RISK_CAUSE_CATEGORY,
+                scope_ref="execution:all",
+                reason="Not applied",
+                authorize=authorize,
+                restriction_guards=(TradingRestrictionGuard(),),
             )
         self.assertEqual(conflict.disposition, "conflicting_revision")
         before = self.store.read_bytes()
@@ -80,7 +101,7 @@ class BoardTimeline(unittest.TestCase):
                 "effective_revision": applied.effective_revision,
                 "last_applied": {
                     "request_id": "hold",
-                    "operation": applied.operation,
+                    "operation": applied.command_type,
                     "recorded_at_ns": applied.recorded_at_ns,
                 },
             },
@@ -132,14 +153,24 @@ class BoardTimeline(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(json.loads(missing_cli.stdout)["status"], "not_found")
-        with closing(sqlite3.connect(self.store)) as database, database:
-            database.execute("DELETE FROM paper_risk_state")
-        self.assertEqual(
-            read_local_board_timeline(self.store, company_id, domain_plugins=plugins)[
-                "domains"
-            ]["trading"]["risk_control"],
-            {"state": "unavailable", "effective_revision": None, "last_applied": None},
-        )
+        with hold_company_writer(
+            self.store, company_id, lease_directory=self.store.parent / "leases"
+        ) as writer:
+            clear_company_restriction(
+                writer,
+                command_id="clear-hold",
+                restriction_id="rest-hold",
+                charter_revision="charter",
+                expected_restriction_revision=1,
+                reason="Resolved",
+                authorize=authorize,
+                restriction_guards=(TradingRestrictionGuard(),),
+            )
+        resumed = read_local_board_timeline(
+            self.store, company_id, domain_plugins=plugins
+        )["domains"]["trading"]["risk_control"]
+        self.assertEqual(resumed["state"], "not_suspended")
+        self.assertEqual(resumed["last_applied"]["request_id"], "clear-hold")
 
     def test_unrelated_company_and_nonowner_are_refused_without_mutation(self):
         before = self.store.read_bytes()

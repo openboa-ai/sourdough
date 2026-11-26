@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..paper_execution import PaperExecution, VenueRefused
+from .execution import PaperExecution, VenueRefused
 
 
 MIN_SEGMENT_SECONDS = 8

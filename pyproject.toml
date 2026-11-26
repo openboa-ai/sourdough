@@ -17,9 +17,9 @@ trading = "sourdough.trading.plugin:TradingDomainPlugin"
 sourdough = [
     "nautilus-macos-arm64.lock",
     "storage/schema/v1/core/*.sql",
-    "storage/schema/v1/paper/*.sql",
+    "storage/schema/v1/trading/*.sql",
 ]
 "sourdough.storage" = [
     "schema/v1/core/*.sql",
-    "schema/v1/paper/*.sql",
+    "schema/v1/trading/*.sql",
 ]

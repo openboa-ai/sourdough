@@ -293,7 +293,7 @@ class ConnectedFlow(unittest.TestCase):
                 # Verify durable autonomous results survived stop before restart.
                 with closing(open_reader(store)) as db, read_tx(db):
                     fill_count = db.execute(
-                        "SELECT COUNT(*) FROM agent_sandbox_fill"
+                        "SELECT COUNT(*) FROM trading_book_fill WHERE environment = 'agent_sandbox'"
                     ).fetchone()[0]
                     self.assertEqual(fill_count, 1)
                     gl_count = db.execute(
@@ -388,14 +388,13 @@ class ConnectedFlow(unittest.TestCase):
                         750_000,
                     )
 
-                    # Verify execution-tiers projection shows autonomous Tier 1 fill and zero live promotion.
-                    tier_status, _etag, tiers = client.projection(
-                        "execution-tiers", expected_company_id=company_id
+                    # Verify trading-desk & agent detail show autonomous Tier 1 fill and zero live promotion.
+                    tier_status, _etag, desk = client.projection(
+                        "trading-desk", expected_company_id=company_id
                     )
                     self.assertEqual(tier_status, 200)
-                    self.assertIsNone(tiers["company_live"])
-                    self.assertEqual(len(tiers["agent_sandboxes"]), 1)
-                    self.assertEqual(tiers["agent_sandboxes"][0]["fill_count"], 1)
+                    self.assertIsNone(desk["governance"]["company_live"])
+                    self.assertEqual(agent_detail["agent_sandbox"]["fill_count"], 1)
         finally:
             mock.close()
 

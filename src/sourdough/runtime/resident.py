@@ -211,6 +211,7 @@ class ResidentCompanyService:
             max_dispatches=self._max_dispatches_per_tick,
             tx_lock=lock,
             on_commit=lambda: self._daemon.notify_commit(invoke_hook=False),
+            stop_event=self._stop_event,
         )
         tick_ts = self._clock()
         with self._state_cond:

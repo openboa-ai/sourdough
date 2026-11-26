@@ -7,9 +7,7 @@ from tempfile import TemporaryDirectory
 from sourdough.abandoned_work import requeue_uncommitted_work
 from sourdough.company import FoundingTerms, found
 from sourdough.duty_run import DutyRefused
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_order import PaperIntent, submit_paper_order
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.accounts import open_company_paper_book
 from sourdough.trading.duty import (
     POSITION_REVIEW,
     claim_paper_first_duty as claim_first_duty,
@@ -19,6 +17,7 @@ from sourdough.trading.duty import (
     require_paper_authority,
     settle_paper_review as settle_review,
 )
+from sourdough.trading.ledger import submit_company_paper_book_order
 from sourdough.work import (
     ResultReference,
     ReviewDecision,
@@ -93,21 +92,34 @@ class RecoverAbandonedWork(unittest.TestCase):
             )
 
     def test_duty_with_external_effect_is_not_requeued(self):
-        venue = FixedQuoteVenue(self.root / "venue.sqlite")
-        account = venue.provision(
-            PaperAccount("paper", "local", "rules", "USD", 1000, "paper"), 100
-        )
-        bind(
-            self.store,
-            PaperMandate("mandate", self.company_id, "charter", account, 500),
-            venue,
-        )
-        opening = self.start()
-        order = submit_paper_order(
-            self.store, opening, PaperIntent("action", "rules", 1, 100), venue
-        )
+        with hold_company_writer(
+            self.store, self.company_id, lease_directory=self.root / "lease"
+        ) as writer:
+            binding = open_company_paper_book(
+                writer,
+                binding_id="paper-main",
+                book_name="Main Paper",
+                account_id="paper-acct",
+                currency="USD",
+                starting_minor_units=10_000,
+                exposure_limit_minor_units=5_000,
+            )
+            opening = self.start()
+            order = submit_company_paper_book_order(
+                writer,
+                binding_id=binding.binding_id,
+                actor_id=opening.founder_id,
+                action_id="action-1",
+                instrument_id="BTC-USDT",
+                side="buy",
+                quantity=1,
+                limit_minor_units=200,
+                market_price_minor_units=100,
+                fill_mode="immediate",
+                run_id=opening.run_id,
+            )
+        self.assertEqual(order["status"], "filled")
         self.assertEqual(self.requeue(), ())
-        self.assertIsNotNone(venue.observe_execution(order.order_id))
         with closing(sqlite3.connect(self.store)) as connection:
             self.assertEqual(
                 connection.execute("SELECT count(*) FROM duty_run").fetchone(), (1,)

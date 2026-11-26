@@ -16,11 +16,10 @@ from sourdough.accounting_close import (
 )
 from sourdough.company import FoundingTerms, found
 from sourdough.general_ledger import JournalEntry, JournalLine, post_journal
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_fee_bridge import PAPER_FILL_FEE_SOURCE
-from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.paper_window import WindowPlan, register_window
-from sourdough.window_costs import CostInventory, read_window_costs
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.fee_bridge import PAPER_FILL_FEE_SOURCE
+from sourdough.trading.window import WindowPlan, register_window
+from sourdough.trading.window_costs import CostInventory, read_window_costs
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -35,15 +34,20 @@ class WindowCostsTests(unittest.TestCase):
         self.company = found(
             self.store, FoundingTerms("company", "charter", "paper", "profile")
         ).company_id
-        venue = FixedQuoteVenue(root / "venue.sqlite")
-        account = venue.provision(
-            PaperAccount("paper", "fixture", "instrument", "USD", 1000, "paper"), 10
-        )
-        bind(
-            self.store,
-            PaperMandate("binding", self.company, "charter", account, 500),
-            venue,
-        )
+        with self.writer() as writer:
+            register_company_paper_tier(
+                writer,
+                account_id="paper",
+                destination_id="fixture-dest",
+                connector_revision="fixture",
+                instrument_rules_digest="instrument",
+                currency="USD",
+                starting_minor_units=1000,
+                exposure_limit_minor_units=500,
+                fee_bps=0,
+                slippage_bps=0,
+                binding_revision="binding",
+            )
         self.day = date(2027, 1, 15)
         self.compute = ExpectedCost("compute", "jan-15", "expense-compute", "billing")
         self.request = CloseRequest(
@@ -89,7 +93,7 @@ class WindowCostsTests(unittest.TestCase):
             hurdle_bps=10,
         )
         with (
-            patch("sourdough.paper_window.time_ns", return_value=opens - 1),
+            patch("sourdough.trading.window.time_ns", return_value=opens - 1),
             self.writer() as writer,
         ):
             return register_window(writer, plan)

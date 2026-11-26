@@ -25,19 +25,18 @@ from sourdough.board_control import (
     bind_board_principal,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
-    ENV_EXTERNAL_TEST,
-    compute_trading_core_digest,
-    open_company_paper_book,
-    propose_paper_to_live_migration,
-    record_venue_qualification_receipt,
-    register_live_candidate_binding,
-    submit_company_paper_book_order,
-)
 from sourdough.ipc import ClientWebBridge
 from sourdough.runtime.handlers import build_production_duty_registry
 from sourdough.runtime.resident import ResidentCompanyService
 from sourdough.trading import TradingDomainPlugin
+from sourdough.trading.accounts import (
+    open_company_paper_book,
+    record_venue_qualification_receipt,
+    register_live_candidate_binding,
+)
+from sourdough.trading.domain import ENV_EXTERNAL_TEST, compute_trading_core_digest
+from sourdough.trading.ledger import submit_company_paper_book_order
+from sourdough.trading.migration import propose_paper_to_live_migration
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -232,16 +231,18 @@ class ConnectedFlow(unittest.TestCase):
                 base = bridge.info.url.rstrip("/")
                 tok = bridge.info.session_token
 
-                # 2. Verify 3 concurrent Paper Books and Book #2 nominated in execution-tiers projection.
-                st_t, tiers = _bridge_json(
-                    f"{base}/api/v1/projections/execution-tiers", tok
+                # 2. Verify 3 concurrent Paper Books and Book #2 nominated via trading-desk projection.
+                st_t, desk_live = _bridge_json(
+                    f"{base}/api/v1/projections/trading-desk?environment=live", tok
                 )
                 self.assertEqual(st_t, 200)
-                self.assertIsNone(tiers["company_live"])
-                self.assertEqual(len(tiers["company_paper_books"]), 3)
-                books_before = {
-                    b["binding_id"]: b for b in tiers["company_paper_books"]
-                }
+                self.assertIsNone(desk_live["governance"]["company_live"])
+                st_p, desk_paper = _bridge_json(
+                    f"{base}/api/v1/projections/trading-desk?environment=paper", tok
+                )
+                self.assertEqual(st_p, 200)
+                self.assertEqual(len(desk_paper["books"]), 3)
+                books_before = {b["binding_id"]: b for b in desk_paper["books"]}
                 self.assertEqual(books_before[book2.binding_id]["role"], "nominated")
                 self.assertEqual(
                     books_before[book2.binding_id]["nominated_question_id"],
@@ -275,22 +276,24 @@ class ConnectedFlow(unittest.TestCase):
 
                 # 4. Wait for ResidentCompanyService to execute board.apply_decision -> migrate_paper_to_live.
                 deadline = time.monotonic() + 8.0
-                tiers_after: dict[str, Any] = {}
+                desk_after: dict[str, Any] = {}
                 while time.monotonic() < deadline:
-                    _, tiers_after = _bridge_json(
-                        f"{base}/api/v1/projections/execution-tiers", tok
+                    _, desk_after = _bridge_json(
+                        f"{base}/api/v1/projections/trading-desk?environment=live", tok
                     )
-                    if tiers_after.get("company_live") is not None:
+                    if desk_after.get("governance", {}).get("company_live") is not None:
                         break
                     time.sleep(0.05)
 
-                self.assertIsNotNone(tiers_after.get("company_live"))
+                self.assertIsNotNone(desk_after["governance"].get("company_live"))
                 self.assertEqual(
-                    tiers_after["company_live"]["binding_id"], live_cand.binding_id
+                    desk_after["governance"]["company_live"]["binding_id"],
+                    live_cand.binding_id,
                 )
-                books_after = {
-                    b["binding_id"]: b for b in tiers_after["company_paper_books"]
-                }
+                _, desk_paper_after = _bridge_json(
+                    f"{base}/api/v1/projections/trading-desk?environment=paper", tok
+                )
+                books_after = {b["binding_id"]: b for b in desk_paper_after["books"]}
                 self.assertEqual(books_after[book2.binding_id]["role"], "shadow")
                 self.assertEqual(
                     books_after[book2.binding_id]["shadow_of_live_binding_id"],
@@ -298,9 +301,12 @@ class ConnectedFlow(unittest.TestCase):
                 )
                 self.assertEqual(books_after[book1.binding_id]["role"], "active")
                 self.assertEqual(books_after[book3.binding_id]["role"], "active")
-                self.assertEqual(len(tiers_after["migration_history"]), 1)
+                self.assertEqual(len(desk_after["governance"]["migration_history"]), 1)
                 self.assertEqual(
-                    tiers_after["migration_history"][0]["positions_copied"], 0
+                    desk_after["governance"]["migration_history"][0][
+                        "positions_copied"
+                    ],
+                    0,
                 )
 
                 # Confirm decision question application status is applied & delivered.

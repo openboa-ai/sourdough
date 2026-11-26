@@ -18,14 +18,7 @@ from ..agent_runtime.protocol import (
     ToolSpec,
     hydrate_shift_context,
 )
-from ..execution_tiers import (
-    AgentSandboxTools,
-    ExecutionTierRefused,
-    execute_paper_to_live_migration,
-    open_agent_sandbox,
-    read_execution_tiers_snapshot,
-)
-from ..paper_risk import PaperRiskRefused, effective_paper_risk
+from ..ipc.protocol import IpcRefused
 from ..runtime.domains import (
     BaseDomainPlugin,
     CommandDescriptor,
@@ -35,6 +28,8 @@ from ..runtime.domains import (
     DecisionActionHandler,
     DomainActionRefused,
     DutyRuntimeServices,
+    ProjectionDescriptor,
+    RestrictionGuard,
     ToolContribution,
     ToolQueryContext,
     WorkDomainPolicy,
@@ -44,15 +39,40 @@ from ..runtime.registry import DutyContext, DutyDescriptor, DutyOutcome
 from ..runtime.work_kernel import WorkItem
 from ..storage.db import open_reader, read_tx
 from ..storage.schema import is_domain_installed
+from .accounts import open_agent_sandbox
 from .commands import (
     ACTIVATE_STRATEGY_RELEASE,
+    DEMOTE_LIVE_ENVIRONMENT,
+    DEMOTE_PRECONDITION_KEYS,
+    EXECUTION_TIER_COMMAND,
+    PROMOTE_EXECUTION_ENVIRONMENT,
+    PROMOTE_PRECONDITION_KEYS,
     ROLLBACK_STRATEGY_DEPLOYMENT,
     STRATEGY_COMMAND,
+    execute_execution_tier_command,
     execute_strategy_command,
 )
+from .domain import ENV_LIVE, ENV_PAPER, ExecutionTierRefused
 from .duty import TRADING_WORK_POLICY, has_trading_committed_result
+from .migration import execute_paper_to_live_migration, read_execution_tiers_snapshot
+from .projections import (
+    PROJECTION_ORDER_TRACE,
+    PROJECTION_STRATEGIES,
+    PROJECTION_TRADING_DESK,
+    enrich_trading_core_projection,
+    read_order_trace_projection,
+    read_strategies_projection,
+    read_trading_desk_projection,
+)
+from .risk import (
+    TRADING_RISK_CAUSE_CATEGORY,
+    TradingRestrictionGuard,
+    active_trading_risk_restrictions,
+)
+from .sandbox_tools import AgentSandboxTools
 
 DUTY_QUANT_AGENT_SANDBOX = "quant.agent_sandbox"
+DUTY_TRADING_AGENT_SANDBOX = "trading.agent_sandbox"
 DUTY_QUANT_PAPER_DECISION = "quant.paper_decision"
 DUTY_QUANT_RECONCILE = "quant.reconcile"
 
@@ -150,53 +170,57 @@ def _rows(connection: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
 def _trading_risk_control(
     connection: sqlite3.Connection, company_id: str, has_trading: bool
 ) -> dict[str, Any] | None:
-    has_risk_receipt = (
-        connection.execute(
-            """SELECT 1 FROM command_receipt
-               WHERE company_id = ?
-                 AND command_type IN ('suspend_new_risk', 'resume_new_risk')
-                 AND (? = 1 OR state = 'applied')
-               LIMIT 1""",
-            (company_id, int(has_trading)),
-        ).fetchone()
-        is not None
-    )
-    if not has_trading and not has_risk_receipt:
+    last_receipt = connection.execute(
+        """SELECT command_id, command_type, COALESCE(finalized_at_ns, created_at_ns)
+           FROM command_receipt
+           WHERE company_id = ?
+             AND command_type IN ('pause_company', 'resume_company', 'suspend_new_risk', 'resume_new_risk')
+             AND state = 'applied'
+           ORDER BY COALESCE(finalized_at_ns, created_at_ns) DESC, rowid DESC
+           LIMIT 1""",
+        (company_id,),
+    ).fetchone()
+    if not has_trading and last_receipt is None:
         return None
-    has_paper_binding = (
-        has_trading
-        and connection.execute("SELECT 1 FROM paper_binding LIMIT 1").fetchone()
-        is not None
-    )
-    has_risk_state = (
+
+    has_binding = (
         has_trading
         and connection.execute(
-            "SELECT 1 FROM paper_risk_state WHERE company_id = ? LIMIT 1",
+            "SELECT 1 FROM execution_environment_binding WHERE company_id = ? LIMIT 1",
             (company_id,),
         ).fetchone()
         is not None
     )
-    if not (has_paper_binding or has_risk_state or has_risk_receipt):
+    risk_rows = connection.execute(
+        """SELECT restriction_id, scope_ref, restriction_revision, active, recorded_at_ns, last_command_id
+           FROM restriction_cause
+           WHERE company_id = ?
+             AND (scope_ref LIKE 'execution:%' OR cause_category = ? OR scope_ref = 'company:all')
+           ORDER BY restriction_revision DESC, recorded_at_ns DESC""",
+        (company_id, TRADING_RISK_CAUSE_CATEGORY),
+    ).fetchall()
+    if not (has_binding or risk_rows or last_receipt is not None):
         return None
-    try:
-        current = effective_paper_risk(connection)
-    except PaperRiskRefused:
-        return {
-            "state": "unavailable",
-            "effective_revision": None,
-            "last_applied": None,
-        }
-    applied = current.applied
+
+    active_paper = active_trading_risk_restrictions(connection, company_id, ENV_PAPER)
+    active_live = active_trading_risk_restrictions(connection, company_id, ENV_LIVE)
+    active_exec = active_paper + [
+        r for r in active_live if r["scope_ref"] == "execution:live"
+    ]
+    max_rev = max(
+        (int(r[2]) for r in risk_rows),
+        default=0,
+    )
     return {
-        "state": "suspended" if current.suspended else "not_suspended",
-        "effective_revision": current.revision,
+        "state": "suspended" if active_exec else "not_suspended",
+        "effective_revision": max_rev,
         "last_applied": (
             {
-                "request_id": applied.request_id,
-                "operation": applied.operation,
-                "recorded_at_ns": applied.recorded_at_ns,
+                "request_id": str(last_receipt[0]),
+                "operation": str(last_receipt[1]),
+                "recorded_at_ns": int(last_receipt[2]),
             }
-            if applied is not None
+            if last_receipt is not None
             else None
         ),
     }
@@ -208,29 +232,19 @@ def _trading_decisions(
     if not has_trading:
         return {}
     decisions: dict[str, dict[str, Any]] = {}
-    rows = _rows(
-        connection,
-        """
-        SELECT d.duty_id,d.decision_id,d.finding_id,d.decided_at,
-               f.revision AS finding_revision, d.content, s.inputs
-        FROM paper_research_decision d
-        JOIN paper_research_finding f ON f.finding_id=d.finding_id
-        JOIN paper_research_snapshot s ON s.run_id=d.run_id
-    """,
-    )
-    for row in rows:
-        row["known_at"] = json.loads(row.pop("inputs"))["cut_at"]
-        proposal = json.loads(row.pop("content"))
-        row.update(action=proposal["action"], rationale=proposal["rationale"])
-        decisions[row["duty_id"]] = row
     for row in _rows(
         connection,
         """
-        SELECT duty_id,decision_id,result_revision,action,rationale,decided_at
-        FROM paper_decision
+        SELECT dr.duty_id, o.decision_id, o.mandate_revision AS result_revision,
+               o.side AS action, o.instrument_id || ' ' || o.status AS rationale,
+               o.created_at_ns AS decided_at
+        FROM trading_book_order o
+        JOIN duty_run dr ON dr.run_id = o.run_id
+        WHERE o.decision_id IS NOT NULL
+        ORDER BY o.created_at_ns ASC
     """,
     ):
-        decisions[row["duty_id"]] = row
+        decisions[str(row["duty_id"])] = row
     return decisions
 
 
@@ -242,19 +256,21 @@ def _paper_timeline_projection(
     trades = _rows(
         connection,
         """
-        SELECT o.order_id,o.run_id,o.action_id,o.account_id,o.instrument_rules_digest,
-               o.quantity AS ordered_quantity,o.reserved_minor_units,o.limit_minor_units,
-               (SELECT latest.fill_id FROM paper_fill latest WHERE order_id=o.order_id
-                ORDER BY latest.rowid DESC LIMIT 1) AS fill_id,
-               SUM(p.quantity) AS quantity,
-               CASE WHEN COUNT(p.fill_id)=1 THEN MAX(p.price_minor_units) END AS price_minor_units,
-               SUM(f.fee_minor_units) AS fee_minor_units,
-               CASE WHEN c.released=1 THEN c.outcome END AS terminal
-        FROM paper_order o
-        LEFT JOIN paper_fill p ON o.order_id=p.order_id
-        LEFT JOIN paper_fill_fee f ON f.fill_id=p.fill_id
-        LEFT JOIN paper_cancellation c ON c.order_id=o.order_id
-        GROUP BY o.order_id ORDER BY o.rowid
+        SELECT o.order_id, o.run_id, o.action_id, b.account_id,
+               b.instrument_rules_digest, o.quantity AS ordered_quantity,
+               o.quantity * o.limit_minor_units AS reserved_minor_units,
+               o.limit_minor_units,
+               (SELECT latest.fill_id FROM trading_book_fill latest
+                WHERE latest.order_id = o.order_id
+                ORDER BY latest.filled_at_ns DESC, latest.fill_id DESC LIMIT 1) AS fill_id,
+               o.filled_quantity AS quantity,
+               o.fill_price_minor_units AS price_minor_units,
+               o.fee_minor_units,
+               o.status AS order_status
+        FROM trading_book_order o
+        JOIN execution_environment_binding b ON b.binding_id = o.binding_id
+        WHERE o.environment IN ('paper', 'live')
+        ORDER BY o.created_at_ns ASC, o.order_id ASC
     """,
     )
     if not trades:
@@ -264,8 +280,11 @@ def _paper_timeline_projection(
             order["quantity"] or 0
         )
         limit = order.pop("limit_minor_units")
-        order["status"] = order.pop("terminal") or (
-            "filled" if order["remaining_quantity"] == 0 else "unresolved"
+        raw_status = order.pop("order_status")
+        order["status"] = (
+            "unresolved"
+            if raw_status == "open"
+            else ("filled" if raw_status == "filled" else str(raw_status))
         )
         order["open_reservation_minor_units"] = (
             order["remaining_quantity"] * limit
@@ -287,7 +306,7 @@ def _require_impact_str(impact: Mapping[str, Any], key: str) -> str:
     value = impact[key]
     if not isinstance(value, str) or not value.strip():
         raise DomainActionRefused(f"Invalid {key}")
-    return value
+    return value.strip()
 
 
 def _optional_impact_str(impact: Mapping[str, Any], key: str, default: str) -> str:
@@ -580,7 +599,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
             return DutyOutcome(
                 disposition="completed",
                 result={
-                    "paper_domain_installed": snapshot["paper_domain_installed"],
+                    "trading_domain_installed": snapshot["trading_domain_installed"],
                     "company_paper_active": snapshot["company_paper"] is not None,
                     "company_live_active": snapshot["company_live"] is not None,
                     "active_agent_sandboxes": len(snapshot["agent_sandboxes"]),
@@ -591,6 +610,10 @@ class TradingDomainPlugin(BaseDomainPlugin):
         return (
             DutyDescriptor(
                 duty_kind=DUTY_QUANT_AGENT_SANDBOX,
+                execute=_run_quant_agent_sandbox,
+            ),
+            DutyDescriptor(
+                duty_kind=DUTY_TRADING_AGENT_SANDBOX,
                 execute=_run_quant_agent_sandbox,
             ),
             DutyDescriptor(
@@ -612,6 +635,26 @@ class TradingDomainPlugin(BaseDomainPlugin):
 
     def committed_result_predicate(self) -> CommittedResultPredicate:
         return has_trading_committed_result
+
+    def restriction_guard(self) -> RestrictionGuard:
+        return TradingRestrictionGuard()
+
+    def enrich_core_projection(
+        self,
+        projection_name: str,
+        db: sqlite3.Connection,
+        company_id: str,
+        payload: dict[str, Any],
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        enrich_trading_core_projection(
+            projection_name,
+            db,
+            company_id,
+            payload,
+            context=dict(context) if context is not None else None,
+        )
 
     def contribute_work_timeline(
         self, connection: sqlite3.Connection, company_id: str
@@ -640,16 +683,121 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 peer_pid=ctx.peer_pid,
             )
 
+        def _exec_tier(ctx: CommandDispatchContext):
+            return execute_execution_tier_command(
+                ctx.writer,
+                command_id=ctx.command_id,
+                command_type=ctx.command_type,
+                preconditions=dict(ctx.preconditions),
+                payload=dict(ctx.payload),
+                authorize=ctx.authorize_board,
+                principal_hint=ctx.principal_hint,
+                peer_pid=ctx.peer_pid,
+            )
+
         return (
             CommandDescriptor(
                 command_type=ACTIVATE_STRATEGY_RELEASE,
                 contract_version=STRATEGY_COMMAND,
                 execute=_exec_strategy,
+                requires_domain="trading",
             ),
             CommandDescriptor(
                 command_type=ROLLBACK_STRATEGY_DEPLOYMENT,
                 contract_version=STRATEGY_COMMAND,
                 execute=_exec_strategy,
+                requires_domain="trading",
+            ),
+            CommandDescriptor(
+                command_type=PROMOTE_EXECUTION_ENVIRONMENT,
+                contract_version=EXECUTION_TIER_COMMAND,
+                execute=_exec_tier,
+                precondition_keys=PROMOTE_PRECONDITION_KEYS,
+                requires_domain="trading",
+            ),
+            CommandDescriptor(
+                command_type=DEMOTE_LIVE_ENVIRONMENT,
+                contract_version=EXECUTION_TIER_COMMAND,
+                execute=_exec_tier,
+                precondition_keys=DEMOTE_PRECONDITION_KEYS,
+                requires_domain="trading",
+            ),
+        )
+
+    def contribute_projections(self) -> tuple[ProjectionDescriptor, ...]:
+        def _valid_segment(raw: str) -> str | None:
+            seg = raw.strip()
+            if not seg or "/" in seg or ".." in seg or len(seg) > 128:
+                return None
+            return seg
+
+        def _read_desk(
+            store: Path,
+            company_id: str,
+            _suffix: str,
+            query: Mapping[str, list[str]],
+            _authorize: Any,
+            _principal: str | None,
+        ) -> tuple[dict[str, Any] | None, int]:
+            env_raw = (query.get("environment", ["live"])[0] or "live").strip().lower()
+            if env_raw not in ("live", "paper"):
+                raise IpcRefused(
+                    "Invalid environment parameter (expected 'live' or 'paper')"
+                )
+            book_raw = query.get("book_id", [None])[0]
+            book_id: str | None = None
+            if book_raw is not None and book_raw.strip():
+                book_id = _valid_segment(book_raw)
+                if book_id is None:
+                    raise IpcRefused("Invalid book_id parameter")
+            return read_trading_desk_projection(
+                store,
+                company_id,
+                environment=env_raw,
+                book_id=book_id,
+            )
+
+        def _read_order(
+            store: Path,
+            company_id: str,
+            suffix: str,
+            _query: Mapping[str, list[str]],
+            _authorize: Any,
+            _principal: str | None,
+        ) -> tuple[dict[str, Any] | None, int]:
+            order_id = _valid_segment(suffix[len("orders/") :])
+            if order_id is None:
+                raise IpcRefused("Invalid order identifier")
+            return read_order_trace_projection(store, company_id, order_id)
+
+        def _read_strategies(
+            store: Path,
+            company_id: str,
+            _suffix: str,
+            _query: Mapping[str, list[str]],
+            _authorize: Any,
+            _principal: str | None,
+        ) -> tuple[dict[str, Any] | None, int]:
+            return read_strategies_projection(store, company_id)
+
+        return (
+            ProjectionDescriptor(
+                name=PROJECTION_TRADING_DESK,
+                route_prefix="trading-desk",
+                read=_read_desk,
+                requires_domain="trading",
+            ),
+            ProjectionDescriptor(
+                name=PROJECTION_ORDER_TRACE,
+                route_prefix="orders/",
+                read=_read_order,
+                requires_domain="trading",
+            ),
+            ProjectionDescriptor(
+                name=PROJECTION_STRATEGIES,
+                route_prefix="strategies",
+                read=_read_strategies,
+                requires_domain="trading",
             ),
         )
 

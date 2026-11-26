@@ -46,6 +46,7 @@ from sourdough.runtime import (
 from sourdough.runtime.registry import RuntimeRefused
 from sourdough.runtime.work_kernel import WorkKernelRefused
 from sourdough.staffing import StaffingAuthority, StaffingNeed, stage_staffing
+from sourdough.storage import migrate_v1_store_to_canonical
 from sourdough.storage.db import StorageRefused
 from sourdough.supervisor import SupervisionRefused, announce_ready, supervise_worker
 from sourdough.work_projection import WORK_TIMELINE_REVISION, read_local_board_timeline
@@ -124,6 +125,11 @@ def main() -> int:
     )
     opening.add_argument("store", type=Path)
     opening.add_argument("--company-id", required=True)
+    migrate_cmd = commands.add_parser(
+        "migrate-store",
+        help="Atomically upgrade a pre-cleanup v1 company store to canonical v1 schema",
+    )
+    migrate_cmd.add_argument("store", type=Path)
     checkpoint = commands.add_parser("checkpoint-company")
     checkpoint.add_argument("store", type=Path)
     checkpoint.add_argument("archive", type=Path)
@@ -270,6 +276,10 @@ def main() -> int:
             )
         elif args.command == "reopen":
             result = reopen(args.store, args.company_id)
+        elif args.command == "migrate-store":
+            domains = migrate_v1_store_to_canonical(args.store)
+            print(json.dumps({"store": str(args.store), "domains": sorted(domains)}))
+            return 0
         elif args.command == "checkpoint-company":
             result = checkpoint_company(args.store, args.company_id, args.archive)
         elif args.command == "inspect-company-checkpoint":

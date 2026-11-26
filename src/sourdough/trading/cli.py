@@ -10,41 +10,25 @@ from pathlib import Path
 from time import time_ns
 
 from ..duty_run import DutyRefused, count_company_runs
-from ..employee_process import EmployeeProcess
-from ..first_trade import TradeRefused, run_first_trade
-from ..fund_returns import ReturnRefused
-from ..hired_paper_run import run_hired_paper_company
-from ..market_runtime import observe_market
-from ..market_worker import MarketRefused
-from ..nautilus_runtime import bind_paper as bind_nautilus_paper
-from ..nautilus_runtime import (
-    paper_venue,
-    prepare_paper,
-    supervise_paper,
-    switch_paper,
-)
-from ..paper_account import BindingRefused, PaperAccount, PaperMandate, bind
-from ..paper_books import PostingRefused
-from ..paper_execution import VenueRefused
-from ..paper_order import OrderRefused
-from ..paper_research import stage_research_inputs
-from ..paper_risk import PaperRiskRefused
-from ..paper_statement_store import (
+from ..runtime.domains import DomainCliRefused
+from ..supervisor import SupervisionRefused, supervise_worker
+from ..writer_lease import hold_company_writer
+from .engine import EngineRefused, prepare_engine
+from .execution import BindingRefused, VenueRefused
+from .fund_returns import ReturnRefused
+from .market_runtime import observe_market
+from .market_worker import MarketRefused
+from .nautilus_runtime import prepare_paper, supervise_paper
+from .statement_store import (
     StatementRequest,
     read_retained_statement,
     retain_paper_statement,
 )
-from ..paper_valuation import ValuationRefused
-from ..paper_venue import FixedQuoteVenue
-from ..paper_window import WindowPlan, WindowRefused
-from ..paper_window_statement import read_paper_statement
-from ..runtime.domains import DomainCliRefused
-from ..supervisor import SupervisionRefused, announce_ready, supervise_worker
-from ..trading_engine import EngineRefused, prepare_engine
-from ..window_run import run_window
-from ..window_sampler import WindowSampler, register_managed_window
-from ..writer_lease import hold_company_writer
-from .company_run import run_paper_company
+from .valuation import ValuationRefused
+from .window import WindowPlan, WindowRefused
+from .window_run import run_window
+from .window_sampler import WindowSampler, register_managed_window
+from .window_statement import read_paper_statement
 
 TRADING_CLI_COMMANDS = frozenset(
     {
@@ -55,47 +39,13 @@ TRADING_CLI_COMMANDS = frozenset(
         "prepare-trading-engine",
         "observe-trading-market",
         "prepare-nautilus-paper",
-        "bind-nautilus-paper",
-        "switch-nautilus-paper",
         "serve-nautilus-paper",
-        "operate-nautilus-paper",
-        "bind-paper",
-        "stage-paper-observations",
-        "supervise-hired-paper",
-        "_hired-paper-worker",
-        "first-duty",
-        "operate-paper",
-        "supervise-paper",
-        "_paper-worker",
     }
 )
 
 
-def _store_key(value: str) -> tuple[int, int]:
-    try:
-        device, inode = (int(part) for part in value.split(":"))
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("Expected device:inode") from error
-    if device < 0 or inode <= 0:
-        raise argparse.ArgumentTypeError("Invalid device:inode")
-    return device, inode
-
-
-def _agent_receipt(fields):
-    receipt = dict(fields)
-    if "founder_id" in receipt and "run_id" in receipt:
-        receipt["agent_id"] = receipt.pop("founder_id")
-    return receipt
-
-
 def _emit_event(event: dict) -> None:
     print(json.dumps(event), file=sys.stderr, flush=True)
-
-
-def _paper_destination(args):
-    if getattr(args, "managed_engine", False):
-        return paper_venue(args.store, args.journal)
-    return FixedQuoteVenue(args.journal)
 
 
 def _paper_sampler(args, directory: Path, *, managed: bool) -> WindowSampler | None:
@@ -112,18 +62,13 @@ def _paper_sampler(args, directory: Path, *, managed: bool) -> WindowSampler | N
 
 
 def _start_supervisor(args, *, emit=_emit_event):
-    worker_name = {
-        "supervise-hired-paper": "_hired-paper-worker",
-        "supervise-paper": "_paper-worker",
-    }[args.command]
     command = [
         sys.executable,
         "-I",
         "-m",
         "sourdough.cli",
-        worker_name,
+        "_assessment-worker",
         str(args.store),
-        str(args.journal),
         "--company-id",
         args.company_id,
         "--employee",
@@ -135,26 +80,6 @@ def _start_supervisor(args, *, emit=_emit_event):
         "--budget-from",
         str(count_company_runs(args.store, args.company_id)),
     ]
-    if getattr(args, "repeat_paper", False):
-        command.append("--repeat-paper")
-    if getattr(args, "managed_engine", False):
-        command.append("--managed-engine")
-    if args.command == "supervise-paper":
-        sampler = _paper_sampler(args, args.journal, managed=args.managed_engine)
-        if sampler is not None:
-            command.extend(("--observe-window", sampler.window_id))
-            if sampler.observe_through_ns is not None:
-                remaining = sampler.observe_through_ns - time_ns()
-                if not 0 < remaining < (args.max_seconds - 1) * 10**9:
-                    raise WindowRefused(
-                        "Observation cutoff does not fit the supervisor deadline"
-                    )
-                command.extend(
-                    ("--observe-through-ns", str(sampler.observe_through_ns))
-                )
-        work_cutoff = getattr(args, "start_work_before_ns", None)
-        if work_cutoff is not None:
-            command.extend(("--start-work-before-ns", str(work_cutoff)))
     return supervise_worker(
         command,
         args.store,
@@ -197,14 +122,6 @@ def _run_paper_window(args):
         company,
         segment_seconds=args.segment_seconds,
         emit=_emit_event,
-    )
-
-
-def _managed_destination_flag(command) -> None:
-    command.add_argument(
-        "--managed-engine",
-        action="store_true",
-        help="Use the original managed engine directory instead of a fixture journal",
     )
 
 
@@ -251,13 +168,7 @@ def register_trading_subcommands(
     market.add_argument("--symbol", required=True)
     market.add_argument("--max-age-seconds", type=int, default=15)
     market.add_argument("--samples", type=int, default=3)
-    for command in (
-        "prepare-nautilus-paper",
-        "bind-nautilus-paper",
-        "switch-nautilus-paper",
-        "serve-nautilus-paper",
-        "operate-nautilus-paper",
-    ):
+    for command in ("prepare-nautilus-paper", "serve-nautilus-paper"):
         sandbox = commands.add_parser(command)
         sandbox.add_argument("store", type=Path)
         sandbox.add_argument("directory", type=Path)
@@ -266,76 +177,9 @@ def register_trading_subcommands(
             sandbox.add_argument("--account-id", required=True)
             sandbox.add_argument("--starting-atoms", required=True, type=int)
             sandbox.add_argument("--replay-tape", type=Path)
-        elif command in ("bind-nautilus-paper", "switch-nautilus-paper"):
-            sandbox.add_argument("--revision", required=True)
-            sandbox.add_argument("--charter-revision", required=True)
-            sandbox.add_argument("--exposure-atoms", required=True, type=int)
-            sandbox.add_argument("--replay", action="store_true")
-            if command == "switch-nautilus-paper":
-                sandbox.add_argument("--previous-directory", type=Path, required=True)
-                sandbox.add_argument("--previous-revision", required=True)
-                sandbox.add_argument("--from-replay", action="store_true")
-        elif command == "serve-nautilus-paper":
+        else:
             sandbox.add_argument("--seconds", type=int, default=60)
             sandbox.add_argument("--replay-tape", type=Path)
-        else:
-            sandbox.add_argument("--employee", type=Path, required=True)
-            sandbox.add_argument("--turn-budget", type=int, default=1)
-            sandbox.add_argument("--idle-seconds", type=int, default=0)
-            sandbox.add_argument("--replay", action="store_true")
-            sandbox.add_argument("--observe-window")
-    paper = commands.add_parser("bind-paper")
-    paper.add_argument("store", type=Path)
-    paper.add_argument("journal", type=Path)
-    for name in ("company-id", "charter-revision", "revision", "account-id", "rules"):
-        paper.add_argument(f"--{name}", required=True)
-    for name in ("starting-minor-units", "exposure-minor-units", "quote-minor-units"):
-        paper.add_argument(f"--{name}", required=True, type=int)
-    paper.add_argument("--fee-bps", type=int, default=0)
-    inputs = commands.add_parser("stage-paper-observations")
-    inputs.add_argument("store", type=Path)
-    inputs.add_argument("observations", type=Path)
-    inputs.add_argument("--company-id", required=True)
-    for command in ("supervise-hired-paper", "_hired-paper-worker"):
-        managed = commands.add_parser(command)
-        managed.add_argument("store", type=Path)
-        managed.add_argument("journal", type=Path)
-        _managed_destination_flag(managed)
-        managed.add_argument("--company-id", required=True)
-        managed.add_argument("--employee", type=Path, required=True)
-        managed.add_argument("--turn-budget", type=int, default=3)
-        managed.add_argument("--idle-seconds", type=int, default=140)
-        if command.startswith("supervise-"):
-            managed.add_argument("--max-restarts", type=int, default=1)
-            managed.add_argument("--startup-seconds", type=int, default=35)
-            managed.add_argument("--max-seconds", type=int, default=360)
-        else:
-            managed.add_argument("--ready-fd", type=int, required=True)
-            managed.add_argument("--store-key", type=_store_key, required=True)
-            managed.add_argument("--budget-from", type=int, required=True)
-    for command in ("first-duty", "operate-paper", "supervise-paper", "_paper-worker"):
-        running = commands.add_parser(command)
-        running.add_argument("store", type=Path)
-        running.add_argument("journal", type=Path)
-        running.add_argument("--company-id", required=True)
-        running.add_argument("--employee", type=Path, required=True)
-        if command != "first-duty":
-            _managed_destination_flag(running)
-            running.add_argument("--repeat-paper", action="store_true")
-            running.add_argument("--turn-budget", type=int, default=2)
-            running.add_argument("--idle-seconds", type=int, default=0)
-            running.add_argument("--observe-window")
-        if command == "supervise-paper":
-            running.add_argument("--observe-through-ns", type=int)
-            running.add_argument("--max-restarts", type=int, default=2)
-            running.add_argument("--startup-seconds", type=int, default=60)
-            running.add_argument("--max-seconds", type=int, default=180)
-        if command == "_paper-worker":
-            running.add_argument("--observe-through-ns", type=int)
-            running.add_argument("--start-work-before-ns", type=int)
-            running.add_argument("--ready-fd", type=int, required=True)
-            running.add_argument("--store-key", type=_store_key, required=True)
-            running.add_argument("--budget-from", type=int, required=True)
 
 
 def handle_trading_cli_command(args: argparse.Namespace) -> int | None:
@@ -348,12 +192,8 @@ def handle_trading_cli_command(args: argparse.Namespace) -> int | None:
         DutyRefused,
         EngineRefused,
         MarketRefused,
-        OrderRefused,
-        PaperRiskRefused,
-        PostingRefused,
         ReturnRefused,
         SupervisionRefused,
-        TradeRefused,
         ValuationRefused,
         VenueRefused,
         WindowRefused,
@@ -427,29 +267,6 @@ def _dispatch_trading_command(args: argparse.Namespace) -> int:
             )
         print(json.dumps({"destination_id": identity}))
         return 0
-    elif args.command == "bind-nautilus-paper":
-        with hold_company_writer(args.store, args.company_id) as writer:
-            result = bind_nautilus_paper(
-                writer,
-                args.directory,
-                revision=args.revision,
-                charter_revision=args.charter_revision,
-                exposure_atoms=args.exposure_atoms,
-                replay=args.replay,
-            )
-    elif args.command == "switch-nautilus-paper":
-        with hold_company_writer(args.store, args.company_id) as writer:
-            result = switch_paper(
-                writer,
-                args.previous_directory,
-                args.directory,
-                previous_revision=args.previous_revision,
-                revision=args.revision,
-                charter_revision=args.charter_revision,
-                exposure_atoms=args.exposure_atoms,
-                from_replay=args.from_replay,
-                replay=args.replay,
-            )
     elif args.command == "serve-nautilus-paper":
         result = supervise_paper(
             args.store,
@@ -461,104 +278,7 @@ def _dispatch_trading_command(args: argparse.Namespace) -> int:
         )
         print(json.dumps(asdict(result)))
         return 0 if result.completed else 1
-    elif args.command == "operate-nautilus-paper":
-        sampler = _paper_sampler(args, args.directory, managed=not args.replay)
-        result = run_paper_company(
-            args.store,
-            args.company_id,
-            paper_venue(args.store, args.directory, replay=args.replay),
-            EmployeeProcess(args.employee),
-            turn_budget=args.turn_budget,
-            idle_seconds=args.idle_seconds,
-            sampler=sampler,
-        )
-    elif args.command == "bind-paper":
-        venue = FixedQuoteVenue(args.journal)
-        venue.require_independent_from(args.store)
-        account = PaperAccount(
-            args.account_id,
-            "fixed-quote-v1",
-            args.rules,
-            "USD",
-            args.starting_minor_units,
-            "paper",
-        )
-        with hold_company_writer(args.store, args.company_id) as writer:
-            writer.verify()
-            account = venue.provision(
-                account, args.quote_minor_units, fee_bps=args.fee_bps
-            )
-            writer.verify()
-            result = bind(
-                args.store,
-                PaperMandate(
-                    args.revision,
-                    args.company_id,
-                    args.charter_revision,
-                    account,
-                    args.exposure_minor_units,
-                ),
-                venue,
-            )
-    elif args.command == "stage-paper-observations":
-        with hold_company_writer(args.store, args.company_id) as writer:
-            writer.verify()
-            with args.observations.open("rb") as source:
-                content = source.read(64_001)
-            if len(content) > 64_000:
-                raise DutyRefused("Research observation input exceeds its size limit")
-            try:
-                observations = json.loads(content)
-            except (UnicodeError, ValueError) as error:
-                raise DutyRefused("Invalid research observation input") from error
-            result = stage_research_inputs(args.store, args.company_id, observations)
-        print(json.dumps(result))
-        return 0
-    elif args.command in ("supervise-paper", "supervise-hired-paper"):
-        result = _start_supervisor(args)
-        print(json.dumps(asdict(result)))
-        return 0 if result.completed else 1
-    elif args.command == "_hired-paper-worker":
-        result = run_hired_paper_company(
-            args.store,
-            args.company_id,
-            _paper_destination(args),
-            lambda: EmployeeProcess(args.employee),
-            turn_budget=args.turn_budget,
-            idle_seconds=args.idle_seconds,
-            budget_from=args.budget_from,
-            store_key=args.store_key,
-            on_ready=lambda lease: announce_ready(args.ready_fd, lease),
-        )
     else:
-        inputs = (
-            args.store,
-            args.company_id,
-            _paper_destination(args),
-            EmployeeProcess(args.employee),
-        )
-        if args.command == "first-duty":
-            result = run_first_trade(*inputs)
-        elif args.command == "_paper-worker":
-            result = run_paper_company(
-                *inputs,
-                repeat_paper=args.repeat_paper,
-                turn_budget=args.turn_budget,
-                idle_seconds=args.idle_seconds,
-                expected_store_key=args.store_key,
-                budget_from=args.budget_from,
-                on_ready=lambda lease: announce_ready(args.ready_fd, lease),
-                sampler=_paper_sampler(args, args.journal, managed=args.managed_engine),
-                start_work_before_ns=args.start_work_before_ns,
-            )
-        else:
-            result = run_paper_company(
-                *inputs,
-                repeat_paper=args.repeat_paper,
-                turn_budget=args.turn_budget,
-                idle_seconds=args.idle_seconds,
-                sampler=_paper_sampler(args, args.journal, managed=args.managed_engine),
-            )
-    fields = _agent_receipt if args.command == "_hired-paper-worker" else dict
-    print(json.dumps(asdict(result, dict_factory=fields)))
+        raise DomainCliRefused(f"Unsupported trading CLI command: {args.command}")
+    print(json.dumps(asdict(result)))
     return 0

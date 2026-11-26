@@ -3,8 +3,8 @@
 Every projection executes inside a single SQLite read_tx snapshot and returns
 (payload, event_seq) so ETag and X-Sourdough-Event-Seq never tear. Private Desk
 drafts are never opened or disclosed (opaque count only), missing accounting or
-valuation telemetry is never coerced to zero, and paper_* tables are queried
-only when the opt-in paper domain is installed.
+valuation telemetry is never coerced to zero, and Core projections remain
+domain-neutral unless an installed DomainPlugin enriches them.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import stat
+from collections.abc import Sequence
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
@@ -22,51 +23,43 @@ from typing import Any
 from ..agent_desk import _check_no_symlinks, _drafts_directory
 from ..board_control import AuthorizeBoard, resolve_board_access
 from ..company import FoundingRefused, _identity
-from ..execution_tiers import (
-    ENV_LIVE,
-    ENV_PAPER,
-    TIER_COMPANY_LIVE,
-    TIER_COMPANY_PAPER,
-    read_agent_sandbox_portfolio_from_db,
-    read_execution_tiers_snapshot,
-    read_trading_book_state_from_db,
-)
-from ..paper_risk import effective_paper_risk
-from ..storage.db import open_reader, read_tx
+from ..runtime.domains import DomainPlugin, load_domain_plugins
+from ..storage.db import connect_sqlite, open_reader, read_tx
 from ..storage.kernel import max_event_seq
-from ..storage.schema import installed_domains, is_domain_installed
+from ..storage.schema import installed_domains
 
-PROJECTION_LIVE_TRADING = "live-trading-v1"
-PROJECTION_ORDER_TRACE = "order-trace-v1"
 PROJECTION_AGENTS_GRAPH = "agents-graph-v1"
 PROJECTION_AGENT_DETAIL = "agent-detail-v1"
 PROJECTION_MESSAGES = "messages-v1"
 PROJECTION_APPROVALS = "approvals-v1"
-PROJECTION_STRATEGIES = "strategies-v1"
 PROJECTION_FINANCE = "finance-v1"
 PROJECTION_ORG = "org-v1"
 PROJECTION_RESTRICTIONS = "restrictions-v1"
 PROJECTION_SYSTEM_SAFETY = "system-safety-v1"
 PROJECTION_SYSTEM_EVALS = "system-evals-v1"
 PROJECTION_SYSTEM_AUDIT = "system-audit-v1"
-PROJECTION_EXECUTION_TIERS = "execution-tiers-v1"
+
+PROJECTION_ORDER_TRACE = "order-trace-v1"
+PROJECTION_STRATEGIES = "strategies-v1"
 PROJECTION_TRADING_DESK = "trading-desk-v1"
 
-ALL_CLIENT_PROJECTIONS: tuple[str, ...] = (
-    PROJECTION_LIVE_TRADING,
-    PROJECTION_ORDER_TRACE,
+CORE_CLIENT_PROJECTIONS: tuple[str, ...] = (
     PROJECTION_AGENTS_GRAPH,
     PROJECTION_AGENT_DETAIL,
     PROJECTION_MESSAGES,
     PROJECTION_APPROVALS,
-    PROJECTION_STRATEGIES,
     PROJECTION_FINANCE,
     PROJECTION_ORG,
     PROJECTION_RESTRICTIONS,
     PROJECTION_SYSTEM_SAFETY,
     PROJECTION_SYSTEM_EVALS,
     PROJECTION_SYSTEM_AUDIT,
-    PROJECTION_EXECUTION_TIERS,
+)
+
+ALL_CLIENT_PROJECTIONS: tuple[str, ...] = (
+    *CORE_CLIENT_PROJECTIONS,
+    PROJECTION_ORDER_TRACE,
+    PROJECTION_STRATEGIES,
     PROJECTION_TRADING_DESK,
 )
 
@@ -80,6 +73,29 @@ _DEFAULT_AVATAR_VARIANTS: tuple[str, ...] = (
     "bean-top",
     "round-pentagon-bottom",
 )
+
+
+def _apply_core_enrichers(
+    projection_name: str,
+    db: sqlite3.Connection,
+    company_id: str,
+    payload: dict[str, Any],
+    domain_plugins: Sequence[DomainPlugin] | None,
+    *,
+    context: dict[str, Any] | None = None,
+) -> None:
+    domains = set(installed_domains(db))
+    non_core = domains - {"core"}
+    if not non_core:
+        return
+    plugins = (
+        tuple(domain_plugins) if domain_plugins is not None else load_domain_plugins()
+    )
+    for plugin in plugins:
+        if plugin.domain_name in domains:
+            plugin.enrich_core_projection(
+                projection_name, db, company_id, payload, context=context
+            )
 
 
 def _json_loads_safe(raw: str | None, default: Any) -> Any:
@@ -142,15 +158,7 @@ def _agent_directory(
         agent_id = str(row[0])
         is_founder = agent_id == founder_id
         scope = str(row[3]) if row[3] is not None else ""
-        default_role = (
-            "CEO"
-            if is_founder
-            else (
-                "Quant Research"
-                if "research" in scope or "paper" in scope
-                else "Operations & QA"
-            )
-        )
+        default_role = "CEO" if is_founder else "Operations & QA"
         default_name = (
             "Founder · CEO" if is_founder else agent_id.replace("-", " ").title()
         )
@@ -254,660 +262,11 @@ def _close_issues_summary(
     return closes, open_issues
 
 
-def _read_execution_tape(
-    db: sqlite3.Connection, directory: dict[str, dict[str, Any]]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Build grouped causal orders (Order -> Fills -> Fees -> Cancellation -> Position)."""
-    orders = db.execute(
-        """SELECT o.order_id, o.run_id, o.mandate_revision, o.account_id,
-                  o.action_id, o.instrument_rules_digest, o.quantity,
-                  o.limit_minor_units, o.reserved_minor_units,
-                  d.agent_id, d.id AS duty_id,
-                  pd.decision_id, pd.rationale, pd.action, pd.decided_at
-           FROM paper_order o
-           LEFT JOIN duty_run dr ON dr.run_id = o.run_id
-           LEFT JOIN duty d ON d.id = dr.duty_id
-           LEFT JOIN paper_decision pd ON pd.run_id = o.run_id
-           ORDER BY o.rowid DESC"""
-    ).fetchall()
-
-    fills_by_order: dict[str, list[dict[str, Any]]] = {}
-    for row in db.execute(
-        """SELECT f.fill_id, f.order_id, f.quantity, f.price_minor_units,
-                  ff.fee_minor_units, po.position_quantity, po.available_at
-           FROM paper_fill f
-           LEFT JOIN paper_fill_fee ff ON ff.fill_id = f.fill_id
-           LEFT JOIN paper_position_observation po ON po.fill_id = f.fill_id
-           ORDER BY f.rowid ASC"""
-    ).fetchall():
-        oid = str(row[1])
-        fills_by_order.setdefault(oid, []).append(
-            {
-                "fill_id": str(row[0]),
-                "quantity": int(row[2]),
-                "price_minor_units": int(row[3]),
-                "fee_minor_units": None if row[4] is None else int(row[4]),
-                "position_quantity": None if row[5] is None else int(row[5]),
-                "available_at": None if row[6] is None else int(row[6]),
-            }
-        )
-
-    cancellations: dict[str, dict[str, Any]] = {}
-    for row in db.execute(
-        """SELECT order_id, event_id, filled_quantity, released,
-                  position_quantity, available_at, outcome
-           FROM paper_cancellation"""
-    ).fetchall():
-        cancellations[str(row[0])] = {
-            "event_id": str(row[1]),
-            "filled_quantity": int(row[2]),
-            "released": bool(row[3]),
-            "position_quantity": None if row[4] is None else int(row[4]),
-            "available_at": None if row[5] is None else int(row[5]),
-            "outcome": str(row[6]),
-        }
-
-    reconciliations: dict[str, dict[str, Any]] = {}
-    for row in db.execute(
-        "SELECT order_id, attempts, next_query_at, fill_id, sources FROM paper_reconciliation"
-    ).fetchall():
-        reconciliations[str(row[0])] = {
-            "attempts": int(row[1]),
-            "next_query_at": None if row[2] is None else int(row[2]),
-            "fill_id": None if row[3] is None else str(row[3]),
-            "sources": _json_loads_safe(str(row[4]), []),
-        }
-
-    tape: list[dict[str, Any]] = []
-    positions_by_instrument: dict[str, dict[str, Any]] = {}
-    for row in orders:
-        order_id = str(row[0])
-        ordered_qty = int(row[6])
-        order_fills = fills_by_order.get(order_id, [])
-        filled_qty = sum(f["quantity"] for f in order_fills)
-        fees_known = all(f["fee_minor_units"] is not None for f in order_fills)
-        total_fee: int | None = (
-            sum(
-                int(f["fee_minor_units"])
-                for f in order_fills
-                if f["fee_minor_units"] is not None
-            )
-            if fees_known
-            else None
-        )
-        avg_price = (
-            int(
-                sum(f["price_minor_units"] * f["quantity"] for f in order_fills)
-                / filled_qty
-            )
-            if filled_qty > 0
-            else None
-        )
-        cancel = cancellations.get(order_id)
-        remaining_qty = max(ordered_qty - filled_qty, 0)
-        residual_pos = (
-            cancel["position_quantity"]
-            if cancel is not None and cancel["position_quantity"] is not None
-            else (
-                order_fills[-1]["position_quantity"]
-                if order_fills and order_fills[-1]["position_quantity"] is not None
-                else filled_qty
-            )
-        )
-        cancelled = cancel is not None
-        if cancelled:
-            status = (
-                "cancelled_with_position"
-                if residual_pos is not None and residual_pos != 0
-                else "cancelled_flat"
-            )
-        elif filled_qty >= ordered_qty and ordered_qty > 0:
-            status = "filled"
-        elif filled_qty > 0:
-            status = "partial_fill"
-        else:
-            status = "working"
-
-        agent_id = None if row[9] is None else str(row[9])
-        agent_meta = directory.get(agent_id or "", {})
-        instrument = str(row[5])[:24]
-        item = {
-            "order_id": order_id,
-            "run_id": str(row[1]),
-            "duty_id": None if row[10] is None else str(row[10]),
-            "decision_id": None if row[11] is None else str(row[11]),
-            "rationale": None if row[12] is None else str(row[12]),
-            "action": str(row[13]) if row[13] else "buy",
-            "decided_at": None if row[14] is None else int(row[14]),
-            "account_id": str(row[3]),
-            "instrument": instrument,
-            "mandate_revision": str(row[2]),
-            "agent_id": agent_id,
-            "agent_name": agent_meta.get("display_name", agent_id or "System"),
-            "agent_role": agent_meta.get("role_label", "Trading"),
-            "ordered_qty": ordered_qty,
-            "filled_qty": filled_qty,
-            "remaining_qty": remaining_qty,
-            "limit_minor_units": int(row[7]),
-            "avg_fill_minor_units": avg_price,
-            "reserved_minor_units": int(row[8]),
-            "total_fee_minor_units": total_fee,
-            "status": status,
-            "cancellation": cancel,
-            "residual_position_qty": residual_pos,
-            "cancel_not_flat": bool(cancelled and residual_pos not in (None, 0)),
-            "reconciliation": reconciliations.get(order_id),
-            "fills": order_fills,
-        }
-        tape.append(item)
-        if residual_pos not in (None, 0) and instrument not in positions_by_instrument:
-            positions_by_instrument[instrument] = {
-                "instrument": instrument,
-                "account_id": str(row[3]),
-                "quantity": residual_pos,
-                "avg_entry_minor_units": avg_price or int(row[7]),
-                "latest_order_id": order_id,
-                "agent_id": agent_id,
-                "agent_name": item["agent_name"],
-                "from_cancelled_order": cancelled,
-            }
-    return tape, list(positions_by_instrument.values())
-
-
-def _build_since_last_visit(
-    db: sqlite3.Connection, company_id: str, since_seq: int | None
-) -> dict[str, Any]:
-    cutoff = since_seq if isinstance(since_seq, int) and since_seq > 0 else 0
-    rows = db.execute(
-        """SELECT event_seq, domain, entity_type, entity_id, event_type, recorded_at_ns
-           FROM audit_event
-           WHERE company_id = ? AND event_seq > ?
-           ORDER BY event_seq DESC
-           LIMIT 50""",
-        (company_id, cutoff),
-    ).fetchall()
-    counts: dict[str, int] = {}
-    highlights: list[dict[str, Any]] = []
-    for r in rows:
-        domain = str(r[1])
-        counts[domain] = counts.get(domain, 0) + 1
-        if len(highlights) < 6:
-            highlights.append(
-                {
-                    "event_seq": int(r[0]),
-                    "domain": domain,
-                    "entity_type": str(r[2]),
-                    "entity_id": str(r[3]),
-                    "event_type": str(r[4]),
-                    "recorded_at_ns": int(r[5]),
-                }
-            )
-    return {
-        "since_seq": cutoff,
-        "new_event_count": len(rows),
-        "by_domain": counts,
-        "highlights": highlights,
-    }
-
-
-def read_live_trading_projection(
+def read_agents_graph_projection(
     store: Path,
     company_id: str,
     *,
-    since_seq: int | None = None,
-    authorize_board: AuthorizeBoard | None = None,
-    principal_hint: str | None = None,
-) -> tuple[dict[str, Any], int]:
-    """Read Area 1 Live Trading & Portfolio projection in one SQLite read_tx."""
-    with closing(open_reader(store)) as db, read_tx(db):
-        if _identity(db) != company_id:
-            raise FoundingRefused("Company identity mismatch")
-        as_of_ns = time_ns()
-        event_seq = max_event_seq(db, company_id)
-        domains = sorted(installed_domains(db))
-        has_paper = "paper" in domains
-        charter_revision = str(
-            db.execute(
-                "SELECT charter_revision FROM company WHERE id = ?", (company_id,)
-            ).fetchone()[0]
-        )
-        directory = _agent_directory(db, company_id)
-        access = resolve_board_access(
-            db,
-            company_id,
-            authorize_board=authorize_board,
-            principal_hint=principal_hint,
-        )
-        restrictions = _active_restrictions_rows(db, company_id)
-        active_restrictions = [r for r in restrictions if r["active"]]
-        gl_balances = _sum_gl_accounts(db)
-        closes, open_close_issues = _close_issues_summary(db)
-        since_visit = _build_since_last_visit(db, company_id, since_seq)
-
-        llm_opex_minor = sum(
-            abs(val)
-            for acct, val in gl_balances.items()
-            if any(
-                k in acct.lower()
-                for k in ("llm", "opex", "compute", "expense", "operating")
-            )
-            and "trading" not in acct.lower()
-            and "fee" not in acct.lower()
-        )
-        has_opex_data = any(
-            any(
-                k in acct.lower()
-                for k in ("llm", "opex", "compute", "expense", "operating")
-            )
-            for acct in gl_balances
-        )
-
-        if not has_paper:
-            payload = {
-                "projection": PROJECTION_LIVE_TRADING,
-                "company_id": company_id,
-                "charter_revision": charter_revision,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "active_domains": domains,
-                "paper_enabled": False,
-                "environment": "core",
-                "board_role": access.role,
-                "risk_gate": {
-                    "suspended": len(active_restrictions) > 0,
-                    "effective_revision": 0,
-                    "active_restriction_count": len(active_restrictions),
-                },
-                "kpis": {
-                    "portfolio_value": {
-                        "value_minor": None,
-                        "return_pct": None,
-                        "currency": "USD",
-                        "status": "unavailable",
-                        "source": "Paper trading domain not active",
-                    },
-                    "trading_bor_pnl": {
-                        "value_minor": None,
-                        "currency": "USD",
-                        "status": "unavailable",
-                        "source": "Paper trading domain not active",
-                    },
-                    "agent_llm_opex": {
-                        "value_minor": -llm_opex_minor if has_opex_data else None,
-                        "currency": "USD",
-                        "status": "ok" if has_opex_data else "unavailable",
-                        "source": "General ledger",
-                    },
-                    "company_net_pnl": {
-                        "value_minor": None,
-                        "currency": "USD",
-                        "status": "unavailable",
-                        "source": "Requires paper domain and clean close",
-                    },
-                },
-                "since_last_visit": since_visit,
-                "cumulative_return_series": [],
-                "pnl_reconciliation_bridge": [],
-                "execution_tape": [],
-                "open_positions": [],
-                "adapter_status": None,
-                "active_restrictions": active_restrictions,
-            }
-            return payload, event_seq
-
-        binding_row = db.execute(
-            """SELECT revision, charter_revision, exposure_limit_minor_units,
-                      account_id, connector_revision, instrument_rules_digest,
-                      currency, starting_minor_units, environment, destination_id
-               FROM paper_binding WHERE singleton = 1"""
-        ).fetchone()
-        risk_state = effective_paper_risk(db)
-        valuations = db.execute(
-            """SELECT capture_id, binding_revision, policy, evidence,
-                      trading_nav_atoms, revision
-               FROM paper_valuation
-               ORDER BY rowid ASC"""
-        ).fetchall()
-        tape, open_positions = _read_execution_tape(db, directory)
-        funding_rows = db.execute(
-            """SELECT status, funding_cashflow_atoms, unavailable_reason
-               FROM paper_funding_settlement"""
-        ).fetchall()
-
-        currency = str(binding_row[6]) if binding_row else "USD"
-        starting_minor = int(binding_row[7]) if binding_row else None
-        exposure_limit = int(binding_row[2]) if binding_row else None
-        fees_known = all(o["total_fee_minor_units"] is not None for o in tape)
-        total_fees: int | None = (
-            sum(
-                int(o["total_fee_minor_units"])
-                for o in tape
-                if o["total_fee_minor_units"] is not None
-            )
-            if fees_known
-            else None
-        )
-        funding_unavailable = any(str(f[0]) == "unavailable" for f in funding_rows)
-        funding_total = sum(
-            int(f[1])
-            for f in funding_rows
-            if f[1] is not None and str(f[0]) == "booked"
-        )
-
-        # Build 0%-baseline cumulative return series strictly from sealed valuations.
-        return_series: list[dict[str, Any]] = []
-        latest_nav: int | None = None
-        if starting_minor and starting_minor > 0 and valuations:
-            for idx, v in enumerate(valuations):
-                nav = int(v[4])
-                ev_meta = _json_loads_safe(str(v[3]), {})
-                missing = (
-                    bool(ev_meta.get("missing")) if isinstance(ev_meta, dict) else False
-                )
-                label = (
-                    str(ev_meta.get("label"))
-                    if isinstance(ev_meta, dict) and ev_meta.get("label")
-                    else f"Cut #{idx + 1}"
-                )
-                if missing:
-                    return_series.append(
-                        {
-                            "id": str(v[0]),
-                            "label": label,
-                            "return_pct": None,
-                            "pnl_minor": None,
-                            "nav_minor": None,
-                            "source": "paper_valuation (missing)",
-                        }
-                    )
-                else:
-                    latest_nav = nav
-                    delta = nav - starting_minor
-                    pct = round((delta / starting_minor) * 100.0, 4)
-                    return_series.append(
-                        {
-                            "id": str(v[0]),
-                            "label": label,
-                            "return_pct": pct,
-                            "pnl_minor": delta,
-                            "nav_minor": nav,
-                            "source": "paper_valuation",
-                        }
-                    )
-
-        trading_pnl = (
-            (latest_nav - starting_minor)
-            if latest_nav is not None and starting_minor is not None
-            else None
-        )
-        return_pct = (
-            round((trading_pnl / starting_minor) * 100.0, 4)
-            if trading_pnl is not None and starting_minor and starting_minor > 0
-            else None
-        )
-        close_has_issues = len(open_close_issues) > 0
-        opex_available = has_opex_data and not close_has_issues
-        if (
-            trading_pnl is not None
-            and opex_available
-            and not funding_unavailable
-            and total_fees is not None
-        ):
-            company_net = trading_pnl - llm_opex_minor
-            net_status = "ok"
-            net_source = "Two-layer reconciled"
-        else:
-            company_net = None
-            net_status = "unavailable"
-            net_source = (
-                "Unavailable: open accounting close issues"
-                if close_has_issues
-                else (
-                    "Unavailable: incomplete funding settlement"
-                    if funding_unavailable
-                    else (
-                        "Unavailable: no operating cost ledger posted"
-                        if not has_opex_data
-                        else "Unavailable: no sealed valuation"
-                    )
-                )
-            )
-
-        gross_trading = (
-            trading_pnl + total_fees - funding_total
-            if trading_pnl is not None and total_fees is not None
-            else None
-        )
-        bridge = [
-            {
-                "step": "gross_trading_pnl",
-                "label": "Gross Trading P&L",
-                "amount_minor": gross_trading,
-                "status": "ok" if gross_trading is not None else "unavailable",
-            },
-            {
-                "step": "trading_fees",
-                "label": "Venue Fees & Commissions",
-                "amount_minor": None
-                if total_fees is None
-                else (-total_fees if tape else 0),
-                "status": "unavailable" if total_fees is None else "ok",
-            },
-            {
-                "step": "funding_settlements",
-                "label": "8h Funding Settlements",
-                "amount_minor": None if funding_unavailable else funding_total,
-                "status": "unavailable" if funding_unavailable else "ok",
-            },
-            {
-                "step": "agent_llm_opex",
-                "label": "Agent LLM & Compute Opex",
-                "amount_minor": -llm_opex_minor if opex_available else None,
-                "status": "ok" if opex_available else "unavailable",
-            },
-            {
-                "step": "company_net_pnl",
-                "label": "Company Net P&L",
-                "amount_minor": company_net,
-                "status": net_status,
-            },
-        ]
-
-        # Check latest quote freshness (non-binding telemetry)
-        quote_row = db.execute(
-            """SELECT quote_minor_units, observed_at, connector_revision
-               FROM paper_review_quote ORDER BY observed_at DESC LIMIT 1"""
-        ).fetchone()
-
-        adapter_status = (
-            {
-                "environment": str(binding_row[8]),
-                "account_id": str(binding_row[3]),
-                "connector_revision": str(binding_row[4]),
-                "destination_id": str(binding_row[9]),
-                "mandate_revision": str(binding_row[0]),
-                "exposure_limit_minor_units": exposure_limit,
-                "starting_minor_units": starting_minor,
-                "currency": currency,
-                "last_quote_minor_units": None if quote_row is None else quote_row[0],
-                "last_quote_observed_at": None
-                if quote_row is None
-                else int(quote_row[1]),
-            }
-            if binding_row
-            else None
-        )
-
-        payload = {
-            "projection": PROJECTION_LIVE_TRADING,
-            "company_id": company_id,
-            "charter_revision": charter_revision,
-            "as_of_ns": as_of_ns,
-            "event_seq": event_seq,
-            "active_domains": domains,
-            "paper_enabled": True,
-            "environment": "paper",
-            "board_role": access.role,
-            "risk_gate": {
-                "suspended": bool(risk_state.suspended or len(active_restrictions) > 0),
-                "paper_risk_suspended": bool(risk_state.suspended),
-                "effective_revision": int(risk_state.revision),
-                "active_restriction_count": len(active_restrictions),
-            },
-            "kpis": {
-                "portfolio_value": {
-                    "value_minor": latest_nav,
-                    "starting_minor": starting_minor,
-                    "return_pct": return_pct,
-                    "currency": currency,
-                    "status": "ok" if latest_nav is not None else "unavailable",
-                    "source": "Sealed paper valuation"
-                    if latest_nav is not None
-                    else "No live market tick",
-                },
-                "trading_bor_pnl": {
-                    "value_minor": trading_pnl,
-                    "currency": currency,
-                    "status": "ok" if trading_pnl is not None else "unavailable",
-                    "source": "Paper trading books of record",
-                },
-                "agent_llm_opex": {
-                    "value_minor": -llm_opex_minor if opex_available else None,
-                    "currency": currency,
-                    "status": "ok" if opex_available else "unavailable",
-                    "source": (
-                        "Unavailable: close issue"
-                        if close_has_issues
-                        else (
-                            "General ledger"
-                            if has_opex_data
-                            else "Unavailable: no GL opex recorded"
-                        )
-                    ),
-                },
-                "company_net_pnl": {
-                    "value_minor": company_net,
-                    "currency": currency,
-                    "status": net_status,
-                    "source": net_source,
-                },
-            },
-            "since_last_visit": since_visit,
-            "cumulative_return_series": return_series,
-            "pnl_reconciliation_bridge": bridge,
-            "execution_tape": tape,
-            "open_positions": open_positions,
-            "adapter_status": adapter_status,
-            "active_restrictions": active_restrictions,
-            "open_close_issues": open_close_issues,
-            "close_count": len(closes),
-        }
-        return payload, event_seq
-
-
-def read_order_trace_projection(
-    store: Path, company_id: str, order_id: str
-) -> tuple[dict[str, Any] | None, int]:
-    """Read full causal lineage for a single paper order."""
-    with closing(open_reader(store)) as db, read_tx(db):
-        if _identity(db) != company_id:
-            raise FoundingRefused("Company identity mismatch")
-        event_seq = max_event_seq(db, company_id)
-        if not is_domain_installed(db, "paper"):
-            return None, event_seq
-        directory = _agent_directory(db, company_id)
-        tape, _ = _read_execution_tape(db, directory)
-        match = next((o for o in tape if o["order_id"] == order_id), None)
-        if match is None:
-            return None, event_seq
-        pubs = [
-            {
-                "asset_id": str(r[0]),
-                "project_id": str(r[1]),
-                "author_id": str(r[2]),
-                "excerpt": str(r[3])[:240],
-            }
-            for r in db.execute(
-                """SELECT asset_id, project_id, author_id, content
-                   FROM shared_publication
-                   WHERE company_id = ? AND author_id = ?
-                   ORDER BY rowid DESC LIMIT 5""",
-                (company_id, match["agent_id"] or ""),
-            ).fetchall()
-        ]
-        steps = [
-            {
-                "stage": "Duty & Run",
-                "id": match["duty_id"] or match["run_id"],
-                "detail": f"Author: {match['agent_name']} ({match['agent_role']})",
-                "status": "complete",
-            },
-            {
-                "stage": "Trading Decision",
-                "id": match["decision_id"] or "unlinked",
-                "detail": match["rationale"] or "No recorded decision rationale",
-                "status": "complete" if match["decision_id"] else "unavailable",
-            },
-            {
-                "stage": "Paper Order",
-                "id": match["order_id"],
-                "detail": f"{match['action'].upper()} {match['ordered_qty']} @ limit {match['limit_minor_units']} ({match['instrument']})",
-                "status": "complete",
-            },
-            {
-                "stage": "Fills & Fees",
-                "id": f"{len(match['fills'])} fills",
-                "detail": f"Filled {match['filled_qty']} / {match['ordered_qty']} · Fees {match['total_fee_minor_units']}",
-                "status": "complete" if match["fills"] else "pending",
-            },
-        ]
-        if match["cancellation"] is not None:
-            c = match["cancellation"]
-            steps.append(
-                {
-                    "stage": "Cancellation",
-                    "id": c["event_id"],
-                    "detail": (
-                        f"Outcome: {c['outcome']} · Residual open position: {match['residual_position_qty']} "
-                        "(cancel does not flatten filled exposure)"
-                        if match["cancel_not_flat"]
-                        else f"Outcome: {c['outcome']} · Flat (0 residual position)"
-                    ),
-                    "status": "warning" if match["cancel_not_flat"] else "complete",
-                }
-            )
-        steps.append(
-            {
-                "stage": "Net Position",
-                "id": match["instrument"],
-                "detail": f"Observed quantity: {match['residual_position_qty']}",
-                "status": "complete",
-            }
-        )
-        return (
-            {
-                "projection": PROJECTION_ORDER_TRACE,
-                "company_id": company_id,
-                "as_of_ns": time_ns(),
-                "event_seq": event_seq,
-                "order": match,
-                "causal_steps": steps,
-                "related_publications": pubs,
-            },
-            event_seq,
-        )
-
-
-def _is_sandbox_authorized(info: dict[str, Any]) -> bool:
-    """Return True iff the agent is active (unarchived) and holds a trading/paper standing grant."""
-    if info.get("archived"):
-        return False
-    scope = str(info.get("grant_scope") or "").strip().lower()
-    return scope in ("paper", "trading", "live")
-
-
-def read_agents_graph_projection(
-    store: Path, company_id: str
+    domain_plugins: Sequence[DomainPlugin] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Read Area 2 Agents & Activity node-and-edge interaction graph projection."""
     with closing(open_reader(store)) as db, read_tx(db):
@@ -1004,37 +363,6 @@ def read_agents_graph_projection(
                     else "Standing watch"
                 )
             )
-            sandbox_authorized = _is_sandbox_authorized(info)
-            sandbox_activity: dict[str, Any] | None = None
-            if sandbox_authorized:
-                portfolio = read_agent_sandbox_portfolio_from_db(db, company_id, aid)
-                if portfolio is not None:
-                    open_pos = sum(
-                        1 for p in portfolio["positions"] if p["quantity"] != 0
-                    )
-                    is_running_sandbox = (
-                        run is not None
-                        and run["status"] in ("running", "waiting")
-                        and run["duty_kind"] == "quant.agent_sandbox"
-                    )
-                    if (
-                        portfolio["fill_count"] > 0
-                        or len(portfolio["orders"]) > 0
-                        or open_pos > 0
-                        or is_running_sandbox
-                    ):
-                        binding = portfolio["binding"]
-                        sandbox_activity = {
-                            "account_id": binding["account_id"],
-                            "currency": binding["currency"],
-                            "fill_count": portfolio["fill_count"],
-                            "open_positions_count": open_pos,
-                            "cash_minor_units": portfolio["cash_minor_units"],
-                            "gross_exposure_minor_units": portfolio[
-                                "gross_exposure_minor_units"
-                            ],
-                        }
-
             nodes.append(
                 {
                     "agent_id": aid,
@@ -1051,8 +379,8 @@ def read_agents_graph_projection(
                     "private_draft_count": _count_private_drafts(store, aid),
                     "published_count": pub_counts.get(aid, 0),
                     "grant_scope": info["grant_scope"],
-                    "sandbox_authorized": sandbox_authorized,
-                    "sandbox_activity": sandbox_activity,
+                    "sandbox_authorized": False,
+                    "sandbox_activity": None,
                 }
             )
 
@@ -1189,22 +517,27 @@ def read_agents_graph_projection(
                 )
 
         default_mode = "graph" if len(nodes) <= 8 else "list"
-        return (
-            {
-                "projection": PROJECTION_AGENTS_GRAPH,
-                "company_id": company_id,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "default_view_mode": default_mode,
-                "nodes": nodes,
-                "edges": edges,
-            },
-            event_seq,
+        payload = {
+            "projection": PROJECTION_AGENTS_GRAPH,
+            "company_id": company_id,
+            "as_of_ns": as_of_ns,
+            "event_seq": event_seq,
+            "default_view_mode": default_mode,
+            "nodes": nodes,
+            "edges": edges,
+        }
+        _apply_core_enrichers(
+            PROJECTION_AGENTS_GRAPH, db, company_id, payload, domain_plugins
         )
+        return payload, event_seq
 
 
 def read_agent_detail_projection(
-    store: Path, company_id: str, agent_id: str
+    store: Path,
+    company_id: str,
+    agent_id: str,
+    *,
+    domain_plugins: Sequence[DomainPlugin] | None = None,
 ) -> tuple[dict[str, Any] | None, int]:
     """Read full-screen Agent Detail: Desk, Authority/Budget, and 4 individual tabs."""
     with closing(open_reader(store)) as db, read_tx(db):
@@ -1396,7 +729,7 @@ def read_agent_detail_projection(
 
         prohibitions = [
             "Cannot modify company charter or Board mandate",
-            "Cannot execute live-money orders (paper-only environment)",
+            "Cannot exceed delegated standing authority or act outside approved grants",
             "Cannot read another Agent's private Desk drafts",
         ]
         if not info["is_ceo"]:
@@ -1407,53 +740,48 @@ def read_agent_detail_projection(
             (r for r in work_activity if r["status"] in ("running", "waiting")), None
         )
 
-        agent_sandbox = read_agent_sandbox_portfolio_from_db(db, company_id, agent_id)
-        sandbox_authorized = _is_sandbox_authorized(info)
-        return (
-            {
-                "projection": PROJECTION_AGENT_DETAIL,
-                "company_id": company_id,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "profile": info | {"active_run": active_run},
-                "sandbox_authorized": sandbox_authorized,
-                "agent_sandbox": agent_sandbox,
-                "desk_workspace": {
-                    "execution_profile": info["execution_profile"],
-                    "desk_manifest_revision": None
-                    if desk_row is None
-                    else str(desk_row[0]),
-                    "private_draft_count": private_draft_count,
-                    "private_draft_notice": "Private drafts remain physically isolated on the Agent's Desk and are never disclosed to the Board.",
-                    "published_count": len(published_reports),
-                    "work_run_count": len(work_activity),
-                },
-                "authority_budget": {
-                    "grant_id": info["grant_id"],
-                    "grant_scope": info["grant_scope"],
-                    "can_hire": staffing_row is not None,
-                    "hiring_slots": None
-                    if staffing_row is None
-                    else int(staffing_row[1]),
-                    "hiring_turns": None
-                    if staffing_row is None
-                    else int(staffing_row[2]),
-                    "monthly_budget_minor": info["monthly_budget_minor"],
-                    "allocated_turns": info["allocated_turns"],
-                    "prohibitions": prohibitions,
-                },
-                "tabs": {
-                    "work_activity": work_activity,
-                    "work_items": work_items,
-                    "conditions": conditions,
-                    "interactions_and_talks": interactions,
-                    "published_reports": published_reports,
-                    "peer_requests": peer_requests,
-                    "handoffs": handoffs,
-                },
+        payload = {
+            "projection": PROJECTION_AGENT_DETAIL,
+            "company_id": company_id,
+            "as_of_ns": as_of_ns,
+            "event_seq": event_seq,
+            "profile": info | {"active_run": active_run},
+            "sandbox_authorized": False,
+            "agent_sandbox": None,
+            "desk_workspace": {
+                "execution_profile": info["execution_profile"],
+                "desk_manifest_revision": None
+                if desk_row is None
+                else str(desk_row[0]),
+                "private_draft_count": private_draft_count,
+                "private_draft_notice": "Private drafts remain physically isolated on the Agent's Desk and are never disclosed to the Board.",
+                "published_count": len(published_reports),
+                "work_run_count": len(work_activity),
             },
-            event_seq,
+            "authority_budget": {
+                "grant_id": info["grant_id"],
+                "grant_scope": info["grant_scope"],
+                "can_hire": staffing_row is not None,
+                "hiring_slots": None if staffing_row is None else int(staffing_row[1]),
+                "hiring_turns": None if staffing_row is None else int(staffing_row[2]),
+                "monthly_budget_minor": info["monthly_budget_minor"],
+                "allocated_turns": info["allocated_turns"],
+                "prohibitions": prohibitions,
+            },
+            "tabs": {
+                "work_activity": work_activity,
+                "work_items": work_items,
+                "conditions": conditions,
+                "interactions_and_talks": interactions,
+                "published_reports": published_reports,
+                "peer_requests": peer_requests,
+                "handoffs": handoffs,
+            },
+        }
+        _apply_core_enrichers(
+            PROJECTION_AGENT_DETAIL, db, company_id, payload, domain_plugins
         )
+        return payload, event_seq
 
 
 def read_messages_projection(
@@ -1601,7 +929,7 @@ def read_messages_projection(
                         ceo_agent["avatar_variant"] if ceo_agent else "wide-oval-top"
                     ),
                     "writable": access.role == "board_control",
-                    "advisory_notice": "Advisory message to CEO · Does not directly execute trades, mutate mandates, or retire employees.",
+                    "advisory_notice": "Advisory message to CEO · Does not directly modify authority, mutate mandates, or retire employees.",
                     "messages": ceo_msgs,
                 },
                 "internal_channels": channels,
@@ -1611,7 +939,10 @@ def read_messages_projection(
 
 
 def read_approvals_projection(
-    store: Path, company_id: str
+    store: Path,
+    company_id: str,
+    *,
+    domain_plugins: Sequence[DomainPlugin] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Read Area 4 Board Approvals queue & resolution ledger (zero popups)."""
     with closing(open_reader(store)) as db, read_tx(db):
@@ -1670,183 +1001,35 @@ def read_approvals_projection(
             else:
                 history.append(item)
 
-        promote_candidates: list[dict[str, Any]] = []
-        if is_domain_installed(db, "paper"):
-            for r in db.execute(
-                """SELECT comparison_id, incumbent_release_id, challenger_release_id,
-                          status, verdict, verdict_json, evaluated_at_ns
-                   FROM paper_challenger_trial
-                   WHERE company_id = ? AND verdict = 'PROMOTE'
-                   ORDER BY evaluated_at_ns DESC""",
-                (company_id,),
-            ).fetchall():
-                promote_candidates.append(
-                    {
-                        "comparison_id": str(r[0]),
-                        "incumbent_release_id": str(r[1]),
-                        "challenger_release_id": str(r[2]),
-                        "status": str(r[3]),
-                        "verdict": str(r[4]),
-                        "verdict_detail": _json_loads_safe(r[5], {}),
-                        "evaluated_at_ns": None if r[6] is None else int(r[6]),
-                    }
-                )
-
-        return (
-            {
-                "projection": PROJECTION_APPROVALS,
-                "company_id": company_id,
-                "charter_revision": charter_revision,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "pending_count": len(pending),
-                "pending": pending,
-                "history": history,
-                "promote_candidates": promote_candidates,
-            },
-            event_seq,
+        payload = {
+            "projection": PROJECTION_APPROVALS,
+            "company_id": company_id,
+            "charter_revision": charter_revision,
+            "as_of_ns": as_of_ns,
+            "event_seq": event_seq,
+            "pending_count": len(pending),
+            "pending": pending,
+            "history": history,
+            "promote_candidates": [],
+        }
+        _apply_core_enrichers(
+            PROJECTION_APPROVALS, db, company_id, payload, domain_plugins
         )
+        return payload, event_seq
 
 
-def read_strategies_projection(
-    store: Path, company_id: str
+def read_finance_projection(
+    store: Path,
+    company_id: str,
+    *,
+    domain_plugins: Sequence[DomainPlugin] | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Read Flow 09 strategy releases, paired challenger trials, deployments & PaperExecution adapter."""
+    """Read Two-Layer P&L, General Ledger entries, period closes, and domain supplements."""
     with closing(open_reader(store)) as db, read_tx(db):
         if _identity(db) != company_id:
             raise FoundingRefused("Company identity mismatch")
         as_of_ns = time_ns()
         event_seq = max_event_seq(db, company_id)
-        if not is_domain_installed(db, "paper"):
-            return (
-                {
-                    "projection": PROJECTION_STRATEGIES,
-                    "company_id": company_id,
-                    "as_of_ns": as_of_ns,
-                    "event_seq": event_seq,
-                    "paper_enabled": False,
-                    "active_deployment": None,
-                    "deployments": [],
-                    "releases": [],
-                    "trials": [],
-                    "adapter": None,
-                },
-                event_seq,
-            )
-
-        directory = _agent_directory(db, company_id)
-        binding = db.execute(
-            """SELECT revision, account_id, connector_revision, exposure_limit_minor_units,
-                      currency, starting_minor_units, environment, destination_id
-               FROM paper_binding WHERE singleton = 1"""
-        ).fetchone()
-        releases = [
-            {
-                "release_id": str(r[0]),
-                "owner_agent_id": str(r[1]),
-                "owner_name": directory.get(str(r[1]), {}).get(
-                    "display_name", str(r[1])
-                ),
-                "parent_release_id": None if r[2] is None else str(r[2]),
-                "parameters": _json_loads_safe(str(r[3]), {}),
-                "pit_manifest_id": str(r[4]),
-                "research_trial_count_n": int(r[5]),
-                "bundle_sha256": str(r[6]),
-                "recorded_at_ns": int(r[7]),
-            }
-            for r in db.execute(
-                """SELECT release_id, owner_agent_id, parent_release_id, parameters_json,
-                          pit_manifest_id, research_trial_count_n, bundle_sha256, recorded_at_ns
-                   FROM paper_strategy_release
-                   WHERE company_id = ?
-                   ORDER BY recorded_at_ns DESC""",
-                (company_id,),
-            ).fetchall()
-        ]
-        trials = [
-            {
-                "comparison_id": str(r[0]),
-                "incumbent_release_id": str(r[1]),
-                "challenger_release_id": str(r[2]),
-                "baseline_statement_revision": str(r[3]),
-                "status": str(r[4]),
-                "verdict": None if r[5] is None else str(r[5]),
-                "verdict_detail": _json_loads_safe(r[6], None),
-                "invalidation_reason": None if r[7] is None else str(r[7]),
-                "registered_at_ns": int(r[8]),
-                "evaluated_at_ns": None if r[9] is None else int(r[9]),
-            }
-            for r in db.execute(
-                """SELECT comparison_id, incumbent_release_id, challenger_release_id,
-                          baseline_statement_revision, status, verdict, verdict_json,
-                          invalidation_reason, registered_at_ns, evaluated_at_ns
-                   FROM paper_challenger_trial
-                   WHERE company_id = ?
-                   ORDER BY registered_at_ns DESC""",
-                (company_id,),
-            ).fetchall()
-        ]
-        deployments = [
-            {
-                "deployment_id": str(r[0]),
-                "release_id": str(r[1]),
-                "program_identity": str(r[2]),
-                "binding_revision": str(r[3]),
-                "comparison_id": None if r[4] is None else str(r[4]),
-                "status": str(r[5]),
-                "command_id": str(r[6]),
-                "activated_at_ns": int(r[7]),
-                "retired_at_ns": None if r[8] is None else int(r[8]),
-            }
-            for r in db.execute(
-                """SELECT deployment_id, release_id, program_identity, binding_revision,
-                          comparison_id, status, command_id, activated_at_ns, retired_at_ns
-                   FROM paper_strategy_deployment
-                   WHERE company_id = ?
-                   ORDER BY activated_at_ns DESC""",
-                (company_id,),
-            ).fetchall()
-        ]
-        active = next((d for d in deployments if d["status"] == "active"), None)
-        adapter = (
-            {
-                "binding_revision": str(binding[0]),
-                "account_id": str(binding[1]),
-                "connector_revision": str(binding[2]),
-                "exposure_limit_minor_units": int(binding[3]),
-                "currency": str(binding[4]),
-                "starting_minor_units": int(binding[5]),
-                "environment": str(binding[6]),
-                "destination_id": str(binding[7]),
-            }
-            if binding
-            else None
-        )
-        return (
-            {
-                "projection": PROJECTION_STRATEGIES,
-                "company_id": company_id,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "paper_enabled": True,
-                "active_deployment": active,
-                "deployments": deployments,
-                "releases": releases,
-                "trials": trials,
-                "adapter": adapter,
-            },
-            event_seq,
-        )
-
-
-def read_finance_projection(store: Path, company_id: str) -> tuple[dict[str, Any], int]:
-    """Read Two-Layer P&L, General Ledger entries, period closes, and 8h funding settlements."""
-    with closing(open_reader(store)) as db, read_tx(db):
-        if _identity(db) != company_id:
-            raise FoundingRefused("Company identity mismatch")
-        as_of_ns = time_ns()
-        event_seq = max_event_seq(db, company_id)
-        has_paper = is_domain_installed(db, "paper")
         gl_balances = _sum_gl_accounts(db)
         closes, open_issues = _close_issues_summary(db)
 
@@ -1876,61 +1059,26 @@ def read_finance_projection(store: Path, company_id: str) -> tuple[dict[str, Any
             ).fetchall()
         ]
 
-        funding: list[dict[str, Any]] = []
-        statements: list[dict[str, Any]] = []
-        if has_paper:
-            funding = [
-                {
-                    "settlement_id": str(r[0]),
-                    "instrument_id": str(r[1]),
-                    "interval_end_ns": int(r[2]),
-                    "signed_position_lots": int(r[3]),
-                    "funding_cashflow_atoms": None if r[4] is None else int(r[4]),
-                    "status": str(r[5]),
-                    "unavailable_reason": None if r[6] is None else str(r[6]),
-                }
-                for r in db.execute(
-                    """SELECT settlement_id, instrument_id, interval_end_ns,
-                              signed_position_lots, funding_cashflow_atoms,
-                              status, unavailable_reason
-                       FROM paper_funding_settlement
-                       WHERE company_id = ?
-                       ORDER BY interval_end_ns DESC LIMIT 30""",
-                    (company_id,),
-                ).fetchall()
-            ]
-            statements = [
-                {
-                    "request_id": str(r[0]),
-                    "window_id": str(r[1]),
-                    "revision": str(r[2]),
-                    "payload": _json_loads_safe(str(r[3]), {}),
-                }
-                for r in db.execute(
-                    """SELECT request_id, window_id, revision, payload
-                       FROM paper_statement ORDER BY rowid DESC LIMIT 12"""
-                ).fetchall()
-            ]
-
-        return (
-            {
-                "projection": PROJECTION_FINANCE,
-                "company_id": company_id,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "paper_enabled": has_paper,
-                "account_balances": [
-                    {"account": k, "balance_minor": v}
-                    for k, v in sorted(gl_balances.items())
-                ],
-                "journals": journals,
-                "accounting_closes": closes,
-                "open_close_issues": open_issues,
-                "funding_settlements": funding,
-                "retained_statements": statements,
-            },
-            event_seq,
+        payload = {
+            "projection": PROJECTION_FINANCE,
+            "company_id": company_id,
+            "as_of_ns": as_of_ns,
+            "event_seq": event_seq,
+            "trading_enabled": False,
+            "account_balances": [
+                {"account": k, "balance_minor": v}
+                for k, v in sorted(gl_balances.items())
+            ],
+            "journals": journals,
+            "accounting_closes": closes,
+            "open_close_issues": open_issues,
+            "funding_settlements": [],
+            "retained_statements": [],
+        }
+        _apply_core_enrichers(
+            PROJECTION_FINANCE, db, company_id, payload, domain_plugins
         )
+        return payload, event_seq
 
 
 def read_org_projection(store: Path, company_id: str) -> tuple[dict[str, Any], int]:
@@ -2009,9 +1157,12 @@ def read_org_projection(store: Path, company_id: str) -> tuple[dict[str, Any], i
 
 
 def read_restrictions_projection(
-    store: Path, company_id: str
+    store: Path,
+    company_id: str,
+    *,
+    domain_plugins: Sequence[DomainPlugin] | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Read active & historical competing restriction causes plus paper risk gate readiness."""
+    """Read active & historical competing restriction causes plus domain risk readiness."""
     with closing(open_reader(store)) as db, read_tx(db):
         if _identity(db) != company_id:
             raise FoundingRefused("Company identity mismatch")
@@ -2022,57 +1173,47 @@ def read_restrictions_projection(
                 "SELECT charter_revision FROM company WHERE id = ?", (company_id,)
             ).fetchone()[0]
         )
-        has_paper = is_domain_installed(db, "paper")
         causes = _active_restrictions_rows(db, company_id)
-        paper_risk: dict[str, Any] | None = None
-        if has_paper:
-            risk = effective_paper_risk(db)
-            unresolved_orders = int(
-                db.execute(
-                    """SELECT COUNT(*) FROM paper_order o
-                       LEFT JOIN paper_cancellation c ON c.order_id = o.order_id
-                       WHERE c.order_id IS NULL
-                         AND (SELECT COALESCE(SUM(f.quantity), 0) FROM paper_fill f WHERE f.order_id = o.order_id) < o.quantity"""
-                ).fetchone()[0]
-            )
-            pending_binding = int(
-                db.execute(
-                    "SELECT COUNT(*) FROM paper_binding_change WHERE effective_at_ns IS NULL"
-                ).fetchone()[0]
-            )
-            quote_row = db.execute(
-                "SELECT observed_at FROM paper_review_quote ORDER BY observed_at DESC LIMIT 1"
-            ).fetchone()
-            paper_risk = {
-                "suspended": bool(risk.suspended),
-                "effective_revision": int(risk.revision),
-                "unresolved_orders_count": unresolved_orders,
-                "pending_binding_change": pending_binding > 0,
-                "settled_company_ok": unresolved_orders == 0 and pending_binding == 0,
-                "last_quote_observed_at": None
-                if quote_row is None
-                else int(quote_row[0]),
-                "server_freshness_note": "Resume verifies live paper quote freshness (<= 15s) server-side upon confirmation.",
-            }
-        return (
-            {
-                "projection": PROJECTION_RESTRICTIONS,
-                "company_id": company_id,
-                "charter_revision": charter_revision,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "active_causes": [c for c in causes if c["active"]],
-                "history": [c for c in causes if not c["active"]],
-                "paper_risk": paper_risk,
-            },
-            event_seq,
+        payload = {
+            "projection": PROJECTION_RESTRICTIONS,
+            "company_id": company_id,
+            "charter_revision": charter_revision,
+            "as_of_ns": as_of_ns,
+            "event_seq": event_seq,
+            "active_causes": [c for c in causes if c["active"]],
+            "history": [c for c in causes if not c["active"]],
+            "trading_risk": None,
+        }
+        _apply_core_enrichers(
+            PROJECTION_RESTRICTIONS, db, company_id, payload, domain_plugins
         )
+        return payload, event_seq
 
 
 def read_system_safety_projection(
-    store: Path, company_id: str
+    store: Path,
+    company_id: str,
+    *,
+    domain_plugins: Sequence[DomainPlugin] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Read checkpoints, restore quarantine status, and 5-step Safe Custody Hold."""
+    checkpoints_dir = store.resolve(strict=False).parent / "checkpoints"
+    checkpoints: list[dict[str, Any]] = []
+    if checkpoints_dir.is_dir():
+        for entry in sorted(checkpoints_dir.glob("*.zip"), reverse=True)[:20]:
+            try:
+                st = os.lstat(entry)
+                if stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+                    checkpoints.append(
+                        {
+                            "archive_name": entry.name,
+                            "size_bytes": int(st.st_size),
+                            "modified_ns": int(st.st_mtime_ns),
+                        }
+                    )
+            except OSError:
+                continue
+
     with closing(open_reader(store)) as db, read_tx(db):
         if _identity(db) != company_id:
             raise FoundingRefused("Company identity mismatch")
@@ -2103,53 +1244,42 @@ def read_system_safety_projection(
             c for c in _active_restrictions_rows(db, company_id) if c["active"]
         ]
 
-    checkpoints_dir = store.resolve(strict=False).parent / "checkpoints"
-    checkpoints: list[dict[str, Any]] = []
-    if checkpoints_dir.is_dir():
-        for entry in sorted(checkpoints_dir.glob("*.zip"), reverse=True)[:20]:
-            try:
-                st = os.lstat(entry)
-                if stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode):
-                    checkpoints.append(
-                        {
-                            "archive_name": entry.name,
-                            "size_bytes": int(st.st_size),
-                            "modified_ns": int(st.st_mtime_ns),
-                        }
+        custody_steps = [
+            {
+                "id": "data_cut",
+                "label": "Data cut integrity verified",
+                "status": "done",
+            },
+            {
+                "id": "sole_writer",
+                "label": "Single-writer lease confirmed",
+                "status": "done",
+            },
+            {
+                "id": "authority",
+                "label": "Current Board authority verified",
+                "status": "done",
+            },
+            {
+                "id": "reconciliation",
+                "label": "External reconciliation complete",
+                "status": (
+                    "done"
+                    if not any(
+                        c["cause_category"] == "restore_quarantine"
+                        for c in active_causes
                     )
-            except OSError:
-                continue
+                    else "active"
+                ),
+            },
+            {
+                "id": "next_actions",
+                "label": "Eligible for normal company operations",
+                "status": "done" if not active_causes else "pending",
+            },
+        ]
 
-    custody_steps = [
-        {"id": "data_cut", "label": "Data cut integrity verified", "status": "done"},
-        {
-            "id": "sole_writer",
-            "label": "Single-writer lease confirmed",
-            "status": "done",
-        },
-        {
-            "id": "authority",
-            "label": "Current Board authority verified",
-            "status": "done",
-        },
-        {
-            "id": "reconciliation",
-            "label": "External paper reconciliation complete",
-            "status": "done"
-            if not any(
-                c["cause_category"] == "restore_quarantine" for c in active_causes
-            )
-            else "active",
-        },
-        {
-            "id": "next_actions",
-            "label": "Eligible for normal trading release",
-            "status": "done" if not active_causes else "pending",
-        },
-    ]
-
-    return (
-        {
+        payload = {
             "projection": PROJECTION_SYSTEM_SAFETY,
             "company_id": company_id,
             "charter_revision": charter_revision,
@@ -2168,9 +1298,11 @@ def read_system_safety_projection(
             ),
             "safe_custody_hold": custody_steps,
             "active_restrictions": active_causes,
-        },
-        event_seq,
-    )
+        }
+        _apply_core_enrichers(
+            PROJECTION_SYSTEM_SAFETY, db, company_id, payload, domain_plugins
+        )
+        return payload, event_seq
 
 
 def read_system_evals_projection(
@@ -2278,7 +1410,11 @@ def read_system_evals_projection(
 
                 encoded_path = quote(str(evaluator_store.absolute()), safe="/")
                 with closing(
-                    sqlite3.connect(f"file:{encoded_path}?mode=ro", uri=True)
+                    connect_sqlite(
+                        f"file:{encoded_path}?mode=ro",
+                        uri=True,
+                        autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,
+                    )
                 ) as edb:
                     edb.execute("PRAGMA query_only = ON")
                     edb.execute("PRAGMA trusted_schema = OFF")
@@ -2335,7 +1471,10 @@ def read_system_evals_projection(
 
 
 def read_system_audit_projection(
-    store: Path, company_id: str
+    store: Path,
+    company_id: str,
+    *,
+    domain_plugins: Sequence[DomainPlugin] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Read redacted audit_event tail, work_conditions, fencing leases, and board_binding roles."""
     with closing(open_reader(store)) as db, read_tx(db):
@@ -2423,490 +1562,6 @@ def read_system_audit_projection(
                 "conditions": conditions,
                 "active_fences": fences,
                 "board_bindings": bindings,
-            },
-            event_seq,
-        )
-
-
-def read_execution_tiers_projection(
-    store: Path, company_id: str
-) -> tuple[dict[str, Any], int]:
-    """Read redacted three-tier execution accounts, sandboxes, and promotion history."""
-    with closing(open_reader(store)) as db, read_tx(db):
-        if _identity(db) != company_id:
-            raise FoundingRefused("Company identity mismatch")
-        event_seq = max_event_seq(db, company_id)
-        snapshot = read_execution_tiers_snapshot(db, company_id)
-        directory = _agent_directory(db, company_id)
-        charter_row = db.execute(
-            "SELECT charter_revision FROM company WHERE id = ?",
-            (company_id,),
-        ).fetchone()
-        charter_revision = (
-            str(charter_row[0])
-            if charter_row is not None
-            else str(snapshot.get("charter_revision", ""))
-        )
-        enriched_sandboxes = [
-            sbx
-            | {
-                "agent_display_name": directory.get(sbx["agent_id"], {}).get(
-                    "display_name", sbx["agent_id"]
-                ),
-                "agent_role_label": directory.get(sbx["agent_id"], {}).get(
-                    "role_label", "Agent"
-                ),
-            }
-            for sbx in snapshot.get("agent_sandboxes", [])
-        ]
-        return (
-            {
-                "projection": PROJECTION_EXECUTION_TIERS,
-                "company_id": company_id,
-                "charter_revision": charter_revision,
-                "as_of_ns": time_ns(),
-                "event_seq": event_seq,
-                **(snapshot | {"agent_sandboxes": enriched_sandboxes}),
-            },
-            event_seq,
-        )
-
-
-def read_trading_desk_projection(
-    store: Path,
-    company_id: str,
-    *,
-    environment: str,
-    book_id: str | None = None,
-) -> tuple[dict[str, Any], int]:
-    """Unified symmetric trading desk projection serving both Live Trading and Paper Trading.
-
-    Strictly scoped to `environment` ('live' or 'paper') so paper and live capital,
-    positions, fills, and valuation series are never commingled.
-    """
-    if environment not in (ENV_LIVE, ENV_PAPER):
-        raise ValueError("environment must be 'live' or 'paper'")
-
-    target_tier = TIER_COMPANY_LIVE if environment == ENV_LIVE else TIER_COMPANY_PAPER
-
-    with closing(open_reader(store)) as db, read_tx(db):
-        if _identity(db) != company_id:
-            raise FoundingRefused("Company identity mismatch")
-        as_of_ns = time_ns()
-        event_seq = max_event_seq(db, company_id)
-        domains = sorted(installed_domains(db))
-        has_paper = is_domain_installed(db, "paper")
-        charter_row = db.execute(
-            "SELECT charter_revision FROM company WHERE id = ?", (company_id,)
-        ).fetchone()
-        charter_revision = str(charter_row[0]) if charter_row else ""
-        directory = _agent_directory(db, company_id)
-        restrictions = _active_restrictions_rows(db, company_id)
-        active_restrictions = [r for r in restrictions if r["active"]]
-        gl_balances = _sum_gl_accounts(db)
-        closes, open_close_issues = _close_issues_summary(db)
-
-        llm_opex_minor = sum(
-            abs(val)
-            for acct, val in gl_balances.items()
-            if any(
-                k in acct.lower()
-                for k in ("llm", "opex", "compute", "expense", "operating")
-            )
-            and "trading" not in acct.lower()
-            and "fee" not in acct.lower()
-        )
-        has_opex_data = any(
-            any(
-                k in acct.lower()
-                for k in ("llm", "opex", "compute", "expense", "operating")
-            )
-            for acct in gl_balances
-        )
-
-        tiers = read_execution_tiers_snapshot(db, company_id)
-        risk_suspended = (
-            bool(effective_paper_risk(db).suspended) if has_paper else False
-        )
-        risk_revision = int(effective_paper_risk(db).revision) if has_paper else 0
-
-        books: list[dict[str, Any]] = []
-        if has_paper:
-            binding_rows = db.execute(
-                """SELECT binding_id FROM execution_environment_binding
-                   WHERE company_id = ? AND tier = ? AND environment = ?
-                   ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'registered' THEN 1 WHEN 'suspended' THEN 2 ELSE 3 END,
-                            created_at_ns ASC, binding_id ASC""",
-                (company_id, target_tier, environment),
-            ).fetchall()
-            for (bid,) in binding_rows:
-                state = read_trading_book_state_from_db(db, company_id, str(bid))
-                if state is not None:
-                    books.append(state)
-
-        # Select active/requested book strictly within this environment.
-        selected_book: dict[str, Any] | None = None
-        if book_id:
-            selected_book = next((b for b in books if b["binding_id"] == book_id), None)
-        if selected_book is None:
-            if environment == ENV_LIVE:
-                selected_book = next(
-                    (b for b in books if b["status"] == "active"), None
-                )
-            else:
-                selected_book = (
-                    next((b for b in books if b["role"] == "nominated"), None)
-                    or next((b for b in books if b["role"] == "shadow"), None)
-                    or next((b for b in books if b["status"] == "active"), None)
-                    or (books[0] if books else None)
-                )
-
-        currency = selected_book["currency"] if selected_book else "USD"
-        close_has_issues = len(open_close_issues) > 0
-        opex_available = has_opex_data and not close_has_issues
-
-        cumulative_return_series: list[dict[str, Any]] = []
-        open_positions: list[dict[str, Any]] = []
-        execution_tape: list[dict[str, Any]] = []
-        pnl_bridge: list[dict[str, Any]] = []
-        exposure_used_minor = 0
-        exposure_limit_minor: int | None = None
-
-        if selected_book is not None:
-            nav = int(selected_book["nav_minor_units"])
-            trading_pnl = int(selected_book["pnl_minor_units"])
-            ret_pct = float(selected_book["return_pct"])
-            total_fees = int(selected_book["total_fees_minor_units"])
-            realized_pnl = int(selected_book["realized_pnl_minor_units"])
-            unrealized_pnl = int(selected_book["unrealized_pnl_minor_units"])
-            gross_trading_pnl = trading_pnl + total_fees
-            exposure_used_minor = int(selected_book["gross_exposure_minor_units"])
-            exposure_limit_minor = int(selected_book["exposure_limit_minor_units"])
-            cumulative_return_series = list(selected_book["cumulative_return_series"])
-
-            for p in selected_book["positions"]:
-                if p["quantity"] != 0:
-                    open_positions.append(p)
-
-            for o in selected_book["orders"]:
-                actor_info = directory.get(o["actor_id"], {})
-                execution_tape.append(
-                    o
-                    | {
-                        "actor_name": actor_info.get("display_name", o["actor_id"]),
-                        "actor_role": actor_info.get("role_label", "Agent"),
-                        "book_name": selected_book["book_name"],
-                        "binding_id": selected_book["binding_id"],
-                    }
-                )
-
-            if opex_available:
-                company_net: int | None = trading_pnl - llm_opex_minor
-                net_status = "ok"
-                net_source = (
-                    "Live BOR minus Opex"
-                    if environment == ENV_LIVE
-                    else "Paper BOR minus Opex"
-                )
-            else:
-                company_net = trading_pnl
-                net_status = "ok"
-                net_source = (
-                    "Live BOR (no opex posted)"
-                    if environment == ENV_LIVE
-                    else "Paper BOR (no opex posted)"
-                )
-
-            kpis = {
-                "portfolio_value": {
-                    "value_minor": nav,
-                    "return_pct": ret_pct,
-                    "currency": currency,
-                    "status": "ok",
-                    "source": (
-                        f"Live book · {selected_book['account_id']}"
-                        if environment == ENV_LIVE
-                        else f"Paper book · {selected_book['book_name']}"
-                    ),
-                },
-                "trading_pnl": {
-                    "value_minor": trading_pnl,
-                    "realized_minor": realized_pnl,
-                    "unrealized_minor": unrealized_pnl,
-                    "fees_minor": total_fees,
-                    "currency": currency,
-                    "status": "ok",
-                    "source": (
-                        "Reconciled live fills & marks"
-                        if environment == ENV_LIVE
-                        else f"{selected_book['fee_bps']} bps fee / {selected_book['slippage_bps']} bps slip"
-                    ),
-                },
-                "agent_llm_opex": {
-                    "value_minor": -llm_opex_minor if has_opex_data else 0,
-                    "currency": currency,
-                    "status": "ok" if has_opex_data else "unavailable",
-                    "source": "General ledger",
-                },
-                "company_net_pnl": {
-                    "value_minor": company_net,
-                    "currency": currency,
-                    "status": net_status,
-                    "source": net_source,
-                },
-            }
-            pnl_bridge = [
-                {
-                    "step": "gross_trading_pnl",
-                    "label": "Gross Trading P&L",
-                    "amount_minor": gross_trading_pnl,
-                    "status": "ok",
-                },
-                {
-                    "step": "trading_fees",
-                    "label": "Venue Fees & Slippage",
-                    "amount_minor": -total_fees,
-                    "status": "ok",
-                },
-                {
-                    "step": "realized_pnl",
-                    "label": "Net Realized P&L",
-                    "amount_minor": realized_pnl,
-                    "status": "ok",
-                },
-                {
-                    "step": "unrealized_pnl",
-                    "label": "Open Unrealized P&L",
-                    "amount_minor": unrealized_pnl,
-                    "status": "ok",
-                },
-                {
-                    "step": "agent_llm_opex",
-                    "label": "Agent LLM & Compute Opex",
-                    "amount_minor": -llm_opex_minor if has_opex_data else 0,
-                    "status": "ok" if has_opex_data else "unavailable",
-                },
-                {
-                    "step": "company_net_pnl",
-                    "label": "Live Net P&L"
-                    if environment == ENV_LIVE
-                    else "Paper Net P&L",
-                    "amount_minor": company_net,
-                    "status": net_status,
-                },
-            ]
-        else:
-            # Standby / gated live desk (or empty paper desk).
-            kpis = {
-                "portfolio_value": {
-                    "value_minor": None,
-                    "return_pct": None,
-                    "currency": currency,
-                    "status": "standby",
-                    "source": (
-                        "Paper-Only Safe Mode (0% live deployed)"
-                        if environment == ENV_LIVE
-                        else "No paper book active"
-                    ),
-                },
-                "trading_pnl": {
-                    "value_minor": None,
-                    "realized_minor": None,
-                    "unrealized_minor": None,
-                    "fees_minor": None,
-                    "currency": currency,
-                    "status": "standby",
-                    "source": "Awaiting Board activation",
-                },
-                "agent_llm_opex": {
-                    "value_minor": -llm_opex_minor if has_opex_data else 0,
-                    "currency": currency,
-                    "status": "ok" if has_opex_data else "unavailable",
-                    "source": "General ledger",
-                },
-                "company_net_pnl": {
-                    "value_minor": None,
-                    "currency": currency,
-                    "status": "standby",
-                    "source": "Awaiting live activation",
-                },
-            }
-
-        # Shadow Benchmark comparison for active Live books!
-        shadow_benchmark: dict[str, Any] | None = None
-        if environment == ENV_LIVE and selected_book is not None:
-            shadow_row = db.execute(
-                """SELECT binding_id FROM company_paper_book
-                   WHERE company_id = ? AND shadow_of_live_binding_id = ?
-                   ORDER BY updated_at_ns DESC LIMIT 1""",
-                (company_id, selected_book["binding_id"]),
-            ).fetchone()
-            shadow_bid = (
-                str(shadow_row[0])
-                if shadow_row is not None
-                else selected_book.get("source_paper_binding_id")
-            )
-            if shadow_bid:
-                shadow_state = read_trading_book_state_from_db(
-                    db, company_id, shadow_bid
-                )
-                if shadow_state is not None:
-                    raw_shadow = list(shadow_state["cumulative_return_series"])
-                    live_start_ns = (
-                        int(cumulative_return_series[0]["observed_at_ns"])
-                        if cumulative_return_series
-                        and cumulative_return_series[0].get("observed_at_ns")
-                        else 0
-                    )
-                    rebased_series: list[dict[str, Any]] = []
-                    if raw_shadow:
-                        pre_or_at = [
-                            pt
-                            for pt in raw_shadow
-                            if int(pt.get("observed_at_ns") or 0) <= live_start_ns
-                        ]
-                        anchor = pre_or_at[-1] if pre_or_at else raw_shadow[0]
-                        anchor_nav = (
-                            int(anchor["nav_minor"])
-                            if anchor.get("nav_minor")
-                            else int(shadow_state["starting_minor_units"])
-                        )
-                        rebased_series.append(
-                            {
-                                "id": f"{anchor['id']}-anchor",
-                                "label": (
-                                    str(cumulative_return_series[0]["label"])
-                                    if cumulative_return_series
-                                    else "Live Launch"
-                                ),
-                                "return_pct": 0.0,
-                                "pnl_minor": 0,
-                                "nav_minor": anchor_nav,
-                                "source": "shadow_anchor",
-                                "observed_at_ns": live_start_ns
-                                or int(anchor.get("observed_at_ns") or 0),
-                            }
-                        )
-                        live_start_cap = int(selected_book["starting_minor_units"])
-                        for pt in raw_shadow:
-                            pt_ns = int(pt.get("observed_at_ns") or 0)
-                            if live_start_ns > 0 and pt_ns <= live_start_ns:
-                                continue
-                            if pt is anchor:
-                                continue
-                            pt_nav = int(pt.get("nav_minor") or anchor_nav)
-                            delta_nav = pt_nav - anchor_nav
-                            rebased_ret = (
-                                round((delta_nav / anchor_nav) * 100.0, 4)
-                                if anchor_nav > 0
-                                else 0.0
-                            )
-                            equiv_pnl = (
-                                round(live_start_cap * (delta_nav / anchor_nav))
-                                if anchor_nav > 0 and live_start_cap > 0
-                                else delta_nav
-                            )
-                            rebased_series.append(
-                                {
-                                    "id": str(pt["id"]),
-                                    "label": str(pt["label"]),
-                                    "return_pct": rebased_ret,
-                                    "pnl_minor": equiv_pnl,
-                                    "nav_minor": pt_nav,
-                                    "source": str(pt.get("source") or "shadow_mark"),
-                                    "observed_at_ns": pt_ns,
-                                }
-                            )
-                    post_launch_ret = (
-                        float(rebased_series[-1]["return_pct"])
-                        if rebased_series
-                        else 0.0
-                    )
-                    drift_pp = round(
-                        float(selected_book["return_pct"]) - post_launch_ret, 4
-                    )
-                    shadow_benchmark = {
-                        "binding_id": shadow_state["binding_id"],
-                        "book_name": shadow_state["book_name"],
-                        "strategy_release_id": shadow_state["strategy_release_id"],
-                        "role": shadow_state["role"],
-                        "return_pct": shadow_state["return_pct"],
-                        "post_launch_return_pct": post_launch_ret,
-                        "execution_drift_pp": drift_pp,
-                        "nav_minor_units": shadow_state["nav_minor_units"],
-                        "pnl_minor_units": shadow_state["pnl_minor_units"],
-                        "series": rebased_series,
-                    }
-
-        paper_books = tiers.get("company_paper_books", [])
-        soak_ready_books = sum(
-            1 for b in paper_books if b["soak_ready"] and b["status"] == "active"
-        )
-
-        # Strip heavy per-book arrays from summary list so payload stays fast & compact.
-        book_summaries = [
-            {
-                k: v
-                for k, v in b.items()
-                if k not in ("positions", "orders", "cumulative_return_series")
-            }
-            for b in books
-        ]
-
-        return (
-            {
-                "projection": PROJECTION_TRADING_DESK,
-                "company_id": company_id,
-                "charter_revision": charter_revision,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "active_domains": domains,
-                "paper_enabled": has_paper,
-                "environment": environment,
-                "selected_book_id": selected_book["binding_id"]
-                if selected_book
-                else None,
-                "selected_book": (
-                    {
-                        k: v
-                        for k, v in selected_book.items()
-                        if k not in ("positions", "orders", "cumulative_return_series")
-                    }
-                    if selected_book
-                    else None
-                ),
-                "books": book_summaries,
-                "kpis": kpis,
-                "cumulative_return_series": cumulative_return_series,
-                "shadow_benchmark": shadow_benchmark,
-                "open_positions": open_positions,
-                "execution_tape": execution_tape,
-                "pnl_reconciliation_bridge": pnl_bridge,
-                "exposure_cap": {
-                    "used_minor_units": exposure_used_minor,
-                    "limit_minor_units": exposure_limit_minor,
-                    "currency": currency,
-                },
-                "close_count": len(closes),
-                "open_close_issues": open_close_issues,
-                "risk_gate": {
-                    "suspended": risk_suspended or len(active_restrictions) > 0,
-                    "effective_revision": risk_revision,
-                    "active_restriction_count": len(active_restrictions),
-                },
-                "governance": {
-                    "company_live": tiers.get("company_live"),
-                    "live_candidates": tiers.get("live_candidates", []),
-                    "qualification_receipts": tiers.get("qualification_receipts", []),
-                    "promotion_history": tiers.get("promotion_history", []),
-                    "migration_history": tiers.get("migration_history", []),
-                    "company_paper_soak_ready": bool(
-                        tiers.get("company_paper_soak_ready", False)
-                    ),
-                    "paper_books_count": len(paper_books),
-                    "soak_ready_books_count": soak_ready_books,
-                    "current_core_digest": tiers.get("current_core_digest", ""),
-                },
             },
             event_seq,
         )

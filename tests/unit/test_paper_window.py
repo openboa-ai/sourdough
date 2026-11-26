@@ -11,9 +11,9 @@ from threading import Event
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.paper_window import (
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.execution import PaperAccount
+from sourdough.trading.window import (
     WindowPlan,
     WindowRefused,
     read_window,
@@ -27,17 +27,31 @@ class ProspectiveWindowTests(unittest.TestCase):
     def setUp(self):
         root = Path(self.enterContext(TemporaryDirectory()))
         self.store = root / "company.sqlite"
-        self.venue = FixedQuoteVenue(root / "venue.sqlite")
         self.company = found(
             self.store, FoundingTerms("company", "charter", "paper", "profile")
         ).company_id
-        self.account = self.venue.provision(
-            PaperAccount("paper", "fixture", "instrument", "USD", 1000, "paper"), 10
-        )
-        bind(
-            self.store,
-            PaperMandate("binding", self.company, "charter", self.account, 500),
-            self.venue,
+        with hold_company_writer(self.store, self.company) as writer:
+            binding = register_company_paper_tier(
+                writer,
+                account_id="paper",
+                destination_id="fixture-dest",
+                connector_revision="fixture",
+                instrument_rules_digest="instrument",
+                currency="USD",
+                starting_minor_units=1000,
+                exposure_limit_minor_units=500,
+                fee_bps=0,
+                slippage_bps=0,
+                binding_revision="binding",
+            )
+        self.account = PaperAccount(
+            binding.account_id,
+            binding.connector_revision,
+            binding.instrument_rules_digest,
+            binding.currency,
+            binding.starting_minor_units,
+            binding.environment,
+            binding.destination_id,
         )
         self.plan = WindowPlan(
             window_id="first",
@@ -62,26 +76,24 @@ class ProspectiveWindowTests(unittest.TestCase):
 
     def register(self, plan, now):
         with (
-            patch("sourdough.paper_window.time_ns", return_value=now),
+            patch("sourdough.trading.window.time_ns", return_value=now),
             hold_company_writer(self.store, self.company) as writer,
         ):
             return register_window(writer, plan)
 
     def test_same_binding_and_terms_reopen_as_the_exact_pre_window_receipt(self):
-        original_venue = self.venue.journal.read_bytes()
         receipt = self.register(self.plan, now=90)
         self.assertEqual(receipt.account, self.account)
         self.assertEqual(receipt.registered_ns, 90)
         self.assertEqual(self.register(self.plan, now=210), receipt)
         self.assertEqual(read_window(self.store, self.company, "first"), receipt)
-        self.assertEqual(self.venue.journal.read_bytes(), original_venue)
         self.assertEqual(
             [receipt.admits_availability(stamp) for stamp in (90, 99, 100, 200, 201)],
             [False, False, True, True, False],
         )
         with closing(sqlite3.connect(self.store)) as database:
             [(raw, committed_ns, revision)] = database.execute(
-                "SELECT contract,committed_ns,revision FROM paper_operating_window"
+                "SELECT contract,committed_ns,revision FROM trading_operating_window"
             ).fetchall()
         self.assertEqual(sha256(f"{committed_ns}:{raw}".encode()).hexdigest(), revision)
         self.assertEqual(json.loads(raw)["account"]["starting_minor_units"], 1000)
@@ -109,7 +121,7 @@ class ProspectiveWindowTests(unittest.TestCase):
 
     def test_pending_registration_cannot_cross_opening_at_commit(self):
         with (
-            patch("sourdough.paper_window.time_ns", side_effect=[99, 100]),
+            patch("sourdough.trading.window.time_ns", side_effect=[99, 100]),
             hold_company_writer(self.store, self.company) as writer,
         ):
             with self.assertRaisesRegex(
@@ -142,8 +154,10 @@ class ProspectiveWindowTests(unittest.TestCase):
 
         with (
             ThreadPoolExecutor(max_workers=1) as pool,
-            patch("sourdough.paper_window.open_writer", side_effect=traced_open_writer),
-            patch("sourdough.paper_window.time_ns", side_effect=clock),
+            patch(
+                "sourdough.trading.window.open_writer", side_effect=traced_open_writer
+            ),
+            patch("sourdough.trading.window.time_ns", side_effect=clock),
         ):
             attempt = pool.submit(register)
             try:
@@ -161,7 +175,7 @@ class ProspectiveWindowTests(unittest.TestCase):
         with closing(sqlite3.connect(self.store)) as database:
             self.assertEqual(
                 database.execute(
-                    "SELECT committed_ns,revision FROM paper_operating_window"
+                    "SELECT committed_ns,revision FROM trading_operating_window"
                 ).fetchone(),
                 (None, None),
             )

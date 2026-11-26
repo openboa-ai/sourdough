@@ -3,8 +3,8 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sourdough.binance_emulator import BinanceWireEmulator
-from sourdough.binance_venue import (
+from sourdough.trading.binance_emulator import BinanceWireEmulator
+from sourdough.trading.binance_venue import (
     MARKET_SPOT,
     MARKET_USDM_FUTURES,
     PINNED_BINANCE_ENDPOINTS,
@@ -12,14 +12,14 @@ from sourdough.binance_venue import (
     BinanceVenueConfig,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.credentials import InMemoryTestCredentialProvider
-from sourdough.execution_tiers import ENV_EXTERNAL_TEST, ENV_LIVE, ENV_PAPER
-from sourdough.external_venue import (
+from sourdough.trading.credentials import InMemoryTestCredentialProvider
+from sourdough.trading.domain import ENV_EXTERNAL_TEST, ENV_LIVE, ENV_PAPER
+from sourdough.trading.external_venue import (
     ExternalEnvironmentMismatch,
     ExternalOrderRequest,
     ExternalVenueRefused,
 )
-from sourdough.venue_qualification import run_binance_testnet_qualification
+from sourdough.trading.venue_qualification import run_binance_testnet_qualification
 from sourdough.writer_lease import hold_company_writer
 
 

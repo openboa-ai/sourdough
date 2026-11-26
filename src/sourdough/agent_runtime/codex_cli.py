@@ -14,7 +14,6 @@ from pathlib import Path
 from time import time_ns
 from typing import Any
 
-from ..harness import build_desk_sandbox_profile
 from ._http import render_context_system_prompt
 from .protocol import (
     PROVIDER_CODEX_CLI,
@@ -207,6 +206,8 @@ class CodexCliAdapter:
                     raise AgentRuntimeRefused(
                         "desk_path and store_path are required when use_macos_sandbox=True"
                     )
+                from ..harness import build_desk_sandbox_profile
+
                 sbpl = build_desk_sandbox_profile(
                     request.store_path,
                     request.desk_path,

@@ -72,7 +72,7 @@ class CanonicalV1Schema(unittest.TestCase):
         self.assertFalse(second)
 
         with closing(open_reader(self.store)) as reader, read_tx(reader):
-            self.assertEqual(verify_v1_schema(reader), frozenset({"core", "paper"}))
+            self.assertEqual(verify_v1_schema(reader), frozenset({"core", "trading"}))
             self.assertTrue(is_domain_installed(reader, "paper"))
             non_strict = reader.execute(
                 """SELECT name FROM pragma_table_list
@@ -83,7 +83,7 @@ class CanonicalV1Schema(unittest.TestCase):
             events = reader.execute(
                 "SELECT entity_id, event_type FROM audit_event WHERE event_type = 'domain.activated'"
             ).fetchall()
-            self.assertEqual(events, [("paper", "domain.activated")])
+            self.assertEqual(events, [("trading", "domain.activated")])
 
     def test_non_canonical_user_versions_fail_closed_across_apis(self):
         receipt = found(self.store, self.terms)

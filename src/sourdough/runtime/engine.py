@@ -113,6 +113,7 @@ class CompanyRuntime:
         truncate_wal_on_exit: bool = False,
         tx_lock: threading.RLock | None = None,
         on_commit: Callable[[], None] | None = None,
+        stop_event: threading.Event | None = None,
     ) -> RuntimeStepSummary:
         """Execute one durable sweep/claim/dispatch cycle using an already-held WriterLease."""
         if max_dispatches < 0:
@@ -153,6 +154,8 @@ class CompanyRuntime:
         executed: list[str] = []
         blocked: list[str] = []
         for _ in range(max_dispatches):
+            if stop_event is not None and stop_event.is_set():
+                break
             writer.verify()
             claim_now = read_clock()
             with lock_ctx:

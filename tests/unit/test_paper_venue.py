@@ -5,9 +5,8 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sourdough.paper_account import PaperAccount
-from sourdough.paper_order import PaperIntent
-from sourdough.paper_venue import FixedQuoteVenue, VenueRefused
+from sourdough.trading.execution import PaperAccount, PaperIntent
+from sourdough.trading.venue import FixedQuoteVenue, VenueRefused
 
 
 class PaperVenueTests(unittest.TestCase):

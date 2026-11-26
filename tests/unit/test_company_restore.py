@@ -9,8 +9,7 @@ from tempfile import TemporaryDirectory
 from sourdough.company import FoundingRefused, FoundingTerms, _connect, found, reopen
 from sourdough.company_checkpoint import CheckpointRefused, checkpoint_company
 from sourdough.company_restore import restore_core_checkpoint
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.accounts import open_company_paper_book
 from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 
@@ -114,15 +113,15 @@ company_restore.restore_core_checkpoint(Path(sys.argv[1]), sys.argv[2], Path(sys
         with self.assertRaisesRegex(CheckpointRefused, "checkpoint cut"):
             self.restore()
         self.assertFalse(self.target.exists())
-        venue = FixedQuoteVenue(self.source.with_name("paper.sqlite"))
-        account = venue.provision(
-            PaperAccount("paper", "local", "rules", "USD", 1000, "paper"), 20
-        )
-        with hold_company_writer(self.source, company_id):
-            bind(
-                self.source,
-                PaperMandate("paper", company_id, "paper", account, 200),
-                venue,
+        with hold_company_writer(self.source, company_id) as writer:
+            open_company_paper_book(
+                writer,
+                binding_id="paper-main",
+                book_name="Paper Main",
+                account_id="acct-paper",
+                currency="USD",
+                starting_minor_units=1000,
+                exposure_limit_minor_units=200,
             )
         with self.assertRaisesRegex(
             CheckpointRefused, "independent restore reconciler"

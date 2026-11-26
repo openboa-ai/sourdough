@@ -8,8 +8,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
-from sourdough.market_runtime import observe_market
-from sourdough.market_worker import (
+from sourdough.trading.market_runtime import observe_market
+from sourdough.trading.market_worker import (
     MarketRefused,
     MarketScope,
     MarketTrade,
@@ -22,7 +22,7 @@ from sourdough.market_worker import (
     spot_trade_time_ns,
 )
 from sourdough.supervisor import ChildAttempt, SupervisionResult
-from sourdough.trading_engine import EngineInstallation
+from sourdough.trading.engine import EngineInstallation
 
 
 class MarketObservation(unittest.TestCase):
@@ -111,9 +111,12 @@ class MarketObservation(unittest.TestCase):
 
         with (
             patch(
-                "sourdough.market_runtime.prepare_engine", return_value=installation
+                "sourdough.trading.market_runtime.prepare_engine",
+                return_value=installation,
             ) as prepare,
-            patch("sourdough.market_runtime.supervise_worker", side_effect=drive),
+            patch(
+                "sourdough.trading.market_runtime.supervise_worker", side_effect=drive
+            ),
             patch.dict(os.environ, {"BINANCE_API_KEY": "fixture-only"}),
         ):
             result = observe_market(

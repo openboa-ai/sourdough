@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 from fractions import Fraction
 
-from sourdough.fund_returns import (
+from sourdough.trading.fund_returns import (
     ExternalFlow,
     ReturnRefused,
     ReturnScope,

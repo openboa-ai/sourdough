@@ -191,11 +191,12 @@ def sync_board_triggers(
                 impact = json.loads(str(impact_json))
             except json.JSONDecodeError:
                 continue
-            if not isinstance(impact, dict) or not isinstance(
-                impact.get("action"), str
-            ):
+            if not isinstance(impact, dict):
                 continue
-            if not impact["action"].strip():
+            raw_action = impact.get("action")
+            if raw_action is None:
+                continue
+            if isinstance(raw_action, str) and not raw_action.strip():
                 continue
             _, reused = create_work_item(
                 db,

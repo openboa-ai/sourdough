@@ -72,7 +72,7 @@ class ConnectedFlow(unittest.TestCase):
             )
 
             with closing(open_writer(store)) as db, write_tx(db):
-                enable_domain_v1(db, "paper", company_id=company_id, actor_id="setup")
+                enable_domain_v1(db, "trading", company_id=company_id, actor_id="setup")
 
                 # Add a second agent (Quant Research)
                 quant_id = "agent-quant-01"
@@ -97,47 +97,81 @@ class ConnectedFlow(unittest.TestCase):
                        VALUES ('drun-1', 'duty-quant-1', 'grant-quant-01', 'paper-research', 'paper_execution', 1)"""
                 )
 
-                # Paper binding + valuations including a null/missing interval
+                # Canonical Trading binding + valuations + partially-filled cancelled order + open position
                 db.execute(
-                    """INSERT INTO paper_binding (
-                           singleton, revision, company_id, charter_revision,
-                           exposure_limit_minor_units, account_id, connector_revision,
-                           instrument_rules_digest, currency, starting_minor_units,
-                           environment, destination_id
-                       ) VALUES (1, 'mandate-1', ?, 'charter-v1', 2500000, 'acct-paper-1',
-                                 'nautilus-paper-v1', 'BTC-USD-SPOT', 'USD', 10000000, 'paper', 'dest-1')""",
-                    (company_id,),
+                    """INSERT INTO execution_environment_binding (
+                           binding_id, company_id, tier, environment, owner_agent_id,
+                           account_id, destination_id, connector_revision, instrument_rules_digest,
+                           currency, starting_minor_units, exposure_limit_minor_units,
+                           fee_bps, slippage_bps, quote_source, binding_revision, book_name,
+                           book_role, status, created_at_ns, updated_at_ns
+                       ) VALUES ('mandate-1', ?, 'company_paper', 'paper', NULL,
+                                 'acct-paper-1', 'dest-1', 'nautilus-paper-v1', 'BTC-USD-SPOT',
+                                 'USD', 10000000, 2500000, 0, 0, 'live_read_only', 'mandate-1',
+                                 'Paper Desk', 'active', 'active', ?, ?)""",
+                    (company_id, now, now),
                 )
                 db.execute(
-                    """INSERT INTO paper_valuation (capture_id, binding_revision, policy, evidence, trading_nav_atoms, revision)
-                       VALUES
-                       ('val-1', 'mandate-1', 'mid', '{"label":"Day 1"}', 10050000, 'vrev-1'),
-                       ('val-2', 'mandate-1', 'mid', '{"label":"Day 2","missing":true}', 10050000, 'vrev-2'),
-                       ('val-3', 'mandate-1', 'mid', '{"label":"Day 3"}', 10185000, 'vrev-3')"""
+                    """INSERT INTO trading_book_valuation (
+                           valuation_id, binding_id, environment, company_id, label,
+                           nav_minor_units, cash_minor_units, gross_exposure_minor_units,
+                           realized_pnl_minor_units, unrealized_pnl_minor_units, total_fees_minor_units,
+                           source, binding_revision, policy, evidence_json, revision, recorded_at_ns
+                       ) VALUES
+                       ('val-1', 'mandate-1', 'paper', ?, 'Day 1', 10050000, 10050000, 0, 50000, 0, 0, 'book_valuation', 'mandate-1', 'mid', '{"label":"Day 1"}', 'vrev-1', ?),
+                       ('val-2', 'mandate-1', 'paper', ?, 'Day 2', 10050000, 10050000, 0, 50000, 0, 0, 'book_valuation', 'mandate-1', 'mid', '{"label":"Day 2"}', 'vrev-2', ?),
+                       ('val-3', 'mandate-1', 'paper', ?, 'Day 3', 10185000, 10185000, 0, 185000, 0, 0, 'book_valuation', 'mandate-1', 'mid', '{"label":"Day 3"}', 'vrev-3', ?)""",
+                    (company_id, now, company_id, now + 1, company_id, now + 2),
                 )
 
-                # Order with S04 cancel != flat residual open position!
                 db.execute(
-                    """INSERT INTO paper_order (
-                           order_id, run_id, mandate_revision, account_id, action_id,
-                           instrument_rules_digest, quantity, limit_minor_units, reserved_minor_units
-                       ) VALUES ('ord-041', 'drun-1', 'mandate-1', 'acct-paper-1', 'act-1',
-                                 'BTC-USD-SPOT', 10, 6500000, 65000000)"""
+                    """INSERT INTO work_items (
+                           work_item_id, company_id, owner_agent_id, duty_kind, state,
+                           source_kind, source_id, payload_json, created_at_ns, updated_at_ns
+                       ) VALUES ('wi-1', ?, ?, 'strategy.review', 'running', 'manual', 's1',
+                                 '{"summary":"Audit v4 fee slippage"}', ?, ?)""",
+                    (company_id, quant_id, now, now),
                 )
                 db.execute(
-                    """INSERT INTO paper_fill (fill_id, order_id, quantity, price_minor_units)
-                       VALUES ('fill-041-a', 'ord-041', 4, 6498000)"""
+                    """INSERT INTO work_runs (
+                           run_id, company_id, work_item_id, agent_id, duty_kind, status,
+                           fencing_token, budget_ceiling_minor, created_at_ns, updated_at_ns
+                       ) VALUES ('wrun-1', ?, 'wi-1', ?, 'strategy.review', 'running', 1, 5000, ?, ?)""",
+                    (company_id, quant_id, now, now),
+                )
+
+                # Order with partial fill + cancel leaving residual open position!
+                db.execute(
+                    """INSERT INTO trading_book_order (
+                           order_id, binding_id, environment, company_id, actor_id, action_id,
+                           run_id, mandate_revision, cancelled_at_ns, cancel_reason,
+                           instrument_id, side, quantity, limit_minor_units, market_price_minor_units,
+                           quote_observed_at_ns, quote_source, fee_bps, slippage_bps,
+                           status, filled_quantity, fill_price_minor_units, fee_minor_units,
+                           created_at_ns, updated_at_ns
+                       ) VALUES ('ord-041', 'mandate-1', 'paper', ?, ?, 'act-1',
+                                 'wrun-1', 'mandate-1', ?, 'cancelled_partial',
+                                 'BTC-USD-SPOT', 'buy', 10, 6500000, 6500000,
+                                 ?, 'fixture', 0, 0,
+                                 'cancelled', 4, 6498000, 1800, ?, ?)""",
+                    (company_id, quant_id, now, now, now, now),
                 )
                 db.execute(
-                    """INSERT INTO paper_fill_fee (fill_id, fee_minor_units)
-                       VALUES ('fill-041-a', 1800)"""
+                    """INSERT INTO trading_book_fill (
+                           fill_id, order_id, binding_id, environment, company_id, actor_id,
+                           instrument_id, side, quantity, price_minor_units, fee_minor_units,
+                           realized_pnl_minor_units, filled_at_ns
+                       ) VALUES ('fill-041-a', 'ord-041', 'mandate-1', 'paper', ?, ?,
+                                 'BTC-USD-SPOT', 'buy', 4, 6498000, 1800, 0, ?)""",
+                    (company_id, quant_id, now),
                 )
                 db.execute(
-                    """INSERT INTO paper_cancellation (
-                           order_id, event_id, filled_quantity, released,
-                           position_quantity, available_at, outcome
-                       ) VALUES ('ord-041', 'cancel-041', 4, 1, 4, ?, 'cancelled_partial')""",
-                    (now,),
+                    """INSERT INTO trading_book_position (
+                           binding_id, environment, company_id, instrument_id, quantity,
+                           avg_entry_minor_units, mark_price_minor_units, realized_pnl_minor_units,
+                           total_fees_minor_units, updated_at_ns
+                       ) VALUES ('mandate-1', 'paper', ?, 'BTC-USD-SPOT', 4, 6498000, 6500000, 0, 1800, ?)""",
+                    (company_id, now),
                 )
 
                 # Open accounting close issue -> Company Net P&L MUST be Unavailable (null), NEVER $0!
@@ -157,21 +191,6 @@ class ConnectedFlow(unittest.TestCase):
                         json.dumps([founder_id, quant_id]),
                         json.dumps([founder_id, quant_id]),
                     ),
-                )
-                db.execute(
-                    """INSERT INTO work_items (
-                           work_item_id, company_id, owner_agent_id, duty_kind, state,
-                           source_kind, source_id, payload_json, created_at_ns, updated_at_ns
-                       ) VALUES ('wi-1', ?, ?, 'strategy.review', 'running', 'manual', 's1',
-                                 '{"summary":"Audit v4 fee slippage"}', ?, ?)""",
-                    (company_id, quant_id, now, now),
-                )
-                db.execute(
-                    """INSERT INTO work_runs (
-                           run_id, company_id, work_item_id, agent_id, duty_kind, status,
-                           fencing_token, budget_ceiling_minor, created_at_ns, updated_at_ns
-                       ) VALUES ('wrun-1', ?, 'wi-1', ?, 'strategy.review', 'running', 1, 5000, ?, ?)""",
-                    (company_id, quant_id, now, now),
                 )
                 db.execute(
                     """INSERT INTO project_message (
@@ -264,25 +283,46 @@ class ConnectedFlow(unittest.TestCase):
             cookie = hdrs["set-cookie"].split(";", 1)[0]
             auth = {"Cookie": cookie, "Origin": f"http://127.0.0.1:{port}"}
 
-            # 2. Inspect Live Trading: verify cancel!=flat, null-gap chart, Unavailable!=0!
-            st, lt_hdrs, lt_raw = req(
+            # 2. Inspect Trading Desk (paper), verify retired routes return 404, and check order trace!
+            st_lt_retired, _, _ = req(
                 "GET", "/api/v1/projections/live-trading", headers=auth
             )
+            self.assertEqual(st_lt_retired, 404)
+            st_et_retired, _, _ = req(
+                "GET", "/api/v1/projections/execution-tiers", headers=auth
+            )
+            self.assertEqual(st_et_retired, 404)
+
+            st, td_hdrs, td_raw = req(
+                "GET",
+                "/api/v1/projections/trading-desk?environment=paper",
+                headers=auth,
+            )
             self.assertEqual(st, 200)
-            lt = json.loads(lt_raw)
-            self.assertTrue(lt["paper_enabled"])
-            self.assertIsNone(lt["kpis"]["company_net_pnl"]["value_minor"])
-            self.assertEqual(lt["kpis"]["company_net_pnl"]["status"], "unavailable")
-            self.assertEqual(lt["cumulative_return_series"][1]["return_pct"], None)
-            self.assertEqual(len(lt["execution_tape"]), 1)
-            self.assertTrue(lt["execution_tape"][0]["cancel_not_flat"])
-            self.assertEqual(lt["execution_tape"][0]["residual_position_qty"], 4)
+            td = json.loads(td_raw)
+            self.assertTrue(td["trading_enabled"])
+            self.assertEqual(len(td["open_close_issues"]), 1)
+            self.assertEqual(len(td["cumulative_return_series"]), 3)
+            self.assertEqual(len(td["execution_tape"]), 1)
+            self.assertEqual(td["execution_tape"][0]["status"], "cancelled")
+            self.assertEqual(td["execution_tape"][0]["filled_quantity"], 4)
+            self.assertEqual(td["open_positions"][0]["quantity"], 4)
+
+            st_trace, _, trace_raw = req(
+                "GET", "/api/v1/projections/orders/ord-041", headers=auth
+            )
+            self.assertEqual(st_trace, 200)
+            trace = json.loads(trace_raw)
+            self.assertEqual(trace["order"]["order_id"], "ord-041")
+            self.assertTrue(trace["order"]["cancel_not_flat"])
+            self.assertEqual(trace["order"]["residual_position_qty"], 4)
+            self.assertEqual(trace["order"]["fills"][0]["fill_id"], "fill-041-a")
 
             # ETag 304 caching works cleanly.
             st304, _, _ = req(
                 "GET",
-                "/api/v1/projections/live-trading",
-                headers=auth | {"If-None-Match": lt_hdrs["etag"]},
+                "/api/v1/projections/trading-desk?environment=paper",
+                headers=auth | {"If-None-Match": td_hdrs["etag"]},
             )
             self.assertEqual(st304, 304)
 

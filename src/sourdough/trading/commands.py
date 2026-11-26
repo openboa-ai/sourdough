@@ -14,16 +14,33 @@ from ..board_control import (
     _require_text,
     make_board_authorizer,
 )
-from ..strategy_comparison import (
+from ..writer_lease import WriterLease
+from .accounts import demote_live_environment, promote_execution_environment
+from .domain import (
+    DEMOTE_LIVE_ENVIRONMENT,
+    EXECUTION_TIER_COMMAND,
+    PROMOTE_EXECUTION_ENVIRONMENT,
+    ExecutionTierRefused,
+)
+from .strategy_comparison import (
     StrategyComparisonRefused,
     activate_strategy_release,
     rollback_strategy_deployment,
 )
-from ..writer_lease import WriterLease
 
 STRATEGY_COMMAND = "strategy-command-v1"
 ACTIVATE_STRATEGY_RELEASE = "activate_strategy_release"
 ROLLBACK_STRATEGY_DEPLOYMENT = "rollback_strategy_deployment"
+
+PROMOTE_PRECONDITION_KEYS = frozenset(
+    {
+        "charter_revision",
+        "target_binding_id",
+        "qualification_receipt_id",
+        "expected_payload_hash",
+    }
+)
+DEMOTE_PRECONDITION_KEYS = frozenset({"charter_revision", "target_binding_id"})
 
 
 def execute_strategy_command(
@@ -114,3 +131,60 @@ def execute_strategy_command(
             "status": deployment.status,
         },
     )
+
+
+def execute_execution_tier_command(
+    writer: WriterLease,
+    *,
+    command_id: str,
+    command_type: str,
+    preconditions: dict[str, Any],
+    payload: dict[str, Any],
+    authorize: AuthorizeBoard | None = None,
+    principal_hint: str | None = None,
+    peer_pid: int | None = None,
+) -> BoardCommandOutcome:
+    """Delegate execution-tier promotion/demotion commands to trading.accounts."""
+    try:
+        if command_type == PROMOTE_EXECUTION_ENVIRONMENT:
+            return promote_execution_environment(
+                writer,
+                command_id=command_id,
+                charter_revision=preconditions.get("charter_revision"),
+                target_binding_id=preconditions.get("target_binding_id"),
+                qualification_receipt_id=preconditions.get("qualification_receipt_id"),
+                expected_payload_hash=preconditions.get("expected_payload_hash"),
+                reason=payload.get("reason"),
+                authorize=authorize,
+                principal_hint=principal_hint,
+                peer_pid=peer_pid,
+            )
+        if command_type == DEMOTE_LIVE_ENVIRONMENT:
+            return demote_live_environment(
+                writer,
+                command_id=command_id,
+                charter_revision=preconditions.get("charter_revision"),
+                target_binding_id=preconditions.get("target_binding_id"),
+                action=payload.get("action"),
+                reason=payload.get("reason"),
+                authorize=authorize,
+                principal_hint=principal_hint,
+                peer_pid=peer_pid,
+            )
+    except ExecutionTierRefused as error:
+        raise BoardControlRefused(str(error)) from error
+    raise BoardControlRefused("Unsupported execution tier command")
+
+
+__all__ = [
+    "ACTIVATE_STRATEGY_RELEASE",
+    "DEMOTE_LIVE_ENVIRONMENT",
+    "DEMOTE_PRECONDITION_KEYS",
+    "EXECUTION_TIER_COMMAND",
+    "PROMOTE_EXECUTION_ENVIRONMENT",
+    "PROMOTE_PRECONDITION_KEYS",
+    "ROLLBACK_STRATEGY_DEPLOYMENT",
+    "STRATEGY_COMMAND",
+    "execute_execution_tier_command",
+    "execute_strategy_command",
+]
