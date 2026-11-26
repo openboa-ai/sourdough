@@ -1,16 +1,10 @@
 """Unified CompanyRuntime, ResidentCompanyService, DutyRegistry, Work kernel, and venue boundary."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 from .engine import CompanyRuntime, RuntimeStepSummary, build_default_registry
-from .handlers import (
-    DUTY_BOARD_APPLY_DECISION,
-    DUTY_CEO_RESPOND_MESSAGE,
-    DUTY_QUANT_AGENT_SANDBOX,
-    DUTY_QUANT_PAPER_DECISION,
-    DUTY_QUANT_RECONCILE,
-    ProfileBindingLookup,
-    build_production_duty_registry,
-    sync_board_triggers,
-)
 from .registry import (
     DutyContext,
     DutyDescriptor,
@@ -18,7 +12,6 @@ from .registry import (
     DutyRegistry,
     RuntimeRefused,
 )
-from .resident import ResidentCompanyService, ResidentHealth
 from .venue_coordinator import (
     DRAIN_MARGIN_SECONDS,
     MAX_SEGMENT_SECONDS,
@@ -54,6 +47,46 @@ from .work_kernel import (
     wake_waiting_runs,
     yield_run_to_wait,
 )
+
+if TYPE_CHECKING:
+    from .handlers import (
+        DUTY_BOARD_APPLY_DECISION,
+        DUTY_CEO_RESPOND_MESSAGE,
+        DUTY_QUANT_AGENT_SANDBOX,
+        DUTY_QUANT_PAPER_DECISION,
+        DUTY_QUANT_RECONCILE,
+        ProfileBindingLookup,
+        build_production_duty_registry,
+        sync_board_triggers,
+    )
+    from .resident import ResidentCompanyService, ResidentHealth
+
+_LAZY_HANDLERS = frozenset(
+    {
+        "DUTY_BOARD_APPLY_DECISION",
+        "DUTY_CEO_RESPOND_MESSAGE",
+        "DUTY_QUANT_AGENT_SANDBOX",
+        "DUTY_QUANT_PAPER_DECISION",
+        "DUTY_QUANT_RECONCILE",
+        "ProfileBindingLookup",
+        "build_production_duty_registry",
+        "sync_board_triggers",
+    }
+)
+_LAZY_RESIDENT = frozenset({"ResidentCompanyService", "ResidentHealth"})
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_HANDLERS:
+        from . import handlers
+
+        return getattr(handlers, name)
+    if name in _LAZY_RESIDENT:
+        from . import resident
+
+        return getattr(resident, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "BoundedVenueCoordinator",

@@ -630,6 +630,142 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
     </Fragment>
   );
 
+  const sandbox = activeData.agent_sandbox ?? null;
+  const sandboxCurrency = sandbox?.binding.currency || "USD";
+  const sandboxFacts: Fact[] = sandbox
+    ? [
+        {
+          id: "sbx-acct",
+          label: "Sandbox Account",
+          value: <Text className="sd-mono">{sandbox.binding.account_id}</Text>,
+        },
+        {
+          id: "sbx-cash",
+          label: "Virtual Cash",
+          value: (
+            <Text className="sd-tabular">
+              {formatMinorCurrency(sandbox.cash_minor_units, sandboxCurrency)}
+            </Text>
+          ),
+        },
+        {
+          id: "sbx-exp",
+          label: "Gross Exposure / Cap",
+          value: (
+            <Text className="sd-tabular">
+              {formatMinorCurrency(sandbox.gross_exposure_minor_units, sandboxCurrency)} /{" "}
+              {formatMinorCurrency(sandbox.exposure_limit_minor_units, sandboxCurrency)}
+            </Text>
+          ),
+        },
+        {
+          id: "sbx-pnl",
+          label: "Realized P&L",
+          value: (
+            <Text
+              className={`sd-tabular ${
+                sandbox.realized_pnl_minor_units > 0
+                  ? "sd-tone-pos"
+                  : sandbox.realized_pnl_minor_units < 0
+                    ? "sd-tone-neg"
+                    : ""
+              }`}
+            >
+              {formatMinorCurrency(sandbox.realized_pnl_minor_units, sandboxCurrency, {
+                signed: true,
+              })}
+            </Text>
+          ),
+        },
+        {
+          id: "sbx-fees",
+          label: "Simulated Fees & Slippage",
+          value: (
+            <Text className="sd-tabular">
+              {formatMinorCurrency(sandbox.total_fees_minor_units, sandboxCurrency)} (
+              {sandbox.binding.fee_bps} bps fee · {sandbox.binding.slippage_bps} bps slip)
+            </Text>
+          ),
+        },
+      ]
+    : [];
+
+  const sandboxPosCols: DataColumn[] = [
+    { id: "instrument", label: "Instrument", kind: "identity" },
+    { id: "qty", label: "Quantity", kind: "numeric", align: "end" },
+    { id: "entry", label: "Avg Entry", kind: "numeric", align: "end" },
+    { id: "pnl", label: "Realized P&L", kind: "numeric", align: "end" },
+    { id: "fees", label: "Fees", kind: "numeric", align: "end" },
+  ];
+
+  const sandboxPosRows: DataRow[] = (sandbox?.positions ?? []).map((p) => ({
+    id: p.instrument_id,
+    cells: {
+      instrument: <Text variant="body">{p.instrument_id}</Text>,
+      qty: <Text className="sd-tabular">{p.quantity}</Text>,
+      entry: (
+        <Text className="sd-tabular">
+          {formatMinorCurrency(p.avg_entry_minor_units, sandboxCurrency)}
+        </Text>
+      ),
+      pnl: (
+        <Text className="sd-tabular">
+          {formatMinorCurrency(p.realized_pnl_minor_units, sandboxCurrency, { signed: true })}
+        </Text>
+      ),
+      fees: (
+        <Text className="sd-tabular">
+          {formatMinorCurrency(p.total_fees_minor_units, sandboxCurrency)}
+        </Text>
+      ),
+    },
+  }));
+
+  const sandboxOrderCols: DataColumn[] = [
+    { id: "order", label: "Order & Instrument", kind: "identity" },
+    { id: "side", label: "Side / Qty", kind: "numeric", align: "end" },
+    { id: "price", label: "Fill / Limit", kind: "numeric", align: "end" },
+    { id: "fee", label: "Fee", kind: "numeric", align: "end" },
+    { id: "status", label: "Status", kind: "role" },
+  ];
+
+  const sandboxOrderRows: DataRow[] = (sandbox?.orders ?? []).map((o) => ({
+    id: o.order_id,
+    cells: {
+      order: (
+        <Stack gap={2}>
+          <Text variant="body">{o.instrument_id}</Text>
+          <Text variant="meta" className="sd-mono">
+            {o.order_id}
+          </Text>
+        </Stack>
+      ),
+      side: (
+        <Text className="sd-tabular">
+          {o.side.toUpperCase()} {o.filled_quantity}/{o.quantity}
+        </Text>
+      ),
+      price: (
+        <Text className="sd-tabular">
+          {formatMinorCurrency(o.fill_price_minor_units ?? o.limit_minor_units, sandboxCurrency)}
+        </Text>
+      ),
+      fee: (
+        <Text className="sd-tabular">
+          {formatMinorCurrency(o.fee_minor_units, sandboxCurrency)}
+        </Text>
+      ),
+      status: (
+        <Badge
+          tone={o.status === "filled" ? "success" : o.status === "open" ? "brand" : "neutral"}
+          dot={false}
+        >
+          {o.status}
+        </Badge>
+      ),
+    },
+  }));
+
   return (
     <Stack gap={16}>
       <Navbar
@@ -1146,6 +1282,92 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                     </List>
                   )}
                 </Card>
+              </Stack>
+            ),
+          },
+          {
+            id: "sandbox",
+            label: sandbox
+              ? `Tier 1 Sandbox (${sandbox.fill_count} ${sandbox.fill_count === 1 ? "fill" : "fills"})`
+              : "Tier 1 Sandbox",
+            panel: (
+              <Stack gap={12}>
+                <Notice title="Isolated Tier 1 personal paper sandbox" tone="neutral">
+                  This virtual account belongs exclusively to {profile.display_name} for
+                  strategy testing. Orders here never touch company paper capital or Tier 3 live
+                  venues.
+                </Notice>
+                {!sandbox ? (
+                  <Card
+                    title="No active Tier 1 sandbox"
+                    variant="raised"
+                    headerAction={
+                      <Button
+                        emphasis="quiet"
+                        size="compact"
+                        shape="pill"
+                        onClick={() => navigate("/company/execution-tiers")}
+                      >
+                        Execution Tiers
+                      </Button>
+                    }
+                  >
+                    <Text variant="help">
+                      {profile.display_name} has not opened an isolated Tier 1 sandbox account
+                      yet.
+                    </Text>
+                  </Card>
+                ) : (
+                  <Stack gap={12}>
+                    <Card
+                      title="Sandbox Portfolio Summary"
+                      description={`Binding ${sandbox.binding.binding_id} · Quote source ${sandbox.binding.quote_source}`}
+                      variant="raised"
+                      headerAction={
+                        <Button
+                          emphasis="quiet"
+                          size="compact"
+                          shape="pill"
+                          onClick={() => navigate("/company/execution-tiers")}
+                        >
+                          All Execution Tiers
+                        </Button>
+                      }
+                    >
+                      <div className="sd-facts-wrap">
+                        <RecordFacts
+                          source="agent_sandbox"
+                          asOf={`seq #${activeData.event_seq}`}
+                          facts={sandboxFacts}
+                        />
+                      </div>
+                    </Card>
+                    <div className="sd-split-equal">
+                      <Card title="Sandbox Positions" variant="raised">
+                        {sandboxPosRows.length === 0 ? (
+                          <Text variant="help">No sandbox positions recorded yet.</Text>
+                        ) : (
+                          <DataTable
+                            caption="Agent Tier 1 sandbox positions"
+                            columns={sandboxPosCols}
+                            rows={sandboxPosRows}
+                          />
+                        )}
+                      </Card>
+                      <Card title="Recent Sandbox Orders" variant="raised">
+                        {sandboxOrderRows.length === 0 ? (
+                          <Text variant="help">No sandbox orders recorded yet.</Text>
+                        ) : (
+                          <DataTable
+                            caption="Agent Tier 1 sandbox orders"
+                            columns={sandboxOrderCols}
+                            rows={sandboxOrderRows}
+                          />
+                        )}
+                      </Card>
+                    </div>
+                  </Stack>
+                )}
               </Stack>
             ),
           },
