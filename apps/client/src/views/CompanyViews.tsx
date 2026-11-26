@@ -277,11 +277,20 @@ export function FinanceView() {
     });
   };
 
+  const showRetainedStatements =
+    data.trading_enabled || data.retained_statements.length > 0;
+  const showTradingFinance =
+    showRetainedStatements || data.funding_settlements.length > 0;
+
   return (
     <Stack gap={16}>
       <PageHeader
         title="Finance"
-        detail="Double-entry general ledger, period accounting closes, retained statements, and funding settlements"
+        detail={
+          showTradingFinance
+            ? "Double-entry general ledger, period accounting closes, retained statements, and funding settlements"
+            : "Double-entry general ledger and period accounting closes"
+        }
       />
 
       {data.open_close_issues.length > 0 ? (
@@ -304,7 +313,7 @@ export function FinanceView() {
         </Notice>
       ) : null}
 
-      <div className="sd-split-equal">
+      <div className={showRetainedStatements ? "sd-split-equal" : undefined}>
         <Card
           title="General Ledger Account Balances"
           variant="raised"
@@ -317,51 +326,49 @@ export function FinanceView() {
           )}
         </Card>
 
-        <Card
-          title={`Retained Window Statements (${data.retained_statements.length})`}
-          description="Sealed window statement snapshots retained for reconciliation and strategy evaluation"
-          variant="raised"
-        >
-          {data.retained_statements.length === 0 ? (
-            <Text variant="help">
-              {!data.trading_enabled
-                ? "Trading domain not enabled — no retained window statements."
-                : "No retained window statements sealed yet."}
-            </Text>
-          ) : (
-            <Stack gap={12}>
-              {data.retained_statements.map((stmt) => (
-                <Surface key={stmt.request_id} variant="surface" density="compact">
-                  <Stack gap={8}>
-                    <Inline justify="between" align="center" gap={8} wrap>
-                      <Inline gap={8} align="center">
-                        <Heading level={4} className="sd-mono">
-                          {stmt.request_id}
-                        </Heading>
-                        <Badge tone="neutral" variant="outline" dot={false}>
-                          {stmt.window_id}
-                        </Badge>
+        {showRetainedStatements ? (
+          <Card
+            title={`Retained Window Statements (${data.retained_statements.length})`}
+            description="Sealed window statement snapshots retained for reconciliation and strategy evaluation"
+            variant="raised"
+          >
+            {data.retained_statements.length === 0 ? (
+              <Text variant="help">No retained window statements sealed yet.</Text>
+            ) : (
+              <Stack gap={12}>
+                {data.retained_statements.map((stmt) => (
+                  <Surface key={stmt.request_id} variant="surface" density="compact">
+                    <Stack gap={8}>
+                      <Inline justify="between" align="center" gap={8} wrap>
+                        <Inline gap={8} align="center">
+                          <Heading level={4} className="sd-mono">
+                            {stmt.request_id}
+                          </Heading>
+                          <Badge tone="neutral" variant="outline" dot={false}>
+                            {stmt.window_id}
+                          </Badge>
+                        </Inline>
+                        <Inline gap={6} align="center">
+                          <Text variant="meta" className="sd-mono">
+                            Rev: {stmt.revision}
+                          </Text>
+                          <CopyButton value={stmt.revision} presentation="quiet" />
+                        </Inline>
                       </Inline>
-                      <Inline gap={6} align="center">
-                        <Text variant="meta" className="sd-mono">
-                          Rev: {stmt.revision}
-                        </Text>
-                        <CopyButton value={stmt.revision} presentation="quiet" />
-                      </Inline>
-                    </Inline>
-                    <div className="sd-facts-wrap">
-                      <RecordFacts
-                        source={`statement:${stmt.window_id}`}
-                        asOf={stmt.revision}
-                        facts={formatStatementPayloadFacts(stmt.request_id, stmt.payload)}
-                      />
-                    </div>
-                  </Stack>
-                </Surface>
-              ))}
-            </Stack>
-          )}
-        </Card>
+                      <div className="sd-facts-wrap">
+                        <RecordFacts
+                          source={`statement:${stmt.window_id}`}
+                          asOf={stmt.revision}
+                          facts={formatStatementPayloadFacts(stmt.request_id, stmt.payload)}
+                        />
+                      </div>
+                    </Stack>
+                  </Surface>
+                ))}
+              </Stack>
+            )}
+          </Card>
+        ) : null}
       </div>
 
       <Card title="Period Accounting Closes" variant="raised" className="sd-ledger-card">

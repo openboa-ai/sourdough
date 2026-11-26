@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from contextlib import closing
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from ..agent_desk import desk_directory
 from ..agent_runtime.cost_accounting import settle_shift_cost_to_ledger
@@ -725,9 +726,31 @@ class TradingDomainPlugin(BaseDomainPlugin):
         )
 
     def contribute_projections(self) -> tuple[ProjectionDescriptor, ...]:
-        def _valid_segment(raw: str) -> str | None:
+        def _valid_path_segment(raw: str) -> str | None:
+            if "/" in raw or not raw:
+                return None
+            decoded = unquote(raw)
+            if (
+                "/" in decoded
+                or "\\" in decoded
+                or "\x00" in decoded
+                or decoded in (".", "..")
+                or not decoded.strip()
+                or len(decoded) > 128
+            ):
+                return None
+            return decoded
+
+        def _valid_query_segment(raw: str) -> str | None:
             seg = raw.strip()
-            if not seg or "/" in seg or ".." in seg or len(seg) > 128:
+            if (
+                not seg
+                or "/" in seg
+                or "\\" in seg
+                or "\x00" in seg
+                or seg in (".", "..")
+                or len(seg) > 128
+            ):
                 return None
             return seg
 
@@ -746,8 +769,8 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 )
             book_raw = query.get("book_id", [None])[0]
             book_id: str | None = None
-            if book_raw is not None and book_raw.strip():
-                book_id = _valid_segment(book_raw)
+            if book_raw is not None:
+                book_id = _valid_query_segment(book_raw)
                 if book_id is None:
                     raise IpcRefused("Invalid book_id parameter")
             return read_trading_desk_projection(
@@ -765,7 +788,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
             _authorize: Any,
             _principal: str | None,
         ) -> tuple[dict[str, Any] | None, int]:
-            order_id = _valid_segment(suffix[len("orders/") :])
+            order_id = _valid_path_segment(suffix[len("orders/") :])
             if order_id is None:
                 raise IpcRefused("Invalid order identifier")
             return read_order_trace_projection(store, company_id, order_id)

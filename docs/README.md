@@ -94,8 +94,8 @@ The Board Client is optional for autonomous operation and serves as the human in
 | Owner | Authoritative output | Decision boundary | Intents / specs |
 | --- | --- | --- | ---: |
 | [C1 · Company mandate and organization](company/systems/organization/README.md) | Charter, roster, staffing and retirement | Binds a new Agent ID to a profile; does not choose tools or authenticate a turn. | 4 / 7 |
-| [C2 · Identity and authority](company/systems/authority/README.md) | Verified principal, effective grant and cutoff | Decides whether this actor may act; a role, profile or budget is not permission. | 2 / 3 |
-| [C3 · Work and Agent communication](company/systems/work/README.md) | Work claim, next wake, conversation and accepted handoff | Schedules and transfers duties; delivery of a message is not acceptance. | 4 / 6 |
+| [C2 · Identity and authority](company/systems/authority/README.md) | Verified principal, effective grant and cutoff | Decides whether this actor may act; a role, profile or budget is not permission. | 2 / 4 |
+| [C3 · Work and Agent communication](company/systems/work/README.md) | Work claim, next wake, conversation and accepted handoff | Schedules and transfers duties; delivery of a message is not acceptance. | 4 / 9 |
 | [C5 · Company resource inventory and custody](company/systems/resources/README.md) | Company asset inventory, custodian and access assignments | Owns custody and provisioning; authority and finance decide grants and budget. | 2 / 3 |
 | [C6 · External resource connectors](company/systems/connectors/README.md) | External resource binding, operation and observation receipt | Transports admitted effects; cannot interpret a timeout as a rejected order. | 1 / 2 |
 | [C7 · Accounting and financial records](company/systems/accounting/README.md) | Balanced journals, reconciled actuals and period close | Books economic sources once; does not allocate capital or compute investment returns. | 2 / 2 |
@@ -109,7 +109,7 @@ The Board Client is optional for autonomous operation and serves as the human in
 | Owner | Authoritative output | Decision boundary | Intents / specs |
 | --- | --- | --- | ---: |
 | [Q1 · Quant research and portfolio management](company/profiles/quant/investments/README.md) | As-of data, finding, historical replay, portfolio target and strategy deployment | Proposes an investment decision; cannot admit an order or book a position. | 5 / 8 |
-| [Q2 · Trade execution, market risk and venues](company/profiles/quant/trading/README.md) | Shared execution binding, company-managed runtime, current-market paper, risk admission, order lifecycle and reconciliation duty | Decides risk admission and queries the venue; Q3 alone writes reservation state and postings, the venue owns fills. | 9 / 13 |
+| [Q2 · Trade execution, market risk and venues](company/profiles/quant/trading/README.md) | Shared execution binding, company-managed runtime, current-market paper, risk admission, order lifecycle and reconciliation duty | Decides risk admission and queries the venue; Q3 alone writes reservation state and postings, the venue owns fills. | 9 / 14 |
 | [Q3 · Positions, fund performance and investment reporting](company/profiles/quant/fund-books/README.md) | Deduplicated investment postings, positions, reservations, performance and lineage | Writes account reservation state, computes net return and maps cash sources to C7; client never computes a second return. | 3 / 7 |
 
 ### Employee

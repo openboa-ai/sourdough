@@ -114,6 +114,8 @@ _CORE_SINGLE_MODULES = (
     "staffing.py",
     "staffing_tools.py",
     "supervisor.py",
+    "trial_execution.py",
+    "trial_registry.py",
     "work.py",
     "work_handoff.py",
     "work_peer_response.py",

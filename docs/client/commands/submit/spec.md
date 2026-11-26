@@ -80,7 +80,7 @@ Every state-mutating governance or safety command confirms **in-place via `Contr
 | Normal & `ControlledInlineConfirm` | Submit an allowed change via `ControlledInlineConfirm`. Verify *What changes*, *What stays untouched*, collapsed `Technical details`, immediate handoff to inline `CommandOutboxPanel` (`pending`, no `Check status`), followed by `applied` and matching effective revision read from the service. |
 | Failure or contention | Disconnect after commit but before response (`unknown` enables `Check status`). Reopen and recover the original `(company_id, principal_id)` receipt (`applied`, `denied(conflicting_revision)`, or `404` -> `not_found_retry_choice`). Verify `403` stale-file quarantine does not deadlock a different principal. |
 | Competing stops, `15s` cut & domain gating | Trigger two restrictions; verify clearing `R1` leaves `R2` active. Verify Trading `execution:*` resume rejects stale quotes (`> 15s`) and core-only stores reject Trading commands (`422`). |
-| CEO Direct Line & no `retire_employee` | Send `send_ceo_message` to `ceo_agent_id`; verify non-CEO targets fail closed (`400`/`403`) and zero `retire_employee` Board commands exist. |
+| Company Messages (Board ↔ CEO) & no `retire_employee` | Send `send_ceo_message` to `ceo_agent_id`; verify non-CEO targets fail closed (`400`/`403`) and zero `retire_employee` Board commands exist. |
 
 **Oracle:** Compare user action, `command_id`, service admission (`command_receipt`), `(company_id, principal_id)` `/api/local/pending` state, and domain effective revision across [Usage scenarios](../../scenarios.md). Verify zero commands from merely browsing.
 

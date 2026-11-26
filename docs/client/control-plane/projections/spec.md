@@ -24,7 +24,7 @@ Input contracts: [Transport, loopback bridge, and role authorization](../bridge-
 - **`1` event stream endpoint:** `GET /v1/events`
 - **`2` command/receipt endpoints:** `POST /v1/commands` and `GET /v1/commands/{command_id}?operation=<command_type>`
 
-`ALL_CLIENT_PROJECTIONS` (`13` = `10` Core + `3` Trading) plus `work-timeline-v1` and `work-timeline-v2` equals `15` projection contract revisions. Retired `live-trading-v1` and `execution-tiers-v1` endpoints are removed completely.
+`ALL_CLIENT_PROJECTIONS` (`13` = `10` Core + `3` Trading) plus `work-timeline-v1` and `work-timeline-v2` equals `15` projection contract revisions. Retired legacy trading projection endpoints are removed completely.
 
 ### 2. Headers, ETag caching, common envelope metadata, and anti-tear snapshot invariant
 

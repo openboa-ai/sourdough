@@ -985,9 +985,12 @@ def enrich_trading_core_projection(
             scope = str(profile.get("grant_scope") or "").lower()
             if "research" in scope or "paper" in scope or "trading" in scope:
                 profile["role_label"] = "Quant Research"
-        payload["sandbox_authorized"] = _is_sandbox_authorized(profile)
-        payload["agent_sandbox"] = read_agent_sandbox_portfolio_from_db(
-            db, company_id, aid
+        sandbox_auth = _is_sandbox_authorized(profile)
+        payload["sandbox_authorized"] = sandbox_auth
+        payload["agent_sandbox"] = (
+            read_agent_sandbox_portfolio_from_db(db, company_id, aid)
+            if sandbox_auth
+            else None
         )
         auth_budget = payload.get("authority_budget")
         if isinstance(auth_budget, dict):

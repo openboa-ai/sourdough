@@ -21,7 +21,7 @@ With this change, a Sourdough company runs continuously with **zero Board Client
 2. `board.apply_decision`: Executes the concrete domain effect declared in an approved `decision_question.impact_json` (e.g., `update_agent_budget` updating `agent_profile.monthly_budget_minor`, or `open_agent_sandbox` opening a Tier 1 sandbox), then seals the application audit receipt via `board_control.record_decision_application_result`.
 3. `quant.agent_sandbox` / `trading.agent_sandbox`: Runs an employee Agent's pinned provider adapter wired strictly to `AgentSandboxTools(writer, agent_id=owner_agent_id)` over `OuterToolBroker`, then settles compute spend into `general_ledger`. Never requires `company_live` and remains isolated from company funds.
 4. `quant.paper_decision`: Guarded by a precondition verifying zero active company risk restrictions; executes the quant Agent's pinned provider adapter with read-only status tools and settles compute spend into `general_ledger`.
-5. `quant.reconcile`: Audits active execution tiers (`read_execution_tiers_snapshot` in `src/sourdough/trading/projections.py`) and records deterministic reconciliation summary even during active risk restrictions.
+5. `quant.reconcile`: Audits active execution tiers (`read_execution_tiers_snapshot`, defined in `src/sourdough/trading/migration.py` and imported/called in `src/sourdough/trading/plugin.py` and `src/sourdough/trading/projections.py`) and records deterministic reconciliation summary even during active risk restrictions.
 
 ## 4. Lifecycle Failures, Wakeups, & Recovery
 

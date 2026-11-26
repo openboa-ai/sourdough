@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -18,6 +20,8 @@ from sourdough.ipc.projections import (
     ALL_CLIENT_PROJECTIONS,
     CORE_CLIENT_PROJECTIONS,
 )
+from sourdough.storage.db import open_writer, write_tx
+from sourdough.storage.schema import enable_domain_v1
 from sourdough.trading.accounts import (
     open_agent_sandbox,
     open_company_paper_book,
@@ -297,3 +301,115 @@ class IpcConsolidationTests(unittest.TestCase):
                 assert strat is not None
                 self.assertTrue(strat["trading_enabled"])
                 self.assertIsNotNone(strat["adapter"])
+
+    def test_order_trace_and_trading_desk_reject_invalid_segments(self) -> None:
+        with (
+            TemporaryDirectory(prefix="sd-ipc-seg-") as tmp,
+            TemporaryDirectory(dir="/tmp", prefix="sd-s-") as sock_tmp,
+        ):
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            sock_dir = Path(sock_tmp)
+            founding = found(
+                store,
+                FoundingTerms("trading-seg", "charter-v1", "trading", "profile-v1"),
+            )
+            cid = founding.company_id
+            with hold_company_writer(store, cid, lease_directory=leases) as writer:
+                bind_board_principal(
+                    writer, principal_id="board-1", role_name=BOARD_CONTROL_ROLE
+                )
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    enable_domain_v1(db, "trading", company_id=cid, actor_id="board-1")
+
+            with CompanyDaemon(
+                store, cid, socket_dir=sock_dir, lease_directory=leases
+            ) as daemon:
+                client = ControlPlaneClient(daemon.socket_path)
+                for suffix in ("orders/%2e%2e", "orders/bad%2Fid"):
+                    with self.assertRaisesRegex(IpcRefused, "HTTP 400"):
+                        client.projection(suffix, principal="board-1")
+
+                with self.assertRaisesRegex(IpcRefused, "HTTP 404"):
+                    client.projection("orders/bad..id", principal="board-1")
+
+                for query_suffix in (
+                    "trading-desk?environment=paper&book_id=../escape",
+                    "trading-desk?environment=paper&book_id=%20",
+                ):
+                    with self.assertRaisesRegex(IpcRefused, "HTTP 400"):
+                        client.projection(query_suffix, principal="board-1")
+
+    def test_archived_agent_hides_agent_sandbox_in_agent_detail_and_graph(
+        self,
+    ) -> None:
+        with (
+            TemporaryDirectory(prefix="sd-ipc-arch-") as tmp,
+            TemporaryDirectory(dir="/tmp", prefix="sd-s-") as sock_tmp,
+        ):
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            sock_dir = Path(sock_tmp)
+            founding = found(
+                store,
+                FoundingTerms("trading-arch", "charter-v1", "trading", "profile-v1"),
+            )
+            cid = founding.company_id
+            now = time.time_ns()
+            with hold_company_writer(store, cid, lease_directory=leases) as writer:
+                bind_board_principal(
+                    writer, principal_id="board-1", role_name=BOARD_CONTROL_ROLE
+                )
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    enable_domain_v1(db, "trading", company_id=cid, actor_id="board-1")
+                    db.execute(
+                        "INSERT INTO agent (id, company_id, execution_profile) VALUES (?, ?, ?)",
+                        ("agent-qa", cid, "profile-v1"),
+                    )
+                    db.execute(
+                        "INSERT INTO standing_grant (id, agent_id, scope) VALUES (?, ?, ?)",
+                        ("grant-qa", "agent-qa", "trading"),
+                    )
+                    db.execute(
+                        """INSERT INTO agent_profile (
+                               agent_id, company_id, display_name, role_label, avatar_variant,
+                               monthly_budget_minor, updated_at_ns
+                           ) VALUES (?, ?, 'Quant A', 'Quant', 'cobalt', 100000, ?)""",
+                        ("agent-qa", cid, now),
+                    )
+                open_agent_sandbox(writer, agent_id="agent-qa", account_id="sbx-qa")
+                submit_agent_sandbox_order(
+                    writer,
+                    agent_id="agent-qa",
+                    action_id="qa-act-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=1_010_000,
+                    market_price_minor_units=1_000_000,
+                )
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    db.execute(
+                        """INSERT INTO agent_archive (
+                               company_id, agent_id, manager_id, grant_id,
+                               request_id, employment_revision, reason, previous_scope
+                           ) VALUES (?, 'agent-qa', ?, 'grant-qa', 'ret-qa', 'emp-1', 'retired', 'trading')""",
+                        (cid, founding.founder_id),
+                    )
+
+            with CompanyDaemon(
+                store, cid, socket_dir=sock_dir, lease_directory=leases
+            ) as daemon:
+                client = ControlPlaneClient(daemon.socket_path)
+                _, _, graph = client.projection("agents-graph", principal="board-1")
+                assert graph is not None
+                nodes = {n["agent_id"]: n for n in graph["nodes"]}
+                self.assertFalse(nodes["agent-qa"]["sandbox_authorized"])
+                self.assertIsNone(nodes["agent-qa"]["sandbox_activity"])
+
+                _, _, detail = client.projection("agents/agent-qa", principal="board-1")
+                assert detail is not None
+                self.assertFalse(detail["sandbox_authorized"])
+                self.assertIsNone(detail["agent_sandbox"])

@@ -144,7 +144,7 @@ M5 updates documentation across the repository to match the refactored architect
 | Path | Action | Required Alignment |
 |---|---|---|
 | `README.md` | **Update** | Preserve mark and 3-element opening (`# sourdough`, exact slogan `put the dough to work`, plain-language paragraph); align paragraph and run commands to Core Company OS + pluggable Trading domain module and `client-web`/`run-company`. |
-| `docs/README.md` | **Update** | Update `U1 · Board Client` (line `134`) from obsolete 5-area Executive IA (`Office Floor`, `CEO Direct Line`, `quiet System`) and `5 / 14` count to Modular IA (`Approvals`, dynamic `Trading`, `COMPANY`, `SYSTEM`) and consolidated `docs/client/` count; clarify Company OS vs Trading module. |
+| `docs/README.md` | **Update** | Update `U1 · Board Client` (line `134`) from obsolete 5-area Executive IA (`Office Floor`, `CEO Direct Line`, `quiet System`) to Modular IA (`Approvals`, dynamic `Trading`, `Company`, `System`) while retaining the verified `5 / 14` `docs/client/` intent/spec count; clarify Company OS vs Trading module. |
 | `docs/intent.md` | **Update** | Replace blanket *"live capital is not authorized"* with Board-gated, qualification-locked 3-tier execution (`agent_sandbox`, `company_paper`, `company_live`). |
 | `docs/architecture.md` | **Update** | Align to Core Company OS vs Trading domain module, `ResidentCompanyService`, unified `trading_book_*`, external venue adapter, and React 19 `client-web`. |
 | `docs/capabilities.md` | **Update** | Sync `docs/client/` links and add `execution-environment` / live-promotion mapping under `Authorize and resolve an effect`. |

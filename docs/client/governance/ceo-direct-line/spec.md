@@ -24,7 +24,7 @@ Input contracts: [Base presentation](../../inspect/present/spec.md) · [Command 
 ### 2. `Contextual Ask CEO` pinned read-only Context Attachment Card
 
 - **Entry points & `ALLOWED_ASK_CONTEXT_KINDS` (`apps/client/src/state/store.tsx:99-113`):** Triggering **`"Ask CEO about this item"`** from a view transitions in-place to `/messages?context_kind=<kind>&context_id=<id>` using one of the supported context kinds:
-  - **Core Company OS kinds:** `"agent"` (`/agents/:id`), `"shared_publication"` (`/reports`), `"decision_question"` (`/approvals/:id`), `"restriction"` / `"restriction_cause"` (`/controls`), `"work_run"` (`/agents/:id`), `"company"` (`/agents`), `"account_balance"` (`/finance`), `"audit_event"` (`/audit`).
+  - **Core Company OS kinds:** `"agent"` (`/agents/:id`), `"shared_publication"` (`/reports`), `"decision_question"` (`/approvals/:id`), `"restriction"` / `"restriction_cause"` (`/controls`), `"work_run"` (`/agents/:id`), `"company"` (`/reports`), `"account_balance"` (`/finance`), `"audit_event"` (`/audit`).
   - **Trading domain kinds (when `"trading"` installed):** `"trading_order"` (`/orders/:orderId`), `"strategy_release"` / `"challenger_trial"` / `"strategy_trial"` (`/trading/strategies`).
 - **Pinned read-only Context Attachment Card**:
   - Anchors above the composer (and attaches `context_ref` to the posted `ceo_message`), displaying item title, plain-language summary, and **live server resolution status** hydrated from projections (`open`, `applied`, `cancelled`, `expired`, etc.).
