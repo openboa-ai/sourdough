@@ -97,6 +97,7 @@ from .projections import (
     read_system_audit_projection,
     read_system_evals_projection,
     read_system_safety_projection,
+    read_trading_desk_projection,
 )
 from .protocol import (
     CONTROL_PLANE_VERSION,
@@ -804,6 +805,34 @@ class CompanyDaemon:
         if suffix == "execution-tiers":
             payload, seq = read_execution_tiers_projection(
                 self._store, self._company_id
+            )
+            self._send_projection(conn, request, payload, seq, deadline=deadline)
+            return
+
+        if suffix == "trading-desk":
+            env_raw = (query.get("environment", ["live"])[0] or "live").strip().lower()
+            if env_raw not in ("live", "paper"):
+                self._safe_error(
+                    conn,
+                    400,
+                    "Invalid environment parameter (expected 'live' or 'paper')",
+                    deadline=deadline,
+                )
+                return
+            book_raw = query.get("book_id", [None])[0]
+            book_id: str | None = None
+            if book_raw is not None and book_raw.strip():
+                book_id = _valid_path_segment(book_raw.strip())
+                if book_id is None:
+                    self._safe_error(
+                        conn, 400, "Invalid book_id parameter", deadline=deadline
+                    )
+                    return
+            payload, seq = read_trading_desk_projection(
+                self._store,
+                self._company_id,
+                environment=env_raw,
+                book_id=book_id,
             )
             self._send_projection(conn, request, payload, seq, deadline=deadline)
             return

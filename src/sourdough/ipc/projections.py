@@ -23,8 +23,13 @@ from ..agent_desk import _check_no_symlinks, _drafts_directory
 from ..board_control import resolve_board_access
 from ..company import FoundingRefused, _identity
 from ..execution_tiers import (
+    ENV_LIVE,
+    ENV_PAPER,
+    TIER_COMPANY_LIVE,
+    TIER_COMPANY_PAPER,
     read_agent_sandbox_portfolio_from_db,
     read_execution_tiers_snapshot,
+    read_trading_book_state_from_db,
 )
 from ..paper_risk import AuthorizeBoard, effective_paper_risk
 from ..storage.db import open_reader, read_tx
@@ -45,6 +50,7 @@ PROJECTION_SYSTEM_SAFETY = "system-safety-v1"
 PROJECTION_SYSTEM_EVALS = "system-evals-v1"
 PROJECTION_SYSTEM_AUDIT = "system-audit-v1"
 PROJECTION_EXECUTION_TIERS = "execution-tiers-v1"
+PROJECTION_TRADING_DESK = "trading-desk-v1"
 
 ALL_CLIENT_PROJECTIONS: tuple[str, ...] = (
     PROJECTION_LIVE_TRADING,
@@ -61,6 +67,7 @@ ALL_CLIENT_PROJECTIONS: tuple[str, ...] = (
     PROJECTION_SYSTEM_EVALS,
     PROJECTION_SYSTEM_AUDIT,
     PROJECTION_EXECUTION_TIERS,
+    PROJECTION_TRADING_DESK,
 )
 
 _DEFAULT_AVATAR_VARIANTS: tuple[str, ...] = (
@@ -2460,6 +2467,446 @@ def read_execution_tiers_projection(
                 "as_of_ns": time_ns(),
                 "event_seq": event_seq,
                 **(snapshot | {"agent_sandboxes": enriched_sandboxes}),
+            },
+            event_seq,
+        )
+
+
+def read_trading_desk_projection(
+    store: Path,
+    company_id: str,
+    *,
+    environment: str,
+    book_id: str | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Unified symmetric trading desk projection serving both Live Trading and Paper Trading.
+
+    Strictly scoped to `environment` ('live' or 'paper') so paper and live capital,
+    positions, fills, and valuation series are never commingled.
+    """
+    if environment not in (ENV_LIVE, ENV_PAPER):
+        raise ValueError("environment must be 'live' or 'paper'")
+
+    target_tier = TIER_COMPANY_LIVE if environment == ENV_LIVE else TIER_COMPANY_PAPER
+
+    with closing(open_reader(store)) as db, read_tx(db):
+        if _identity(db) != company_id:
+            raise FoundingRefused("Company identity mismatch")
+        as_of_ns = time_ns()
+        event_seq = max_event_seq(db, company_id)
+        domains = sorted(installed_domains(db))
+        has_paper = is_domain_installed(db, "paper")
+        charter_row = db.execute(
+            "SELECT charter_revision FROM company WHERE id = ?", (company_id,)
+        ).fetchone()
+        charter_revision = str(charter_row[0]) if charter_row else ""
+        directory = _agent_directory(db, company_id)
+        restrictions = _active_restrictions_rows(db, company_id)
+        active_restrictions = [r for r in restrictions if r["active"]]
+        gl_balances = _sum_gl_accounts(db)
+        closes, open_close_issues = _close_issues_summary(db)
+
+        llm_opex_minor = sum(
+            abs(val)
+            for acct, val in gl_balances.items()
+            if any(
+                k in acct.lower()
+                for k in ("llm", "opex", "compute", "expense", "operating")
+            )
+            and "trading" not in acct.lower()
+            and "fee" not in acct.lower()
+        )
+        has_opex_data = any(
+            any(
+                k in acct.lower()
+                for k in ("llm", "opex", "compute", "expense", "operating")
+            )
+            for acct in gl_balances
+        )
+
+        tiers = read_execution_tiers_snapshot(db, company_id)
+        risk_suspended = (
+            bool(effective_paper_risk(db).suspended) if has_paper else False
+        )
+        risk_revision = int(effective_paper_risk(db).revision) if has_paper else 0
+
+        books: list[dict[str, Any]] = []
+        if has_paper:
+            binding_rows = db.execute(
+                """SELECT binding_id FROM execution_environment_binding
+                   WHERE company_id = ? AND tier = ? AND environment = ?
+                   ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'registered' THEN 1 WHEN 'suspended' THEN 2 ELSE 3 END,
+                            created_at_ns ASC, binding_id ASC""",
+                (company_id, target_tier, environment),
+            ).fetchall()
+            for (bid,) in binding_rows:
+                state = read_trading_book_state_from_db(db, company_id, str(bid))
+                if state is not None:
+                    books.append(state)
+
+        # Select active/requested book strictly within this environment.
+        selected_book: dict[str, Any] | None = None
+        if book_id:
+            selected_book = next((b for b in books if b["binding_id"] == book_id), None)
+        if selected_book is None:
+            if environment == ENV_LIVE:
+                selected_book = next(
+                    (b for b in books if b["status"] == "active"), None
+                )
+            else:
+                selected_book = (
+                    next((b for b in books if b["role"] == "nominated"), None)
+                    or next((b for b in books if b["role"] == "shadow"), None)
+                    or next((b for b in books if b["status"] == "active"), None)
+                    or (books[0] if books else None)
+                )
+
+        currency = selected_book["currency"] if selected_book else "USD"
+        close_has_issues = len(open_close_issues) > 0
+        opex_available = has_opex_data and not close_has_issues
+
+        cumulative_return_series: list[dict[str, Any]] = []
+        open_positions: list[dict[str, Any]] = []
+        execution_tape: list[dict[str, Any]] = []
+        pnl_bridge: list[dict[str, Any]] = []
+        exposure_used_minor = 0
+        exposure_limit_minor: int | None = None
+
+        if selected_book is not None:
+            nav = int(selected_book["nav_minor_units"])
+            trading_pnl = int(selected_book["pnl_minor_units"])
+            ret_pct = float(selected_book["return_pct"])
+            total_fees = int(selected_book["total_fees_minor_units"])
+            realized_pnl = int(selected_book["realized_pnl_minor_units"])
+            unrealized_pnl = int(selected_book["unrealized_pnl_minor_units"])
+            gross_trading_pnl = trading_pnl + total_fees
+            exposure_used_minor = int(selected_book["gross_exposure_minor_units"])
+            exposure_limit_minor = int(selected_book["exposure_limit_minor_units"])
+            cumulative_return_series = list(selected_book["cumulative_return_series"])
+
+            for p in selected_book["positions"]:
+                if p["quantity"] != 0:
+                    open_positions.append(p)
+
+            for o in selected_book["orders"]:
+                actor_info = directory.get(o["actor_id"], {})
+                execution_tape.append(
+                    o
+                    | {
+                        "actor_name": actor_info.get("display_name", o["actor_id"]),
+                        "actor_role": actor_info.get("role_label", "Agent"),
+                        "book_name": selected_book["book_name"],
+                        "binding_id": selected_book["binding_id"],
+                    }
+                )
+
+            if opex_available:
+                company_net: int | None = trading_pnl - llm_opex_minor
+                net_status = "ok"
+                net_source = (
+                    "Live BOR minus Opex"
+                    if environment == ENV_LIVE
+                    else "Paper BOR minus Opex"
+                )
+            else:
+                company_net = trading_pnl
+                net_status = "ok"
+                net_source = (
+                    "Live BOR (no opex posted)"
+                    if environment == ENV_LIVE
+                    else "Paper BOR (no opex posted)"
+                )
+
+            kpis = {
+                "portfolio_value": {
+                    "value_minor": nav,
+                    "return_pct": ret_pct,
+                    "currency": currency,
+                    "status": "ok",
+                    "source": (
+                        f"Live book · {selected_book['account_id']}"
+                        if environment == ENV_LIVE
+                        else f"Paper book · {selected_book['book_name']}"
+                    ),
+                },
+                "trading_pnl": {
+                    "value_minor": trading_pnl,
+                    "realized_minor": realized_pnl,
+                    "unrealized_minor": unrealized_pnl,
+                    "fees_minor": total_fees,
+                    "currency": currency,
+                    "status": "ok",
+                    "source": (
+                        "Reconciled live fills & marks"
+                        if environment == ENV_LIVE
+                        else f"{selected_book['fee_bps']} bps fee / {selected_book['slippage_bps']} bps slip"
+                    ),
+                },
+                "agent_llm_opex": {
+                    "value_minor": -llm_opex_minor if has_opex_data else 0,
+                    "currency": currency,
+                    "status": "ok" if has_opex_data else "unavailable",
+                    "source": "General ledger",
+                },
+                "company_net_pnl": {
+                    "value_minor": company_net,
+                    "currency": currency,
+                    "status": net_status,
+                    "source": net_source,
+                },
+            }
+            pnl_bridge = [
+                {
+                    "step": "gross_trading_pnl",
+                    "label": "Gross Trading P&L",
+                    "amount_minor": gross_trading_pnl,
+                    "status": "ok",
+                },
+                {
+                    "step": "trading_fees",
+                    "label": "Venue Fees & Slippage",
+                    "amount_minor": -total_fees,
+                    "status": "ok",
+                },
+                {
+                    "step": "realized_pnl",
+                    "label": "Net Realized P&L",
+                    "amount_minor": realized_pnl,
+                    "status": "ok",
+                },
+                {
+                    "step": "unrealized_pnl",
+                    "label": "Open Unrealized P&L",
+                    "amount_minor": unrealized_pnl,
+                    "status": "ok",
+                },
+                {
+                    "step": "agent_llm_opex",
+                    "label": "Agent LLM & Compute Opex",
+                    "amount_minor": -llm_opex_minor if has_opex_data else 0,
+                    "status": "ok" if has_opex_data else "unavailable",
+                },
+                {
+                    "step": "company_net_pnl",
+                    "label": "Live Net P&L"
+                    if environment == ENV_LIVE
+                    else "Paper Net P&L",
+                    "amount_minor": company_net,
+                    "status": net_status,
+                },
+            ]
+        else:
+            # Standby / gated live desk (or empty paper desk).
+            kpis = {
+                "portfolio_value": {
+                    "value_minor": None,
+                    "return_pct": None,
+                    "currency": currency,
+                    "status": "standby",
+                    "source": (
+                        "Paper-Only Safe Mode (0% live deployed)"
+                        if environment == ENV_LIVE
+                        else "No paper book active"
+                    ),
+                },
+                "trading_pnl": {
+                    "value_minor": None,
+                    "realized_minor": None,
+                    "unrealized_minor": None,
+                    "fees_minor": None,
+                    "currency": currency,
+                    "status": "standby",
+                    "source": "Awaiting Board activation",
+                },
+                "agent_llm_opex": {
+                    "value_minor": -llm_opex_minor if has_opex_data else 0,
+                    "currency": currency,
+                    "status": "ok" if has_opex_data else "unavailable",
+                    "source": "General ledger",
+                },
+                "company_net_pnl": {
+                    "value_minor": None,
+                    "currency": currency,
+                    "status": "standby",
+                    "source": "Awaiting live activation",
+                },
+            }
+
+        # Shadow Benchmark comparison for active Live books!
+        shadow_benchmark: dict[str, Any] | None = None
+        if environment == ENV_LIVE and selected_book is not None:
+            shadow_row = db.execute(
+                """SELECT binding_id FROM company_paper_book
+                   WHERE company_id = ? AND shadow_of_live_binding_id = ?
+                   ORDER BY updated_at_ns DESC LIMIT 1""",
+                (company_id, selected_book["binding_id"]),
+            ).fetchone()
+            shadow_bid = (
+                str(shadow_row[0])
+                if shadow_row is not None
+                else selected_book.get("source_paper_binding_id")
+            )
+            if shadow_bid:
+                shadow_state = read_trading_book_state_from_db(
+                    db, company_id, shadow_bid
+                )
+                if shadow_state is not None:
+                    raw_shadow = list(shadow_state["cumulative_return_series"])
+                    live_start_ns = (
+                        int(cumulative_return_series[0]["observed_at_ns"])
+                        if cumulative_return_series
+                        and cumulative_return_series[0].get("observed_at_ns")
+                        else 0
+                    )
+                    rebased_series: list[dict[str, Any]] = []
+                    if raw_shadow:
+                        pre_or_at = [
+                            pt
+                            for pt in raw_shadow
+                            if int(pt.get("observed_at_ns") or 0) <= live_start_ns
+                        ]
+                        anchor = pre_or_at[-1] if pre_or_at else raw_shadow[0]
+                        anchor_nav = (
+                            int(anchor["nav_minor"])
+                            if anchor.get("nav_minor")
+                            else int(shadow_state["starting_minor_units"])
+                        )
+                        rebased_series.append(
+                            {
+                                "id": f"{anchor['id']}-anchor",
+                                "label": (
+                                    str(cumulative_return_series[0]["label"])
+                                    if cumulative_return_series
+                                    else "Live Launch"
+                                ),
+                                "return_pct": 0.0,
+                                "pnl_minor": 0,
+                                "nav_minor": anchor_nav,
+                                "source": "shadow_anchor",
+                                "observed_at_ns": live_start_ns
+                                or int(anchor.get("observed_at_ns") or 0),
+                            }
+                        )
+                        live_start_cap = int(selected_book["starting_minor_units"])
+                        for pt in raw_shadow:
+                            pt_ns = int(pt.get("observed_at_ns") or 0)
+                            if live_start_ns > 0 and pt_ns <= live_start_ns:
+                                continue
+                            if pt is anchor:
+                                continue
+                            pt_nav = int(pt.get("nav_minor") or anchor_nav)
+                            delta_nav = pt_nav - anchor_nav
+                            rebased_ret = (
+                                round((delta_nav / anchor_nav) * 100.0, 4)
+                                if anchor_nav > 0
+                                else 0.0
+                            )
+                            equiv_pnl = (
+                                round(live_start_cap * (delta_nav / anchor_nav))
+                                if anchor_nav > 0 and live_start_cap > 0
+                                else delta_nav
+                            )
+                            rebased_series.append(
+                                {
+                                    "id": str(pt["id"]),
+                                    "label": str(pt["label"]),
+                                    "return_pct": rebased_ret,
+                                    "pnl_minor": equiv_pnl,
+                                    "nav_minor": pt_nav,
+                                    "source": str(pt.get("source") or "shadow_mark"),
+                                    "observed_at_ns": pt_ns,
+                                }
+                            )
+                    post_launch_ret = (
+                        float(rebased_series[-1]["return_pct"])
+                        if rebased_series
+                        else 0.0
+                    )
+                    drift_pp = round(
+                        float(selected_book["return_pct"]) - post_launch_ret, 4
+                    )
+                    shadow_benchmark = {
+                        "binding_id": shadow_state["binding_id"],
+                        "book_name": shadow_state["book_name"],
+                        "strategy_release_id": shadow_state["strategy_release_id"],
+                        "role": shadow_state["role"],
+                        "return_pct": shadow_state["return_pct"],
+                        "post_launch_return_pct": post_launch_ret,
+                        "execution_drift_pp": drift_pp,
+                        "nav_minor_units": shadow_state["nav_minor_units"],
+                        "pnl_minor_units": shadow_state["pnl_minor_units"],
+                        "series": rebased_series,
+                    }
+
+        paper_books = tiers.get("company_paper_books", [])
+        soak_ready_books = sum(
+            1 for b in paper_books if b["soak_ready"] and b["status"] == "active"
+        )
+
+        # Strip heavy per-book arrays from summary list so payload stays fast & compact.
+        book_summaries = [
+            {
+                k: v
+                for k, v in b.items()
+                if k not in ("positions", "orders", "cumulative_return_series")
+            }
+            for b in books
+        ]
+
+        return (
+            {
+                "projection": PROJECTION_TRADING_DESK,
+                "company_id": company_id,
+                "charter_revision": charter_revision,
+                "as_of_ns": as_of_ns,
+                "event_seq": event_seq,
+                "active_domains": domains,
+                "paper_enabled": has_paper,
+                "environment": environment,
+                "selected_book_id": selected_book["binding_id"]
+                if selected_book
+                else None,
+                "selected_book": (
+                    {
+                        k: v
+                        for k, v in selected_book.items()
+                        if k not in ("positions", "orders", "cumulative_return_series")
+                    }
+                    if selected_book
+                    else None
+                ),
+                "books": book_summaries,
+                "kpis": kpis,
+                "cumulative_return_series": cumulative_return_series,
+                "shadow_benchmark": shadow_benchmark,
+                "open_positions": open_positions,
+                "execution_tape": execution_tape,
+                "pnl_reconciliation_bridge": pnl_bridge,
+                "exposure_cap": {
+                    "used_minor_units": exposure_used_minor,
+                    "limit_minor_units": exposure_limit_minor,
+                    "currency": currency,
+                },
+                "close_count": len(closes),
+                "open_close_issues": open_close_issues,
+                "risk_gate": {
+                    "suspended": risk_suspended or len(active_restrictions) > 0,
+                    "effective_revision": risk_revision,
+                    "active_restriction_count": len(active_restrictions),
+                },
+                "governance": {
+                    "company_live": tiers.get("company_live"),
+                    "live_candidates": tiers.get("live_candidates", []),
+                    "qualification_receipts": tiers.get("qualification_receipts", []),
+                    "promotion_history": tiers.get("promotion_history", []),
+                    "migration_history": tiers.get("migration_history", []),
+                    "company_paper_soak_ready": bool(
+                        tiers.get("company_paper_soak_ready", False)
+                    ),
+                    "paper_books_count": len(paper_books),
+                    "soak_ready_books_count": soak_ready_books,
+                    "current_core_digest": tiers.get("current_core_digest", ""),
+                },
             },
             event_seq,
         )

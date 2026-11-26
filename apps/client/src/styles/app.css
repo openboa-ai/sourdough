@@ -402,6 +402,16 @@
     transition: opacity var(--yg-motion-settle);
   }
 
+  .sd-chart-line-benchmark {
+    fill: none;
+    stroke: var(--yg-muted);
+    stroke-width: 1.75;
+    stroke-dasharray: 5 4;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.9;
+  }
+
   .sd-chart-point {
     fill: var(--yg-brand-ink);
     stroke: var(--yg-raised);
@@ -414,6 +424,59 @@
     stroke: var(--yg-raised);
     stroke-width: 2.5;
     transition: r var(--yg-motion-press);
+  }
+
+  .sd-chart-point-benchmark {
+    fill: var(--yg-raised);
+    stroke: var(--yg-muted);
+    stroke-width: 1.75;
+  }
+
+  .sd-chart-legend-solid {
+    display: inline-block;
+    inline-size: 14px;
+    block-size: 2px;
+    border-radius: 1px;
+    background: var(--yg-brand-ink);
+    vertical-align: middle;
+  }
+
+  .sd-chart-legend-dashed {
+    display: inline-block;
+    inline-size: 14px;
+    block-size: 0;
+    border-block-start: 2px dashed var(--yg-muted);
+    vertical-align: middle;
+  }
+
+  .sd-chart-standby {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--boa-space-12);
+    min-block-size: 184px;
+    padding: var(--boa-space-24) var(--boa-space-16);
+    border-radius: var(--yg-radius-panel);
+    border: 1px dashed var(--yg-border-control);
+    background: var(--yg-surface);
+    text-align: center;
+  }
+
+  .sd-book-row-selected {
+    background: var(--yg-brand-soft);
+  }
+
+  .sd-book-row-clickable {
+    cursor: pointer;
+  }
+
+  .sd-book-row-clickable:hover {
+    background: var(--yg-surface);
+  }
+
+  .sd-book-row-selected:hover {
+    background: var(--yg-brand-soft);
   }
 
   .sd-chart-gap {

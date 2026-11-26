@@ -163,6 +163,10 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "company_paper_fill": frozenset({"execution_tiers.py"}),
     "company_paper_position": frozenset({"execution_tiers.py"}),
     "paper_live_migration_record": frozenset({"execution_tiers.py"}),
+    "trading_book_order": frozenset({"execution_tiers.py"}),
+    "trading_book_fill": frozenset({"execution_tiers.py"}),
+    "trading_book_position": frozenset({"execution_tiers.py"}),
+    "trading_book_valuation": frozenset({"execution_tiers.py"}),
     # Separate venue / market SQLite databases (outside company store)
     "replay_decision_cut": frozenset({"nautilus_paper.py"}),
     "venue_account": frozenset({"paper_venue.py"}),

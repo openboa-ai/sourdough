@@ -28,7 +28,8 @@ CREATE TABLE execution_environment_binding (
     CHECK (tier != 'agent_sandbox' OR environment = 'paper'),
     CHECK (tier != 'company_paper' OR environment = 'paper'),
     CHECK (tier != 'company_live' OR environment = 'live'),
-    CHECK (environment != 'live' OR credential_handle_ref IS NOT NULL)
+    CHECK (environment != 'live' OR credential_handle_ref IS NOT NULL),
+    UNIQUE (binding_id, environment)
 ) STRICT;
 
 CREATE UNIQUE INDEX idx_exec_binding_unique_active_company_paper_account
