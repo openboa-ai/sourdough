@@ -7740,6 +7740,313 @@ class TestM5Tier5Hardening(unittest.TestCase):
         msg_proj = read_messages_projection(self.store, self.company_id)
         self.assertNotIn("PRIVATE_DRAFT_CANARY_999", json.dumps(msg_proj))
 
+    def test_pr191_r16_security_work_decision_action_kind_enum_and_board_projection_redaction(
+        self,
+    ) -> None:
+        """PR #191 R16 Security P2: constrain action_kind to server enum and redact legacy/adjacent free-form fields in Board projections."""
+        from sourdough.ipc.projections import (
+            read_agent_detail_projection,
+            read_system_audit_projection,
+        )
+        from sourdough.runtime.proactive_tools import (
+            build_core_proactive_tool_contribution,
+        )
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            contrib = build_core_proactive_tool_contribution(writer=w, claim=claim)
+            # 1. Free-form action_kind is rejected by record_work_decision!
+            with self.assertRaisesRegex(
+                WorkKernelRefused, "Unsupported work_decision action_kind"
+            ):
+                contrib.handlers["record_work_decision"](
+                    {
+                        "action_kind": "PRIVATE_DRAFT_CANARY_IN_ACTION_KIND_8819",
+                        "rationale": "Attempted exfil",
+                        "evidence": [],
+                    }
+                )
+            # 2. Free-form source_identity on timer condition is rejected by set_condition!
+            with self.assertRaisesRegex(
+                WorkKernelRefused, "Timer conditions assign source_identity"
+            ):
+                contrib.handlers["set_condition"](
+                    {
+                        "trigger_kind": "timer",
+                        "due_at_ns": 5_000,
+                        "source_identity": "PRIVATE_TIMER_CANARY_666",
+                    }
+                )
+            # 3. Valid enum action_kind succeeds cleanly!
+            ok_dec = contrib.handlers["record_work_decision"](
+                {
+                    "action_kind": "hold",
+                    "rationale": "Valid decision",
+                    "action_id": "CANARY_ACTION_ID_777",
+                    "evidence": [],
+                }
+            )
+            self.assertEqual(ok_dec["action_kind"], "hold")
+
+            # 4. Seed legacy rows with unconstrained action_kind, outcome_json, and timer source_identity
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                db.execute(
+                    """INSERT INTO work_decision (
+                           decision_id, company_id, work_item_id, run_id, agent_id,
+                           action_id, action_kind, evidence_refs_json, evidence_digest,
+                           rationale, next_condition_id, active_snapshot_id, decision_at_ns
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]', 'd0', 'legacy', NULL, NULL, 2_500)""",
+                    (
+                        "dec-legacy-r16",
+                        self.company_id,
+                        item.work_item_id,
+                        run.run_id,
+                        self.founder_id,
+                        "LEGACY_ACTION_ID_CANARY_555",
+                        "PRIVATE_DRAFT_CANARY_IN_ACTION_KIND_8819",
+                    ),
+                )
+                db.execute(
+                    """UPDATE work_runs
+                       SET outcome_json = ?
+                       WHERE company_id = ? AND run_id = ?""",
+                    (
+                        json.dumps(
+                            {"action_kind": "PRIVATE_DRAFT_CANARY_IN_ACTION_KIND_8819"}
+                        ),
+                        self.company_id,
+                        run.run_id,
+                    ),
+                )
+                db.execute(
+                    """INSERT INTO work_conditions (
+                           condition_id, company_id, owner_agent_id, responsibility_id,
+                           work_item_id, condition_revision, trigger_kind, due_at_ns,
+                           source_identity, expected_revision, expires_at_ns,
+                           cooldown_ns, max_fires, fire_count, status,
+                           created_at_ns, updated_at_ns
+                       ) VALUES ('cond-legacy-r16', ?, ?, NULL, ?, 1, 'timer', 9999,
+                                 'PRIVATE_TIMER_CANARY_666', NULL, NULL, 0, NULL, 0, 'armed', 2000, 2000)""",
+                    (self.company_id, self.founder_id, item.work_item_id),
+                )
+
+        detail, _ = read_agent_detail_projection(
+            self.store, self.company_id, self.founder_id, domain_plugins=()
+        )
+        audit, _ = read_system_audit_projection(
+            self.store, self.company_id, domain_plugins=()
+        )
+        assert detail is not None
+        detail_dump = json.dumps(detail)
+        audit_dump = json.dumps(audit)
+        for canary in (
+            "PRIVATE_DRAFT_CANARY_IN_ACTION_KIND_8819",
+            "CANARY_ACTION_ID_777",
+            "LEGACY_ACTION_ID_CANARY_555",
+            "PRIVATE_TIMER_CANARY_666",
+        ):
+            self.assertNotIn(canary, detail_dump)
+            self.assertNotIn(canary, audit_dump)
+
+        by_id = {d["decision_id"]: d for d in detail["tabs"]["work_decisions"]}
+        self.assertEqual(by_id["dec-legacy-r16"]["action_kind"], "redacted")
+        self.assertTrue(by_id["dec-legacy-r16"]["action_kind_redacted"])
+        self.assertEqual(by_id[ok_dec["decision_id"]]["action_kind"], "hold")
+        self.assertFalse(by_id[ok_dec["decision_id"]]["action_kind_redacted"])
+        self.assertTrue(by_id[ok_dec["decision_id"]]["action_id_redacted"])
+
+    def test_pr191_r16_isolated_trial_enforces_authoritative_episode_token_usage(
+        self,
+    ) -> None:
+        """PR #191 R16 P2: run_isolated_trial_slot rejects production trials exceeding the sealed token ceiling."""
+        from sourdough.trial_execution import TrialWorkerInput
+        from sourdough.trial_registry import (
+            TrialCeiling,
+            TrialInputs,
+            TrialSlot,
+            TrialSuite,
+            seal_trial_suite,
+        )
+        from sourdough.trial_runner import (
+            _compute_source_store_fixture,
+            run_isolated_trial_slot,
+        )
+
+        class _HeavyUsageAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                broker.invoke(
+                    "c1",
+                    "record_work_decision",
+                    {"action_kind": "hold", "rationale": "Heavy run", "evidence": []},
+                )
+                return ShiftResult(
+                    output_text="Done.",
+                    usage=TokenUsage(input_tokens=10_000, output_tokens=5_000),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=1,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_HeavyUsageAdapter())
+        prod_reg = build_production_duty_registry(
+            adapter_registry=areg,
+            profile_bindings={self.founder_id: self.profile},
+            default_budget_ceiling_minor=10_000_000,
+        )
+
+        eval_store = self.root / "evals_r16_tokens" / "evaluator.sqlite"
+        eval_store.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fixture_bytes, profiles, _ = _compute_source_store_fixture(
+            self.store, self.company_id
+        )
+        case_bytes = b'{"case":"r16-tokens"}'
+        ctx_bytes = b'{"arm":"cand"}'
+        tools_bytes = b'{"tools":[]}'
+        tight_limits = TrialCeiling(turns=1, wall_seconds=30, tokens=2_000)
+        generous_limits = TrialCeiling(turns=1, wall_seconds=30, tokens=20_000)
+        sealed_inputs = TrialInputs(
+            company_fixture=sha256(fixture_bytes).hexdigest(),
+            case_inputs=sha256(case_bytes).hexdigest(),
+            worker_context=sha256(ctx_bytes).hexdigest(),
+            tools=sha256(tools_bytes).hexdigest(),
+            runtime_profile=profiles[self.founder_id],
+        )
+        suite = TrialSuite(
+            suite_id="r16-token-ceiling",
+            purpose="judgment",
+            rubric_digest=sha256(b"r").hexdigest(),
+            evaluator_digest=sha256(b"e").hexdigest(),
+            analysis_plan_digest=sha256(b"p").hexdigest(),
+            slots=(
+                TrialSlot("s-tight", "c1", "f1", sealed_inputs, tight_limits),
+                TrialSlot("s-ok", "c2", "f1", sealed_inputs, generous_limits),
+            ),
+        )
+        rev = seal_trial_suite(eval_store, suite)
+        trial_root = self.root / "trials_r16_tokens"
+
+        ev_over = run_isolated_trial_slot(
+            eval_store,
+            revision=rev,
+            slot_id="s-tight",
+            run_id="r16-over-tokens",
+            trial_root=trial_root,
+            source_store=self.store,
+            company_id=self.company_id,
+            agent_ids=(self.founder_id,),
+            worker_input=TrialWorkerInput(
+                case_bytes, ctx_bytes, tools_bytes, tight_limits
+            ),
+            duty_registry=prod_reg,
+        )
+        self.assertEqual(ev_over.outcome, "failed")
+
+        ev_ok = run_isolated_trial_slot(
+            eval_store,
+            revision=rev,
+            slot_id="s-ok",
+            run_id="r16-within-tokens",
+            trial_root=trial_root,
+            source_store=self.store,
+            company_id=self.company_id,
+            agent_ids=(self.founder_id,),
+            worker_input=TrialWorkerInput(
+                case_bytes, ctx_bytes, tools_bytes, generous_limits
+            ),
+            duty_registry=prod_reg,
+        )
+        self.assertEqual(ev_ok.outcome, "completed")
+
+    def test_pr191_r16_private_desk_tool_error_message_redacted_in_company_sqlite_receipt(
+        self,
+    ) -> None:
+        """PR #191 R16 P2: private Desk refusal error_message must not leak draft filenames into company.sqlite."""
+        live_error_seen: list[str] = []
+
+        class _MissingDraftAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                res = broker.invoke(
+                    "c-miss",
+                    "desk_read_draft",
+                    {"name": "secret-acquisition-plan"},
+                )
+                live_error_seen.append(json.dumps(res))
+                return ShiftResult(
+                    output_text="Checked.",
+                    usage=TokenUsage(input_tokens=15, output_tokens=5),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=1,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_MissingDraftAdapter())
+        dreg = build_production_duty_registry(
+            adapter_registry=areg, profile_bindings={self.founder_id: self.profile}
+        )
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.assessment_review",
+                    source_kind="manual",
+                    source_id="r16-missing-draft",
+                    now_ns=1_000,
+                )
+        rt = CompanyRuntime(self.store, self.company_id, dreg, clock=lambda: 2_000)
+        summary = rt.step(max_dispatches=1, now_ns=2_000)
+        self.assertEqual(len(summary.executed_runs), 1)
+        # Live tool response still informs the Agent itself
+        self.assertIn("secret-acquisition-plan", live_error_seen[0])
+        # Persisted receipt in company.sqlite MUST redact both result_json and error_message!
+        with closing(open_reader(self.store)) as ro_db, read_tx(ro_db):
+            row = ro_db.execute(
+                """SELECT result_json, error_type, error_message
+                   FROM tool_call_receipt
+                   WHERE company_id = ? AND run_id = ? AND call_id = 'c-miss'""",
+                (self.company_id, summary.executed_runs[0]),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertNotIn("secret-acquisition-plan", str(row[0]))
+        self.assertNotIn("secret-acquisition-plan", str(row[2]))
+        self.assertTrue(str(row[2]).startswith("redacted_private_error:"))
+
 
 if __name__ == "__main__":
     unittest.main()

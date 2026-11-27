@@ -715,9 +715,25 @@ def run_isolated_trial_slot(
                         (target_cid, *exec_runs),
                     ).fetchone()[0]
                 )
+                ep_usage_row = ro_db.execute(
+                    f"""SELECT COALESCE(SUM(input_tokens), 0),
+                               COALESCE(SUM(output_tokens), 0),
+                               COALESCE(SUM(cost_minor_units), 0)
+                        FROM agent_episode
+                        WHERE company_id = ? AND run_id IN ({run_placeholders})""",
+                    (target_cid, *exec_runs),
+                ).fetchone()
+                actual_input_tokens = int(ep_usage_row[0]) if ep_usage_row else 0
+                actual_output_tokens = int(ep_usage_row[1]) if ep_usage_row else 0
+                actual_tokens = actual_input_tokens + actual_output_tokens
+                actual_cost_minor = int(ep_usage_row[2]) if ep_usage_row else 0
             else:
                 dec_count = 0
                 fatal_calls = 0
+                actual_input_tokens = 0
+                actual_output_tokens = 0
+                actual_tokens = 0
+                actual_cost_minor = 0
         result = {
             "outcome": "completed"
             if settled_count >= 1 and dec_count >= 1
@@ -729,6 +745,7 @@ def run_isolated_trial_slot(
                 "executed_runs": list(step_summary.executed_runs),
                 "settled_items": settled_count,
                 "decision_count": dec_count,
+                "actual_tokens": actual_tokens,
             },
             "decision": {
                 "decision_id": captured.get("decision_id"),
@@ -742,7 +759,13 @@ def run_isolated_trial_slot(
                 "service_correct": settled_count >= 1 and fatal_calls == 0,
                 "invariant_breach": False,
             },
-            "usage": {"turns": len(step_summary.executed_runs), "tokens": 120},
+            "usage": {
+                "turns": len(step_summary.executed_runs),
+                "tokens": actual_tokens,
+                "input_tokens": actual_input_tokens,
+                "output_tokens": actual_output_tokens,
+                "cost_minor_units": actual_cost_minor,
+            },
         }
     elapsed = monotonic() - started
 

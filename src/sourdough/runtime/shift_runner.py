@@ -89,6 +89,16 @@ _PRIVATE_DESK_RECEIPT_TOOLS = frozenset(
         "desk_run_command",
     }
 )
+_PRIVATE_RECEIPT_ERROR_TOOLS = frozenset(
+    {
+        *_PRIVATE_DESK_RECEIPT_TOOLS,
+        "desk_publish_selection",
+        "search_episodes",
+        "skill_read",
+        "skill_list_active",
+        "skill_record_invocation",
+    }
+)
 _SAFE_DESK_RECEIPT_FIELDS = (
     "ok",
     "revision",
@@ -119,6 +129,19 @@ def _sanitize_receipt_result_json(
             if key in parsed:
                 safe_payload[key] = parsed[key]
     return json.dumps(safe_payload, sort_keys=True, separators=(",", ":"))
+
+
+def _sanitize_receipt_error_message(
+    tool_name: str, error_type: str | None, raw_error_message: str | None
+) -> str | None:
+    """Keep private Desk filenames, draft identifiers, and skill details out of company.sqlite receipts."""
+    if raw_error_message is None:
+        return None
+    if tool_name in _PRIVATE_RECEIPT_ERROR_TOOLS or tool_name.startswith("desk_"):
+        err_kind = str(error_type or "Error")
+        digest = sha256(str(raw_error_message).encode("utf-8")).hexdigest()[:12]
+        return f"redacted_private_error:{err_kind}:{digest}"
+    return str(raw_error_message)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -561,10 +584,18 @@ class ShiftRunner:
                 )
 
         def _record_receipt(receipt: dict[str, Any]) -> None:
+            tool_name = str(receipt["tool_name"])
             stored_result_json = _sanitize_receipt_result_json(
-                str(receipt["tool_name"]),
+                tool_name,
                 str(receipt["result_digest"]),
                 str(receipt["result_json"]),
+            )
+            stored_error_message = _sanitize_receipt_error_message(
+                tool_name,
+                None if receipt["error_type"] is None else str(receipt["error_type"]),
+                None
+                if receipt["error_message"] is None
+                else str(receipt["error_message"]),
             )
             with (
                 ctx.write_lock_ctx(),
@@ -583,13 +614,13 @@ class ShiftRunner:
                         receipt["run_id"],
                         receipt["agent_id"],
                         receipt["call_id"],
-                        receipt["tool_name"],
+                        tool_name,
                         receipt["arg_digest"],
                         receipt["status"],
                         receipt["result_digest"],
                         stored_result_json,
                         receipt["error_type"],
-                        receipt["error_message"],
+                        stored_error_message,
                         receipt["offloaded_log_path"],
                         receipt["recorded_at_ns"],
                     ),

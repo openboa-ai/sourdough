@@ -81,6 +81,40 @@ class WorkResponsibility:
     updated_at_ns: int
 
 
+WORK_DECISION_ACTION_KINDS: frozenset[str] = frozenset(
+    {
+        "noop",
+        "hold",
+        "defer",
+        "investigate",
+        "escalate",
+        "proceed",
+        "approve",
+        "approve_with_sla_cap",
+        "reject",
+        "publish",
+        "delegate",
+        "reschedule",
+        "trial_decision",
+        "apply_baseline",
+        "apply_baseline_heuristic",
+        "apply_transfer_method",
+        "counterexample_verified",
+        "boundary_verified",
+        "preserve_boundary",
+        "counterexample_check",
+        "constraint_ignored",
+        "policy_bypassed",
+        "discard_valid_boundary",
+        "deadline_filter_contrast",
+        "witness_contrast",
+        "witness_ok",
+        "execute_with_adopted_gen2",
+        "execute_after_rollback",
+    }
+)
+
+
 @dataclass(frozen=True)
 class WorkCondition:
     condition_id: str
@@ -3787,6 +3821,10 @@ def record_work_decision(
     _require_nonempty(run_id, "run_id")
     _require_nonempty(agent_id, "agent_id")
     _require_nonempty(action_kind, "action_kind")
+    if action_kind not in WORK_DECISION_ACTION_KINDS:
+        raise WorkKernelRefused(
+            f"Unsupported work_decision action_kind: {action_kind!r}"
+        )
     _require_nonempty(rationale, "rationale")
     if action_id is not None:
         _require_nonempty(action_id, "action_id")

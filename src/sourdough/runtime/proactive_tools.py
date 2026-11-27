@@ -22,6 +22,7 @@ from .collab_tools import (
 )
 from .domains import DomainPlugin, ToolContribution
 from .work_kernel import (
+    WORK_DECISION_ACTION_KINDS,
     DecisionEvidence,
     WorkCondition,
     WorkKernelRefused,
@@ -130,6 +131,14 @@ def build_core_proactive_tool_contribution(
         item_id = _optional_str(obj.get("work_item_id"), "work_item_id")
         due_at_ns = _optional_int(obj.get("due_at_ns"), "due_at_ns", minimum=0)
         source_identity = _optional_str(obj.get("source_identity"), "source_identity")
+        if source_identity is not None and source_identity.startswith("result_dep:"):
+            raise WorkKernelRefused(
+                "Reserved source_identity prefix 'result_dep:' may only be armed via arm_result_continuation"
+            )
+        if trigger_kind == "timer" and source_identity is not None:
+            raise WorkKernelRefused(
+                "Timer conditions assign source_identity automatically; omit source_identity"
+            )
         expected_revision = _optional_str(
             obj.get("expected_revision"), "expected_revision"
         )
@@ -222,6 +231,14 @@ def build_core_proactive_tool_contribution(
         trigger_kind = _require_str(obj["trigger_kind"], "trigger_kind")
         due_at_ns = _optional_int(obj.get("due_at_ns"), "due_at_ns", minimum=0)
         source_identity = _optional_str(obj.get("source_identity"), "source_identity")
+        if source_identity is not None and source_identity.startswith("result_dep:"):
+            raise WorkKernelRefused(
+                "Reserved source_identity prefix 'result_dep:' may only be armed via arm_result_continuation"
+            )
+        if trigger_kind == "timer" and source_identity is not None:
+            raise WorkKernelRefused(
+                "Timer conditions assign source_identity automatically; omit source_identity"
+            )
         expected_revision = _optional_str(
             obj.get("expected_revision"), "expected_revision"
         )
@@ -526,7 +543,10 @@ def build_core_proactive_tool_contribution(
             parameters={
                 "type": "object",
                 "properties": {
-                    "action_kind": {"type": "string"},
+                    "action_kind": {
+                        "type": "string",
+                        "enum": sorted(WORK_DECISION_ACTION_KINDS),
+                    },
                     "rationale": {"type": "string"},
                     "action_id": {"type": "string"},
                     "decision_at_ns": {"type": "integer", "minimum": 1},

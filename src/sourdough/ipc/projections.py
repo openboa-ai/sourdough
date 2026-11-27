@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import stat
 from collections.abc import Mapping, Sequence
@@ -34,6 +35,7 @@ from ..method_learning import (
     resolve_active_methods,
 )
 from ..runtime.domains import DomainPlugin, load_domain_plugins
+from ..runtime.work_kernel import WORK_DECISION_ACTION_KINDS
 from ..storage.db import open_reader, read_tx
 from ..storage.kernel import max_event_seq
 from ..storage.schema import installed_domains
@@ -142,19 +144,101 @@ def _redact_active_method_for_board(method_dict: dict[str, Any]) -> dict[str, An
     return projected
 
 
+_OPAQUE_TIMER_SOURCE_RE = re.compile(r"^(?:timer|result_dep):[0-9a-f]{12,64}$")
+
+
+def _sanitize_action_kind_for_board(action_kind: Any) -> str:
+    """Allow only server-defined decision action kinds in Board projections; redact legacy values."""
+    val = str(action_kind or "")
+    return val if val in WORK_DECISION_ACTION_KINDS else "redacted"
+
+
+def _redact_condition_source_for_board(
+    db: sqlite3.Connection,
+    company_id: str,
+    trigger_kind: str | None,
+    source_identity: str | None,
+) -> str | None:
+    """Keep arbitrary Agent-supplied condition labels out of Board projections."""
+    if source_identity is None:
+        return None
+    raw = str(source_identity)
+    if _OPAQUE_TIMER_SOURCE_RE.fullmatch(raw):
+        return raw
+    if trigger_kind == "shared_asset_revision":
+        pub = db.execute(
+            "SELECT 1 FROM shared_publication WHERE company_id = ? AND asset_id = ? LIMIT 1",
+            (company_id, raw),
+        ).fetchone()
+        if pub is not None:
+            return raw
+    elif trigger_kind == "peer_response":
+        req_id = raw.removeprefix("peer_response:")
+        req = db.execute(
+            "SELECT 1 FROM work_peer_requests WHERE company_id = ? AND request_id = ? LIMIT 1",
+            (company_id, req_id),
+        ).fetchone()
+        if req is not None:
+            return raw
+    return f"redacted:{sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _redact_work_item_payload_for_board(
+    db: sqlite3.Connection, company_id: str, raw_json: str
+) -> dict[str, Any]:
+    """Sanitize condition/trigger source identities inside projected work_item payloads."""
+    parsed = _json_loads_safe(raw_json, {})
+    if not isinstance(parsed, dict):
+        return {}
+    projected = dict(parsed)
+    trig_kind = (
+        str(projected.get("trigger_kind"))
+        if projected.get("trigger_kind") is not None
+        else None
+    )
+    if isinstance(projected.get("source_identity"), str):
+        projected["source_identity"] = _redact_condition_source_for_board(
+            db, company_id, trig_kind, projected["source_identity"]
+        )
+    if isinstance(projected.get("coalesced_revisions"), list):
+        safe_coal: list[Any] = []
+        for entry in projected["coalesced_revisions"]:
+            if isinstance(entry, Mapping):
+                e_copy = dict(entry)
+                e_trig = (
+                    str(e_copy.get("trigger_kind"))
+                    if e_copy.get("trigger_kind") is not None
+                    else trig_kind
+                )
+                if isinstance(e_copy.get("source_identity"), str):
+                    e_copy["source_identity"] = _redact_condition_source_for_board(
+                        db, company_id, e_trig, e_copy["source_identity"]
+                    )
+                safe_coal.append(e_copy)
+        projected["coalesced_revisions"] = safe_coal
+    return projected
+
+
 def _redact_run_outcome_for_board(raw_json: str | None) -> Any:
-    """Redact free-form model prose (output_text) from work_runs outcomes projected to Board."""
+    """Redact free-form model prose (output_text) and non-enum action_kind from work_runs outcomes."""
     parsed = _json_loads_safe(raw_json, None)
     if not isinstance(parsed, dict):
         return parsed
-    if "output_text" not in parsed:
-        return parsed
     projected = dict(parsed)
-    raw_out = projected.pop("output_text", None)
-    projected["output_text"] = None
-    projected["output_redacted"] = True
-    if raw_out is not None and "output_digest" not in projected:
-        projected["output_digest"] = sha256(str(raw_out).encode("utf-8")).hexdigest()
+    if "output_text" in projected:
+        raw_out = projected.pop("output_text", None)
+        projected["output_text"] = None
+        projected["output_redacted"] = True
+        if raw_out is not None and "output_digest" not in projected:
+            projected["output_digest"] = sha256(
+                str(raw_out).encode("utf-8")
+            ).hexdigest()
+    if "action_kind" in projected and projected["action_kind"] is not None:
+        raw_act = str(projected["action_kind"])
+        safe_act = _sanitize_action_kind_for_board(raw_act)
+        projected["action_kind"] = safe_act
+        if safe_act != raw_act:
+            projected["action_kind_redacted"] = True
     return projected
 
 
@@ -674,7 +758,9 @@ def read_agent_detail_projection(
                 "state": str(r[2]),
                 "source_kind": str(r[3]),
                 "source_id": str(r[4]),
-                "payload": _json_loads_safe(str(r[5]), {}),
+                "payload": _redact_work_item_payload_for_board(
+                    db, company_id, str(r[5])
+                ),
                 "updated_at_ns": int(r[6]),
             }
             for r in db.execute(
@@ -692,7 +778,9 @@ def read_agent_detail_projection(
                 "condition_id": str(r[0]),
                 "trigger_kind": str(r[1]),
                 "due_at_ns": None if r[2] is None else int(r[2]),
-                "source_identity": None if r[3] is None else str(r[3]),
+                "source_identity": _redact_condition_source_for_board(
+                    db, company_id, str(r[1]), None if r[3] is None else str(r[3])
+                ),
                 "status": str(r[4]),
                 "condition_revision": int(r[5]),
                 "responsibility_id": None if r[6] is None else str(r[6]),
@@ -729,8 +817,10 @@ def read_agent_detail_projection(
                 "decision_id": str(r[0]),
                 "work_item_id": str(r[1]),
                 "run_id": str(r[2]),
-                "action_id": str(r[3]),
-                "action_kind": str(r[4]),
+                "action_id": f"action:{sha256(str(r[3]).encode('utf-8')).hexdigest()[:16]}",
+                "action_id_redacted": True,
+                "action_kind": _sanitize_action_kind_for_board(r[4]),
+                "action_kind_redacted": str(r[4]) not in WORK_DECISION_ACTION_KINDS,
                 "evidence_refs": _redact_evidence_refs_for_board(str(r[5])),
                 "evidence_digest": str(r[6]),
                 "rationale": None,
@@ -1809,7 +1899,9 @@ def read_system_audit_projection(
                 "owner_agent_id": str(r[1]),
                 "trigger_kind": str(r[2]),
                 "due_at_ns": None if r[3] is None else int(r[3]),
-                "source_identity": None if r[4] is None else str(r[4]),
+                "source_identity": _redact_condition_source_for_board(
+                    db, company_id, str(r[2]), None if r[4] is None else str(r[4])
+                ),
                 "status": str(r[5]),
             }
             for r in db.execute(
