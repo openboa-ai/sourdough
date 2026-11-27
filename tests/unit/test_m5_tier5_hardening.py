@@ -6605,6 +6605,200 @@ class TestM5Tier5Hardening(unittest.TestCase):
         # Historical settled item & decision MUST NOT make the blocked trial pass!
         self.assertEqual(ev.outcome, "failed")
 
+    def test_pr191_r13_discovery_review_instruction_has_no_invalid_work_run_revision(
+        self,
+    ) -> None:
+        """PR #191 R13 P2: work.discovery_review prompt must never prescribe work_run revision '1'."""
+        seen_instructions: list[str] = []
+
+        class _CaptureInstructionAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                seen_instructions.append(request.instruction)
+                broker.invoke(
+                    "c1",
+                    "record_work_decision",
+                    {
+                        "action_kind": "hold",
+                        "rationale": "Baseline review",
+                        "evidence": [],
+                    },
+                )
+                return ShiftResult(
+                    output_text="Done.",
+                    usage=TokenUsage(input_tokens=10, output_tokens=5),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=1,
+                    events=(),
+                )
+
+        reg = AgentAdapterRegistry()
+        reg.register(_CaptureInstructionAdapter())
+        duty_reg = build_production_duty_registry(
+            adapter_registry=reg, profile_bindings={self.founder_id: self.profile}
+        )
+        rt = CompanyRuntime(self.store, self.company_id, duty_reg, clock=lambda: 25_000)
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="r13-prompt",
+                    now_ns=24_000,
+                )
+        rt.step(max_dispatches=1, now_ns=25_000)
+        self.assertEqual(len(seen_instructions), 1)
+        self.assertNotIn("'revision':'1'", seen_instructions[0])
+        self.assertIn("evidence=[]", seen_instructions[0])
+
+    def test_pr191_r13_item_linked_discovery_timers_bounded_coalesced_and_budgeted(
+        self,
+    ) -> None:
+        """PR #191 R13 Security P2: item-linked discovery timers are capped at 1 per item, coalesced, and budgeted."""
+        from sourdough.runtime.proactive_tools import (
+            build_core_proactive_tool_contribution,
+        )
+        from sourdough.runtime.work_kernel import DEFAULT_DISCOVERY_WAKE_BUDGET
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                # Part 1: Calling set_condition without owner fields on an unscoped discovery item
+                # permits at most 1 armed continuation; a 2nd attempt fails closed!
+                unscoped_item, _, unscoped_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            contrib = build_core_proactive_tool_contribution(
+                writer=w, claim=unscoped_claim
+            )
+            set_cond_tool = contrib.handlers["set_condition"]
+            first = set_cond_tool({"trigger_kind": "timer", "due_at_ns": 2_000})
+            self.assertTrue(first["ok"])
+            self.assertEqual(first["work_item_id"], unscoped_item.work_item_id)
+            self.assertIsNone(first["responsibility_id"])
+
+            # 2nd, 3rd, 4th calls on the same discovery item MUST be refused!
+            with self.assertRaisesRegex(WorkKernelRefused, "at most one armed"):
+                set_cond_tool({"trigger_kind": "timer", "due_at_ns": 2_000})
+
+            # Part 2: When work item payload carries a responsibility_id, omitting owner fields
+            # auto-binds to that standing responsibility (under its budget & hysteresis).
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                disc_resp = register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Bounded discovery",
+                    readable_scope={
+                        "max_wakes_per_window": 2,
+                        "wake_window_ns": 100_000,
+                    },
+                    now_ns=1_000,
+                )
+                complete_work_run(
+                    db,
+                    unscoped_claim.run_id,
+                    unscoped_claim.fencing_token,
+                    outcome={"done": True},
+                    now_ns=1_500,
+                )
+                scoped_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="condition",
+                    source_id="cond-resp",
+                    payload={"responsibility_id": disc_resp.responsibility_id},
+                    now_ns=1_600,
+                )
+                scoped_run = claim_work_run(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=scoped_item.work_item_id,
+                    lease_owner="test-r13",
+                    lease_ttl_ns=100_000,
+                    now_ns=1_700,
+                )
+                scoped_claim = WorkRunClaim(
+                    company_id=self.company_id,
+                    founder_id=self.founder_id,
+                    duty_id=scoped_item.work_item_id,
+                    run_id=scoped_run.run_id,
+                    fencing_token=scoped_run.fencing_token,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    purpose="discovery_review",
+                    _clock=1_800,
+                )
+            scoped_contrib = build_core_proactive_tool_contribution(
+                writer=w, claim=scoped_claim
+            )
+            bound = scoped_contrib.handlers["set_condition"](
+                {"trigger_kind": "timer", "due_at_ns": 5_000}
+            )
+            self.assertEqual(bound["responsibility_id"], disc_resp.responsibility_id)
+            self.assertIsNone(bound["work_item_id"])
+
+            # Part 3: Unscoped discovery continuations in evaluate_conditions are bounded by
+            # aggregate DEFAULT_DISCOVERY_WAKE_BUDGET and coalesce when an open item exists.
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                admitted1 = evaluate_conditions(db, self.company_id, now_ns=3_000)
+                self.assertEqual(len(admitted1), 1)
+                # Pre-fill DEFAULT_DISCOVERY_WAKE_BUDGET unscoped condition items in current window
+                for idx in range(DEFAULT_DISCOVERY_WAKE_BUDGET):
+                    wi, _ = create_work_item(
+                        db,
+                        company_id=self.company_id,
+                        owner_agent_id=self.founder_id,
+                        duty_kind="work.discovery_review",
+                        source_kind="condition",
+                        source_id=f"hist-unscoped-{idx}",
+                        payload={"trigger_kind": "timer"},
+                        now_ns=3_100 + idx,
+                    )
+                    db.execute(
+                        "UPDATE work_items SET state = 'settled' WHERE work_item_id = ?",
+                        (wi.work_item_id,),
+                    )
+                # Arm one more unscoped continuation -> aggregate budget MUST block admission!
+                set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    work_item_id=admitted1[0].work_item_id,
+                    trigger_kind="timer",
+                    due_at_ns=4_000,
+                    now_ns=3_500,
+                )
+                # Mark admitted1 settled so coalescing doesn't mask budget check
+                db.execute(
+                    "UPDATE work_items SET state = 'settled' WHERE work_item_id = ?",
+                    (admitted1[0].work_item_id,),
+                )
+                admitted_over = evaluate_conditions(db, self.company_id, now_ns=4_500)
+                self.assertEqual(admitted_over, ())
+
 
 if __name__ == "__main__":
     unittest.main()

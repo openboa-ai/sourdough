@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Sequence
 from contextlib import closing, nullcontext
@@ -127,8 +128,6 @@ def build_core_proactive_tool_contribution(
         trigger_kind = _require_str(obj["trigger_kind"], "trigger_kind")
         resp_id = _optional_str(obj.get("responsibility_id"), "responsibility_id")
         item_id = _optional_str(obj.get("work_item_id"), "work_item_id")
-        if resp_id is None and item_id is None:
-            item_id = claim.duty_id
         due_at_ns = _optional_int(obj.get("due_at_ns"), "due_at_ns", minimum=0)
         source_identity = _optional_str(obj.get("source_identity"), "source_identity")
         expected_revision = _optional_str(
@@ -147,6 +146,38 @@ def build_core_proactive_tool_contribution(
             write_tx(db),
         ):
             _verify_fencing_and_desk(db)
+            if resp_id is None and item_id is None:
+                # Prefer binding omitted owner fields to the work item's active standing
+                # responsibility so discovery/dreaming timers stay under responsibility budgets.
+                wi_row = db.execute(
+                    """SELECT payload_json FROM work_items
+                       WHERE company_id = ? AND work_item_id = ?""",
+                    (claim.company_id, claim.duty_id),
+                ).fetchone()
+                inferred_resp: str | None = None
+                if wi_row is not None:
+                    try:
+                        wi_payload = json.loads(str(wi_row[0]))
+                    except json.JSONDecodeError:
+                        wi_payload = {}
+                    cand_resp = (
+                        wi_payload.get("responsibility_id")
+                        if isinstance(wi_payload, dict)
+                        else None
+                    )
+                    if isinstance(cand_resp, str) and cand_resp.strip():
+                        r_row = db.execute(
+                            """SELECT 1 FROM work_responsibilities
+                               WHERE company_id = ? AND responsibility_id = ?
+                                 AND owner_agent_id = ? AND status = 'active'""",
+                            (claim.company_id, cand_resp.strip(), claim.founder_id),
+                        ).fetchone()
+                        if r_row is not None:
+                            inferred_resp = cand_resp.strip()
+                if inferred_resp is not None:
+                    resp_id = inferred_resp
+                else:
+                    item_id = claim.duty_id
             cond = set_condition(
                 db,
                 company_id=claim.company_id,

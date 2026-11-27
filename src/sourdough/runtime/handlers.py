@@ -1132,8 +1132,8 @@ def build_production_duty_registry(
                 f"(run_id={ctx.run.run_id}). "
                 "If any improvement_procedure skill is listed in active_methods, read the latest-version "
                 "improvement_procedure via skill_read first and follow it; otherwise inspect open_receipts "
-                "and ALWAYS finish by calling record_work_decision (if no shared_publication applies, cite "
-                "evidence=[{'kind':'work_run','resource_id':run_id,'revision':'1','available_at_ns':1,'observed_at_ns':2}])."
+                "and ALWAYS finish by calling record_work_decision (cite verified DecisionEvidence from "
+                "open_receipts when available, or pass evidence=[] for an evidence-free baseline decision)."
             ),
             purpose="discovery_review",
             base_tools=merged_specs,

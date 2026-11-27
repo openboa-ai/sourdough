@@ -2048,7 +2048,7 @@ def _insert_work_condition(
             )
     if work_item_id is not None:
         item_owner = connection.execute(
-            """SELECT owner_agent_id FROM work_items
+            """SELECT owner_agent_id, duty_kind FROM work_items
                WHERE company_id = ? AND work_item_id = ?""",
             (company_id, work_item_id),
         ).fetchone()
@@ -2056,6 +2056,30 @@ def _insert_work_condition(
             raise WorkKernelRefused(
                 "Work item does not exist or belongs to another Agent"
             )
+        is_result_dep_cond = isinstance(
+            source_identity, str
+        ) and source_identity.startswith("result_dep:")
+        if (
+            responsibility_id is None
+            and str(item_owner[1]) in ("work.discovery_review", "work.dreaming")
+            and trigger_kind != "peer_response"
+            and not is_result_dep_cond
+        ):
+            existing_item_cond = connection.execute(
+                """SELECT 1 FROM work_conditions
+                   WHERE company_id = ? AND owner_agent_id = ?
+                     AND work_item_id = ? AND responsibility_id IS NULL
+                     AND status = 'armed'
+                     AND trigger_kind != 'peer_response'
+                     AND (source_identity IS NULL OR source_identity NOT LIKE 'result_dep:%')
+                   LIMIT 1""",
+                (company_id, owner_agent_id, work_item_id),
+            ).fetchone()
+            if existing_item_cond is not None:
+                raise WorkKernelRefused(
+                    "Discretionary discovery/dreaming work item may have at most one armed "
+                    "item-linked continuation (use replace_condition or bind a standing responsibility)"
+                )
 
     cid = condition_id or uuid4().hex
     timestamp = time_ns() if now_ns is None else now_ns
@@ -2901,11 +2925,99 @@ def evaluate_conditions(
             and duty_kind in ("work.discovery_review", "work.dreaming")
             and not is_result_dep
         )
+        is_unscoped_discretionary = (
+            resp_id is None
+            and effective_parent_id is None
+            and trigger_kind != "peer_response"
+            and duty_kind in ("work.discovery_review", "work.dreaming")
+            and not is_result_dep
+        )
         disc_noops = 0
         disc_cooldown_until = 0
         disc_window_started = now_ns
         disc_window_wakes = 0
         configured_cooldown_ns = 0
+        if is_unscoped_discretionary:
+            window_floor = max(0, now_ns - DEFAULT_DISCOVERY_WAKE_WINDOW_NS)
+            recent_unscoped = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM work_items
+                       WHERE company_id = ? AND owner_agent_id = ?
+                         AND duty_kind = ? AND source_kind = 'condition'
+                         AND json_extract(payload_json, '$.responsibility_id') IS NULL
+                         AND created_at_ns >= ?""",
+                    (company_id, owner_agent_id, duty_kind, window_floor),
+                ).fetchone()[0]
+            )
+            if recent_unscoped >= DEFAULT_DISCOVERY_WAKE_BUDGET:
+                continue
+            open_unscoped = connection.execute(
+                """SELECT work_item_id, state, payload_json
+                   FROM work_items
+                   WHERE company_id = ? AND owner_agent_id = ?
+                     AND duty_kind = ?
+                     AND state IN ('due', 'scheduled', 'running')
+                     AND json_extract(payload_json, '$.responsibility_id') IS NULL
+                     AND source_kind = 'condition'
+                   ORDER BY created_at_ns ASC, work_item_id ASC
+                   LIMIT 1""",
+                (company_id, owner_agent_id, duty_kind),
+            ).fetchone()
+            if open_unscoped is not None:
+                open_item_id, open_state, open_payload_raw = open_unscoped
+                if str(open_state) in ("due", "scheduled"):
+                    try:
+                        open_payload = json.loads(str(open_payload_raw))
+                    except json.JSONDecodeError:
+                        open_payload = {}
+                    if not isinstance(open_payload, dict):
+                        open_payload = {}
+                    coalesced = open_payload.get("coalesced_revisions")
+                    if not isinstance(coalesced, list):
+                        coalesced = []
+                    coalesced.append(
+                        {
+                            "condition_id": cid,
+                            "condition_revision": int(cond_rev),
+                            "source_identity": source_identity,
+                            "observed_revision": matched_revision,
+                        }
+                    )
+                    open_payload["condition_id"] = cid
+                    open_payload["condition_revision"] = int(cond_rev)
+                    open_payload["trigger_kind"] = trigger_kind
+                    open_payload["source_identity"] = source_identity
+                    open_payload["observed_revision"] = matched_revision
+                    open_payload["coalesced_revisions"] = coalesced[-32:]
+                    connection.execute(
+                        """UPDATE work_items
+                           SET payload_json = ?, updated_at_ns = ?
+                           WHERE work_item_id = ?""",
+                        (_canonical_json(open_payload), now_ns, str(open_item_id)),
+                    )
+                    connection.execute(
+                        """INSERT INTO work_condition_occurrences (
+                               company_id, source_identity, condition_revision,
+                               condition_id, work_item_id, admitted_at_ns
+                           ) VALUES (?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(company_id, source_identity, condition_revision) DO NOTHING""",
+                        (
+                            company_id,
+                            dedupe_source,
+                            int(cond_rev),
+                            cid,
+                            str(open_item_id),
+                            now_ns,
+                        ),
+                    )
+                    if not is_multi_fire:
+                        connection.execute(
+                            """UPDATE work_conditions
+                               SET status = 'triggered', fire_count = fire_count + 1, updated_at_ns = ?
+                               WHERE condition_id = ? AND condition_revision = ? AND status = 'armed'""",
+                            (now_ns, cid, int(cond_rev)),
+                        )
+                continue
         if is_discretionary:
             wake_budget, wake_window_ns, configured_cooldown_ns = _parse_scope_policy(
                 resp_scope_json
