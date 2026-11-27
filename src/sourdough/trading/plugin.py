@@ -40,8 +40,12 @@ from .commands import (
     DEMOTE_LIVE_ENVIRONMENT,
     DEMOTE_PRECONDITION_KEYS,
     EXECUTION_TIER_COMMAND,
+    OPEN_COMPANY_PAPER_BOOK,
+    OPEN_PAPER_BOOK_PRECONDITION_KEYS,
     PROMOTE_EXECUTION_ENVIRONMENT,
     PROMOTE_PRECONDITION_KEYS,
+    RECONCILE_TRADING_BOOKS,
+    RECONCILE_TRADING_PRECONDITION_KEYS,
     ROLLBACK_PRECONDITION_KEYS,
     ROLLBACK_STRATEGY_DEPLOYMENT,
     STRATEGY_COMMAND,
@@ -55,7 +59,7 @@ from .company_tools import (
     READ_TRADING_BOOKS_SPEC,
     read_trading_books_summary,
 )
-from .domain import ENV_LIVE, ENV_PAPER, ExecutionTierRefused
+from .domain import ENV_EXTERNAL_TEST, ENV_LIVE, ENV_PAPER, ExecutionTierRefused
 from .duty import TRADING_WORK_POLICY, has_trading_committed_result
 from .external_venue import ExternalVenueAdapter
 from .migration import execute_paper_to_live_migration, read_execution_tiers_snapshot
@@ -81,6 +85,7 @@ from .risk import (
     active_trading_risk_restrictions,
 )
 from .sandbox_tools import AgentSandboxTools
+from .venue_resolver import build_default_live_venue_resolver
 
 DUTY_QUANT_AGENT_SANDBOX = "quant.agent_sandbox"
 DUTY_TRADING_AGENT_SANDBOX = "trading.agent_sandbox"
@@ -423,15 +428,39 @@ class TradingDomainPlugin(BaseDomainPlugin):
         *,
         quote_provider: MarketQuoteProvider | None = None,
         live_venue_resolver: Callable[[str], ExternalVenueAdapter | None] | None = None,
+        auto_resolve_live_venues: bool = False,
+        live_venue_environment: str | None = None,
         max_quote_age_ns: int = 60 * 10**9,
     ) -> None:
         if quote_provider is None:
             env_spec = os.environ.get("SOURDOUGH_TRADING_QUOTE_SOURCE", "").strip()
             if env_spec:
                 quote_provider = build_quote_provider_from_spec(env_spec)
+        env_live = (
+            live_venue_environment
+            if live_venue_environment is not None
+            else os.environ.get("SOURDOUGH_TRADING_LIVE_ENV", "").strip().lower()
+        )
+        if env_live and env_live not in (ENV_LIVE, ENV_EXTERNAL_TEST):
+            raise ExecutionTierRefused(
+                f"SOURDOUGH_TRADING_LIVE_ENV must be '{ENV_LIVE}' or '{ENV_EXTERNAL_TEST}'"
+            )
         self._quote_provider = quote_provider
         self._live_venue_resolver = live_venue_resolver
+        self._auto_resolve_live_venues = auto_resolve_live_venues or bool(env_live)
+        self._default_live_env = env_live or ENV_LIVE
         self._max_quote_age_ns = max_quote_age_ns
+
+    def _effective_live_venue_resolver(
+        self, store: Path, company_id: str
+    ) -> Callable[[str], ExternalVenueAdapter | None] | None:
+        if self._live_venue_resolver is not None:
+            return self._live_venue_resolver
+        if self._auto_resolve_live_venues:
+            return build_default_live_venue_resolver(
+                store, company_id, environment=self._default_live_env
+            )
+        return None
 
     def work_policy(self) -> WorkDomainPolicy:
         return TRADING_WORK_POLICY
@@ -556,7 +585,9 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 agent_id=agent_id,
                 run_id=ctx.run.run_id,
                 quote_provider=self._quote_provider,
-                live_venue_resolver=self._live_venue_resolver,
+                live_venue_resolver=self._effective_live_venue_resolver(
+                    ctx.writer.store, ctx.company_id
+                ),
                 max_quote_age_ns=self._max_quote_age_ns,
             )
             broker_handlers: dict[str, Any] = {
@@ -612,7 +643,9 @@ class TradingDomainPlugin(BaseDomainPlugin):
             reconcile_summary = reconcile_trading_books(
                 ctx.writer,
                 quote_provider=self._quote_provider,
-                live_venue_resolver=self._live_venue_resolver,
+                live_venue_resolver=self._effective_live_venue_resolver(
+                    ctx.writer.store, ctx.company_id
+                ),
                 max_quote_age_ns=self._max_quote_age_ns,
                 now_ns=ctx.now_ns,
             )
@@ -732,6 +765,10 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 authorize=ctx.authorize_board,
                 principal_hint=ctx.principal_hint,
                 peer_pid=ctx.peer_pid,
+                quote_provider=self._quote_provider,
+                live_venue_resolver=self._effective_live_venue_resolver(
+                    ctx.writer.store, ctx.writer.company_id
+                ),
             )
 
         return (
@@ -760,6 +797,20 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 contract_version=EXECUTION_TIER_COMMAND,
                 execute=_exec_tier,
                 precondition_keys=DEMOTE_PRECONDITION_KEYS,
+                requires_domain="trading",
+            ),
+            CommandDescriptor(
+                command_type=OPEN_COMPANY_PAPER_BOOK,
+                contract_version=EXECUTION_TIER_COMMAND,
+                execute=_exec_tier,
+                precondition_keys=OPEN_PAPER_BOOK_PRECONDITION_KEYS,
+                requires_domain="trading",
+            ),
+            CommandDescriptor(
+                command_type=RECONCILE_TRADING_BOOKS,
+                contract_version=EXECUTION_TIER_COMMAND,
+                execute=_exec_tier,
+                precondition_keys=RECONCILE_TRADING_PRECONDITION_KEYS,
                 requires_domain="trading",
             ),
         )
