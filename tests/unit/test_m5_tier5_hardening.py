@@ -6215,6 +6215,77 @@ class TestM5Tier5Hardening(unittest.TestCase):
         self.assertNotIn("'revision':'1'", inc_body)
         self.assertIn("evidence=[]", inc_body)
 
+    def test_pr191_r11_codex_cli_never_injects_credential_token_into_child_env(
+        self,
+    ) -> None:
+        """PR #191 R11 Security P2: CodexCliAdapter must never place resolved credentials in child env."""
+        from sourdough.agent_runtime import (
+            PROVIDER_CODEX_CLI,
+            CodexCliAdapter,
+            hydrate_shift_context,
+        )
+
+        canary = "CANARY_CLI_SECRET_998877"
+        resolver = InMemorySecretResolver({"envref:CLI_SECRET": canary})
+        fake_cli = self.root / "fake_env_dumper_cli.py"
+        fake_cli.write_text(
+            "import json, os, sys\n"
+            "_ = sys.stdin.read()\n"
+            "leaked = {k: v for k, v in os.environ.items() if 'TOKEN' in k or 'CANARY_CLI_SECRET' in v}\n"
+            "if '--json' in sys.argv:\n"
+            "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(leaked)}}))\n"
+            "    print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 5, 'output_tokens': 5}}))\n"
+            "else:\n"
+            "    print(json.dumps({'type': 'terminal', 'output_text': json.dumps(leaked), 'usage': {'input_tokens': 5, 'output_tokens': 5}}))\n",
+            encoding="utf-8",
+        )
+        profile = AgentProfileBinding(
+            provider=PROVIDER_CODEX_CLI,
+            model="gpt-6-luna",
+            revision="v1",
+            credential_handle_ref="envref:CLI_SECRET",
+        )
+        ctx = hydrate_shift_context(
+            company_id=self.company_id,
+            agent_id=self.founder_id,
+            run_id="run-r11-env",
+            fencing_token=1,
+            grant_scope="manage-company",
+            mandate_summary="Env isolation check",
+        )
+        for mode in ("codex_mcp", "shim"):
+            with self.subTest(protocol_mode=mode):
+                adapter = CodexCliAdapter(
+                    executable=(sys.executable, str(fake_cli)),
+                    secret_resolver=resolver,
+                    protocol_mode=mode,
+                    use_macos_sandbox=False,
+                )
+                broker = OuterToolBroker(
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    run_id=f"run-r11-{mode}",
+                    fencing_token=1,
+                    handlers={},
+                )
+                req = ShiftRequest(
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    run_id=f"run-r11-{mode}",
+                    turn_id="turn-1",
+                    fencing_token=1,
+                    instruction="Check env",
+                    context=ctx,
+                    tools=(),
+                    budget_ceiling_minor_units=100,
+                    desk_path=self.root / f"desk-r11-{mode}",
+                    store_path=self.store,
+                )
+                res = adapter.run_shift(profile, req, broker)
+                self.assertNotIn("SOURDOUGH_CLI_AUTH_TOKEN", res.output_text)
+                self.assertNotIn(canary, res.output_text)
+                self.assertEqual(json.loads(res.output_text), {})
+
 
 if __name__ == "__main__":
     unittest.main()

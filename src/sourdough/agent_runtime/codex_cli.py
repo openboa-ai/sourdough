@@ -296,11 +296,9 @@ class CodexCliAdapter:
             else:
                 env["HOME"] = str(sock_dir)
 
-            if profile.credential_handle_ref is not None:
-                secret = self._secret_resolver.resolve_secret(
-                    profile.credential_handle_ref
-                )
-                env["SOURDOUGH_CLI_AUTH_TOKEN"] = secret.value
+            # Never inject resolved credential_handle_ref secrets (e.g., SOURDOUGH_CLI_AUTH_TOKEN)
+            # into the model-directed CLI child process environment; credentials stay on host-side
+            # provider channels or host-managed CODEX_HOME auth outside Agent tool visibility.
 
             if codex_mcp:
                 resolved_codex_home = _resolve_codex_home(self._codex_home)
