@@ -3558,6 +3558,394 @@ class TestM5Tier5Hardening(unittest.TestCase):
             self.assertEqual(restored[0].method_id, inc.method_id)
             self.assertEqual(restored[0].revision_sha256, inc.revision_sha256)
 
+    def test_pr191_r3_tool_call_receipt_evidence_authenticates_digest_run_and_time(
+        self,
+    ) -> None:
+        """PR #191 Security P2: tool_call_receipt citations must authenticate digest, run, and time."""
+        from sourdough.runtime.work_kernel import complete_work_run
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _item0, run0, _claim0 = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=500,
+                )
+                complete_work_run(
+                    db,
+                    run_id=run0.run_id,
+                    fencing_token=run0.fencing_token,
+                    outcome="completed",
+                    now_ns=900,
+                )
+                item1, run1, claim1 = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+                db.execute(
+                    """INSERT INTO tool_call_receipt
+                       (company_id, run_id, agent_id, call_id, tool_name, arg_digest,
+                        status, result_digest, result_json, recorded_at_ns)
+                       VALUES (?, ?, ?, 'call-shared', 'desk_read_draft', 'a1',
+                               'ok', 'result-real-0', '{"ok":true}', 800),
+                              (?, ?, ?, 'call-shared', 'desk_read_draft', 'a2',
+                               'ok', 'result-real-1', '{"ok":true}', 1_100)""",
+                    (
+                        self.company_id,
+                        run0.run_id,
+                        self.founder_id,
+                        self.company_id,
+                        run1.run_id,
+                        self.founder_id,
+                    ),
+                )
+                # 1. Attacker-chosen forged revision MUST be refused
+                with self.assertRaises(WorkKernelRefused):
+                    record_work_decision(
+                        db,
+                        company_id=self.company_id,
+                        work_item_id=item1.work_item_id,
+                        run_id=run1.run_id,
+                        fencing_token=claim1.fencing_token,
+                        agent_id=self.founder_id,
+                        action_kind="hold",
+                        rationale="forged receipt digest",
+                        evidence=(
+                            DecisionEvidence(
+                                "tool_call_receipt",
+                                f"{run1.run_id}/call-shared",
+                                "attacker-chosen-not-result-real",
+                                1_500,
+                                1_400,
+                            ),
+                        ),
+                        decision_at_ns=2_000,
+                    )
+                # 2. Claiming availability BEFORE receipt recorded_at_ns MUST be refused
+                with self.assertRaises(WorkKernelRefused):
+                    record_work_decision(
+                        db,
+                        company_id=self.company_id,
+                        work_item_id=item1.work_item_id,
+                        run_id=run1.run_id,
+                        fencing_token=claim1.fencing_token,
+                        agent_id=self.founder_id,
+                        action_kind="hold",
+                        rationale="premature availability",
+                        evidence=(
+                            DecisionEvidence(
+                                "tool_call_receipt",
+                                f"{run1.run_id}/call-shared",
+                                "result-real-1",
+                                1_500,
+                                1_050,
+                            ),
+                        ),
+                        decision_at_ns=2_000,
+                    )
+                # 3. Unambiguous qualified receipt with exact result_digest & valid time accepted
+                dec = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item1.work_item_id,
+                    run_id=run1.run_id,
+                    fencing_token=claim1.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="authenticated receipt citation",
+                    evidence=(
+                        DecisionEvidence(
+                            "tool_call_receipt",
+                            f"{run1.run_id}/call-shared",
+                            "result-real-1",
+                            1_500,
+                            1_200,
+                        ),
+                    ),
+                    decision_at_ns=2_000,
+                )
+                self.assertEqual(dec.action_kind, "hold")
+
+    def test_pr191_r3_board_projection_redacts_private_draft_identifiers(self) -> None:
+        """PR #191 R3 P2: Board agent-detail projection must never disclose private draft names."""
+        from sourdough.ipc.projections import read_agent_detail_projection
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            draft = save_draft(
+                w,
+                claim,
+                claim.purpose,
+                name="secret-acquisition-plan",
+                content="Confidential private draft content",
+                expected_revision=None,
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=claim.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Verified internal note",
+                    evidence=(
+                        DecisionEvidence(
+                            "private_draft",
+                            f"{self.founder_id}/secret-acquisition-plan",
+                            draft.revision,
+                            900,
+                            800,
+                        ),
+                    ),
+                    decision_at_ns=1_500,
+                )
+            detail, _ = read_agent_detail_projection(
+                self.store, self.company_id, self.founder_id
+            )
+            serialized = json.dumps(detail)
+            self.assertNotIn("secret-acquisition-plan", serialized)
+            refs = detail["tabs"]["work_decisions"][0]["evidence_refs"]
+            self.assertEqual(len(refs), 1)
+            self.assertEqual(refs[0]["kind"], "private_draft")
+            self.assertTrue(refs[0]["resource_id"].startswith("private_draft:"))
+            self.assertEqual(refs[0]["revision"], draft.revision)
+
+    def test_pr191_r3_recursive_cycle_uses_structurally_distinct_transfer_families(
+        self,
+    ) -> None:
+        """PR #191 R3 P1: Gen-2 transfer suite must seal genuinely distinct problem families."""
+        from sourdough.trial_registry import TrialRefused
+        from sourdough.trial_runner import run_recursive_learning_cycle
+
+        eval_dir = self.root / "evals_distinct"
+        eval_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        eval_store = eval_dir / "eval_distinct.sqlite"
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Improve company work methods safely",
+                    readable_scope=["*"],
+                    now_ns=1_000,
+                )
+            # Requesting more families than genuinely distinct registered problem specs MUST fail closed
+            with self.assertRaisesRegex(TrialRefused, "genuinely distinct"):
+                run_recursive_learning_cycle(
+                    w,
+                    evaluator_store=eval_dir / "eval_excess.sqlite",
+                    company_id=self.company_id,
+                    meta_agent_id=self.founder_id,
+                    promotion_actor_id=self.founder_id,
+                    promotion_grant_id=self.grant_id,
+                    trial_root=self.root / "rsi-excess",
+                    min_families=99,
+                )
+            cycle = run_recursive_learning_cycle(
+                w,
+                evaluator_store=eval_store,
+                company_id=self.company_id,
+                meta_agent_id=self.founder_id,
+                promotion_actor_id=self.founder_id,
+                promotion_grant_id=self.grant_id,
+                trial_root=self.root / "rsi-distinct",
+                min_families=6,
+            )
+            self.assertEqual(cycle.transfer_verdict, "SUPPORTED")
+            self.assertEqual(cycle.distinct_transfer_families, 6)
+            # Inspect sealed suite: all 6 families must have distinct case_inputs digests
+            with closing(sqlite3.connect(eval_store)) as edb:
+                doc = json.loads(
+                    edb.execute(
+                        "SELECT document FROM trial_suite WHERE singleton = 1"
+                    ).fetchone()[0]
+                )
+            by_family: dict[str, str] = {}
+            for slot in doc["slots"]:
+                by_family[slot["family_id"]] = slot["inputs"]["case_inputs"]
+            self.assertEqual(len(by_family), 6)
+            self.assertEqual(len(set(by_family.values())), 6)
+            # Confirm distinct domain slugs (not relabeled identical cases)
+            self.assertIn("unseen-transfer-schedule-sla-triage", by_family)
+            self.assertIn("unseen-transfer-budget-variance-audit", by_family)
+            self.assertIn("unseen-transfer-handoff-expiry-recovery", by_family)
+            self.assertIn("unseen-transfer-publication-disclosure-review", by_family)
+            self.assertIn("unseen-transfer-evidence-freshness-check", by_family)
+            self.assertIn("unseen-transfer-staffing-authority-check", by_family)
+
+    def test_pr191_r3_codex_mcp_bridge_ignores_poisoned_desk_package(self) -> None:
+        """PR #191 Security P1: poisoned Desk sourdough package must never hijack MCP bridge."""
+        from sourdough.agent_runtime.codex_cli import CodexCliAdapter
+        from sourdough.agent_runtime.protocol import (
+            PROVIDER_CODEX_CLI,
+            ToolSpec,
+            hydrate_shift_context,
+        )
+
+        desk = desk_directory(self.store, self.founder_id)
+        poison_pkg = desk / "sourdough" / "agent_runtime"
+        poison_pkg.mkdir(parents=True, exist_ok=True)
+        marker = self.root / "pwned_marker.txt"
+        (desk / "sourdough" / "__init__.py").write_text("", encoding="utf-8")
+        (poison_pkg / "__init__.py").write_text("", encoding="utf-8")
+        (poison_pkg / "codex_cli.py").write_text(
+            f"import os, pathlib; pathlib.Path({str(marker)!r}).write_text(os.environ.get('SOURDOUGH_CLI_AUTH_TOKEN', 'PWN'), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        (desk / "sitecustomize.py").write_text(
+            f"import pathlib; pathlib.Path({str(marker)!r}).write_text('SITE_PWN', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+
+        fake_codex = self.root / "fake_codex_check_mcp.py"
+        fake_codex.write_text(
+            f"#!{sys.executable}\n"
+            "import json, subprocess, sys\n"
+            "args = sys.argv[1:]\n"
+            "mcp_cmd = mcp_args = mcp_cwd = None\n"
+            "for i, a in enumerate(args):\n"
+            "    if a == '-c' and i + 1 < len(args):\n"
+            "        cfg = args[i + 1]\n"
+            "        if cfg.startswith('mcp_servers.sourdough.command='):\n"
+            "            mcp_cmd = json.loads(cfg.split('=', 1)[1])\n"
+            "        elif cfg.startswith('mcp_servers.sourdough.args='):\n"
+            "            mcp_args = json.loads(cfg.split('=', 1)[1])\n"
+            "        elif cfg.startswith('mcp_servers.sourdough.cwd='):\n"
+            "            mcp_cwd = json.loads(cfg.split('=', 1)[1])\n"
+            "assert mcp_cmd and mcp_args and mcp_cwd, f'missing mcp config: {args}'\n"
+            "assert mcp_args[0] == '-I', f'expected isolated -I flag: {mcp_args}'\n"
+            "assert mcp_cwd != str(sys.path[0]), 'unexpected cwd'\n"
+            "# Even if launched with cwd = poisoned Desk, -I must ignore Desk imports!\n"
+            "bridge = subprocess.Popen(\n"
+            "    [mcp_cmd, *mcp_args],\n"
+            "    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
+            "    text=True,\n"
+            ")\n"
+            "out, err = bridge.communicate(\n"
+            "    json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'ping','arguments':{}}}) + '\\n',\n"
+            "    timeout=10,\n"
+            ")\n"
+            "assert bridge.returncode == 0, f'bridge failed: {err}'\n"
+            "resp = json.loads(out.strip().splitlines()[0])\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'mcp_cwd':mcp_cwd,'resp':resp})}}))\n",
+            encoding="utf-8",
+        )
+        os.chmod(fake_codex, 0o700)
+
+        adapter = CodexCliAdapter(
+            executable=(str(fake_codex),),
+            protocol_mode="codex_mcp",
+            secret_resolver=InMemorySecretResolver(
+                {"envref:CLI_TOK": "SECRET-TOKEN-99"}
+            ),
+        )
+        profile = AgentProfileBinding(
+            provider=PROVIDER_CODEX_CLI,
+            model="gpt-6-luna",
+            revision="v1",
+            credential_handle_ref="envref:CLI_TOK",
+        )
+        ctx = hydrate_shift_context(
+            company_id=self.company_id,
+            agent_id=self.founder_id,
+            run_id="run-mcp-iso",
+            fencing_token=1,
+            grant_scope="manage-company",
+            mandate_summary="Test MCP isolation",
+        )
+        req = ShiftRequest(
+            company_id=self.company_id,
+            agent_id=self.founder_id,
+            run_id="run-mcp-iso",
+            turn_id="turn-1",
+            fencing_token=1,
+            instruction="Call ping",
+            context=ctx,
+            tools=(ToolSpec("ping", "Ping broker", {"type": "object"}),),
+            budget_ceiling_minor_units=100,
+            desk_path=desk,
+            store_path=self.store,
+        )
+        broker = OuterToolBroker(
+            company_id=self.company_id,
+            agent_id=self.founder_id,
+            run_id="run-mcp-iso",
+            fencing_token=1,
+            handlers={"ping": lambda _a: {"pong": True}},
+        )
+        res = adapter.run_shift(profile, req, broker)
+        self.assertFalse(
+            marker.exists(), "Poisoned Desk package executed inside MCP bridge!"
+        )
+        parsed = json.loads(res.output_text)
+        self.assertNotEqual(Path(parsed["mcp_cwd"]).resolve(), desk.resolve())
+        self.assertIn("pong", json.dumps(parsed["resp"]))
+
+    def test_pr191_r3_sandboxed_desk_command_kernel_denies_detached_child_fork(
+        self,
+    ) -> None:
+        """PR #191 Security P2: real macOS sandbox denies process-fork / start_new_session escape."""
+        if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+            self.skipTest("macOS sandbox-exec required")
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+            session = create_agent_session(w, claim, claim.purpose)
+            attempt_detach = (
+                "import subprocess, sys\n"
+                "try:\n"
+                "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+                "start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "    print('ESCAPE_ALLOWED')\n"
+                "except PermissionError:\n"
+                "    print('FORK_KERNEL_DENIED')\n"
+            )
+            res = run_desk_command_sandboxed(
+                session,
+                [sys.executable, "-c", attempt_detach],
+                store=self.store,
+                sandbox_backend="local-macos",
+                limits=DeskCommandLimits(timeout_seconds=10),
+                granted_capabilities=("desk:exec",),
+            )
+            self.assertTrue(res["ok"], res)
+            self.assertIn("FORK_KERNEL_DENIED", res["stdout"])
+            self.assertNotIn("ESCAPE_ALLOWED", res["stdout"])
+
 
 if __name__ == "__main__":
     unittest.main()

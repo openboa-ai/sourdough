@@ -122,6 +122,24 @@ def _json_loads_safe(raw: str | None, default: Any) -> Any:
         return default
 
 
+def _redact_evidence_refs_for_board(raw_json: str) -> list[Any]:
+    parsed = _json_loads_safe(raw_json, [])
+    if not isinstance(parsed, list):
+        return []
+    redacted: list[Any] = []
+    for entry in parsed:
+        if isinstance(entry, Mapping) and str(entry.get("kind", "")) == "private_draft":
+            item = dict(entry)
+            raw_res = str(item.get("resource_id", ""))
+            item["resource_id"] = (
+                f"private_draft:{sha256(raw_res.encode('utf-8')).hexdigest()[:16]}"
+            )
+            redacted.append(item)
+        else:
+            redacted.append(entry)
+    return redacted
+
+
 def _count_private_drafts(store: Path, agent_id: str) -> int:
     """Count unique private Desk draft stems without opening, reading, or naming any file."""
     try:
@@ -675,7 +693,7 @@ def read_agent_detail_projection(
                 "run_id": str(r[2]),
                 "action_id": str(r[3]),
                 "action_kind": str(r[4]),
-                "evidence_refs": _json_loads_safe(str(r[5]), []),
+                "evidence_refs": _redact_evidence_refs_for_board(str(r[5])),
                 "evidence_digest": str(r[6]),
                 "rationale": str(r[7]),
                 "next_condition_id": None if r[8] is None else str(r[8]),

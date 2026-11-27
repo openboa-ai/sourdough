@@ -1563,10 +1563,174 @@ def run_recursive_learning_cycle(
             arm_stores[arm_name] = arm_store
 
         # ------------------------------------------------------------------
-        # Generation 2: Sealed transfer suite across >= 6 distinct unseen
-        # families, isolated execution, deterministic grading & blind (AB, BA)
+        # Generation 2: Sealed transfer suite across genuinely distinct unseen
+        # company task families (never relabeled repetitions!), isolated
+        # execution, deterministic grading & blind (AB, BA)
         # ------------------------------------------------------------------
+        distinct_catalog: tuple[dict[str, Any], ...] = (
+            {
+                "family_slug": "schedule-sla-triage",
+                "domain": "operations_scheduling",
+                "problem_kind": "deadline_breach_vs_evergreen_remit",
+                "objective": "Flag missed SLA obligations while preserving standing evergreen remits without deadlines.",
+                "primary_item": {
+                    "symptom": "missed_sla_deadline",
+                    "has_deadline": True,
+                    "overdue_minutes": 45,
+                    "valid_obligation": True,
+                },
+                "boundary_counterexample": {
+                    "symptom": "standing_evergreen_no_deadline",
+                    "has_deadline": False,
+                    "cadence": "continuous_watch",
+                    "valid_obligation": True,
+                    "must_preserve": True,
+                },
+            },
+            {
+                "family_slug": "budget-variance-audit",
+                "domain": "finance_ledger",
+                "problem_kind": "unapproved_spend_vs_preauthorized_reserve",
+                "objective": "Escalate unapproved budget overruns without halting pre-authorized standing reserve draws.",
+                "primary_item": {
+                    "symptom": "unapproved_budget_overrun",
+                    "ceiling_minor_units": 5_000,
+                    "incurred_minor_units": 6_250,
+                    "authorized_reserve": False,
+                    "valid_obligation": True,
+                },
+                "boundary_counterexample": {
+                    "symptom": "preauthorized_standing_reserve",
+                    "ceiling_minor_units": 5_000,
+                    "reserve_draw_minor_units": 1_200,
+                    "authorized_reserve": True,
+                    "valid_obligation": True,
+                    "must_preserve": True,
+                },
+            },
+            {
+                "family_slug": "handoff-expiry-recovery",
+                "domain": "collaboration_handoffs",
+                "problem_kind": "expired_unaccepted_handoff_vs_active_peer_wait",
+                "objective": "Reclaim expired unaccepted handoff offers while preserving active zero-compute waiting peer requests.",
+                "primary_item": {
+                    "symptom": "expired_handoff_offer",
+                    "handoff_state": "offered",
+                    "expired": True,
+                    "valid_obligation": True,
+                },
+                "boundary_counterexample": {
+                    "symptom": "active_waiting_peer_request",
+                    "run_status": "waiting",
+                    "peer_deadline_active": True,
+                    "valid_obligation": True,
+                    "must_preserve": True,
+                },
+            },
+            {
+                "family_slug": "publication-disclosure-review",
+                "domain": "custody_disclosure",
+                "problem_kind": "unredacted_draft_leak_vs_scoped_publication",
+                "objective": "Block unredacted private-desk path leaks while preserving authorized project-scoped shared publications.",
+                "primary_item": {
+                    "symptom": "unredacted_private_desk_reference",
+                    "target_scope": "company",
+                    "contains_private_path": True,
+                    "valid_obligation": True,
+                },
+                "boundary_counterexample": {
+                    "symptom": "authorized_scoped_shared_publication",
+                    "target_scope": "project",
+                    "redaction_verified": True,
+                    "valid_obligation": True,
+                    "must_preserve": True,
+                },
+            },
+            {
+                "family_slug": "evidence-freshness-check",
+                "domain": "decision_audit",
+                "problem_kind": "future_dated_citation_vs_point_in_time_receipt",
+                "objective": "Reject decisions citing post-decision timestamps while preserving point-in-time verified ledger receipts.",
+                "primary_item": {
+                    "symptom": "temporal_future_leak_citation",
+                    "available_after_decision": True,
+                    "receipt_verified": False,
+                    "valid_obligation": True,
+                },
+                "boundary_counterexample": {
+                    "symptom": "verified_point_in_time_receipt",
+                    "available_after_decision": False,
+                    "receipt_verified": True,
+                    "valid_obligation": True,
+                    "must_preserve": True,
+                },
+            },
+            {
+                "family_slug": "staffing-authority-check",
+                "domain": "governance_authority",
+                "problem_kind": "unauthorized_scope_escalation_vs_delegated_grant",
+                "objective": "Refuse hiring or grant expansions exceeding delegated authority while preserving valid delegated staffing.",
+                "primary_item": {
+                    "symptom": "delegated_grant_escalation",
+                    "requested_scope": "manage-company",
+                    "delegated_scope": "assessment",
+                    "valid_obligation": True,
+                },
+                "boundary_counterexample": {
+                    "symptom": "within_delegated_staffing_budget",
+                    "requested_scope": "assessment",
+                    "delegated_scope": "assessment",
+                    "valid_obligation": True,
+                    "must_preserve": True,
+                },
+            },
+            {
+                "family_slug": "always-on-watchdog-triage",
+                "domain": "always_on_continuity",
+                "problem_kind": "expired_fenced_run_vs_sleeping_resident",
+                "objective": "Recover expired fenced work runs without disrupting intentionally sleeping zero-compute resident schedules.",
+                "primary_item": {
+                    "symptom": "expired_fenced_work_run",
+                    "lease_expired": True,
+                    "open_receipts_pending": True,
+                    "valid_obligation": True,
+                },
+                "boundary_counterexample": {
+                    "symptom": "intentional_zero_compute_sleep",
+                    "sleep_state": "sleeping",
+                    "open_receipts_pending": False,
+                    "valid_obligation": True,
+                    "must_preserve": True,
+                },
+            },
+            {
+                "family_slug": "skill-regression-triage",
+                "domain": "learning_governance",
+                "problem_kind": "unqualified_self_edit_vs_three_stage_skill_delta",
+                "objective": "Quarantine unverified skill edits while preserving 3-stage qualified skill deltas with counterexamples.",
+                "primary_item": {
+                    "symptom": "unqualified_skill_mutation",
+                    "passed_stages": 1,
+                    "negative_triggers_present": False,
+                    "valid_obligation": True,
+                },
+                "boundary_counterexample": {
+                    "symptom": "three_stage_qualified_skill_delta",
+                    "passed_stages": 3,
+                    "negative_triggers_present": True,
+                    "valid_obligation": True,
+                    "must_preserve": True,
+                },
+            },
+        )
         num_families = max(6, min_families)
+        if num_families > len(distinct_catalog):
+            raise TrialRefused(
+                f"Requested {num_families} transfer families exceeds the "
+                f"{len(distinct_catalog)} genuinely distinct registered task families "
+                "(refusing to duplicate cases as pseudoreplicated families)"
+            )
+        selected_families = distinct_catalog[:num_families]
         limits = TrialCeiling(
             turns=4,
             wall_seconds=150,
@@ -1595,29 +1759,41 @@ def run_recursive_learning_cycle(
         rubric_digest = sha256(b"rsi-transfer-rubric-v1").hexdigest()
         evaluator_digest = sha256(b"rsi-transfer-evaluator-v1").hexdigest()
 
-        family_specs = [
-            f"unseen-transfer-family-{idx}" for idx in range(1, num_families + 1)
-        ]
+        # Verify every selected family has a structurally unique problem spec after stripping IDs
+        structural_digests: set[str] = set()
         slots: list[TrialSlot] = []
         slot_case_meta: dict[str, tuple[str, str, str, dict[str, Any]]] = {}
-        for idx, fam_id in enumerate(family_specs, start=1):
-            case_id = f"transfer-case-{idx}"
+        for idx, tmpl in enumerate(selected_families, start=1):
+            fam_id = f"unseen-transfer-{tmpl['family_slug']}"
+            case_id = f"transfer-case-{tmpl['family_slug']}"
+            structural_body = {
+                "domain": tmpl["domain"],
+                "problem_kind": tmpl["problem_kind"],
+                "objective": tmpl["objective"],
+                "requires_counterexample_guard": True,
+                "primary_item": dict(tmpl["primary_item"]),
+                "boundary_counterexample": dict(tmpl["boundary_counterexample"]),
+            }
+            structural_digest = _canonical_digest(structural_body)
+            if structural_digest in structural_digests:
+                raise TrialRefused(
+                    "Duplicate structural problem specification cannot be registered as an independent transfer family"
+                )
+            structural_digests.add(structural_digest)
             case_spec: dict[str, Any] = {
                 "family_id": fam_id,
                 "case_id": case_id,
+                "domain": tmpl["domain"],
+                "problem_kind": tmpl["problem_kind"],
+                "objective": tmpl["objective"],
                 "requires_counterexample_guard": True,
                 "primary_item": {
                     "item_id": f"{case_id}-primary",
-                    "symptom": "missed_sla",
-                    "has_deadline": True,
-                    "valid_obligation": True,
+                    **tmpl["primary_item"],
                 },
                 "boundary_counterexample": {
                     "item_id": f"{case_id}-boundary",
-                    "symptom": "no_deadline",
-                    "has_deadline": False,
-                    "valid_obligation": True,
-                    "must_preserve": True,
+                    **tmpl["boundary_counterexample"],
                 },
             }
             case_bytes = _canonical_json(case_spec).encode("utf-8")

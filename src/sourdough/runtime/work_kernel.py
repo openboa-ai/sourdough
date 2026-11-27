@@ -3150,6 +3150,7 @@ def _validate_core_evidence_entry(
     agent_id: str,
     decision_at_ns: int,
     ev: DecisionEvidence,
+    current_run_id: str | None = None,
 ) -> None:
     if ev.available_at_ns > ev.observed_at_ns or ev.observed_at_ns > decision_at_ns:
         raise WorkKernelRefused(
@@ -3271,22 +3272,67 @@ def _validate_core_evidence_entry(
         if str(item_row[0]) != company_id or str(item_row[1]) != agent_id:
             raise WorkKernelRefused("Agent is not authorized to cite work_item")
     elif ev.kind == "tool_call_receipt":
-        rec_row = connection.execute(
-            """SELECT 1 FROM tool_call_receipt
-               WHERE company_id = ? AND agent_id = ? AND call_id = ?
-               LIMIT 1""",
-            (company_id, agent_id, ev.resource_id),
-        ).fetchone()
-        if rec_row is None:
-            any_row = connection.execute(
-                """SELECT 1 FROM tool_call_receipt
-                   WHERE company_id = ? AND call_id = ?
-                   LIMIT 1""",
-                (company_id, ev.resource_id),
-            ).fetchone()
+        target_run_id: str | None = None
+        target_call_id = ev.resource_id
+        if "/" in ev.resource_id:
+            target_run_id, target_call_id = ev.resource_id.split("/", 1)
+        elif ":" in ev.resource_id:
+            target_run_id, target_call_id = ev.resource_id.split(":", 1)
+        if not target_call_id or "/" in target_call_id or ":" in target_call_id:
+            raise WorkKernelRefused("Invalid tool_call_receipt resource_id")
+        if target_run_id is not None:
+            rec_rows = connection.execute(
+                """SELECT run_id, result_digest, recorded_at_ns
+                   FROM tool_call_receipt
+                   WHERE company_id = ? AND agent_id = ? AND run_id = ? AND call_id = ?""",
+                (company_id, agent_id, target_run_id, target_call_id),
+            ).fetchall()
+        else:
+            rec_rows = connection.execute(
+                """SELECT run_id, result_digest, recorded_at_ns
+                   FROM tool_call_receipt
+                   WHERE company_id = ? AND agent_id = ? AND call_id = ?""",
+                (company_id, agent_id, target_call_id),
+            ).fetchall()
+            if len(rec_rows) > 1 and current_run_id is not None:
+                same_run = [r for r in rec_rows if str(r[0]) == current_run_id]
+                if len(same_run) == 1:
+                    rec_rows = same_run
+        if not rec_rows:
+            any_row = (
+                connection.execute(
+                    """SELECT 1 FROM tool_call_receipt
+                       WHERE company_id = ? AND run_id = ? AND call_id = ?
+                       LIMIT 1""",
+                    (company_id, target_run_id, target_call_id),
+                ).fetchone()
+                if target_run_id is not None
+                else connection.execute(
+                    """SELECT 1 FROM tool_call_receipt
+                       WHERE company_id = ? AND call_id = ?
+                       LIMIT 1""",
+                    (company_id, target_call_id),
+                ).fetchone()
+            )
             if any_row is None:
                 raise WorkKernelRefused("Cited tool_call_receipt does not exist")
             raise WorkKernelRefused("Agent is not authorized to cite tool_call_receipt")
+        if len(rec_rows) > 1:
+            raise WorkKernelRefused(
+                "Cited tool_call_receipt call_id is ambiguous across runs; qualify with run_id/call_id"
+            )
+        _rec_run_id, rec_digest, rec_recorded_at_ns = rec_rows[0]
+        if ev.revision != str(rec_digest):
+            raise WorkKernelRefused(
+                "Cited tool_call_receipt revision does not match recorded result_digest"
+            )
+        if (
+            ev.available_at_ns < int(rec_recorded_at_ns)
+            or int(rec_recorded_at_ns) > decision_at_ns
+        ):
+            raise WorkKernelRefused(
+                "Cited tool_call_receipt timestamps precede receipt recording or follow decision"
+            )
 
 
 def record_work_decision(
@@ -3352,6 +3398,7 @@ def record_work_decision(
             agent_id=agent_id,
             decision_at_ns=effective_decision_ns,
             ev=ev,
+            current_run_id=run_id,
         )
         for plugin in domain_plugins:
             validator = getattr(plugin, "validate_decision_evidence", None)

@@ -261,6 +261,7 @@ def build_desk_sandbox_profile(
     scratch_dir: Path | None = None,
     extra_read_paths: tuple[Path, ...] = (),
     extra_read_files: tuple[Path, ...] = (),
+    allow_process_fork: bool = True,
 ) -> str:
     """Generate a macOS Seatbelt (SBPL) profile isolating an Agent to its own Desk."""
     resolved_store = store.resolve(strict=False)
@@ -329,12 +330,17 @@ def build_desk_sandbox_profile(
                 f"(deny file-write* (literal {_sbpl_quote(resolved_scratch)}))",
             ]
         )
+    process_rule = (
+        "(allow process-exec process-fork file-map-executable)"
+        if allow_process_fork
+        else "(allow process-exec file-map-executable)\n(deny process-fork)"
+    )
     return "\n".join(
         [
             "(version 1)",
             "(deny default)",
             '(import "system.sb")',
-            "(allow process-exec process-fork file-map-executable)",
+            process_rule,
             "(allow signal (target self))",
             "(allow file-read-metadata)",
             "(allow file-read*",
@@ -572,6 +578,7 @@ def run_desk_command_sandboxed(
         session.desk_path,
         broker_socket=None,
         scratch_dir=scratch_dir,
+        allow_process_fork=False,
     )
     sandbox_env = (
         {"PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.defpath}"}
