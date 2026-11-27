@@ -10,6 +10,8 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from ..duty_run import has_turn_capacity
+from ..episode_index import upsert_episode_entry
+from ..memory import update_episode_outcome
 from ..storage.db import open_writer, wal_checkpoint, write_tx
 from ..writer_lease import WriterLease, hold_company_writer
 from .domains import IndependentProcessGuard
@@ -277,6 +279,7 @@ class CompanyRuntime:
                     return_to_due, increment_attempt, next_retry_at_ns = (
                         self._classify_failure(error, item, fail_now)
                     )
+                    reconciled_fail_ep = None
                     with (
                         lock_ctx,
                         closing(open_writer(self._store, lease=writer)) as conn,
@@ -292,6 +295,16 @@ class CompanyRuntime:
                             next_retry_at_ns=next_retry_at_ns,
                             now_ns=fail_now,
                         )
+                        reconciled_fail_ep = update_episode_outcome(
+                            conn,
+                            self._company_id,
+                            run.run_id,
+                            outcome_status="failed",
+                            reason=type(error).__name__,
+                            only_from_statuses=frozenset({"completed"}),
+                        )
+                    if reconciled_fail_ep is not None:
+                        upsert_episode_entry(self._store, reconciled_fail_ep)
                     if on_commit is not None:
                         on_commit()
                 except RunFenced:
@@ -299,6 +312,7 @@ class CompanyRuntime:
                 raise
             writer.verify()
             commit_now = read_clock()
+            reconciled_ep = None
             with (
                 lock_ctx,
                 closing(open_writer(self._store, lease=writer)) as conn,
@@ -331,6 +345,20 @@ class CompanyRuntime:
                         item_state="blocked",
                         now_ns=commit_now,
                     )
+                    block_reason = (
+                        str(outcome.result.get("reason"))
+                        if isinstance(outcome.result, dict)
+                        and outcome.result.get("reason")
+                        else "blocked"
+                    )
+                    reconciled_ep = update_episode_outcome(
+                        conn,
+                        self._company_id,
+                        run.run_id,
+                        outcome_status="blocked",
+                        reason=block_reason,
+                        only_from_statuses=frozenset({"completed"}),
+                    )
                     blocked.append(item.work_item_id)
                 else:
                     complete_work_run(
@@ -342,6 +370,8 @@ class CompanyRuntime:
                         next_condition=outcome.next_condition,
                         now_ns=commit_now,
                     )
+            if reconciled_ep is not None:
+                upsert_episode_entry(self._store, reconciled_ep)
             executed.append(run.run_id)
             if on_commit is not None:
                 on_commit()

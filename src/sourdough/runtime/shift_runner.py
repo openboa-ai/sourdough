@@ -47,7 +47,12 @@ from ..harness import (
     create_agent_session,
     offload_large_output,
 )
-from ..memory import AgentEpisode, list_recent_episodes, record_episode
+from ..memory import (
+    AgentEpisode,
+    list_recent_episodes,
+    record_episode,
+    update_episode_outcome,
+)
 from ..method_learning import (
     build_causal_method_trace,
     compute_active_snapshot_id,
@@ -187,6 +192,57 @@ def _append_trace_line(store: Path, trace_path: Path, payload: dict[str, Any]) -
     finally:
         os.close(fd)
     os.chmod(trace_path, 0o600)
+
+
+def reconcile_shift_episode_outcome(
+    ctx: DutyContext,
+    *,
+    outcome_status: str,
+    reason: str | None = None,
+    causal_method_trace: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Reconcile recorded episode + episode index + causal trace after duty validation."""
+    reconciled: dict[str, Any] | None = None
+    if causal_method_trace is not None:
+        reconciled = dict(causal_method_trace)
+        od = reconciled.get("outcome_delta")
+        patched_od = dict(od) if isinstance(od, dict) else {}
+        patched_od["status"] = outcome_status
+        if reason is not None:
+            patched_od["reason"] = reason
+        reconciled["outcome_delta"] = patched_od
+    with (
+        ctx.write_lock_ctx(),
+        closing(open_writer(ctx.writer.store, lease=ctx.writer)) as db,
+        write_tx(db),
+    ):
+        updated_ep = update_episode_outcome(
+            db,
+            ctx.company_id,
+            ctx.run.run_id,
+            outcome_status=outcome_status,
+            reason=reason,
+        )
+        if reconciled is not None and (
+            reconciled.get("available")
+            or reconciled.get("retrieved")
+            or reconciled.get("invoked")
+        ):
+            append_audit_event(
+                db,
+                company_id=ctx.company_id,
+                domain="learning",
+                entity_type="agent_episode",
+                entity_id=ctx.run.run_id,
+                event_type="learning.causal_method_trace_reconciled",
+                actor_id=ctx.work_item.owner_agent_id,
+                run_id=ctx.run.run_id,
+                payload=reconciled,
+                recorded_at_ns=max(1, int(ctx.now_ns)),
+            )
+    if updated_ep is not None:
+        upsert_episode_entry(ctx.writer.store, updated_ep)
+    return reconciled
 
 
 class ShiftRunner:

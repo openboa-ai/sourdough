@@ -56,7 +56,11 @@ from .registry import (
     DutyRegistry,
     RuntimeRefused,
 )
-from .shift_runner import ActiveMethodsProvider, ShiftRunner
+from .shift_runner import (
+    ActiveMethodsProvider,
+    ShiftRunner,
+    reconcile_shift_episode_outcome,
+)
 from .work_kernel import (
     _PEER_REQUEST_COLUMNS,
     PeerRequest,
@@ -753,6 +757,7 @@ def build_production_duty_registry(
                 wait_reason="waiting_for_peer_response",
                 result={"request_id": peer.request_id, "waiting": True},
             )
+        blocked_no_peer = False
         with (
             ctx.write_lock_ctx(),
             closing(open_writer(ctx.writer.store, lease=ctx.writer)) as db,
@@ -784,13 +789,22 @@ def build_production_duty_registry(
                         disposition="completed",
                         result={"request_id": peer.request_id, "outcome": "expired"},
                     )
-                return DutyOutcome(
-                    disposition="blocked",
-                    result={
-                        "request_id": peer.request_id,
-                        "reason": "no_peer_disposition",
-                    },
-                )
+                blocked_no_peer = True
+        if blocked_no_peer:
+            reconciled_trace = reconcile_shift_episode_outcome(
+                ctx,
+                outcome_status="blocked",
+                reason="no_peer_disposition",
+                causal_method_trace=run_res.causal_method_trace,
+            )
+            return DutyOutcome(
+                disposition="blocked",
+                result={
+                    "request_id": peer.request_id,
+                    "reason": "no_peer_disposition",
+                    "causal_method_trace": reconciled_trace,
+                },
+            )
         return DutyOutcome(
             disposition="completed",
             result={
@@ -1143,6 +1157,12 @@ def build_production_duty_registry(
                 run_id=ctx.run.run_id,
             )
         if dec is None:
+            reconciled_trace = reconcile_shift_episode_outcome(
+                ctx,
+                outcome_status="blocked",
+                reason="no_work_decision",
+                causal_method_trace=run_res.causal_method_trace,
+            )
             return DutyOutcome(
                 disposition="blocked",
                 result={
@@ -1151,7 +1171,7 @@ def build_production_duty_registry(
                     "cost_minor_units": run_res.settlement.cost_minor_units,
                     "journal_entry_id": run_res.settlement.journal_entry_id,
                     "active_snapshot_id": run_res.active_snapshot_id,
-                    "causal_method_trace": run_res.causal_method_trace,
+                    "causal_method_trace": reconciled_trace,
                     "stable_prefix_sha256": run_res.stable_prefix_sha256,
                 },
             )

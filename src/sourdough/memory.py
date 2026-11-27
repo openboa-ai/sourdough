@@ -227,3 +227,78 @@ def list_recent_episodes(
         (company_id, agent_id, bounded),
     ).fetchall()
     return tuple(AgentEpisode(*row) for row in rows)
+
+
+def update_episode_outcome(
+    connection: sqlite3.Connection,
+    company_id: str,
+    run_id: str,
+    *,
+    outcome_status: str,
+    reason: str | None = None,
+    only_from_statuses: frozenset[str] | None = None,
+) -> AgentEpisode | None:
+    """Reconcile an existing episode's final outcome_status and embedded causal trace."""
+    if outcome_status not in _OUTCOME_STATUSES:
+        raise MemoryRefused(f"Unsupported episode outcome_status: {outcome_status}")
+    row = connection.execute(
+        f"""SELECT {_EPISODE_COLUMNS}
+            FROM agent_episode
+            WHERE company_id = ? AND run_id = ?
+            ORDER BY recorded_at_ns DESC, episode_id DESC
+            LIMIT 1""",
+        (company_id, run_id),
+    ).fetchone()
+    if row is None:
+        return None
+    ep = AgentEpisode(*row)
+    if ep.outcome_status == outcome_status:
+        return None
+    if only_from_statuses is not None and ep.outcome_status not in only_from_statuses:
+        return None
+    try:
+        parsed_decisions = json.loads(ep.decisions_json)
+    except json.JSONDecodeError:
+        parsed_decisions = []
+    if isinstance(parsed_decisions, list):
+        updated_decisions: list[Any] = []
+        for entry in parsed_decisions:
+            if isinstance(entry, dict):
+                patched = dict(entry)
+                od = patched.get("outcome_delta")
+                if isinstance(od, dict):
+                    patched_od = dict(od)
+                    patched_od["status"] = outcome_status
+                    if reason is not None:
+                        patched_od["reason"] = reason
+                    patched["outcome_delta"] = patched_od
+                if "outcome_status" in patched:
+                    patched["outcome_status"] = outcome_status
+                    if reason is not None:
+                        patched["outcome_reason"] = reason
+                updated_decisions.append(patched)
+            else:
+                updated_decisions.append(entry)
+        new_decisions_json = json.dumps(
+            updated_decisions, sort_keys=True, separators=(",", ":")
+        )
+    else:
+        new_decisions_json = ep.decisions_json
+    new_summary = (
+        f"{ep.summary_text} [{outcome_status}: {reason}]"[:_MAX_SUMMARY_CHARS]
+        if reason and outcome_status != ep.outcome_status
+        else ep.summary_text
+    )
+    connection.execute(
+        """UPDATE agent_episode
+           SET outcome_status = ?, summary_text = ?, decisions_json = ?
+           WHERE company_id = ? AND episode_id = ?""",
+        (outcome_status, new_summary, new_decisions_json, company_id, ep.episode_id),
+    )
+    refreshed = connection.execute(
+        f"""SELECT {_EPISODE_COLUMNS}
+            FROM agent_episode
+            WHERE company_id = ? AND episode_id = ?""",
+        (company_id, ep.episode_id),
+    ).fetchone()
+    return None if refreshed is None else AgentEpisode(*refreshed)

@@ -71,6 +71,7 @@ from .trial_registry import (
     PairwiseJudgment,
     TrialCeiling,
     TrialGrade,
+    TrialInputs,
     TrialRefused,
     TrialSlot,
     TrialSuite,
@@ -189,18 +190,13 @@ def _score_live_gen2_observables(
         for tn, st, _raw in rcpt_rows
     )
     positive_action = action in POSITIVE_BOUNDARY_ACTION_KINDS
+    # Award boundary-check and false-positive-prevention credit strictly from actual
+    # boundary-preserving decisions on the sealed case — never from unverified candidate
+    # draft metadata alone.
     counterexample_checked = bool(
-        shift_ok
-        and not explicit_constraint_violation
-        and (positive_action or drafted_counterexample_method)
+        shift_ok and not explicit_constraint_violation and positive_action
     )
-    false_positive_prevented = bool(
-        counterexample_checked
-        and (
-            drafted_counterexample_method
-            or (positive_action and int(evidence_count) >= 1)
-        )
-    )
+    false_positive_prevented = bool(counterexample_checked and int(evidence_count) >= 1)
     return {
         "explicit_constraint_violation": explicit_constraint_violation,
         "counterexample_checked": counterexample_checked,
@@ -423,6 +419,43 @@ def _build_default_isolated_case_runner(
     return registry, captured
 
 
+def _compute_source_store_fixture(
+    source_store: Path, company_id: str
+) -> tuple[bytes, dict[str, str], str]:
+    """Derive canonical company fixture bytes, agent profiles, and founder_id from source_store."""
+    with closing(open_reader(source_store)) as ro_db, read_tx(ro_db):
+        if _identity(ro_db) != company_id:
+            raise TrialRefused("Source trial store company identity mismatch")
+        co_row = ro_db.execute(
+            "SELECT id, charter_revision, schema_revision FROM company WHERE id = ?",
+            (company_id,),
+        ).fetchone()
+        if co_row is None:
+            raise TrialRefused("Source trial store is missing company row")
+        founder_row = ro_db.execute(
+            "SELECT setup_identity, founder_id FROM founding_receipt WHERE company_id = ?",
+            (company_id,),
+        ).fetchone()
+        if founder_row is None:
+            raise TrialRefused("Source trial store is missing founding receipt")
+        profiles = {
+            str(r[0]): str(r[1])
+            for r in ro_db.execute(
+                "SELECT id, execution_profile FROM agent WHERE company_id = ? ORDER BY id",
+                (company_id,),
+            ).fetchall()
+        }
+        fixture_bytes = _canonical_json(
+            {
+                "company_id": str(co_row[0]),
+                "charter_revision": str(co_row[1]),
+                "schema_revision": int(co_row[2]),
+                "setup_identity": str(founder_row[0]),
+            }
+        ).encode("utf-8")
+        return fixture_bytes, profiles, str(founder_row[1])
+
+
 def run_isolated_trial_slot(
     evaluator_store: Path,
     *,
@@ -463,7 +496,9 @@ def run_isolated_trial_slot(
     ):
         raise TrialRefused("Sealed slot ceilings exceed runner enforcement caps")
 
-    if company_fixture is not None or worker_input is not None:
+    if source_store is None and (
+        company_fixture is not None or worker_input is not None
+    ):
         if company_fixture is None or worker_input is None:
             raise TrialRefused(
                 "company_fixture and worker_input must be supplied together"
@@ -516,14 +551,48 @@ def run_isolated_trial_slot(
             raise TrialRefused("Trial slot reservation has already been consumed")
         return adapter.evidences[run_id]
 
-    reservation = reserve_trial_launch(
-        evaluator_store,
-        revision=revision,
-        slot_id=slot_id,
-        run_id=run_id,
-        inputs=slot.inputs,
-        limits=slot.limits,
-    )
+    if source_store is not None:
+        if not company_id:
+            raise TrialRefused("source_store requires company_id")
+        if worker_input is None:
+            raise TrialRefused(
+                "source_store trial execution requires worker_input to verify sealed slot inputs"
+            )
+        actual_fixture_bytes, store_profiles, founder_id = (
+            _compute_source_store_fixture(source_store, company_id)
+        )
+        if company_fixture is not None and company_fixture != actual_fixture_bytes:
+            raise TrialRefused(
+                "Supplied company_fixture does not match source_store state"
+            )
+        verify_actor_id = agent_ids[0] if agent_ids else founder_id
+        if verify_actor_id not in store_profiles:
+            raise TrialRefused("Target trial Agent is missing from source_store")
+        actual_profile = store_profiles[verify_actor_id]
+        actual_inputs = TrialInputs(
+            company_fixture=sha256(actual_fixture_bytes).hexdigest(),
+            case_inputs=sha256(worker_input.case_inputs).hexdigest(),
+            worker_context=sha256(worker_input.worker_context).hexdigest(),
+            tools=sha256(worker_input.tool_manifest).hexdigest(),
+            runtime_profile=actual_profile,
+        )
+        reservation = reserve_trial_launch(
+            evaluator_store,
+            revision=revision,
+            slot_id=slot_id,
+            run_id=run_id,
+            inputs=actual_inputs,
+            limits=worker_input.limits,
+        )
+    else:
+        reservation = reserve_trial_launch(
+            evaluator_store,
+            revision=revision,
+            slot_id=slot_id,
+            run_id=run_id,
+            inputs=slot.inputs,
+            limits=slot.limits,
+        )
     if not reservation.launch_permitted:
         raise TrialRefused("Trial slot reservation has already been consumed")
 
@@ -1736,7 +1805,9 @@ def run_recursive_learning_cycle(
             wall_seconds=150,
             tokens=1_500_000 if use_live_runtime else 10_000,
         )
-        fixture_bytes = f"company-fixture-{cycle_tag}".encode("utf-8")
+        fixture_bytes, _base_profiles, _base_founder = _compute_source_store_fixture(
+            store_path, company_id
+        )
         tools_bytes = b'{"tools":["desk_read_draft","record_work_decision"]}'
         inc_ctx_bytes = _canonical_json(
             {"generation": 2, "procedure_revision": inc_proc_delta.revision_sha256}
@@ -2321,6 +2392,14 @@ def run_recursive_learning_cycle(
                     "usage": usage_doc,
                 }
 
+            slot_worker_input = TrialWorkerInput(
+                case_inputs=_canonical_json(case_spec).encode("utf-8"),
+                worker_context=(
+                    inc_ctx_bytes if arm_name == "incumbent" else cand_ctx_bytes
+                ),
+                tool_manifest=tools_bytes,
+                limits=limits,
+            )
             evidence = run_isolated_trial_slot(
                 evaluator_store,
                 revision=eval_rev,
@@ -2330,6 +2409,7 @@ def run_recursive_learning_cycle(
                 source_store=arm_store,
                 company_id=company_id,
                 agent_ids=(meta_agent_id,),
+                worker_input=slot_worker_input,
                 execute_case=_run_gen2_arm_case,
                 duty_registry=live_registry,
                 max_tokens=max(100_000, limits.tokens),

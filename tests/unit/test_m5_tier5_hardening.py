@@ -4121,6 +4121,564 @@ class TestM5Tier5Hardening(unittest.TestCase):
                     limits=tiny_entries,
                 )
 
+    def test_pr191_r5_detail_projection_redacts_episode_summary_and_one_agent_method_body(
+        self,
+    ) -> None:
+        """PR #191 R5 Security P2: Board agent-detail projection must redact episode summary & one_agent method bodies."""
+        from sourdough.ipc.projections import read_agent_detail_projection
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            save_draft(
+                w,
+                claim,
+                claim.purpose,
+                name="secret-alpha",
+                content="TOP_SECRET_ALPHA_DRAFT",
+                expected_revision=None,
+            )
+            priv_delta = distill_method_delta(
+                w,
+                claim,
+                method_id="priv-method-r5",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="one_agent",
+                audience_target_id=self.founder_id,
+                trigger_spec={
+                    "duty_kinds": ["work.discovery_review"],
+                    "negative_triggers": ["PRIVATE_TRIGGER_HINT_66"],
+                },
+                body="PRIVATE_ONE_AGENT_SECRET_77",
+                uncertainty_note="PRIVATE_UNCERTAINTY_88",
+                falsification_criteria="PRIVATE_FALSIFICATION_99",
+                source_refs=("private_draft:secret-alpha", f"work_run:{run.run_id}"),
+                now_ns=1_100,
+            )
+            qualify_method_delta(
+                w,
+                priv_delta.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_150,
+            )
+            activate_method_delta(
+                w,
+                priv_delta.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=1_200,
+            )
+            pub_delta = distill_method_delta(
+                w,
+                claim,
+                method_id="shared-method-r5",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="company",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="COMPANY_SHARED_METHOD_OK",
+                falsification_criteria="Fails if shared rule breaks.",
+                source_refs=(f"work_run:{run.run_id}",),
+                now_ns=1_250,
+            )
+            qualify_method_delta(
+                w,
+                pub_delta.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_300,
+            )
+            activate_method_delta(
+                w,
+                pub_delta.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=1_350,
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                record_episode(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    duty_kind="work.discovery_review",
+                    context_digest=sha256(b"ctx-r5").hexdigest(),
+                    outcome_status="completed",
+                    summary_text="SECRET_EPISODE_DRAFT_TEXT_55",
+                    recorded_at_ns=1_400,
+                )
+
+        detail, _wm = read_agent_detail_projection(
+            self.store, self.company_id, self.founder_id
+        )
+        serialized = json.dumps(detail, sort_keys=True)
+        for leaked in (
+            "PRIVATE_ONE_AGENT_SECRET_77",
+            "PRIVATE_UNCERTAINTY_88",
+            "PRIVATE_FALSIFICATION_99",
+            "PRIVATE_TRIGGER_HINT_66",
+            "secret-alpha",
+            "TOP_SECRET_ALPHA_DRAFT",
+            "SECRET_EPISODE_DRAFT_TEXT_55",
+        ):
+            self.assertNotIn(leaked, serialized)
+
+        by_method = {m["method_id"]: m for m in detail["active_methods"]}
+        priv_proj = by_method["priv-method-r5"]
+        self.assertIsNone(priv_proj["body_text"])
+        self.assertTrue(priv_proj["body_redacted"])
+        self.assertEqual(
+            priv_proj["body_digest"],
+            sha256(b"PRIVATE_ONE_AGENT_SECRET_77").hexdigest(),
+        )
+        self.assertIsNone(priv_proj["uncertainty_note"])
+        self.assertIsNone(priv_proj["falsification_criteria"])
+        self.assertEqual(priv_proj["trigger_spec"], {"redacted": True})
+
+        pub_proj = by_method["shared-method-r5"]
+        self.assertEqual(pub_proj["body_text"], "COMPANY_SHARED_METHOD_OK")
+
+        ep = detail["tabs"]["agent_episodes"][0]
+        self.assertEqual(ep["summary_text"], "completed:work.discovery_review")
+        self.assertTrue(ep["summary_redacted"])
+        self.assertEqual(
+            ep["summary_digest"],
+            sha256(b"SECRET_EPISODE_DRAFT_TEXT_55").hexdigest(),
+        )
+
+    def test_pr191_r5_unverified_discard_everything_draft_earns_zero_boundary_credit(
+        self,
+    ) -> None:
+        """PR #191 R5 P1: drafting a harmful candidate rule must never earn boundary credit."""
+        harmful_draft = (
+            "harmful-m1",
+            "rev1",
+            "ADD",
+            "work_method",
+            json.dumps({"negative_triggers": ["no_deadline_valid_item"]}),
+            "Discard everything immediately without reviewing obligations.",
+            "",
+            "Fails if valid obligations are dropped.",
+            "candidate",
+        )
+        for action_kind, evidence_count in (("hold", 0), ("noop", 1)):
+            with self.subTest(action_kind=action_kind, evidence_count=evidence_count):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind=action_kind,
+                    evidence_count=evidence_count,
+                    rcpt_rows=(),
+                    drafted_methods=(harmful_draft,),
+                )
+                self.assertTrue(obs["drafted_counterexample_method"])
+                self.assertFalse(obs["counterexample_checked"])
+                self.assertFalse(obs["false_positive_prevented"])
+
+        obs_ungrounded = _score_live_gen2_observables(
+            shift_ok=True,
+            action_kind="counterexample_verified",
+            evidence_count=0,
+            rcpt_rows=(),
+            drafted_methods=(harmful_draft,),
+        )
+        self.assertTrue(obs_ungrounded["counterexample_checked"])
+        self.assertFalse(obs_ungrounded["false_positive_prevented"])
+
+        obs_grounded = _score_live_gen2_observables(
+            shift_ok=True,
+            action_kind="counterexample_verified",
+            evidence_count=1,
+            rcpt_rows=(),
+            drafted_methods=(harmful_draft,),
+        )
+        self.assertTrue(obs_grounded["counterexample_checked"])
+        self.assertTrue(obs_grounded["false_positive_prevented"])
+
+    def test_pr191_r5_source_store_mismatched_inputs_refused_before_launch(
+        self,
+    ) -> None:
+        """PR #191 R5 P2: source_store trial execution verifies actual inputs before slot launch."""
+        from sourdough.trial_execution import TrialWorkerInput
+        from sourdough.trial_registry import (
+            TrialCeiling,
+            TrialInputs,
+            TrialRefused,
+            TrialSlot,
+            TrialSuite,
+            seal_trial_suite,
+        )
+        from sourdough.trial_runner import (
+            _backup_sqlite_private,
+            _compute_source_store_fixture,
+            run_isolated_trial_slot,
+        )
+
+        eval_store = self.root / "eval_r5" / "evaluator.sqlite"
+        eval_store.parent.mkdir(parents=True, exist_ok=True)
+        trial_root = self.root / "trials_r5"
+        fixture_bytes, profiles, _founder = _compute_source_store_fixture(
+            self.store, self.company_id
+        )
+        case_bytes = b'{"case":"r5-sealed"}'
+        ctx_bytes = b'{"arm":"incumbent"}'
+        tools_bytes = b'{"tools":["record_work_decision"]}'
+        limits = TrialCeiling(turns=2, wall_seconds=30, tokens=2_000)
+
+        sealed_inputs = TrialInputs(
+            company_fixture=sha256(fixture_bytes).hexdigest(),
+            case_inputs=sha256(case_bytes).hexdigest(),
+            worker_context=sha256(ctx_bytes).hexdigest(),
+            tools=sha256(tools_bytes).hexdigest(),
+            runtime_profile=profiles[self.founder_id],
+        )
+        suite = TrialSuite(
+            suite_id="r5-source-verify",
+            purpose="judgment",
+            rubric_digest=sha256(b"rubric").hexdigest(),
+            evaluator_digest=sha256(b"eval").hexdigest(),
+            analysis_plan_digest=sha256(b"plan").hexdigest(),
+            slots=(TrialSlot("s1", "c1", "f1", sealed_inputs, limits),),
+        )
+        rev = seal_trial_suite(eval_store, suite)
+        executed = []
+
+        def _exec(_rt, _desk, _wi):
+            executed.append(True)
+            return {
+                "outcome": "completed",
+                "observation": {"ok": True},
+                "decision": {"action": "ok"},
+                "tool_trace": {"calls": [], "violations": 0},
+                "service_effects": {"service_correct": True},
+                "usage": {"turns": 1, "tokens": 10, "wall_seconds": 0.01},
+            }
+
+        # 1. Missing worker_input fails closed before reserving slot
+        with self.assertRaisesRegex(TrialRefused, "worker_input"):
+            run_isolated_trial_slot(
+                eval_store,
+                revision=rev,
+                slot_id="s1",
+                run_id="r5-missing-wi",
+                trial_root=trial_root,
+                source_store=self.store,
+                company_id=self.company_id,
+                agent_ids=(self.founder_id,),
+                execute_case=_exec,
+            )
+
+        # 2. Tampered worker_input (wrong case_inputs) fails closed BEFORE launch
+        with self.assertRaises(TrialRefused):
+            run_isolated_trial_slot(
+                eval_store,
+                revision=rev,
+                slot_id="s1",
+                run_id="r5-bad-case",
+                trial_root=trial_root,
+                source_store=self.store,
+                company_id=self.company_id,
+                agent_ids=(self.founder_id,),
+                worker_input=TrialWorkerInput(
+                    b'{"case":"tampered"}', ctx_bytes, tools_bytes, limits
+                ),
+                execute_case=_exec,
+            )
+
+        # 3. Tampered source_store (modified charter_revision) fails closed BEFORE launch
+        tampered_dir = self.root / "tampered_co"
+        tampered_dir.mkdir(parents=True, exist_ok=True)
+        tampered_store = tampered_dir / "company.sqlite"
+        _backup_sqlite_private(self.store, tampered_store)
+        with closing(sqlite3.connect(str(tampered_store))) as tdb:
+            tdb.execute(
+                "UPDATE company SET charter_revision = 'tampered-charter' WHERE id = ?",
+                (self.company_id,),
+            )
+            tdb.commit()
+        with self.assertRaises(TrialRefused):
+            run_isolated_trial_slot(
+                eval_store,
+                revision=rev,
+                slot_id="s1",
+                run_id="r5-bad-charter",
+                trial_root=trial_root,
+                source_store=tampered_store,
+                company_id=self.company_id,
+                agent_ids=(self.founder_id,),
+                worker_input=TrialWorkerInput(
+                    case_bytes, ctx_bytes, tools_bytes, limits
+                ),
+                execute_case=_exec,
+            )
+
+        self.assertEqual(executed, [])
+
+        # 4. Genuine source_store + matching worker_input succeeds (slot was NOT burned!)
+        ev = run_isolated_trial_slot(
+            eval_store,
+            revision=rev,
+            slot_id="s1",
+            run_id="r5-good",
+            trial_root=trial_root,
+            source_store=self.store,
+            company_id=self.company_id,
+            agent_ids=(self.founder_id,),
+            worker_input=TrialWorkerInput(case_bytes, ctx_bytes, tools_bytes, limits),
+            execute_case=_exec,
+        )
+        self.assertEqual(ev.outcome, "completed")
+        self.assertEqual(len(executed), 1)
+
+    def test_pr191_r5_peer_response_exempt_from_discretionary_cooldown_backoff(
+        self,
+    ) -> None:
+        """PR #191 R5 P2: peer_response conditions must fire immediately despite discovery backoff."""
+        from sourdough.runtime.work_kernel import (
+            record_peer_request_read,
+            resolve_peer_request,
+        )
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            peer_id, _peer_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="peer-r5",
+                profile_id=self.profile.profile_id(),
+            )
+            assign_project(
+                w,
+                self.grant_id,
+                "proj-peer-r5",
+                (self.founder_id, peer_id),
+                publishers=(self.founder_id, peer_id),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=peer_id,
+                    duty_kind="work.peer_response",
+                    remit="Answer compliance peer requests",
+                    readable_scope={
+                        "project_id": "proj-peer-r5",
+                        "allowed_requesters": [self.founder_id],
+                    },
+                    now_ns=1_000,
+                )
+                disc_resp = register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Discovery with strict cooldown",
+                    readable_scope={
+                        "max_wakes_per_window": 1,
+                        "wake_window_ns": 1_000_000,
+                        "cooldown_ns": 500_000,
+                    },
+                    now_ns=1_000,
+                )
+                # Put discovery responsibility deep in cooldown + exhausted wake budget
+                db.execute(
+                    """INSERT INTO work_discovery_state (
+                           company_id, responsibility_id, consecutive_noops, cooldown_until_ns,
+                           window_started_ns, window_wakes, updated_at_ns
+                       ) VALUES (?, ?, 4, 999_999, 1_000, 99, 1_000)""",
+                    (self.company_id, disc_resp.responsibility_id),
+                )
+                # Open & immediately answer a peer request from founder -> peer-r5
+                parent_item, parent_run, _ = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_500,
+                )
+                req, _ = open_peer_request(
+                    db,
+                    company_id=self.company_id,
+                    requester_work_item_id=parent_item.work_item_id,
+                    requester_run_id=parent_run.run_id,
+                    fencing_token=parent_run.fencing_token,
+                    recipient_agent_id=peer_id,
+                    question="Confirm compliance gate",
+                    expected_decision="approve_or_decline",
+                    evidence_refs=[],
+                    deadline_ns=900_000,
+                    request_id="req-r5-exempt",
+                    project_id="proj-peer-r5",
+                    now_ns=2_000,
+                )
+                peer_run = claim_work_run(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=req.response_work_item_id,
+                    lease_owner="test-peer-r5",
+                    lease_ttl_ns=100_000,
+                    now_ns=2_200,
+                )
+                record_peer_request_read(
+                    db,
+                    company_id=self.company_id,
+                    request_id=req.request_id,
+                    actor_id=peer_id,
+                    response_run_id=peer_run.run_id,
+                    response_fencing_token=peer_run.fencing_token,
+                    now_ns=2_300,
+                )
+                resolve_peer_request(
+                    db,
+                    company_id=self.company_id,
+                    request_id=req.request_id,
+                    actor_id=peer_id,
+                    resolution_state="answered",
+                    response_payload={"answer": "approved"},
+                    response_run_id=peer_run.run_id,
+                    response_fencing_token=peer_run.fencing_token,
+                    now_ns=2_500,
+                )
+                # Arm BOTH a discretionary timer AND a peer_response condition on disc_resp
+                set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=disc_resp.responsibility_id,
+                    trigger_kind="timer",
+                    due_at_ns=2_600,
+                    now_ns=2_500,
+                )
+                set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=disc_resp.responsibility_id,
+                    trigger_kind="peer_response",
+                    source_identity=f"peer_response:{req.request_id}",
+                    now_ns=2_500,
+                )
+                # Evaluate while STILL inside cooldown (3_000 < 999_999) and budget exhausted
+                admitted = evaluate_conditions(db, self.company_id, now_ns=3_000)
+
+        self.assertEqual(len(admitted), 1)
+        payload = json.loads(admitted[0].payload_json)
+        self.assertEqual(payload["trigger_kind"], "peer_response")
+        self.assertEqual(payload["source_identity"], f"peer_response:{req.request_id}")
+
+    def test_pr191_r5_blocked_discovery_shift_reconciles_episode_and_causal_outcome(
+        self,
+    ) -> None:
+        """PR #191 R5 P2: blocked discovery shift must reconcile agent_episode & causal trace to blocked."""
+
+        class _NoDecisionAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                # Deliberately finish LLM turn WITHOUT calling record_work_decision
+                return ShiftResult(
+                    output_text="Reviewed context without recording a decision.",
+                    usage=TokenUsage(input_tokens=15, output_tokens=8),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=0,
+                    events=(),
+                )
+
+        reg = AgentAdapterRegistry()
+        reg.register(_NoDecisionAdapter())
+        duty_reg = build_production_duty_registry(
+            adapter_registry=reg, profile_bindings={self.founder_id: self.profile}
+        )
+        rt = CompanyRuntime(self.store, self.company_id, duty_reg, clock=lambda: 10_000)
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                disc_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="r5-no-decision",
+                    now_ns=9_000,
+                )
+
+        step = rt.step(max_dispatches=1, now_ns=10_000)
+        self.assertEqual(step.blocked_items, (disc_item.work_item_id,))
+        self.assertEqual(len(step.executed_runs), 1)
+        run_id = step.executed_runs[0]
+
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            run_row = ro.execute(
+                "SELECT outcome_json FROM work_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            ep_row = ro.execute(
+                """SELECT outcome_status, summary_text, decisions_json
+                   FROM agent_episode
+                   WHERE company_id = ? AND run_id = ?""",
+                (self.company_id, run_id),
+            ).fetchone()
+
+        self.assertIsNotNone(run_row)
+        outcome_doc = json.loads(str(run_row[0]))
+        self.assertEqual(outcome_doc["reason"], "no_work_decision")
+        self.assertEqual(
+            outcome_doc["causal_method_trace"]["outcome_delta"]["status"], "blocked"
+        )
+        self.assertEqual(
+            outcome_doc["causal_method_trace"]["outcome_delta"]["reason"],
+            "no_work_decision",
+        )
+
+        self.assertIsNotNone(ep_row)
+        self.assertEqual(str(ep_row[0]), "blocked")
+        self.assertIn("blocked: no_work_decision", str(ep_row[1]))
+        decisions = json.loads(str(ep_row[2]))
+        self.assertTrue(
+            any(
+                isinstance(d, dict)
+                and isinstance(d.get("outcome_delta"), dict)
+                and d["outcome_delta"].get("status") == "blocked"
+                and d["outcome_delta"].get("reason") == "no_work_decision"
+                for d in decisions
+            ),
+            decisions,
+        )
+
+        # Verify external episodes_fts.sqlite index also reflects reconciled blocked state
+        hits = search_episodes(
+            self.store, self.company_id, self.founder_id, "no_work_decision"
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["outcome_status"], "blocked")
+
 
 if __name__ == "__main__":
     unittest.main()

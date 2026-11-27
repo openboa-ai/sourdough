@@ -2872,11 +2872,13 @@ def evaluate_conditions(
             None
             if duty_kind in ("work.discovery_review", "work.dreaming")
             and not is_result_dep
+            and trigger_kind != "peer_response"
             else parent_item_id
         )
         is_discretionary = (
             resp_id is not None
             and effective_parent_id is None
+            and trigger_kind != "peer_response"
             and duty_kind in ("work.discovery_review", "work.dreaming")
             and not is_result_dep
         )

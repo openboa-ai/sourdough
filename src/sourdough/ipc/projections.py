@@ -122,6 +122,26 @@ def _json_loads_safe(raw: str | None, default: Any) -> Any:
         return default
 
 
+def _redact_active_method_for_board(method_dict: dict[str, Any]) -> dict[str, Any]:
+    """Keep Agent-only (one_agent) method bodies and notes out of Board projections."""
+    projected = dict(method_dict)
+    if str(projected.get("audience_scope", "")) != "one_agent":
+        return projected
+    raw_body = str(projected.get("body_text", "") or "")
+    projected["body_text"] = None
+    projected["body_redacted"] = True
+    projected["body_digest"] = sha256(raw_body.encode("utf-8")).hexdigest()
+    if "uncertainty_note" in projected:
+        projected["uncertainty_note"] = None
+    if "falsification_criteria" in projected:
+        projected["falsification_criteria"] = None
+    if "trigger_spec" in projected:
+        projected["trigger_spec"] = {"redacted": True}
+    if "procedure_meta" in projected:
+        projected["procedure_meta"] = None
+    return projected
+
+
 def _redact_evidence_refs_for_board(raw_json: str) -> list[Any]:
     parsed = _json_loads_safe(raw_json, [])
     if not isinstance(parsed, list):
@@ -681,7 +701,9 @@ def read_agent_detail_projection(
             db, company_id, agent_id=agent_id
         )
         active_methods = [
-            m.to_dict() | {"delta_id": f"{m.method_id}:{m.revision_sha256}"}
+            _redact_active_method_for_board(
+                m.to_dict() | {"delta_id": f"{m.method_id}:{m.revision_sha256}"}
+            )
             for m in active_methods_resolved
         ]
         active_snapshot_id = compute_active_snapshot_id(active_methods_resolved)
@@ -719,7 +741,9 @@ def read_agent_detail_projection(
                 "duty_kind": str(r[3]),
                 "outcome_status": str(r[4]),
                 "active_snapshot_id": None if r[5] is None else str(r[5]),
-                "summary_text": str(r[6])[:400],
+                "summary_text": f"{r[4]}:{r[3]}",
+                "summary_redacted": True,
+                "summary_digest": sha256(str(r[6]).encode("utf-8")).hexdigest(),
                 "tool_calls_count": int(r[7]),
                 "input_tokens": int(r[8]),
                 "output_tokens": int(r[9]),

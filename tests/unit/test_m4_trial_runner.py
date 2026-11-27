@@ -1625,7 +1625,9 @@ class M4TrialRunnerTests(unittest.TestCase):
                 self.assertFalse(obs_fatal["counterexample_checked"])
                 self.assertFalse(obs_fatal["false_positive_prevented"])
 
-        # Valid PATCH and alternative structured boundary keys (counterexamples, exclusion_boundaries) pass
+        # Valid PATCH and alternative structured boundary keys (counterexamples, exclusion_boundaries)
+        # set drafted_counterexample_method=True, but NEVER award boundary credit without an actual
+        # boundary-preserving work_decision with grounded evidence.
         for delta_kind, trig_key in (
             ("ADD", "negative_triggers"),
             ("PATCH", "counterexamples"),
@@ -1643,17 +1645,29 @@ class M4TrialRunnerTests(unittest.TestCase):
                     "Fails if valid no-deadline item is dropped.",
                     "candidate",
                 )
-                obs_draft = _score_live_gen2_observables(
+                obs_draft_only = _score_live_gen2_observables(
                     shift_ok=True,
                     action_kind="hold",
                     evidence_count=0,
                     rcpt_rows=(),
                     drafted_methods=(draft,),
                 )
-                self.assertFalse(obs_draft["explicit_constraint_violation"])
-                self.assertTrue(obs_draft["counterexample_checked"])
-                self.assertTrue(obs_draft["false_positive_prevented"])
-                self.assertTrue(obs_draft["drafted_counterexample_method"])
+                self.assertFalse(obs_draft_only["explicit_constraint_violation"])
+                self.assertFalse(obs_draft_only["counterexample_checked"])
+                self.assertFalse(obs_draft_only["false_positive_prevented"])
+                self.assertTrue(obs_draft_only["drafted_counterexample_method"])
+
+                obs_grounded = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind="counterexample_verified",
+                    evidence_count=1,
+                    rcpt_rows=(),
+                    drafted_methods=(draft,),
+                )
+                self.assertFalse(obs_grounded["explicit_constraint_violation"])
+                self.assertTrue(obs_grounded["counterexample_checked"])
+                self.assertTrue(obs_grounded["false_positive_prevented"])
+                self.assertTrue(obs_grounded["drafted_counterexample_method"])
 
         # Draft structural filtering: disputed, non-work_method, DEPRECATE, empty falsification,
         # missing/empty/malformed negative_triggers
