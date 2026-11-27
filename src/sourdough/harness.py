@@ -638,17 +638,22 @@ def run_desk_command_sandboxed(
     t_out.start()
     t_err.start()
     timed_out = False
+    returncode: int | None = None
     try:
-        returncode: int | None = proc.wait(timeout=limits.timeout_seconds)
+        returncode = proc.wait(timeout=limits.timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
+    finally:
+        # Terminate any surviving descendants in the command's process group on every exit path.
         try:
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError, OSError):
             pass
-        proc.wait(timeout=5.0)
-        returncode = None
-    finally:
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
         t_out.join(timeout=5.0)
         t_err.join(timeout=5.0)
 

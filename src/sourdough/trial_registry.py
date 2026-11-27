@@ -633,10 +633,25 @@ def _validate_grade_against_packet(packet: BlindedTrial, grade: TrialGrade) -> N
         raise TrialRefused("Grade claims an outcome without its evidence")
 
 
-def seal_trial_suite(path: Path, suite: TrialSuite) -> str:
+def seal_trial_suite(
+    path: Path,
+    suite: TrialSuite,
+    *,
+    analysis_plan: Mapping[str, Any] | None = None,
+) -> str:
     if not isinstance(suite, TrialSuite):
         raise TrialRefused("Expected a validated TrialSuite")
-    document = _canonical_json({"format": _FORMAT, **asdict(suite)})
+    payload: dict[str, Any] = {"format": _FORMAT, **asdict(suite)}
+    if analysis_plan is not None:
+        if not isinstance(analysis_plan, Mapping):
+            raise TrialRefused("Invalid sealed trial analysis_plan")
+        plan_dict = dict(analysis_plan)
+        if _revision(_canonical_json(plan_dict)) != suite.analysis_plan_digest:
+            raise TrialRefused(
+                "Analysis plan does not match sealed analysis_plan_digest"
+            )
+        payload["analysis_plan"] = plan_dict
+    document = _canonical_json(payload)
     revision = _revision(document)
     # Pre-check read-only first when file already exists so foreign DBs (such as an
     # operating company.sqlite) are rejected with zero write locks or WAL mutations.
@@ -1338,6 +1353,12 @@ def read_sealed_suite_meta(path: Path) -> dict[str, Any]:
         inv_count = int(
             database.execute("SELECT COUNT(*) FROM trial_invalidation").fetchone()[0]
         )
+        sealed_plan: dict[str, Any] | None = None
+        raw_plan = suite.get("analysis_plan")
+        if isinstance(raw_plan, Mapping) and _revision(
+            _canonical_json(dict(raw_plan))
+        ) == str(suite["analysis_plan_digest"]):
+            sealed_plan = dict(raw_plan)
         return {
             "revision": str(stored[0]),
             "suite_id": str(suite["suite_id"]),
@@ -1345,7 +1366,14 @@ def read_sealed_suite_meta(path: Path) -> dict[str, Any]:
             "rubric_digest": str(suite["rubric_digest"]),
             "evaluator_digest": str(suite["evaluator_digest"]),
             "analysis_plan_digest": str(suite["analysis_plan_digest"]),
+            "analysis_plan": sealed_plan,
             "planned_slots": len(suite["slots"]),
+            "planned_pairs": (
+                len(suite["slots"]) // 2 if suite["purpose"] == "recursive" else 0
+            ),
+            "distinct_transfer_families": len(
+                {str(slot["family_id"]) for slot in suite["slots"]}
+            ),
             "observation_count": obs_count,
             "grade_count": grade_count,
             "pairwise_grade_count": pair_count,

@@ -3157,13 +3157,53 @@ def _validate_core_evidence_entry(
         )
     if ev.kind == "private_draft":
         if "/" in ev.resource_id:
-            owner_prefix = ev.resource_id.split("/", 1)[0]
+            owner_prefix, draft_name = ev.resource_id.split("/", 1)
             if owner_prefix != agent_id:
                 raise WorkKernelRefused("Cannot cite another Agent's private draft")
         elif ":" in ev.resource_id:
-            owner_prefix = ev.resource_id.split(":", 1)[0]
+            owner_prefix, draft_name = ev.resource_id.split(":", 1)
             if owner_prefix != agent_id:
                 raise WorkKernelRefused("Cannot cite another Agent's private draft")
+        else:
+            draft_name = ev.resource_id
+        if not draft_name or "/" in draft_name or ":" in draft_name:
+            raise WorkKernelRefused("Invalid private_draft resource_id")
+        desk_row = connection.execute(
+            "SELECT 1 FROM private_desk WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        if desk_row is None:
+            raise WorkKernelRefused(
+                "Agent has no private Desk for private_draft evidence"
+            )
+        db_file = ""
+        for _seq, db_name, file_path in connection.execute(
+            "PRAGMA database_list"
+        ).fetchall():
+            if db_name == "main" and file_path:
+                db_file = str(file_path)
+                break
+        if not db_file:
+            raise WorkKernelRefused(
+                "Cannot validate private_draft without a file-backed company store"
+            )
+        from ..agent_desk import PRODUCTION_DESK_LIMITS, draft_at_revision
+        from ..duty_run import DutyRefused
+
+        try:
+            resolved = draft_at_revision(
+                Path(db_file),
+                agent_id,
+                draft_name,
+                ev.revision,
+                limits=PRODUCTION_DESK_LIMITS,
+            )
+        except DutyRefused as error:
+            raise WorkKernelRefused(str(error)) from error
+        if resolved is None:
+            raise WorkKernelRefused(
+                "Cited private_draft does not exist or revision does not match"
+            )
     elif ev.kind == "shared_publication":
         pub_row = connection.execute(
             """SELECT company_id, project_id, audience, content

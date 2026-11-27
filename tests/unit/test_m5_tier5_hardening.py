@@ -2831,6 +2831,326 @@ class TestM5Tier5Hardening(unittest.TestCase):
             )
             self.assertEqual(clean_delta.status, "candidate")
 
+    def test_pr191_sandboxed_desk_command_terminates_descendants_on_normal_exit(
+        self,
+    ) -> None:
+        """PR #191 P1: backgrounded child processes must be terminated even when parent exits 0."""
+        import signal
+        import time
+        from unittest import mock
+
+        from sourdough import harness as harness_mod
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+            session = create_agent_session(w, claim, claim.purpose)
+            standin = self.root / "fake_sandbox_exec.py"
+            standin.write_text(
+                f"#!{sys.executable}\n"
+                "import subprocess, sys\n"
+                "# Skip '-p <profile>' and execute the command\n"
+                "cmd = sys.argv[3:]\n"
+                "sys.exit(subprocess.call(cmd))\n",
+                encoding="utf-8",
+            )
+            os.chmod(standin, 0o700)
+            pid_file = session.desk_path / ".desk" / "scratch" / claim.run_id / "bg.pid"
+            spawner = (
+                "import pathlib, subprocess, sys; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid), encoding='utf-8')"
+            )
+            with mock.patch.object(harness_mod, "_SANDBOX_EXEC", standin):
+                res = run_desk_command_sandboxed(
+                    session,
+                    [sys.executable, "-c", spawner],
+                    store=self.store,
+                    sandbox_backend="local-macos",
+                    limits=DeskCommandLimits(timeout_seconds=10),
+                    granted_capabilities=("desk:exec",),
+                )
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["returncode"], 0)
+            bg_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            # Background descendant in the command's process group must be terminated.
+            alive = True
+            for _ in range(40):
+                try:
+                    os.kill(bg_pid, 0)
+                except ProcessLookupError:
+                    alive = False
+                    break
+                time.sleep(0.05)
+            if alive:
+                try:
+                    os.kill(bg_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self.assertFalse(
+                alive, f"Detached background descendant {bg_pid} survived normal exit"
+            )
+
+    def test_pr191_record_work_decision_validates_private_draft_existence_and_revision(
+        self,
+    ) -> None:
+        """PR #191 P2: private_draft citations must resolve to the agent's real draft & revision."""
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            draft = save_draft(
+                w,
+                claim,
+                claim.purpose,
+                name="real-note",
+                content="Verified private working note",
+                expected_revision=None,
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                # 1. Nonexistent draft refused
+                with self.assertRaises(WorkKernelRefused):
+                    record_work_decision(
+                        db,
+                        company_id=self.company_id,
+                        work_item_id=item.work_item_id,
+                        run_id=run.run_id,
+                        fencing_token=claim.fencing_token,
+                        agent_id=self.founder_id,
+                        action_kind="hold",
+                        rationale="citing nonexistent draft",
+                        evidence=(
+                            DecisionEvidence(
+                                "private_draft",
+                                "nonexistent",
+                                "fake-revision",
+                                900,
+                                800,
+                            ),
+                        ),
+                        decision_at_ns=1_500,
+                    )
+                # 2. Stale/wrong revision on existing draft refused
+                with self.assertRaises(WorkKernelRefused):
+                    record_work_decision(
+                        db,
+                        company_id=self.company_id,
+                        work_item_id=item.work_item_id,
+                        run_id=run.run_id,
+                        fencing_token=claim.fencing_token,
+                        agent_id=self.founder_id,
+                        action_kind="hold",
+                        rationale="citing stale revision",
+                        evidence=(
+                            DecisionEvidence(
+                                "private_draft",
+                                f"{self.founder_id}/real-note",
+                                "stale-revision",
+                                900,
+                                800,
+                            ),
+                        ),
+                        decision_at_ns=1_500,
+                    )
+                # 3. Valid existing draft & exact revision accepted
+                dec = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=claim.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="citing verified draft",
+                    evidence=(
+                        DecisionEvidence(
+                            "private_draft",
+                            f"{self.founder_id}/real-note",
+                            draft.revision,
+                            900,
+                            800,
+                        ),
+                    ),
+                    decision_at_ns=1_500,
+                )
+                self.assertEqual(dec.action_kind, "hold")
+
+    def test_pr191_evals_projection_preserves_sealed_analysis_plan_criteria(
+        self,
+    ) -> None:
+        """PR #191 P2: read_system_evals_projection must never weaken sealed analysis criteria."""
+        from sourdough.ipc.projections import read_system_evals_projection
+        from sourdough.trial_registry import (
+            PairwiseJudgment,
+            TrialCeiling,
+            TrialGrade,
+            TrialInputs,
+            TrialSlot,
+            TrialSuite,
+            TrialTerminalEvidence,
+            blind_pairwise_packets,
+            blind_trial_packet,
+            commit_blind_grade,
+            commit_position_swapped_pairwise_grade,
+            commit_trial_observation,
+            reserve_trial_launch,
+            seal_trial_suite,
+            summarize_rsi_transfer,
+        )
+
+        def _populate_three_family_wins(
+            eval_path: Path, *, pass_plan_at_seal: bool
+        ) -> tuple[str, dict[str, object]]:
+            plan: dict[str, object] = {
+                "min_pairs": 3,
+                "min_net_wins": 1,
+                "min_families": 3,
+                "alpha": 0.05,
+                "min_worthwhile_margin": 0.0,
+                "bootstrap_resamples": 1000,
+            }
+            plan_digest = sha256(
+                json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            slots = []
+            for idx in (1, 2, 3):
+                for arm, cp in (("incumbent", f"s{idx}-c"), ("candidate", f"s{idx}-i")):
+                    sid = f"s{idx}-i" if arm == "incumbent" else f"s{idx}-c"
+                    slots.append(
+                        TrialSlot(
+                            slot_id=sid,
+                            case_id=f"c{idx}",
+                            family_id=f"f{idx}",
+                            inputs=TrialInputs(
+                                sha256(b"fix").hexdigest(),
+                                sha256(f"case-{idx}".encode()).hexdigest(),
+                                sha256(arm.encode()).hexdigest(),
+                                sha256(b"tools").hexdigest(),
+                                "offline-v1",
+                            ),
+                            limits=TrialCeiling(2, 10, 1000),
+                            arm=arm,
+                            counterpart_id=cp,
+                        )
+                    )
+            suite = TrialSuite(
+                suite_id="strict-3fam-suite",
+                purpose="recursive",
+                rubric_digest=sha256(b"rubric").hexdigest(),
+                evaluator_digest=sha256(b"eval").hexdigest(),
+                analysis_plan_digest=plan_digest,
+                slots=tuple(slots),
+            )
+            rev = seal_trial_suite(
+                eval_path,
+                suite,
+                analysis_plan=plan if pass_plan_at_seal else None,
+            )
+            cand_results: set[str] = set()
+            for idx, slot in enumerate(suite.slots, start=1):
+                rid = f"r-{idx}"
+                reserve_trial_launch(
+                    eval_path,
+                    revision=rev,
+                    slot_id=slot.slot_id,
+                    run_id=rid,
+                    inputs=slot.inputs,
+                    limits=slot.limits,
+                )
+                rec = commit_trial_observation(
+                    eval_path,
+                    revision=rev,
+                    slot_id=slot.slot_id,
+                    run_id=rid,
+                    evidence=TrialTerminalEvidence(
+                        "completed",
+                        sha256(f"o-{slot.slot_id}".encode()).hexdigest(),
+                        sha256(f"d-{slot.slot_id}".encode()).hexdigest(),
+                        sha256(b"t").hexdigest(),
+                        sha256(b"s").hexdigest(),
+                    ),
+                )
+                assert rec.result_id is not None
+                if slot.arm == "candidate":
+                    cand_results.add(rec.result_id)
+                pkt = blind_trial_packet(
+                    eval_path, revision=rev, result_id=rec.result_id
+                )
+                commit_blind_grade(
+                    eval_path,
+                    revision=rev,
+                    packet=pkt,
+                    grade=TrialGrade(True, True, True, 0, True),
+                )
+            for ab, ba in blind_pairwise_packets(eval_path, revision=rev):
+                ab_pref = "first" if ab.first.result_id in cand_results else "second"
+                ba_pref = "first" if ba.first.result_id in cand_results else "second"
+                commit_position_swapped_pairwise_grade(
+                    eval_path,
+                    revision=rev,
+                    ab_packet=ab,
+                    ab_judgment=PairwiseJudgment("Candidate won", ab_pref),
+                    ba_packet=ba,
+                    ba_judgment=PairwiseJudgment("Candidate won", ba_pref),
+                )
+            return rev, plan
+
+        # Case 1: Sealed with explicit plan (3 families, perm_p = 0.125 > alpha = 0.05 -> INCONCLUSIVE)
+        eval_sealed = self.root / "eval_sealed.sqlite"
+        rev1, plan1 = _populate_three_family_wins(eval_sealed, pass_plan_at_seal=True)
+        direct = summarize_rsi_transfer(eval_sealed, revision=rev1, analysis_plan=plan1)
+        self.assertEqual(direct.verdict, "INCONCLUSIVE")
+        self.assertAlmostEqual(direct.perm_p, 0.125)
+        proj1, _ = read_system_evals_projection(
+            self.store, self.company_id, evaluator_store=eval_sealed
+        )
+        self.assertEqual(len(proj1["rsi_transfer_summaries"]), 1)
+        self.assertEqual(proj1["rsi_transfer_summaries"][0]["verdict"], "INCONCLUSIVE")
+        self.assertIn(
+            "permutation-p-above-alpha", proj1["rsi_transfer_summaries"][0]["reasons"]
+        )
+
+        # Case 2: Sealed without embedded plan -> fail-closed UNAVAILABLE (never weaker SUPPORTED!)
+        eval_opaque = self.root / "eval_opaque.sqlite"
+        _rev2, plan2 = _populate_three_family_wins(eval_opaque, pass_plan_at_seal=False)
+        proj2, _ = read_system_evals_projection(
+            self.store, self.company_id, evaluator_store=eval_opaque
+        )
+        self.assertEqual(len(proj2["rsi_transfer_summaries"]), 1)
+        self.assertEqual(proj2["rsi_transfer_summaries"][0]["verdict"], "UNAVAILABLE")
+        self.assertIn(
+            "sealed-analysis-plan-unavailable",
+            proj2["rsi_transfer_summaries"][0]["reasons"],
+        )
+        # Passing the verified plan explicitly restores exact INCONCLUSIVE verdict
+        proj2_with_plan, _ = read_system_evals_projection(
+            self.store,
+            self.company_id,
+            evaluator_store=eval_opaque,
+            analysis_plan=plan2,
+        )
+        self.assertEqual(
+            proj2_with_plan["rsi_transfer_summaries"][0]["verdict"], "INCONCLUSIVE"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

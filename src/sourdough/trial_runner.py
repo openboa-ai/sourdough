@@ -876,10 +876,124 @@ def grade_trial_observation(
     )
 
 
+_BLIND_REDACTED_KEYS = frozenset(
+    {
+        "arm",
+        "slot_id",
+        "run_id",
+        "executed_runs",
+        "agent_id",
+        "owner_agent_id",
+        "company_id",
+        "procedure_id",
+        "method_id",
+        "delta_id",
+        "snapshot_id",
+        "active_snapshot_id",
+        "desk_path",
+        "store_path",
+        "workspace_path",
+        "decision_id",
+        "work_item_id",
+        "created_at_ns",
+        "updated_at_ns",
+        "recorded_at_ns",
+        "started_at_ns",
+        "completed_at_ns",
+    }
+)
+_BLIND_PATH_RE = re.compile(
+    r"(?:(?:/(?:Users|home|tmp|var|private|Volumes)/[^\s\"',;)\]}]+)|(?:\.desk/[^\s\"',;)\]}]+))"
+)
+
+
+def _redact_blinded_value(value: Any) -> Any:
+    """Recursively strip identifying arm/run/agent/path metadata from blinded judge evidence."""
+    if isinstance(value, Mapping):
+        cleaned: dict[str, Any] = {}
+        for k, v in value.items():
+            key = str(k)
+            if key in _BLIND_REDACTED_KEYS:
+                continue
+            cleaned[key] = _redact_blinded_value(v)
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [_redact_blinded_value(item) for item in value]
+    if isinstance(value, str):
+        return _BLIND_PATH_RE.sub("[redacted-path]", value)
+    return value
+
+
+def _verify_and_redact_rubric(
+    rubric_document: str | Mapping[str, Any] | None,
+    expected_digest: str,
+) -> Any:
+    if rubric_document is None:
+        raise TrialRefused(
+            "Model-backed blind judge requires rubric_document matching sealed rubric_digest"
+        )
+    if isinstance(rubric_document, str):
+        actual = sha256(rubric_document.encode("utf-8")).hexdigest()
+        if actual != expected_digest:
+            raise TrialRefused(
+                "Rubric document digest does not match sealed rubric_digest"
+            )
+        return _redact_blinded_value(rubric_document)
+    if isinstance(rubric_document, Mapping):
+        if _canonical_digest(rubric_document) != expected_digest:
+            raise TrialRefused(
+                "Rubric document digest does not match sealed rubric_digest"
+            )
+        return _redact_blinded_value(rubric_document)
+    raise TrialRefused("Unsupported rubric_document type for blind judge")
+
+
+def _verify_and_redact_blinded_evidence(
+    trial: BlindedTrial,
+    raw_evidence: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    needs_any = any(
+        d is not None
+        for d in (
+            trial.decision_digest,
+            trial.tool_trace_digest,
+            trial.service_effects_digest,
+        )
+    )
+    if needs_any and not isinstance(raw_evidence, Mapping):
+        raise TrialRefused(
+            "Model-backed blind judge requires verified evidence matching sealed packet digests"
+        )
+    evidence_map: Mapping[str, Any] = raw_evidence or {}
+    redacted: dict[str, Any] = {}
+    for field_name, expected_digest in (
+        ("decision", trial.decision_digest),
+        ("tool_trace", trial.tool_trace_digest),
+        ("service_effects", trial.service_effects_digest),
+    ):
+        if expected_digest is None:
+            continue
+        payload = evidence_map.get(field_name)
+        if not isinstance(payload, Mapping):
+            raise TrialRefused(
+                f"Model-backed blind judge is missing verified '{field_name}' payload"
+            )
+        if _canonical_digest(payload) != expected_digest:
+            raise TrialRefused(
+                f"Blinded '{field_name}' payload digest does not match sealed packet"
+            )
+        redacted[field_name] = _redact_blinded_value(payload)
+    return redacted
+
+
 def _judge_via_adapter(
     adapter: AgentRuntimeAdapter,
     profile: AgentProfileBinding,
     packet: BlindPairwisePacket,
+    *,
+    rubric_content: Any,
+    first_evidence: Mapping[str, Any],
+    second_evidence: Mapping[str, Any],
 ) -> PairwiseJudgment:
     run_id = f"judge-{packet.pair_id[:16]}-{packet.ordering}"
     ctx = hydrate_shift_context(
@@ -898,6 +1012,7 @@ def _judge_via_adapter(
                     "pair_id": packet.pair_id,
                     "ordering": packet.ordering,
                     "rubric_digest": packet.rubric_digest,
+                    "rubric": rubric_content,
                     "evaluator_digest": packet.evaluator_digest,
                     "first": {
                         "result_id": packet.first.result_id,
@@ -905,6 +1020,7 @@ def _judge_via_adapter(
                         "decision_digest": packet.first.decision_digest,
                         "tool_trace_digest": packet.first.tool_trace_digest,
                         "service_effects_digest": packet.first.service_effects_digest,
+                        "evidence": dict(first_evidence),
                     },
                     "second": {
                         "result_id": packet.second.result_id,
@@ -912,6 +1028,7 @@ def _judge_via_adapter(
                         "decision_digest": packet.second.decision_digest,
                         "tool_trace_digest": packet.second.tool_trace_digest,
                         "service_effects_digest": packet.second.service_effects_digest,
+                        "evidence": dict(second_evidence),
                     },
                 }
             ),
@@ -924,8 +1041,9 @@ def _judge_via_adapter(
         turn_id=f"turn-{packet.ordering}",
         fencing_token=1,
         instruction=(
-            "Compare first and second blinded results. Emit JSON with keys "
-            "'rationale' (non-empty string) and 'preferred' ('first' | 'second' | 'tie')."
+            "Compare first and second blinded results using the supplied rubric and "
+            "identity-redacted evidence. Emit JSON with keys 'rationale' (non-empty "
+            "string) and 'preferred' ('first' | 'second' | 'tie')."
         ),
         context=ctx,
         tools=(),
@@ -962,6 +1080,8 @@ def run_blind_pairwise_judge(
     judge_fn: Callable[[BlindPairwisePacket], PairwiseJudgment] | None = None,
     judge_adapter: AgentRuntimeAdapter | None = None,
     judge_profile: AgentProfileBinding | None = None,
+    rubric_document: str | Mapping[str, Any] | None = None,
+    evidence_by_result_id: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[PairwiseBlindResult, ...]:
     """Run order-blind position-swapped (AB, BA) pairwise judging over a sealed recursive suite."""
     if judge_fn is None and (judge_adapter is None or judge_profile is None):
@@ -976,8 +1096,32 @@ def run_blind_pairwise_judge(
             ba_j = judge_fn(ba)
         else:
             assert judge_adapter is not None and judge_profile is not None
-            ab_j = _judge_via_adapter(judge_adapter, judge_profile, ab)
-            ba_j = _judge_via_adapter(judge_adapter, judge_profile, ba)
+            redacted_rubric = _verify_and_redact_rubric(
+                rubric_document, ab.rubric_digest
+            )
+            ev_map = evidence_by_result_id or {}
+            ab_first_ev = _verify_and_redact_blinded_evidence(
+                ab.first, ev_map.get(ab.first.result_id)
+            )
+            ab_second_ev = _verify_and_redact_blinded_evidence(
+                ab.second, ev_map.get(ab.second.result_id)
+            )
+            ab_j = _judge_via_adapter(
+                judge_adapter,
+                judge_profile,
+                ab,
+                rubric_content=redacted_rubric,
+                first_evidence=ab_first_ev,
+                second_evidence=ab_second_ev,
+            )
+            ba_j = _judge_via_adapter(
+                judge_adapter,
+                judge_profile,
+                ba,
+                rubric_content=redacted_rubric,
+                first_evidence=ab_second_ev,
+                second_evidence=ab_first_ev,
+            )
         results.append(
             commit_position_swapped_pairwise_grade(
                 evaluator_store,
@@ -1496,7 +1640,7 @@ def run_recursive_learning_cycle(
             analysis_plan_digest=analysis_plan_digest,
             slots=tuple(slots),
         )
-        eval_rev = seal_trial_suite(evaluator_store, suite)
+        eval_rev = seal_trial_suite(evaluator_store, suite, analysis_plan=analysis_plan)
 
         # Store ONLY blinded rubric metrics keyed by opaque (decision_digest, tool_trace_digest) (never arm!).
         blinded_rubric_by_decision: dict[tuple[str, str], dict[str, Any]] = {}

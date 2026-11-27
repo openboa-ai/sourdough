@@ -458,6 +458,7 @@ class M4TrialRunnerTests(unittest.TestCase):
             eval_store = root / "evaluator.sqlite"
             suite = _build_recursive_suite(("f1", "f2"))
             rev = seal_trial_suite(eval_store, suite)
+            evidence_by_result_id: dict[str, dict[str, object]] = {}
             for idx, slot in enumerate(suite.slots, start=1):
                 rid = f"jrun-{idx}"
                 reserve_trial_launch(
@@ -468,7 +469,22 @@ class M4TrialRunnerTests(unittest.TestCase):
                     inputs=slot.inputs,
                     limits=slot.limits,
                 )
-                commit_trial_observation(
+                decision_doc = {
+                    "action_kind": "counterexample_verified"
+                    if slot.arm == "candidate"
+                    else "hold",
+                    "grounded": True,
+                    "arm": slot.arm,
+                    "slot_id": slot.slot_id,
+                    "run_id": rid,
+                    "desk_path": f"/Users/secret/desks/{slot.slot_id}/draft.md",
+                }
+                trace_doc = {
+                    "calls": [{"name": "skill_read", "status": "ok"}],
+                    "violations": 0,
+                }
+                effects_doc = {"service_correct": True, "invariant_breach": False}
+                rec = commit_trial_observation(
                     eval_store,
                     revision=rev,
                     slot_id=slot.slot_id,
@@ -476,18 +492,26 @@ class M4TrialRunnerTests(unittest.TestCase):
                     evidence=TrialTerminalEvidence(
                         "completed",
                         _sha(f"o-{slot.slot_id}"),
-                        _sha(f"d-{slot.slot_id}"),
-                        _sha(b"t"),
-                        _sha(b"s"),
+                        _sha(_cjson(decision_doc)),
+                        _sha(_cjson(trace_doc)),
+                        _sha(_cjson(effects_doc)),
                     ),
                 )
+                assert rec.result_id is not None
+                evidence_by_result_id[rec.result_id] = {
+                    "decision": decision_doc,
+                    "tool_trace": trace_doc,
+                    "service_effects": effects_doc,
+                }
 
             seen_tools: list[tuple[str, ...]] = []
+            seen_notes: list[str] = []
 
             class _PositionBiasedAdapter:
                 def run_shift(self, profile_arg, req, broker):
                     del profile_arg, broker
                     seen_tools.append(tuple(t.name for t in req.tools))
+                    seen_notes.extend(req.context.history_notes)
                     return ShiftResult(
                         provider=PROVIDER_OPENAI,
                         model="gpt-6-luna",
@@ -507,17 +531,66 @@ class M4TrialRunnerTests(unittest.TestCase):
                 revision="v1",
                 credential_handle_ref="envref:KEY",
             )
+            # Fail closed when rubric or verified evidence is omitted or tampered
+            with self.assertRaisesRegex(TrialRefused, "rubric_document"):
+                run_blind_pairwise_judge(
+                    eval_store,
+                    revision=rev,
+                    judge_adapter=_PositionBiasedAdapter(),
+                    judge_profile=profile,
+                )
+            with self.assertRaisesRegex(TrialRefused, "verified evidence"):
+                run_blind_pairwise_judge(
+                    eval_store,
+                    revision=rev,
+                    judge_adapter=_PositionBiasedAdapter(),
+                    judge_profile=profile,
+                    rubric_document="rubric-v1",
+                )
+            tampered_ev = {
+                rid: {**payload, "decision": {"tampered": True}}
+                for rid, payload in evidence_by_result_id.items()
+            }
+            with self.assertRaisesRegex(TrialRefused, "digest"):
+                run_blind_pairwise_judge(
+                    eval_store,
+                    revision=rev,
+                    judge_adapter=_PositionBiasedAdapter(),
+                    judge_profile=profile,
+                    rubric_document="rubric-v1",
+                    evidence_by_result_id=tampered_ev,
+                )
+
             results = run_blind_pairwise_judge(
                 eval_store,
                 revision=rev,
                 judge_adapter=_PositionBiasedAdapter(),
                 judge_profile=profile,
+                rubric_document="rubric-v1",
+                evidence_by_result_id=evidence_by_result_id,
             )
             self.assertEqual(len(results), 2)
             self.assertTrue(all(t == () for t in seen_tools))
             self.assertTrue(
                 all(r.outcome == "tie_noise" and not r.consistent for r in results)
             )
+            # Verify actual rubric & redacted evidence were supplied without arm/run/path leaks
+            self.assertEqual(len(seen_notes), 4)
+            for note in seen_notes:
+                parsed = json.loads(note)
+                self.assertEqual(parsed["rubric"], "rubric-v1")
+                for side in ("first", "second"):
+                    ev = parsed[side]["evidence"]
+                    self.assertIn("decision", ev)
+                    self.assertIn("tool_trace", ev)
+                    self.assertIn("service_effects", ev)
+                    self.assertNotIn("arm", ev["decision"])
+                    self.assertNotIn("slot_id", ev["decision"])
+                    self.assertNotIn("run_id", ev["decision"])
+                    self.assertNotIn("desk_path", ev["decision"])
+                self.assertNotIn("/Users/secret", note)
+                self.assertNotIn("p1-cand", note)
+                self.assertNotIn("p1-inc", note)
 
     def test_run_recursive_learning_cycle_end_to_end(self) -> None:
         with TemporaryDirectory(prefix="sd-m4-rsi-") as tmp:

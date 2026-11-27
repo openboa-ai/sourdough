@@ -13,7 +13,7 @@ import json
 import os
 import sqlite3
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import asdict
 from hashlib import sha256
@@ -1411,6 +1411,7 @@ def read_system_evals_projection(
     company_id: str,
     *,
     evaluator_store: Path | None = None,
+    analysis_plan: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Read Flow 12 review tool pass^3 / DAG lineage + optional isolated Flow 13 offline DB."""
     with closing(open_reader(store)) as db, read_tx(db):
@@ -1657,20 +1658,39 @@ def read_system_evals_projection(
                     }
                 ]
                 if meta["purpose"] == "recursive":
-                    summary = summarize_rsi_transfer(
-                        evaluator_store,
-                        revision=meta["revision"],
-                        min_pairs=1,
-                        min_net_wins=1,
-                        min_families=1,
+                    effective_plan = (
+                        analysis_plan
+                        if analysis_plan is not None
+                        else meta.get("analysis_plan")
                     )
-                    rsi_transfer_summaries.append(
-                        {
-                            "suite_id": meta["suite_id"],
-                            "revision": meta["revision"],
-                            **asdict(summary),
-                        }
-                    )
+                    if effective_plan is not None:
+                        summary = summarize_rsi_transfer(
+                            evaluator_store,
+                            revision=meta["revision"],
+                            analysis_plan=effective_plan,
+                        )
+                        rsi_transfer_summaries.append(
+                            {
+                                "suite_id": meta["suite_id"],
+                                "revision": meta["revision"],
+                                **asdict(summary),
+                            }
+                        )
+                    else:
+                        rsi_transfer_summaries.append(
+                            {
+                                "suite_id": meta["suite_id"],
+                                "revision": meta["revision"],
+                                "verdict": "UNAVAILABLE",
+                                "reasons": ("sealed-analysis-plan-unavailable",),
+                                "analysis_plan_digest": meta["analysis_plan_digest"],
+                                "planned_pairs": meta["planned_pairs"],
+                                "complete_pairs": meta["pairwise_grade_count"],
+                                "distinct_transfer_families": meta[
+                                    "distinct_transfer_families"
+                                ],
+                            }
+                        )
         except (TrialRefused, OSError, sqlite3.Error):
             offline_evals["connected"] = False
             offline_evals["suites"] = []
