@@ -1183,6 +1183,274 @@ class RuntimeShiftRunnerTests(unittest.TestCase):
                     ).fetchone()
                     self.assertEqual(wi, ("settled",))
 
+    def test_crash_mid_shift_recover_reclaim_and_resume_preserves_receipts_without_duplicate_effects(
+        self,
+    ) -> None:
+        from sourdough.agent_runtime._http import compute_stable_prefix_sha256
+        from sourdough.agent_runtime.protocol import (
+            AdapterManifest,
+            ShiftRequest,
+            ShiftResult,
+        )
+        from sourdough.agent_runtime.registry import AgentAdapterRegistry
+        from sourdough.runtime.domains import ToolContribution
+        from sourdough.runtime.shift_runner import ShiftRunner
+        from sourdough.runtime.work_kernel import (
+            assert_run_fencing,
+            claim_work_run,
+            reclaim_expired_runs,
+        )
+
+        captured_requests: list[ShiftRequest] = []
+        crash_on_run1 = {"active": True}
+        proj_rev_holder = {"rev": ""}
+
+        class _CrashAndResumeAdapter:
+            manifest = AdapterManifest(
+                PROVIDER_OPENAI, "crash-resume-v1", "https_json", True, True, True
+            )
+
+            def run_shift(
+                self,
+                prof: AgentProfileBinding,
+                req: ShiftRequest,
+                broker: OuterToolBroker,
+            ) -> ShiftResult:
+                del prof
+                captured_requests.append(req)
+                if crash_on_run1["active"]:
+                    res_draft = broker.invoke(
+                        "call-crash-draft",
+                        "desk_save_draft",
+                        {"name": "brief", "content": "Clause A: zero duplicates."},
+                    )
+                    assert res_draft["ok"] is True
+                    res_pub = broker.invoke(
+                        "call-crash-pub",
+                        "desk_publish_selection",
+                        {
+                            "request_id": "pub-crash-1",
+                            "draft_name": "brief",
+                            "draft_revision": res_draft["revision"],
+                            "project_id": "proj-crash",
+                            "project_revision": proj_rev_holder["rev"],
+                            "audience": [req.agent_id],
+                            "start": 0,
+                            "end": 26,
+                        },
+                    )
+                    assert res_pub["ok"] is True
+                    raise RuntimeError("simulated worker crash mid-shift")
+
+                # Resumed run sees prior receipts in open_receipts; replay same request_id idempotently
+                prior_pub = next(
+                    r
+                    for r in req.context.open_receipts
+                    if r["tool_name"] == "desk_publish_selection"
+                )
+                prior_draft = next(
+                    r
+                    for r in req.context.open_receipts
+                    if r["tool_name"] == "desk_save_draft"
+                )
+                broker.invoke(
+                    "call-resume-pub-replay",
+                    "desk_publish_selection",
+                    {
+                        "request_id": "pub-crash-1",
+                        "draft_name": "brief",
+                        "draft_revision": prior_draft["result"]["revision"],
+                        "project_id": "proj-crash",
+                        "project_revision": proj_rev_holder["rev"],
+                        "audience": [req.agent_id],
+                        "start": 0,
+                        "end": 26,
+                    },
+                )
+                _ = prior_pub
+                return ShiftResult(
+                    provider=PROVIDER_OPENAI,
+                    model="gpt-5-mini",
+                    run_id=req.run_id,
+                    turn_id=req.turn_id,
+                    output_text="Recovered cleanly from prior receipts.",
+                    usage=TokenUsage(input_tokens=100, output_tokens=20),
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        with TemporaryDirectory(prefix="sd-crash-resume-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms(
+                    "crash-resume-co",
+                    "charter-v1",
+                    "manage-company",
+                    self.ceo_profile.profile_id(),
+                ),
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as writer:
+                proj_rev_holder["rev"] = assign_project(
+                    writer,
+                    founding.grant_id,
+                    "proj-crash",
+                    (founding.founder_id,),
+                    publishers=(founding.founder_id,),
+                )
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    item, _ = create_work_item(
+                        db,
+                        company_id=founding.company_id,
+                        owner_agent_id=founding.founder_id,
+                        duty_kind="ceo.respond_message",
+                        source_kind="board",
+                        source_id="crash-msg-1",
+                        payload={"message_id": "m-crash", "body": "Publish brief"},
+                        now_ns=1_000,
+                    )
+                    run1 = claim_work_run(
+                        db,
+                        company_id=founding.company_id,
+                        work_item_id=item.work_item_id,
+                        lease_owner="dead-worker-1",
+                        lease_ttl_ns=1_000,
+                        now_ns=1_000,
+                    )
+
+                adapters = AgentAdapterRegistry()
+                adapters.register(_CrashAndResumeAdapter())
+
+                def _read_agent_state(st: Path, cid: str, aid: str) -> tuple[str, str]:
+                    with closing(open_reader(st)) as ro, read_tx(ro):
+                        row = ro.execute(
+                            """SELECT a.execution_profile, COALESCE(g.scope, 'none')
+                               FROM agent a
+                               LEFT JOIN standing_grant g ON g.agent_id = a.id
+                               WHERE a.company_id = ? AND a.id = ?""",
+                            (cid, aid),
+                        ).fetchone()
+                    return str(row[0]), str(row[1])
+
+                runner = ShiftRunner(
+                    adapter_registry=adapters,
+                    profile_bindings={founding.founder_id: self.ceo_profile},
+                    default_budget_ceiling_minor=5000,
+                    read_agent_state=_read_agent_state,
+                    resolve_profile=lambda bindings, aid: bindings[aid],
+                    contribute_tools=lambda _qctx: ToolContribution(),
+                )
+                with self.assertRaisesRegex(RuntimeError, "simulated worker crash"):
+                    runner.run(
+                        DutyContext(
+                            writer,
+                            founding.company_id,
+                            item,
+                            run1,
+                            lambda: 1_500,
+                        ),
+                        mandate_summary="Publish brief",
+                        instruction="Save draft and publish brief.",
+                    )
+
+                # Reclaim expired run (recover-shift) and verify stale token is fenced
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    fenced = reclaim_expired_runs(db, founding.company_id, now_ns=5_000)
+                    self.assertEqual(fenced, (run1.run_id,))
+                    with self.assertRaises(RunFenced):
+                        assert_run_fencing(
+                            db, run1.run_id, run1.fencing_token, now_ns=5_000
+                        )
+
+                # Resume via CompanyRuntime on Run 2 (fencing_token=2)
+                crash_on_run1["active"] = False
+                reg = build_production_duty_registry(
+                    adapter_registry=adapters,
+                    profile_bindings={founding.founder_id: self.ceo_profile},
+                )
+                runtime = CompanyRuntime(
+                    store, founding.company_id, reg, lease_directory=leases
+                )
+                summary = runtime.step_with_writer(
+                    writer, max_dispatches=1, now_ns=6_000
+                )
+                self.assertEqual(len(summary.executed_runs), 1)
+                run2_id = summary.executed_runs[0]
+                self.assertNotEqual(run2_id, run1.run_id)
+
+            self.assertEqual(len(captured_requests), 2)
+            req1, req2 = captured_requests
+            self.assertEqual(req1.context.open_receipts, ())
+            self.assertEqual(len(req2.context.open_receipts), 2)
+            self.assertEqual(
+                [r["tool_name"] for r in req2.context.open_receipts],
+                ["desk_save_draft", "desk_publish_selection"],
+            )
+            self.assertTrue(
+                all(r["run_id"] == run1.run_id for r in req2.context.open_receipts)
+            )
+            # Compaction preserves open_receipts while keeping stable_prefix_sha256 unchanged
+            compacted_pack = hydrate_shift_context(
+                company_id=req2.context.company_id,
+                agent_id=req2.context.agent_id,
+                run_id=req2.context.run_id,
+                fencing_token=req2.context.fencing_token,
+                grant_scope=req2.context.grant_scope,
+                mandate_summary=req2.context.mandate_summary,
+                open_receipts=req2.context.open_receipts,
+                history_notes=tuple("H" * 1024 for _ in range(20)),
+                desk_manifest=req2.context.desk_manifest,
+                active_methods=req2.context.active_methods,
+                active_snapshot_id=req2.context.active_snapshot_id,
+                recent_episodes=req2.context.recent_episodes,
+                max_context_bytes=4096,
+            )
+            self.assertTrue(compacted_pack.compacted)
+            self.assertEqual(len(compacted_pack.open_receipts), 2)
+            self.assertEqual(
+                compute_stable_prefix_sha256(req2),
+                compute_stable_prefix_sha256(
+                    ShiftRequest(
+                        company_id=req2.company_id,
+                        agent_id=req2.agent_id,
+                        run_id=req2.run_id,
+                        turn_id=req2.turn_id,
+                        fencing_token=req2.fencing_token,
+                        instruction=req2.instruction,
+                        context=compacted_pack,
+                        tools=req2.tools,
+                        budget_ceiling_minor_units=req2.budget_ceiling_minor_units,
+                    )
+                ),
+            )
+
+            with closing(open_reader(store)) as db, read_tx(db):
+                pub_count = db.execute(
+                    "SELECT COUNT(*) FROM shared_publication WHERE company_id = ?",
+                    (founding.company_id,),
+                ).fetchone()[0]
+                self.assertEqual(pub_count, 1)
+                rcpt_count = db.execute(
+                    "SELECT COUNT(*) FROM tool_call_receipt WHERE company_id = ? AND run_id = ?",
+                    (founding.company_id, run1.run_id),
+                ).fetchone()[0]
+                self.assertEqual(rcpt_count, 2)
+                ep_row = db.execute(
+                    "SELECT outcome_status FROM agent_episode WHERE company_id = ? AND run_id = ?",
+                    (founding.company_id, run2_id),
+                ).fetchone()
+                self.assertEqual(ep_row, ("completed",))
+            drafts = list(
+                (desk_directory(store, founding.founder_id) / ".desk" / "drafts").glob(
+                    "*.json"
+                )
+            )
+            self.assertEqual(len(drafts), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

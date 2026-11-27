@@ -745,7 +745,12 @@ class M4TrialRunnerTests(unittest.TestCase):
                                 "method_id": draft_id,
                                 "delta_kind": "ADD",
                                 "item_kind": "work_method",
-                                "trigger_spec": {"duty_kind": "work.discovery_review"},
+                                "trigger_spec": {
+                                    "duty_kind": "work.discovery_review",
+                                    "negative_triggers": [
+                                        "valid_no_deadline_obligation"
+                                    ],
+                                },
                                 "body": (
                                     "Counterexample-verified rule retaining valid no-deadline "
                                     "boundary exceptions and preventing false-positive exclusions."
@@ -762,7 +767,7 @@ class M4TrialRunnerTests(unittest.TestCase):
                             f"dec-{req.run_id}",
                             "record_work_decision",
                             {
-                                "action_kind": "apply_counterexample_verified_transfer",
+                                "action_kind": "counterexample_verified",
                                 "rationale": (
                                     f"Verified boundary counterexample via {counterexample_proc_id}; "
                                     f"preserved no-deadline exception and prevented false-positive "
@@ -1092,12 +1097,20 @@ class M4TrialRunnerTests(unittest.TestCase):
                             f"dec-{req.run_id}",
                             "record_work_decision",
                             {
-                                "action_kind": "apply_counterexample_verified_transfer",
+                                "action_kind": "counterexample_verified",
                                 "rationale": (
                                     f"Verified boundary counterexample via {cx_proc} "
                                     f"and prevented false-positive exclusion."
                                 ),
-                                "evidence": [],
+                                "evidence": [
+                                    {
+                                        "kind": "work_run",
+                                        "resource_id": req.run_id,
+                                        "revision": "v1",
+                                        "available_at_ns": 1,
+                                        "observed_at_ns": 1,
+                                    }
+                                ],
                             },
                         )
                     else:
@@ -1227,6 +1240,518 @@ class M4TrialRunnerTests(unittest.TestCase):
                     / "SKILL.md"
                 ).is_file()
             )
+
+    def test_prose_only_bluff_cannot_game_structured_artifact_scoring(self) -> None:
+        class _ProseOnlyBluffAdapter:
+            manifest = AdapterManifest(
+                PROVIDER_OPENAI, "test-prose-bluff-v1", "https_json", True, True, True
+            )
+
+            def run_shift(self, prof, req, broker):
+                del prof
+                has_cx_proc = False
+                for entry in req.context.active_methods:
+                    if entry.get("item_kind") != "improvement_procedure":
+                        continue
+                    mid = str(entry["method_id"])
+                    res = broker.invoke(
+                        f"read-{req.run_id}-{mid}",
+                        "skill_read",
+                        {"method_id": mid},
+                    )
+                    broker.invoke(
+                        f"inv-{req.run_id}-{mid}",
+                        "skill_record_invocation",
+                        {"method_id": mid, "note": "Evaluated"},
+                    )
+                    meta = (res.get("skill") or {}).get("procedure_meta") or {}
+                    if meta.get("require_counterexample") is True:
+                        has_cx_proc = True
+
+                if has_cx_proc:
+                    # Candidate bluffs with glowing counterexample prose in body_text and rationale,
+                    # but omits negative_triggers/counterexamples/exclusion_boundaries in trigger_spec
+                    # and emits a non-allowlisted action_kind without evidence.
+                    broker.invoke(
+                        f"draft-{req.run_id}",
+                        "skill_draft_candidate",
+                        {
+                            "method_id": f"wm-bluff-{req.run_id[:20]}",
+                            "delta_kind": "ADD",
+                            "item_kind": "work_method",
+                            "trigger_spec": {"duty_kind": "work.discovery_review"},
+                            "body": (
+                                "Counterexample-verified rule retaining valid no-deadline "
+                                "boundary exceptions and preventing false-positive exclusions."
+                            ),
+                            "falsification_criteria": (
+                                "Reject if valid no-deadline boundary items are discarded."
+                            ),
+                            "audience_scope": "company",
+                            "source_refs": [f"work_run:{req.run_id}"],
+                        },
+                    )
+                    broker.invoke(
+                        f"dec-{req.run_id}",
+                        "record_work_decision",
+                        {
+                            "action_kind": "apply_transfer_method",
+                            "rationale": (
+                                "Verified boundary counterexample and prevented "
+                                "false-positive exclusion completely."
+                            ),
+                            "evidence": [],
+                        },
+                    )
+                else:
+                    broker.invoke(
+                        f"dec-{req.run_id}",
+                        "record_work_decision",
+                        {
+                            "action_kind": "apply_baseline_heuristic",
+                            "rationale": "Applied baseline heuristic.",
+                            "evidence": [],
+                        },
+                    )
+                return ShiftResult(
+                    provider=PROVIDER_OPENAI,
+                    model="gpt-6-luna",
+                    run_id=req.run_id,
+                    turn_id=req.turn_id,
+                    output_text="Done.",
+                    usage=TokenUsage(input_tokens=20, output_tokens=10),
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        with TemporaryDirectory(prefix="sd-m4-bluff-") as tmp:
+            root = Path(tmp)
+            co_dir = root / "co"
+            co_dir.mkdir(mode=0o700)
+            store = co_dir / "company.sqlite"
+            leases = co_dir / "leases"
+            leases.mkdir(mode=0o700)
+            eval_store = root / "evals" / "evaluator.sqlite"
+            eval_store.parent.mkdir(mode=0o700)
+
+            profile = AgentProfileBinding(
+                provider=PROVIDER_OPENAI,
+                model="gpt-6-luna",
+                revision="v1",
+                credential_handle_ref="envref:KEY",
+            )
+            rec = found(
+                store,
+                FoundingTerms(
+                    "bluff-co",
+                    "charter-v1",
+                    "manage-company",
+                    profile.profile_id(),
+                ),
+            )
+            adapters = AgentAdapterRegistry()
+            adapters.register(_ProseOnlyBluffAdapter())
+            with hold_company_writer(
+                store, rec.company_id, lease_directory=leases
+            ) as w:
+                with closing(open_writer(store, lease=w)) as db, write_tx(db):
+                    ensure_private_desk(
+                        db, rec.company_id, rec.founder_id, profile.profile_id()
+                    )
+                    register_responsibility(
+                        db,
+                        company_id=rec.company_id,
+                        owner_agent_id=rec.founder_id,
+                        duty_kind="work.discovery_review",
+                        remit="Monitor and improve work methods",
+                        readable_scope=["*"],
+                        now_ns=1_000,
+                    )
+                with self.assertRaisesRegex(TrialRefused, "INCONCLUSIVE"):
+                    run_recursive_learning_cycle(
+                        w,
+                        evaluator_store=eval_store,
+                        company_id=rec.company_id,
+                        meta_agent_id=rec.founder_id,
+                        promotion_actor_id=rec.founder_id,
+                        promotion_grant_id=rec.grant_id,
+                        trial_root=root / "rsi-trials",
+                        min_families=3,
+                        adapter_registry=adapters,
+                        profile_bindings={rec.founder_id: profile},
+                    )
+
+            meta = read_sealed_suite_meta(eval_store)
+            summary = summarize_rsi_transfer(
+                eval_store,
+                revision=meta["revision"],
+                min_pairs=6,
+                min_net_wins=5,
+                min_families=3,
+            )
+            self.assertEqual(summary.verdict, "INCONCLUSIVE")
+            self.assertEqual(summary.candidate_pairwise_wins, 0)
+            self.assertEqual(summary.incumbent_pairwise_wins, 0)
+            self.assertEqual(summary.pairwise_ties, 6)
+
+    def test_structured_artifact_action_kind_allowlists_and_legacy_regex_removal(
+        self,
+    ) -> None:
+        import inspect
+        import sourdough.trial_runner as tr
+        from sourdough.trial_runner import (
+            POSITIVE_BOUNDARY_ACTION_KINDS,
+            VIOLATION_ACTION_KINDS,
+            _score_live_gen2_observables,
+        )
+
+        # Ensure brittle English-prose regex engine is completely removed
+        for removed_name in (
+            "_CONTRACTIONS",
+            "_COMPOUNDS",
+            "_SENTENCE_SPLIT_RE",
+            "_BARE_NP_NON_NOUN_WORDS",
+            "_ClauseResult",
+            "_ObservableAnalysis",
+            "_analyze_observable_clauses",
+            "_analyze_observable_text",
+        ):
+            self.assertFalse(hasattr(tr, removed_name), msg=removed_name)
+        self.assertNotIn(
+            "rationale_text",
+            inspect.signature(_score_live_gen2_observables).parameters,
+        )
+
+        # Positive allowlist without evidence: counterexample_checked=True, false_positive_prevented=False
+        for pos_action in sorted(POSITIVE_BOUNDARY_ACTION_KINDS):
+            with self.subTest(pos_action=pos_action, evidence=0):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind=pos_action,
+                    evidence_count=0,
+                    rcpt_rows=(),
+                    drafted_methods=(),
+                )
+                self.assertFalse(obs["explicit_constraint_violation"])
+                self.assertTrue(obs["counterexample_checked"])
+                self.assertFalse(obs["false_positive_prevented"])
+
+        # Positive allowlist with evidence_count >= 1: both counterexample_checked & false_positive_prevented
+        for pos_action in sorted(POSITIVE_BOUNDARY_ACTION_KINDS):
+            with self.subTest(pos_action=pos_action, evidence=1):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind=pos_action,
+                    evidence_count=1,
+                    rcpt_rows=(),
+                    drafted_methods=(),
+                )
+                self.assertFalse(obs["explicit_constraint_violation"])
+                self.assertTrue(obs["counterexample_checked"])
+                self.assertTrue(obs["false_positive_prevented"])
+
+        # Violation allowlist vetoes even when valid drafted method is present
+        valid_draft = (
+            "m1",
+            "r1",
+            "ADD",
+            "work_method",
+            json.dumps(
+                {
+                    "duty_kind": "work.discovery_review",
+                    "negative_triggers": ["valid_no_deadline_obligation"],
+                }
+            ),
+            "Retain valid no-deadline items.",
+            "",
+            "Reject if valid no-deadline boundary items are discarded.",
+            "candidate",
+        )
+        for viol_action in sorted(VIOLATION_ACTION_KINDS):
+            with self.subTest(viol_action=viol_action):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind=viol_action,
+                    evidence_count=2,
+                    rcpt_rows=(("skill_read", "ok", "{}"),),
+                    drafted_methods=(valid_draft,),
+                )
+                self.assertTrue(obs["explicit_constraint_violation"])
+                self.assertFalse(obs["counterexample_checked"])
+                self.assertFalse(obs["false_positive_prevented"])
+
+        # Arbitrary non-allowlisted strings (including legacy names, camelCase, negated tokens) score False
+        for non_allowlisted in (
+            "",
+            "none",
+            "hold",
+            "apply_counterexample_verified_transfer",
+            "apply_transfer_method",
+            "BoundaryVerified",
+            "CounterexampleVerified",
+            "skip_counterexample",
+            "not_counterexample_verified",
+        ):
+            with self.subTest(non_allowlisted=non_allowlisted):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind=non_allowlisted,
+                    evidence_count=3,
+                    rcpt_rows=(),
+                    drafted_methods=(),
+                )
+                self.assertFalse(obs["explicit_constraint_violation"])
+                self.assertFalse(obs["counterexample_checked"])
+                self.assertFalse(obs["false_positive_prevented"])
+
+    def test_score_live_gen2_observables_matrix_and_draft_gates(self) -> None:
+        from sourdough.trial_runner import _score_live_gen2_observables
+
+        valid_draft = (
+            "m1",
+            "r1",
+            "ADD",
+            "work_method",
+            json.dumps(
+                {
+                    "duty_kind": "work.discovery_review",
+                    "negative_triggers": ["valid_no_deadline_obligation"],
+                }
+            ),
+            "Retain valid no-deadline boundary obligations.",
+            "",
+            "Reject if valid no-deadline boundary items are discarded.",
+            "candidate",
+        )
+
+        # shift_ok=False gates counterexample_checked & false_positive_prevented
+        obs_fail = _score_live_gen2_observables(
+            shift_ok=False,
+            action_kind="counterexample_verified",
+            evidence_count=1,
+            rcpt_rows=(),
+            drafted_methods=(valid_draft,),
+        )
+        self.assertFalse(obs_fail["explicit_constraint_violation"])
+        self.assertFalse(obs_fail["counterexample_checked"])
+        self.assertFalse(obs_fail["false_positive_prevented"])
+        self.assertTrue(obs_fail["drafted_counterexample_method"])
+
+        # Fatal or denied tool receipt sets explicit_constraint_violation & vetoes positive scores
+        for bad_status in ("fatal", "denied"):
+            with self.subTest(bad_status=bad_status):
+                obs_fatal = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind="counterexample_verified",
+                    evidence_count=1,
+                    rcpt_rows=(("desk_write_draft", bad_status, "{}"),),
+                    drafted_methods=(valid_draft,),
+                )
+                self.assertTrue(obs_fatal["explicit_constraint_violation"])
+                self.assertFalse(obs_fatal["counterexample_checked"])
+                self.assertFalse(obs_fatal["false_positive_prevented"])
+
+        # Valid PATCH and alternative structured boundary keys (counterexamples, exclusion_boundaries) pass
+        for delta_kind, trig_key in (
+            ("ADD", "negative_triggers"),
+            ("PATCH", "counterexamples"),
+            ("ADD", "exclusion_boundaries"),
+        ):
+            with self.subTest(delta_kind=delta_kind, trig_key=trig_key):
+                draft = (
+                    "m1",
+                    "r1",
+                    delta_kind,
+                    "work_method",
+                    json.dumps({trig_key: ["no_deadline_valid_item"]}),
+                    "Structured rule body.",
+                    "",
+                    "Fails if valid no-deadline item is dropped.",
+                    "candidate",
+                )
+                obs_draft = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind="hold",
+                    evidence_count=0,
+                    rcpt_rows=(),
+                    drafted_methods=(draft,),
+                )
+                self.assertFalse(obs_draft["explicit_constraint_violation"])
+                self.assertTrue(obs_draft["counterexample_checked"])
+                self.assertTrue(obs_draft["false_positive_prevented"])
+                self.assertTrue(obs_draft["drafted_counterexample_method"])
+
+        # Draft structural filtering: disputed, non-work_method, DEPRECATE, empty falsification,
+        # missing/empty/malformed negative_triggers
+        invalid_drafts = (
+            (
+                "disputed_status",
+                (
+                    "m1",
+                    "r1",
+                    "ADD",
+                    "work_method",
+                    json.dumps({"negative_triggers": ["no_deadline_item"]}),
+                    "Body.",
+                    "",
+                    "Reject if discarded.",
+                    "disputed",
+                ),
+            ),
+            (
+                "non_work_method",
+                (
+                    "m1",
+                    "r1",
+                    "ADD",
+                    "improvement_procedure",
+                    json.dumps({"negative_triggers": ["no_deadline_item"]}),
+                    "Body.",
+                    "",
+                    "Reject if discarded.",
+                    "candidate",
+                ),
+            ),
+            (
+                "deprecate_delta",
+                (
+                    "m1",
+                    "r1",
+                    "DEPRECATE",
+                    "work_method",
+                    json.dumps({"negative_triggers": ["no_deadline_item"]}),
+                    "Body.",
+                    "",
+                    "Reject if discarded.",
+                    "candidate",
+                ),
+            ),
+            (
+                "empty_falsification",
+                (
+                    "m1",
+                    "r1",
+                    "ADD",
+                    "work_method",
+                    json.dumps({"negative_triggers": ["no_deadline_item"]}),
+                    "Body.",
+                    "",
+                    "   ",
+                    "candidate",
+                ),
+            ),
+            (
+                "missing_negative_triggers",
+                (
+                    "m1",
+                    "r1",
+                    "ADD",
+                    "work_method",
+                    json.dumps({"duty_kind": "work.discovery_review"}),
+                    "Counterexample-verified prose bluff.",
+                    "",
+                    "Reject if valid items discarded.",
+                    "candidate",
+                ),
+            ),
+            (
+                "empty_negative_triggers_list",
+                (
+                    "m1",
+                    "r1",
+                    "ADD",
+                    "work_method",
+                    json.dumps({"negative_triggers": []}),
+                    "Body.",
+                    "",
+                    "Reject if discarded.",
+                    "candidate",
+                ),
+            ),
+            (
+                "blank_string_in_negative_triggers",
+                (
+                    "m1",
+                    "r1",
+                    "ADD",
+                    "work_method",
+                    json.dumps({"negative_triggers": ["   "]}),
+                    "Body.",
+                    "",
+                    "Reject if discarded.",
+                    "candidate",
+                ),
+            ),
+            (
+                "non_string_in_negative_triggers",
+                (
+                    "m1",
+                    "r1",
+                    "ADD",
+                    "work_method",
+                    json.dumps({"negative_triggers": [123]}),
+                    "Body.",
+                    "",
+                    "Reject if discarded.",
+                    "candidate",
+                ),
+            ),
+            (
+                "malformed_trigger_spec_json",
+                (
+                    "m1",
+                    "r1",
+                    "ADD",
+                    "work_method",
+                    "{not-valid-json",
+                    "Body.",
+                    "",
+                    "Reject if discarded.",
+                    "candidate",
+                ),
+            ),
+        )
+        for case_id, draft in invalid_drafts:
+            with self.subTest(case_id=case_id):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind="hold",
+                    evidence_count=0,
+                    rcpt_rows=(),
+                    drafted_methods=(draft,),
+                )
+                self.assertFalse(obs["counterexample_checked"], msg=case_id)
+                self.assertFalse(obs["false_positive_prevented"], msg=case_id)
+                self.assertFalse(obs["drafted_counterexample_method"], msg=case_id)
+
+        # skill_grounded receipt status gating (recoverable 'refused' is NOT fatal)
+        obs_ungrounded = _score_live_gen2_observables(
+            shift_ok=True,
+            action_kind="hold",
+            evidence_count=0,
+            rcpt_rows=(
+                ("skill_read", "refused", None),
+                ("desk_read_draft", "ok", None),
+            ),
+            drafted_methods=(),
+        )
+        self.assertFalse(obs_ungrounded["explicit_constraint_violation"])
+        self.assertFalse(obs_ungrounded["skill_grounded"])
+
+        for skill_tool in (
+            "skill_read",
+            "skill_record_invocation",
+            "skill_draft_candidate",
+        ):
+            with self.subTest(skill_tool=skill_tool):
+                obs_grounded = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind="hold",
+                    evidence_count=0,
+                    rcpt_rows=((skill_tool, "ok", "{}"),),
+                    drafted_methods=(),
+                )
+                self.assertTrue(obs_grounded["skill_grounded"])
 
 
 if __name__ == "__main__":

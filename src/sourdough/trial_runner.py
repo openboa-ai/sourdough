@@ -81,153 +81,117 @@ _HEX64 = re.compile(r"^[a-f0-9]{64}$")
 _MAX_I64 = 2**63 - 1
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
-_NEGATED_IGNORE_PREFIX_RE = re.compile(
-    r"\b(?:never|do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|avoid(?:ed|ing|s)?|must\s+not)\s+"
-    r"(?:ignore|disregard|bypass)\b",
-    re.IGNORECASE,
+POSITIVE_BOUNDARY_ACTION_KINDS: frozenset[str] = frozenset(
+    {
+        "counterexample_verified",
+        "boundary_verified",
+        "preserve_boundary",
+        "counterexample_check",
+    }
 )
-_IGNORE_CONSTRAINTS_RE = re.compile(
-    r"\b(?:ignore[ds]?|ignoring|disregard(?:ed|ing)?|bypass(?:ed|ing)?)\b"
-    r"[^.\n;]{0,80}\b(?:skills?|instructions?|constraints?|rules?|counterexamples?|procedures?)\b",
-    re.IGNORECASE,
+VIOLATION_ACTION_KINDS: frozenset[str] = frozenset(
+    {
+        "constraint_ignored",
+        "policy_bypassed",
+        "discard_valid_boundary",
+    }
 )
-_NEGATED_DISCARD_PREFIX_RE = re.compile(
-    r"\b(?:prevent(?:ed|s|ing)?|avoid(?:ed|s|ing)?|did\s+not|didn't|never|not|stop(?:ped|ping)?)\s+"
-    r"(?:discard|drop|reject|exclud)(?:ed|ing|e|es|s)?\b",
-    re.IGNORECASE,
+_BOUNDARY_TRIGGER_KEYS: tuple[str, ...] = (
+    "negative_triggers",
+    "counterexamples",
+    "exclusion_boundaries",
 )
-_NO_COUNTEREXAMPLE_RE = re.compile(
-    r"\b(?:without|no|not|skip(?:ped|ping)?|omit(?:ted|ting)?|lack(?:s|ed|ing)?|missing)\s+"
-    r"(?:a\s+|an\s+|any\s+|explicit\s+)?(?:counterexample|boundary\s+(?:check|verification|test|exception|guard)|false[- _]?positive\s+(?:check|guard|prevention))\b",
-    re.IGNORECASE,
-)
-_DISCARD_EXCEPTION_RE = re.compile(
-    r"\b(?:discard|drop|reject|exclud)(?:ed|ing|e|es|s)?\b[^.\n;]{0,50}"
-    r"\b(?:valid\s+)?(?:no[- _]?deadline|boundary|exception|counterexample)\b",
-    re.IGNORECASE,
-)
-_COUNTEREXAMPLE_NOUN_RE = re.compile(
-    r"\b(?:counterexample|boundary(?:[- _](?:case|exception|check|item|guard))?)\b",
-    re.IGNORECASE,
-)
-_COUNTEREXAMPLE_VERB_RE = re.compile(
-    r"\b(?:check(?:ed|ing)?|verif(?:y|ied|ying)|test(?:ed|ing)?|evaluat(?:e|ed|ing)|"
-    r"preserv(?:e|ed|ing)|retain(?:ed|ing)?|guard(?:ed|ing)?|confirm(?:ed|ing)?|"
-    r"validat(?:e|ed|ing)|pass(?:ed|ing)?|requir(?:e|ed|ing))\b",
-    re.IGNORECASE,
-)
-_COUNTEREXAMPLE_ACTION_RE = re.compile(
-    r"(?:counterexample|boundary_verified)", re.IGNORECASE
-)
-_FALSE_POSITIVE_PREVENTED_RE = re.compile(
-    r"(?:"
-    r"\b(?:prevent(?:ed|s|ing)?|avoid(?:ed|s|ing)?|eliminat(?:e|ed|es|ing)|block(?:ed|ing)?)\b"
-    r"[^.\n;]{0,40}\bfalse[- _]?positives?\b"
-    r"|"
-    r"\bzero\s+false[- _]?positives?\b"
-    r"|"
-    r"\bno\s+false[- _]?positives?\b(?!\s*(?:check|guard|test|verification|prevention|filter))"
-    r"|"
-    r"\b(?:preserv(?:e|ed|es|ing)|retain(?:ed|s|ing)?|kept|keep(?:ing)?|protect(?:ed|s|ing)?|safeguard(?:ed|s|ing)?)\b"
-    r"[^.\n;]{0,60}\b(?:boundary|exception|no[- _]?deadline|valid[- _](?:obligation|item|work))\b"
-    r"|"
-    r"\b(?:over[- _]?generaliz(?:e|ed|ing|ation)|over[- _]?filter(?:ed|ing)?)\b"
-    r"[^.\n;]{0,60}\b(?:avoid(?:ed|ing)?|prevent(?:ed|ing)?|blocked|stopped)\b"
-    r")",
-    re.IGNORECASE,
+_SKILL_GROUNDED_TOOLS: frozenset[str] = frozenset(
+    {
+        "skill_read",
+        "skill_record_invocation",
+        "skill_draft_candidate",
+    }
 )
 
 
-def _analyze_observable_text(text: str) -> tuple[bool, bool, bool]:
-    """Return (explicit_ignore, has_counterexample_check, has_false_positive_prevention)."""
-    explicit_ignore = False
-    has_cx = False
-    has_fp = False
-    for raw_sentence in _SENTENCE_SPLIT_RE.split(text.strip()):
-        sentence = raw_sentence.strip()
-        if not sentence:
-            continue
-        ignores = bool(_IGNORE_CONSTRAINTS_RE.search(sentence)) and not bool(
-            _NEGATED_IGNORE_PREFIX_RE.search(sentence)
-        )
-        if ignores:
-            explicit_ignore = True
-            continue
-        neg_cx = bool(_NO_COUNTEREXAMPLE_RE.search(sentence))
-        discards_exc = bool(_DISCARD_EXCEPTION_RE.search(sentence)) and not bool(
-            _NEGATED_DISCARD_PREFIX_RE.search(sentence)
-        )
-        if neg_cx or discards_exc:
-            continue
-        if bool(_COUNTEREXAMPLE_NOUN_RE.search(sentence)) and bool(
-            _COUNTEREXAMPLE_VERB_RE.search(sentence)
-        ):
-            has_cx = True
-        if bool(_FALSE_POSITIVE_PREVENTED_RE.search(sentence)):
-            has_fp = True
-    return explicit_ignore, has_cx, has_fp
+def _has_valid_negative_triggers(
+    trigger_spec_raw: str | Mapping[str, Any] | None,
+) -> bool:
+    if isinstance(trigger_spec_raw, Mapping):
+        spec: Any = trigger_spec_raw
+    elif isinstance(trigger_spec_raw, str) and trigger_spec_raw.strip():
+        try:
+            spec = json.loads(trigger_spec_raw)
+        except json.JSONDecodeError:
+            return False
+    else:
+        return False
+    if not isinstance(spec, Mapping):
+        return False
+    return any(
+        isinstance(val, (list, tuple))
+        and len(val) > 0
+        and all(isinstance(item, str) and bool(item.strip()) for item in val)
+        for key in _BOUNDARY_TRIGGER_KEYS
+        if (val := spec.get(key)) is not None
+    )
 
 
 def _score_live_gen2_observables(
     *,
     shift_ok: bool,
     action_kind: str,
-    rationale_text: str,
-    rcpt_rows: Sequence[tuple[str, str, str | None]],
-    drafted_methods: Sequence[tuple[str, str, str, str, str, str, str, str]],
+    evidence_count: int = 0,
+    rcpt_rows: Sequence[tuple[str, str, str | None]] = (),
+    drafted_methods: Sequence[tuple[str, str, str, str, str, str, str, str, str]] = (),
+    fatal_calls: int | None = None,
 ) -> dict[str, bool]:
-    """Score Gen-2 live shift strictly from arm-blind, run-scoped observable outputs."""
-    dec_ignore, dec_cx, dec_fp = _analyze_observable_text(rationale_text)
-    if (
-        not dec_ignore
-        and not _NO_COUNTEREXAMPLE_RE.search(rationale_text)
-        and bool(_COUNTEREXAMPLE_ACTION_RE.search(action_kind))
-    ):
-        dec_cx = True
-
-    drafted_has_cx = False
-    drafted_has_fp = False
-    for (
-        _mid,
-        _rev,
-        delta_kind,
-        item_kind,
-        body_text,
-        uncertainty_note,
-        falsification_criteria,
-        status,
-    ) in drafted_methods:
-        if (
-            str(status) == "disputed"
-            or str(item_kind) != "work_method"
-            or str(delta_kind) == "DEPRECATE"
-        ):
-            continue
-        draft_text = "\n".join(
-            part
-            for part in (body_text, uncertainty_note, falsification_criteria)
-            if part
-        )
-        d_ignore, d_cx, d_fp = _analyze_observable_text(draft_text)
-        if not d_ignore:
-            drafted_has_cx = drafted_has_cx or d_cx
-            drafted_has_fp = drafted_has_fp or d_fp
-
-    skill_grounded = any(
-        str(tn) in ("skill_read", "skill_record_invocation", "skill_draft_candidate")
-        and str(st) == "ok"
-        for tn, st, _raw_res in rcpt_rows
+    """Score Gen-2 live shift strictly from structured SQLite artifacts (never prose)."""
+    action = str(action_kind or "").strip()
+    receipt_fatal = sum(
+        1 for _tn, st, _raw in rcpt_rows if str(st) in ("fatal", "denied")
     )
+    total_fatal = (
+        max(int(fatal_calls), receipt_fatal)
+        if fatal_calls is not None
+        else receipt_fatal
+    )
+    explicit_constraint_violation = bool(
+        total_fatal > 0 or action in VIOLATION_ACTION_KINDS
+    )
+    drafted_counterexample_method = any(
+        str(status) != "disputed"
+        and str(item_kind) == "work_method"
+        and str(delta_kind) in ("ADD", "PATCH")
+        and bool(str(falsification_criteria or "").strip())
+        and _has_valid_negative_triggers(trigger_spec_json)
+        for (
+            _mid,
+            _rev,
+            delta_kind,
+            item_kind,
+            trigger_spec_json,
+            _body_text,
+            _uncertainty_note,
+            falsification_criteria,
+            status,
+        ) in drafted_methods
+    )
+    skill_grounded = any(
+        str(tn) in _SKILL_GROUNDED_TOOLS and str(st) == "ok"
+        for tn, st, _raw in rcpt_rows
+    )
+    positive_action = action in POSITIVE_BOUNDARY_ACTION_KINDS
     counterexample_checked = bool(
-        shift_ok and not dec_ignore and (dec_cx or drafted_has_cx)
+        shift_ok
+        and not explicit_constraint_violation
+        and (positive_action or drafted_counterexample_method)
     )
     false_positive_prevented = bool(
-        counterexample_checked and (dec_fp or drafted_has_fp)
+        counterexample_checked
+        and (
+            drafted_counterexample_method
+            or (positive_action and int(evidence_count) >= 1)
+        )
     )
-    drafted_counterexample_method = bool(drafted_has_cx and drafted_has_fp)
     return {
-        "explicit_constraint_violation": dec_ignore,
+        "explicit_constraint_violation": explicit_constraint_violation,
         "counterexample_checked": counterexample_checked,
         "false_positive_prevented": false_positive_prevented,
         "skill_grounded": skill_grounded,
@@ -1519,7 +1483,7 @@ def run_recursive_learning_cycle(
                     dec_row = None
                     rcpt_rows: list[tuple[str, str, str | None]] = []
                     drafted_methods: list[
-                        tuple[str, str, str, str, str, str, str, str]
+                        tuple[str, str, str, str, str, str, str, str, str]
                     ] = []
                     total_tokens = 0
                     with closing(open_reader(slot_store)) as ro_db, read_tx(ro_db):
@@ -1587,7 +1551,8 @@ def run_recursive_learning_cycle(
                                     seen_draft_pairs.add((d_mid, d_rev))
                                     d_row = ro_db.execute(
                                         """SELECT method_id, revision_sha256, delta_kind, item_kind,
-                                                  body_text, uncertainty_note, falsification_criteria, status
+                                                  trigger_spec_json, body_text, uncertainty_note,
+                                                  falsification_criteria, status
                                            FROM method_delta
                                            WHERE company_id = ? AND method_id = ? AND revision_sha256 = ?
                                            LIMIT 1""",
@@ -1600,13 +1565,16 @@ def run_recursive_learning_cycle(
                                                 str(d_row[1]),
                                                 str(d_row[2]),
                                                 str(d_row[3]),
-                                                str(d_row[4] or ""),
+                                                str(d_row[4] or "{}"),
                                                 str(d_row[5] or ""),
                                                 str(d_row[6] or ""),
-                                                str(d_row[7]),
+                                                str(d_row[7] or ""),
+                                                str(d_row[8]),
                                             )
                                         )
-                    fatal_calls = sum(1 for _tn, st, _rr in rcpt_rows if st == "fatal")
+                    fatal_calls = sum(
+                        1 for _tn, st, _rr in rcpt_rows if st in ("fatal", "denied")
+                    )
                     calls_list: list[dict[str, Any]] = []
                     for tn, st, raw_res in rcpt_rows:
                         call_entry: dict[str, Any] = {"name": tn, "status": st}
@@ -1655,9 +1623,10 @@ def run_recursive_learning_cycle(
                     obs_scores = _score_live_gen2_observables(
                         shift_ok=shift_ok,
                         action_kind=action_kind,
-                        rationale_text=rationale_text,
+                        evidence_count=evidence_count,
                         rcpt_rows=rcpt_rows,
                         drafted_methods=drafted_methods,
+                        fatal_calls=fatal_calls,
                     )
                     explicit_violation = obs_scores["explicit_constraint_violation"]
                     decision_doc = {

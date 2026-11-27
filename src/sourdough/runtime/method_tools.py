@@ -1,4 +1,11 @@
-"""Core OuterToolBroker tool suite for reading active Skills and drafting candidate Method deltas."""
+"""Core OuterToolBroker tool suite for Desk Skill projection and Work Method delta drafting.
+
+Two-Layer mapping:
+- Company & Employee layer: `Work Method` (`work_method`, `improvement_procedure`,
+  `helper_script`) governed in `method_delta` and `method_activation`.
+- Agent Harness layer: `Skill` (`skills/<skill-name>/SKILL.md` projection, lazy
+  Skill Index in `ContextPack`, and `skill_*` tools).
+"""
 
 from __future__ import annotations
 
@@ -306,7 +313,7 @@ def build_core_skill_tool_contribution(
     specs: tuple[ToolSpec, ...] = (
         ToolSpec(
             name="skill_list_active",
-            description="List currently active Work Methods and Skills authorized for your Employee Desk.",
+            description="List currently active Work Methods (projected as Desk Skills) authorized for your Employee Desk.",
             parameters={
                 "type": "object",
                 "properties": {"duty_kind": {"type": "string"}},
@@ -331,8 +338,8 @@ def build_core_skill_tool_contribution(
         ToolSpec(
             name="skill_draft_candidate",
             description=(
-                "Draft an evidence-linked candidate Method or Skill delta (ADD, PATCH, or DEPRECATE) "
-                "for gated qualification without modifying live active Skills."
+                "Draft an evidence-linked candidate Work Method / Skill delta (ADD, PATCH, or DEPRECATE) "
+                "for 3-stage evaluation without modifying live active Skills."
             ),
             parameters={
                 "type": "object",

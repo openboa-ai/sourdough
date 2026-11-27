@@ -1186,9 +1186,9 @@ def build_production_duty_registry(
         episode_limit = _int_opt("episode_limit", 20, minimum=1) or 20
         min_pattern_count = _int_opt("min_pattern_count", 2, minimum=2) or 2
         max_proposals = _int_opt("max_proposals", 3, minimum=1) or 3
-        cooldown_ns = _int_opt("cooldown_ns", 0, minimum=0) or 0
+        raw_cooldown_ns = _int_opt("cooldown_ns", None, minimum=0)
         max_runs_per_window = _int_opt("max_runs_per_window", None, minimum=1)
-        window_ns = _int_opt("window_ns", 3_600_000_000_000, minimum=1) or 1
+        raw_window_ns = _int_opt("window_ns", None, minimum=1)
         next_timer_delay_ns = _int_opt("next_timer_delay_ns", None, minimum=1)
         resp_id = payload.get("responsibility_id")
         eff_resp_id = (
@@ -1224,23 +1224,33 @@ def build_production_duty_registry(
                         ):
                             max_runs_per_window = scope_cfg["max_wakes_per_window"]
                         if (
-                            type(scope_cfg.get("wake_window_ns")) is int
+                            raw_window_ns is None
+                            and type(scope_cfg.get("wake_window_ns")) is int
                             and scope_cfg["wake_window_ns"] >= 1
                         ):
-                            window_ns = scope_cfg["wake_window_ns"]
+                            raw_window_ns = scope_cfg["wake_window_ns"]
                         if (
-                            cooldown_ns == 0
+                            raw_cooldown_ns is None
                             and type(scope_cfg.get("cooldown_ns")) is int
                             and scope_cfg["cooldown_ns"] >= 0
                         ):
-                            cooldown_ns = scope_cfg["cooldown_ns"]
-                    if next_timer_delay_ns is not None:
-                        next_cond = {
-                            "responsibility_id": eff_resp_id,
-                            "trigger_kind": "timer",
-                            "due_at_ns": ctx.now_ns + next_timer_delay_ns,
-                            "cooldown_ns": cooldown_ns,
-                        }
+                            raw_cooldown_ns = scope_cfg["cooldown_ns"]
+            window_ns = (
+                raw_window_ns if raw_window_ns is not None else 3_600_000_000_000
+            )
+            cooldown_ns = raw_cooldown_ns if raw_cooldown_ns is not None else 0
+            if (
+                eff_resp_id is not None
+                and resp_row is not None
+                and str(resp_row[0]) == "active"
+            ):
+                if next_timer_delay_ns is not None:
+                    next_cond = {
+                        "responsibility_id": eff_resp_id,
+                        "trigger_kind": "timer",
+                        "due_at_ns": ctx.now_ns + next_timer_delay_ns,
+                        "cooldown_ns": cooldown_ns,
+                    }
 
             if cooldown_ns > 0:
                 last_row = db.execute(

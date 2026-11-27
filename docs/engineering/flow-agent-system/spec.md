@@ -38,6 +38,9 @@ With this specification, a company operates continuously with zero Board Clients
 - **Client Absence & Private Custody:**
   - Closing all Board Clients never halts autonomous work, supervision, or recovery.
   - Private Desk draft filenames and contents never leak into `company.sqlite` audit logs, Board projections, or another Agent's Desk.
+- **Two-Layer Naming & Abstraction Model:**
+  - **Layer 1 — Company & Employee Operating Layer:** Organization, ownership, work continuity, and collaboration are modeled and named after a real company and human employees (`Company`, `Employee`/`Agent`, `Desk`, `Shared Project`, `Publication`, `Conversation`, `Peer Request`, `Handoff`, `Standing Responsibility`, `Work Item`, `Shift`, `Authority`/`Grant`, `Board`, `Work Method`).
+  - **Layer 2 — Canonical AI-Agent Technical Mechanism Layer:** Established AI-agent engineering mechanisms use clear, standard industry terminology (`Always-On`, `Sleep`/`Wake`, `Heartbeat`, `Lease`, `FencingToken`, `Memory`, `Tool`, `Skill`, `Plugin`, `Connector`, `LLM`/`Model`/`Provider`, `Harness`, `Context`, `Prompt Cache`, `Compaction`, `Learning`, `Dreaming`, `Evaluation`, `Sandbox`). Company `Work Method` records (`method_delta` / `method_activation`) project deterministically into each Agent Desk as Harness `Skill` files (`skills/<skill-name>/SKILL.md`) paired with `skill_*` broker tools.
 
 ## 3. Subsystem Specifications
 
@@ -128,6 +131,36 @@ With this specification, a company operates continuously with zero Board Clients
   - `trial_registry.py:summarize_rsi_transfer` aggregates repetitions by `family_id`, computes a deterministic family-clustered paired bootstrap lower confidence bound (`lcb_alpha`) and paired sign-flip permutation `perm_p`, and requires zero hard invariant violations alongside `lcb_alpha > min_worthwhile_margin` for `SUPPORTED`.
 - **Read-Only Client Projections (`src/sourdough/ipc/projections.py`):**
   - Extends `PROJECTION_AGENT_DETAIL` (`active_methods`, `work_decisions`, `armed_conditions`, episode summaries while keeping private Desk draft names/contents opaque) and `PROJECTION_SYSTEM_EVALS` (`method_deltas`, `method_qualifications`, `method_activations`, `rsi_transfer_summaries`).
+
+### 3.5 Always-On Agent Lifecycle, Wake Priority, Dreaming & Desk Harness Projections
+
+1. **Single-Process Always-On Sleep/Wake Telemetry (`src/sourdough/runtime/resident.py`, `src/sourdough/ipc/server.py`):**
+   - `ResidentCompanyService` runs a local-first single-process sleep/wake loop (zero additional daemon processes) over one `WriterLease` and `CompanyRuntime`.
+   - `ResidentHealth` exposes explicit sleep/wake observability: `sleep_state` (`"sleeping"` | `"awake"`), `wake_count`, `last_wake_reason` (`"startup"` | `"trigger"` | `"ipc_commit"` | `"timer"`), `last_tick_at_ns`, `last_good_tick_at_ns`, `last_error`, and `recovered_runs_count`. Failing ticks update `last_tick_at_ns` and `last_error` without overwriting `last_good_tick_at_ns`; successful ticks update `last_good_tick_at_ns` and clear `last_error = None`.
+   - `CompanyDaemon._handle_meta` (`/v1/meta`) optionally attaches live `resident_health` via a `health_provider` callback while `src/sourdough/ipc/projections.py` remains pure deterministic SQLite `read_tx` snapshots.
+   - Rapid duplicate wake signals coalesce cleanly at three layers: `ResidentCompanyService.trigger_now` (`threading.Event`), `drain_work_event_cursor` (folding rapid `asset.published` events per asset), and `evaluate_conditions` (coalescing repeated `work.discovery_review` and `work.dreaming` condition triggers onto open `due`/`scheduled` items).
+2. **Deterministic Wake Priority Ordering (`src/sourdough/runtime/engine.py`, `src/sourdough/runtime/work_kernel.py`):**
+   - `CompanyRuntime._claim_next` and `evaluate_conditions` enforce deterministic priority tiers (`ORDER BY CASE ... ASC, created_at_ns ASC, work_item_id ASC`):
+     - Tier `0`: Direct Board / human directives (`ceo.respond_message`, `board.apply_decision`).
+     - Tier `1`: Blocking peer responses (`work.peer_response`).
+     - Tier `2`: Mandatory work items, child continuations (`parent_work_item_id IS NOT NULL`, `result_dep:*`), and non-discretionary duties.
+     - Tier `3`: Discretionary proactive discovery (`work.discovery_review`).
+     - Tier `4`: Bounded idle-time episodic consolidation (`work.dreaming`).
+3. **Crash-Mid-Shift Recovery & Receipt Preservation (`src/sourdough/runtime/shift_runner.py`, `work_kernel.py`):**
+   - Each tool execution persists an immediate `tool_call_receipt` in an independent `write_tx` before returning to the model.
+   - On worker crash or lease expiry, `recover-shift` (`reclaim_expired_runs`, also invoked synchronously on `ResidentCompanyService.start()`) fences expired `running` `work_runs` (`status = 'fenced'`), rejects stale fencing tokens with `RunFenced`, and returns the `work_item` to `'due'`.
+   - On the resumed shift (`ShiftRunner.run`), bounded prior durable `tool_call_receipt` rows for `work_item_id` (`run_id != current_run_id`, latest 32 in chronological order) are hydrated into `ContextPack.open_receipts` (dynamic suffix, immune to compaction, preserving `stable_prefix_sha256`) so the resumed Employee observes prior completed/refused effects without duplicating idempotent side effects.
+4. **Progressive Disclosure & Prompt-Cache Stability (`agent_runtime/protocol.py`, `_http.py`, `runtime/shift_runner.py`, `runtime/method_tools.py`):**
+   - `ContextPack v2` projects active methods into a compact, deterministically sorted Skill Index (`project_skill_index`: `method_id`, `skill_name`, `item_kind`, short `when_to_use`, `skill_path`, `revision_sha256`, `audience_scope`) without embedding full multi-KB skill bodies in the system prompt.
+   - Employees load full `SKILL.md` instructions on demand via `skill_read` and record causal usage via `skill_record_invocation`.
+   - `ShiftRequest` deterministically sorts `tools` by name and `active_methods` by `(method_id, revision_sha256, audience_scope)`, and `render_context_system_blocks` records `stable_prefix_sha256` across turns to verify prompt-cache prefix stability.
+5. **Bounded Idle-Time `Dreaming` Duty (`work.dreaming`, `method_learning.py`, `runtime/handlers.py`):**
+   - `work.dreaming` runs only during idle windows (`_dreaming_precondition` yields whenever any mandatory `due` item exists company-wide or any non-dreaming `due` item exists for the same Agent) under explicit `window_ns`, `max_runs_per_window`, and `cooldown_ns` limits (honoring explicit item payload overrides before `work_responsibilities` scope fallbacks).
+   - `audit_episodes_for_dreaming` inspects recent `agent_episode` records without deleting raw episodes or mutating L0 ledger/work tables, and drafts candidate `method_delta` (`ADD`/`PATCH`/`DEPRECATE`) proposals routed strictly through the 3-Stage Pre-Commit Gate.
+6. **Host-Projected Desk `AGENTS.md` & `skills/<skill-name>/SKILL.md` (`method_learning.py`, `agent_desk.py`, `harness.py`):**
+   - Host Harness projections materialize read-only `AGENTS.md` and `skills/<skill-name>/SKILL.md` inside each Agent Desk on `rehydrate_desk`, activation, BFS DAG quarantine/rollback, and pre/post `ShiftRunner.run` reconciliation.
+   - `AGENTS.md` embeds both `## Desk Harness Custody Rules` and `## Operating Discipline`: (a) **Cheapest-First Execution Ladder**, (b) **Untrusted External Input Isolation**, (c) **Lazy Skill Loading** (`skills/<skill-name>/SKILL.md` + `skill_read` + `skill_record_invocation`), and (d) **Selective Silence & Draft-Before-Irreversible-Action**.
+   - Both Python path guards (`assert_writable_desk_relative_path`) and Seatbelt profiles (`build_desk_sandbox_profile`) block Agent overwrites of `AGENTS.md` and `skills/` so pre-commit evaluation cannot be bypassed.
 
 ## 4. Allowed & Prohibited Behavior
 

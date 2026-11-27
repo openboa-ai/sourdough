@@ -1136,3 +1136,123 @@ class M4DeskHarnessRuntimeTests(unittest.TestCase):
         self.assertEqual(by_rev["skill"]["body_text"], "COMPANY_SENTINEL_BODY")
         self.assertIn("COMPANY_SENTINEL_BODY", by_rev["skill_markdown"])
         self.assertNotIn("ONE_AGENT_OVERRIDE_BODY", by_rev["skill_markdown"])
+
+    def test_agents_md_operating_disciplines_survive_rehydrate_shift_and_restore(
+        self,
+    ) -> None:
+        _item_id, _run_id, claim = self._open_claim()
+        d = distill_method_delta(
+            self.writer,
+            claim,
+            delta_kind="ADD",
+            item_kind="work_method",
+            method_id="m-op-disc",
+            trigger_spec={"duty_kind": "work.discovery_review"},
+            body="Use cheapest-first checks before escalating.",
+            audience_scope="company",
+            source_refs=[f"work_run:{claim.run_id}"],
+        )
+        qualify_method_delta(
+            self.writer,
+            d.delta_id,
+            passed_k=3,
+            negative_trigger_passed=True,
+            safety_passed=True,
+        )
+        activate_method_delta(
+            self.writer,
+            d.delta_id,
+            actor_id=self.founder_id,
+            grant_id=self.founding.grant_id,
+        )
+
+        desk = rehydrate_desk(self.store, self.company_id, self.founder_id)
+        agents_text = (desk / "AGENTS.md").read_text(encoding="utf-8")
+        expected_phrases = (
+            "## Operating Discipline",
+            "Cheapest-First Execution Ladder",
+            "Untrusted External Input Isolation",
+            "Lazy Skill Loading",
+            "Selective Silence & Draft-Before-Irreversible-Action",
+            "skill_read",
+            "skill_record_invocation",
+        )
+        for phrase in expected_phrases:
+            self.assertIn(phrase, agents_text)
+
+        # Tamper AGENTS.md, run a ShiftRunner shift, and confirm reconciliation restores all 4 rules
+        ts = time_ns()
+        with closing(open_writer(self.store, lease=self.writer)) as db, write_tx(db):
+            complete_work_run(
+                db, claim.run_id, claim.fencing_token, outcome={"prep": True}, now_ns=ts
+            )
+            resp = register_responsibility(
+                db,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.discovery_review",
+                remit="Operating discipline check",
+                readable_scope=["*"],
+                now_ns=ts + 10,
+            )
+            create_work_item(
+                db,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.discovery_review",
+                source_kind="manual",
+                source_id=f"op-disc-{resp.responsibility_id}",
+                now_ns=ts + 20,
+            )
+
+        (desk / "AGENTS.md").write_text("tampered-by-agent", encoding="utf-8")
+        with _M4MockOpenAIServer() as srv:
+            resolver = InMemorySecretResolver({"envref:SD_OPENAI_KEY": "sk-test-123"})
+            adapters = build_default_adapter_registry(
+                secret_resolver=resolver,
+                openai_base_url=srv.base_url,
+                allow_loopback_override=True,
+            )
+            reg = build_production_duty_registry(
+                adapter_registry=adapters,
+                profile_bindings={self.founder_id: self.profile},
+                domain_plugins=(),
+            )
+            runtime = CompanyRuntime(
+                self.store, self.company_id, reg, lease_directory=self.leases
+            )
+            summary = runtime.step_with_writer(
+                self.writer, max_dispatches=1, now_ns=ts + 100
+            )
+            self.assertEqual(len(summary.executed_runs), 1)
+
+        reconciled = (desk / "AGENTS.md").read_text(encoding="utf-8")
+        for phrase in expected_phrases:
+            self.assertIn(phrase, reconciled)
+
+        # Checkpoint + restore preserves AGENTS.md with all 4 Operating Disciplines
+        from sourdough.storage.checkpoint import checkpoint_store
+
+        ckpt_dir = self.root / "ckpt-op-disc"
+        restored_dir = self.root / "restored-op-disc"
+        restored_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        restored_store = restored_dir / "company.sqlite"
+        checkpoint_store(
+            self.store,
+            self.company_id,
+            ckpt_dir,
+            desk_root=desks_root(self.store),
+            writer=self.writer,
+        )
+        restore_core_checkpoint(
+            self.store,
+            self.company_id,
+            ckpt_dir,
+            restored_store,
+            desk_destination=desks_root(restored_store),
+        )
+        restored_agents = (
+            desk_directory(restored_store, self.founder_id) / "AGENTS.md"
+        ).read_text(encoding="utf-8")
+        for phrase in expected_phrases:
+            self.assertIn(phrase, restored_agents)

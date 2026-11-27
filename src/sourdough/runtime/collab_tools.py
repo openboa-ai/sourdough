@@ -410,7 +410,9 @@ def build_core_collab_tool_contribution(
                 (claim.company_id, claim.duty_id),
             ).fetchone()
             if row is None:
-                raise DutyRefused("No peer request is linked to this response duty")
+                raise DutyRefused(
+                    "No peer request is linked to this response work item"
+                )
             peer = PeerRequest(*row)
             if peer.recipient_agent_id != claim.founder_id:
                 raise DutyRefused("Only the named recipient Agent may respond")
@@ -726,7 +728,7 @@ def build_core_collab_tool_contribution(
     if include_peer_respond:
         _add(
             "respond_peer_request",
-            "Answer or decline the open blocking peer decision request assigned to this response duty.",
+            "Answer or decline the open blocking peer decision request assigned to this peer response work item.",
             {
                 "outcome": {"type": "string", "enum": ["answered", "declined"]},
                 "answer": {"type": "string"},
@@ -739,7 +741,7 @@ def build_core_collab_tool_contribution(
     if include_handoffs:
         _add(
             "offer_handoff",
-            "Offer an explicit responsibility handoff referencing a shared asset published by this duty (expires_at in Unix epoch seconds).",
+            "Offer an explicit responsibility handoff referencing a shared asset published during this work item (expires_at in Unix epoch seconds).",
             {
                 "request_id": {"type": "string"},
                 "recipient_id": {"type": "string"},

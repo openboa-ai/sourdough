@@ -1506,3 +1506,103 @@ class MethodLearningTests(unittest.TestCase):
             now_ns=1_100,
         )
         self.assertEqual(set(q2.quarantined_methods), {m_a.method_id, m_desc.method_id})
+
+    def test_work_dreaming_window_and_cooldown_payload_overrides_vs_scope_fallbacks(
+        self,
+    ) -> None:
+        a_id, _ = self._hire("alice-dream-cfg")
+        base_ts = 1_000_000
+        with closing(open_writer(self.store, lease=self.writer)) as db, write_tx(db):
+            dream_resp = register_responsibility(
+                db,
+                company_id=self.company_id,
+                owner_agent_id=a_id,
+                duty_kind=DUTY_WORK_DREAMING,
+                remit="Bounded dreaming config check.",
+                readable_scope={
+                    "max_wakes_per_window": 1,
+                    "wake_window_ns": 100_000,
+                    "cooldown_ns": 50_000,
+                },
+                now_ns=base_ts,
+            )
+            # Item 1: uses responsibility scope_cfg fallbacks (max_runs=1, window=100_000)
+            create_work_item(
+                db,
+                company_id=self.company_id,
+                owner_agent_id=a_id,
+                duty_kind=DUTY_WORK_DREAMING,
+                source_kind="manual",
+                source_id="dream-cfg-1",
+                payload={"responsibility_id": dream_resp.responsibility_id},
+                now_ns=base_ts + 10,
+            )
+            # Item 2 at base_ts + 1_000: explicit window_ns=100 & cooldown_ns=0 must NOT be overwritten by scope_cfg
+            create_work_item(
+                db,
+                company_id=self.company_id,
+                owner_agent_id=a_id,
+                duty_kind=DUTY_WORK_DREAMING,
+                source_kind="manual",
+                source_id="dream-cfg-2",
+                payload={
+                    "responsibility_id": dream_resp.responsibility_id,
+                    "window_ns": 100,
+                    "cooldown_ns": 0,
+                },
+                now_ns=base_ts + 20,
+            )
+            # Item 3 at base_ts + 2_000: omits window_ns & cooldown_ns, so scope_cfg cooldown_ns=50_000 applies
+            create_work_item(
+                db,
+                company_id=self.company_id,
+                owner_agent_id=a_id,
+                duty_kind=DUTY_WORK_DREAMING,
+                source_kind="manual",
+                source_id="dream-cfg-3",
+                payload={"responsibility_id": dream_resp.responsibility_id},
+                now_ns=base_ts + 30,
+            )
+
+        reg = build_production_duty_registry(
+            adapter_registry=build_default_adapter_registry(
+                secret_resolver=InMemorySecretResolver({})
+            ),
+            profile_bindings={},
+        )
+        runtime = CompanyRuntime(
+            self.store, self.company_id, reg, lease_directory=self.leases
+        )
+
+        s1 = runtime.step_with_writer(
+            self.writer, max_dispatches=1, now_ns=base_ts + 100
+        )
+        s2 = runtime.step_with_writer(
+            self.writer, max_dispatches=1, now_ns=base_ts + 1_000
+        )
+        s3 = runtime.step_with_writer(
+            self.writer, max_dispatches=1, now_ns=base_ts + 2_000
+        )
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            out1 = json.loads(
+                db.execute(
+                    "SELECT outcome_json FROM work_runs WHERE run_id = ?",
+                    (s1.executed_runs[0],),
+                ).fetchone()[0]
+            )
+            out2 = json.loads(
+                db.execute(
+                    "SELECT outcome_json FROM work_runs WHERE run_id = ?",
+                    (s2.executed_runs[0],),
+                ).fetchone()[0]
+            )
+            out3 = json.loads(
+                db.execute(
+                    "SELECT outcome_json FROM work_runs WHERE run_id = ?",
+                    (s3.executed_runs[0],),
+                ).fetchone()[0]
+            )
+        self.assertTrue(out1["audited"])
+        self.assertTrue(out2["audited"])
+        self.assertFalse(out3["audited"])
+        self.assertEqual(out3["skipped_reason"], "cooldown_active")

@@ -868,7 +868,7 @@ def _authorize_peer_route(
     project_id: str | None = None,
     check_open_quota: bool = False,
     check_turn_capacity: bool = True,
-) -> None:
+) -> str | None:
     """Atomically verify peer-request route, recipient grant/responsibility, evidence scope, and budget."""
     if not has_active_grant(connection, company_id, requester_agent_id):
         raise WorkKernelRefused("Requester Agent has no active standing grant")
@@ -980,7 +980,9 @@ def _authorize_peer_route(
                 raise WorkKernelRefused(
                     "Recipient Agent has reached its open peer-request quota"
                 )
-        return
+        if project_id is not None:
+            return project_id
+        return str(scoped_project) if scoped_project is not None else None
 
     raise WorkKernelRefused(
         "Peer request route or evidence scope is not authorized by recipient responsibility"
@@ -2527,7 +2529,21 @@ def evaluate_conditions(
            FROM work_conditions c
            LEFT JOIN work_responsibilities r ON r.responsibility_id = c.responsibility_id
            WHERE c.company_id = ? AND c.status = 'armed'
-           ORDER BY c.created_at_ns, c.condition_id""",
+           ORDER BY
+               CASE
+                   WHEN c.trigger_kind = 'peer_response'
+                        OR c.work_item_id IS NOT NULL
+                        OR c.source_identity LIKE 'result_dep:%'
+                        OR (
+                            r.duty_kind IS NOT NULL
+                            AND r.duty_kind NOT IN ('work.discovery_review', 'work.dreaming')
+                        )
+                   THEN 0
+                   WHEN COALESCE(r.duty_kind, 'work.discovery_review') = 'work.discovery_review' THEN 1
+                   ELSE 2
+               END ASC,
+               c.created_at_ns ASC,
+               c.condition_id ASC""",
         (company_id,),
     ).fetchall()
     admitted: list[WorkItem] = []
@@ -2746,7 +2762,7 @@ def evaluate_conditions(
         is_discretionary = (
             resp_id is not None
             and parent_item_id is None
-            and duty_kind == "work.discovery_review"
+            and duty_kind in ("work.discovery_review", "work.dreaming")
             and not (
                 isinstance(source_identity, str)
                 and source_identity.startswith("result_dep:")
@@ -2782,12 +2798,12 @@ def evaluate_conditions(
                 """SELECT work_item_id, state, payload_json
                    FROM work_items
                    WHERE company_id = ? AND owner_agent_id = ?
-                     AND duty_kind = 'work.discovery_review'
+                     AND duty_kind = ?
                      AND state IN ('due', 'scheduled', 'running')
                      AND json_extract(payload_json, '$.responsibility_id') = ?
                    ORDER BY created_at_ns ASC, work_item_id ASC
                    LIMIT 1""",
-                (company_id, owner_agent_id, resp_id),
+                (company_id, owner_agent_id, duty_kind, resp_id),
             ).fetchone()
             if open_row is not None:
                 open_item_id, open_state, open_payload_raw = open_row
@@ -3426,7 +3442,7 @@ def open_peer_request(
             or prior.expected_decision != expected_decision
             or prior.evidence_refs_json != evidence_json
             or prior.deadline_ns != deadline_ns
-            or prior.project_id != project_id
+            or (project_id is not None and prior.project_id != project_id)
             or (request_key is not None and prior.request_key != request_key)
         ):
             raise WorkKernelRefused("Peer request conflicts with the original receipt")
@@ -3444,7 +3460,7 @@ def open_peer_request(
     if deadline_ns <= timestamp:
         raise WorkKernelRefused("Peer request deadline must be in the future")
 
-    _authorize_peer_route(
+    resolved_project_id = _authorize_peer_route(
         connection,
         company_id=company_id,
         requester_agent_id=run.agent_id,
@@ -3454,6 +3470,7 @@ def open_peer_request(
         check_open_quota=True,
         check_turn_capacity=True,
     )
+    project_id = resolved_project_id
 
     parent_row = connection.execute(
         f"""SELECT {_PEER_REQUEST_COLUMNS}

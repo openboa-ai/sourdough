@@ -876,6 +876,169 @@ class ResidentRuntimeTests(unittest.TestCase):
                 self.assertIn(prof[0], ALLOWED_AVATAR_VARIANTS)
                 self.assertEqual(prof[1], 120_000)
 
+    def test_resident_health_sleep_wake_telemetry_and_meta_exposure(self) -> None:
+        from sourdough.runtime.work_kernel import claim_work_run
+
+        with TemporaryDirectory(prefix="sd-rt-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            sock_path = root / "d.sock"
+            founding = found(
+                store,
+                FoundingTerms(
+                    "telemetry-co",
+                    "charter-v1",
+                    "manage",
+                    self.ceo_profile.profile_id(),
+                ),
+            )
+            # Seed an expired work_run so ResidentCompanyService.start() reclaims it
+            with closing(open_writer(store)) as db, write_tx(db):
+                rec_item, _ = create_work_item(
+                    db,
+                    company_id=founding.company_id,
+                    owner_agent_id=founding.founder_id,
+                    duty_kind="ceo.respond_message",
+                    source_kind="board",
+                    source_id="expired-on-start",
+                    payload={"message_id": "m-exp", "body": "Hi"},
+                    now_ns=100,
+                )
+                claim_work_run(
+                    db,
+                    company_id=founding.company_id,
+                    work_item_id=rec_item.work_item_id,
+                    lease_owner="dead-worker",
+                    lease_ttl_ns=100,
+                    now_ns=100,
+                )
+
+            fail_flag = {"fail": True}
+            now_val = [1_000_000]
+
+            def _flaky_ceo(ctx):
+                if fail_flag["fail"]:
+                    raise RuntimeError("transient_tick_boom")
+                return {
+                    "disposition": "completed",
+                    "result": {"ok": True},
+                }
+
+            from sourdough.runtime import (
+                DutyDescriptor,
+                DutyOutcome,
+                DutyRegistry,
+                RuntimeRefused,
+            )
+
+            registry = DutyRegistry()
+            registry.register(
+                DutyDescriptor(
+                    duty_kind="ceo.respond_message",
+                    execute=lambda ctx: (
+                        (_ for _ in ()).throw(RuntimeRefused("transient_tick_boom"))
+                        if fail_flag["fail"]
+                        else DutyOutcome("completed", result={"ok": True})
+                    ),
+                )
+            )
+
+            service = ResidentCompanyService(
+                store,
+                founding.company_id,
+                registry,
+                socket_path=sock_path,
+                lease_directory=leases,
+                tick_interval_seconds=0.05,
+                enable_board_trigger_intake=False,
+                clock=lambda: now_val[0],
+            )
+            self.assertEqual(service.health.sleep_state, "sleeping")
+            self.assertEqual(service.health.wake_count, 0)
+            self.assertIsNone(service.health.last_wake_reason)
+            self.assertIsNone(service.health.last_good_tick_at_ns)
+
+            with service:
+                # Startup reclaimed the expired run, then first tick failed
+                h1 = service.wait_for(
+                    lambda h: h.ticks_completed >= 1 and h.last_error is not None,
+                    timeout_seconds=5.0,
+                )
+                self.assertEqual(h1.recovered_runs_count, 1)
+                self.assertEqual(h1.last_tick_at_ns, 1_000_000)
+                self.assertIsNone(h1.last_good_tick_at_ns)
+                self.assertIn("transient_tick_boom", h1.last_error or "")
+                self.assertGreaterEqual(h1.wake_count, 1)
+
+                # Wait for timer wake and recover on tick >= 2
+                now_val[0] = 2_000_000
+                fail_flag["fail"] = False
+                # Re-queue item as due because RuntimeError caused return_to_due=False
+                with closing(open_reader(store)) as db, read_tx(db):
+                    state_row = db.execute(
+                        "SELECT state FROM work_items WHERE work_item_id = ?",
+                        (rec_item.work_item_id,),
+                    ).fetchone()
+                self.assertEqual(state_row, ("blocked",))
+
+                h2 = service.wait_for(
+                    lambda h: (
+                        h.last_good_tick_at_ns is not None
+                        and h.last_error is None
+                        and h.sleep_state == "sleeping"
+                    ),
+                    timeout_seconds=5.0,
+                )
+                self.assertEqual(h2.last_good_tick_at_ns, 2_000_000)
+                self.assertIsNone(h2.last_error)
+                self.assertGreaterEqual(h2.wake_count, 2)
+                self.assertIn(h2.last_wake_reason, ("startup", "timer", "trigger"))
+
+                # Explicit trigger_now wakes with reason='trigger', failing tick preserves last_good_tick_at_ns
+                with (
+                    closing(
+                        open_writer(store, lease=service.daemon.writer_lease)
+                    ) as db,
+                    write_tx(db),
+                ):
+                    create_work_item(
+                        db,
+                        company_id=founding.company_id,
+                        owner_agent_id=founding.founder_id,
+                        duty_kind="ceo.respond_message",
+                        source_kind="board",
+                        source_id="fail-after-good",
+                        now_ns=3_000_000,
+                    )
+                now_val[0] = 3_000_000
+                fail_flag["fail"] = True
+                prev_ticks = h2.ticks_completed
+                service.trigger_now("trigger")
+                h3 = service.wait_for(
+                    lambda h: (
+                        h.ticks_completed > prev_ticks
+                        and h.last_error is not None
+                        and h.sleep_state == "sleeping"
+                    ),
+                    timeout_seconds=5.0,
+                )
+                self.assertEqual(h3.last_good_tick_at_ns, 2_000_000)
+                self.assertEqual(h3.last_tick_at_ns, 3_000_000)
+                self.assertIn("transient_tick_boom", h3.last_error or "")
+                self.assertEqual(h3.last_wake_reason, "trigger")
+
+                # /v1/meta exposes resident_health cleanly
+                meta = ControlPlaneClient(service.socket_path).meta()
+                self.assertIn("resident_health", meta)
+                self.assertEqual(meta["resident_health"]["recovered_runs_count"], 1)
+                self.assertEqual(
+                    meta["resident_health"]["last_good_tick_at_ns"], 2_000_000
+                )
+
+            self.assertEqual(service.health.sleep_state, "sleeping")
+            self.assertFalse(service.health.running)
+
 
 if __name__ == "__main__":
     unittest.main()

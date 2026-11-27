@@ -235,6 +235,50 @@ class ShiftRunner:
 
         with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
             recent_eps = list_recent_episodes(db, ctx.company_id, agent_id, limit=5)
+            prior_receipt_rows = db.execute(
+                """SELECT t.run_id, t.call_id, t.tool_name, t.arg_digest,
+                          t.status, t.result_digest, t.result_json,
+                          t.offloaded_log_path, t.recorded_at_ns
+                   FROM tool_call_receipt t
+                   JOIN work_runs wr
+                     ON wr.company_id = t.company_id AND wr.run_id = t.run_id
+                   WHERE t.company_id = ?
+                     AND wr.work_item_id = ?
+                     AND t.run_id != ?
+                   ORDER BY t.recorded_at_ns DESC, t.call_id DESC
+                   LIMIT 32""",
+                (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
+            ).fetchall()
+        prior_tool_receipts: list[dict[str, Any]] = []
+        for (
+            r_run_id,
+            r_call_id,
+            r_tool_name,
+            r_arg_digest,
+            r_status,
+            r_result_digest,
+            r_result_json,
+            r_offloaded_log_path,
+            r_recorded_at_ns,
+        ) in reversed(prior_receipt_rows):
+            receipt_entry: dict[str, Any] = {
+                "kind": "tool_call_receipt",
+                "run_id": str(r_run_id),
+                "call_id": str(r_call_id),
+                "tool_name": str(r_tool_name),
+                "arg_digest": str(r_arg_digest),
+                "status": str(r_status),
+                "result_digest": str(r_result_digest),
+                "recorded_at_ns": int(r_recorded_at_ns),
+            }
+            if r_offloaded_log_path is not None:
+                receipt_entry["offloaded_log_path"] = str(r_offloaded_log_path)
+            if isinstance(r_result_json, str) and len(r_result_json) <= 1024:
+                try:
+                    receipt_entry["result"] = json.loads(r_result_json)
+                except json.JSONDecodeError:
+                    receipt_entry["result_preview"] = r_result_json[:256]
+            prior_tool_receipts.append(receipt_entry)
         recent_episodes = tuple(
             {
                 "episode_id": ep.episode_id,
@@ -303,7 +347,7 @@ class ShiftRunner:
             fencing_token=ctx.run.fencing_token,
             grant_scope=grant_scope,
             mandate_summary=mandate_summary,
-            open_receipts=tuple(open_receipts),
+            open_receipts=(*prior_tool_receipts, *open_receipts),
             history_notes=tuple(history_notes),
             desk_manifest=desk_manifest,
             active_methods=active_methods,

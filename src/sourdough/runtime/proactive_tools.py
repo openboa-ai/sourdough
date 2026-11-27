@@ -480,8 +480,8 @@ def build_core_proactive_tool_contribution(
         ToolSpec(
             name="record_work_decision",
             description=(
-                "Record a grounded work_decision with verified DecisionEvidence references "
-                "and an optional follow-up next_condition."
+                "Record a grounded work decision backed by verified evidence references "
+                "and an optional follow-up condition (next_condition)."
             ),
             parameters={
                 "type": "object",

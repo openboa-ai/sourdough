@@ -27,9 +27,23 @@ class DutyClaim:
     run_id: str
     execution_profile: str
 
+    @property
+    def agent_id(self) -> str:
+        return self.founder_id
+
+    @property
+    def work_item_id(self) -> str:
+        return self.duty_id
+
 
 @dataclass(frozen=True)
 class WorkRunClaim:
+    """Fenced execution claim for a Work Kernel run.
+
+    Retains `founder_id` (semantic `agent_id`) and `duty_id` (semantic
+    `work_item_id`) field names for structural compatibility with `DutyClaim`.
+    """
+
     company_id: str
     founder_id: str
     duty_id: str
@@ -41,6 +55,14 @@ class WorkRunClaim:
     _clock: int | Callable[[], int] | None = field(
         default=None, repr=False, compare=False
     )
+
+    @property
+    def agent_id(self) -> str:
+        return self.founder_id
+
+    @property
+    def work_item_id(self) -> str:
+        return self.duty_id
 
     def current_now_ns(self) -> int | None:
         if self._clock is None:

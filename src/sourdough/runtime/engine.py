@@ -402,7 +402,21 @@ class CompanyRuntime:
                      AND owner_agent_id NOT IN (
                          SELECT agent_id FROM duty WHERE state = 'running'
                      )
-                   ORDER BY created_at_ns, work_item_id""",
+                   ORDER BY
+                       CASE
+                           WHEN duty_kind IN ('ceo.respond_message', 'board.apply_decision') THEN 0
+                           WHEN duty_kind = 'work.peer_response' THEN 1
+                           WHEN parent_work_item_id IS NOT NULL THEN 2
+                           WHEN source_kind = 'condition'
+                                AND json_valid(payload_json)
+                                AND json_extract(payload_json, '$.source_identity') LIKE 'result_dep:%' THEN 2
+                           WHEN duty_kind NOT IN ('work.discovery_review', 'work.dreaming') THEN 2
+                           WHEN duty_kind = 'work.discovery_review' THEN 3
+                           WHEN duty_kind = 'work.dreaming' THEN 4
+                           ELSE 2
+                       END ASC,
+                       created_at_ns ASC,
+                       work_item_id ASC""",
                 (self._company_id, now_ns),
             ).fetchall()
             for row in rows:

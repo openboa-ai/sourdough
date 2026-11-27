@@ -183,6 +183,7 @@ class CompanyDaemon:
         request_timeout: float = 10.0,
         on_commit: Callable[[], None] | None = None,
         domain_plugins: Sequence[DomainPlugin] | None = None,
+        health_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self._store = store.absolute()
         self._company_id = company_id
@@ -205,6 +206,7 @@ class CompanyDaemon:
         self._service_incarnation_id = secrets.token_hex(12)
         self._request_timeout = validate_timeout_seconds(request_timeout)
         self._on_commit = on_commit
+        self._health_provider = health_provider
         self._domain_plugins = (
             load_domain_plugins() if domain_plugins is None else tuple(domain_plugins)
         )
@@ -875,6 +877,8 @@ class CompanyDaemon:
             "supported_projections": self._supported_projections(domain_set),
             "supported_commands": self._supported_commands(domain_set),
         }
+        if self._health_provider is not None:
+            body["resident_health"] = self._health_provider()
         write_http_response(conn, 200, body=_json_bytes(body), deadline=deadline)
 
     def _handle_work_timeline(
