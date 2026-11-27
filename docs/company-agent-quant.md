@@ -20,8 +20,8 @@ flowchart TB
             Agent <-->|context and requests| Harness
             Agent <-->|artifacts and experience| Desk
         end
-        subgraph Common["Common company systems"]
-            Interface["Query and command interface"]
+        subgraph Common["Core Company OS systems"]
+            Interface["Query and command interface (DomainPlugin gated)"]
             Org["Organization and roster"]
             Auth["Delegation and authority"]
             Work["Work, shifts and handoffs"]
@@ -36,12 +36,12 @@ flowchart TB
             Registry["External connection registry"]
             Gateway["Connector dispatch and receipt"]
         end
-        subgraph Fund["Fund systems: illustrative decomposition"]
+        subgraph Fund["Trading domain module (opt-in 'trading' pack)"]
             Research["Market observations and investment research"]
             Strategy["Strategy candidates and active revisions"]
             Risk["Account grants and trading risk"]
-            Ledger["Investment ledger, reservations and positions"]
-            Execution["Execution and reconciliation"]
+            Ledger["Unified trading_book_* ledger & execution_environment_binding"]
+            Execution["3-tier execution (agent_sandbox, company_paper, company_live) & reconciliation"]
             Performance["Performance and net return"]
         end
         subgraph Managed["Company-managed software"]
@@ -280,10 +280,10 @@ flowchart TD
     Hold["Record reason and next condition"]
     Risk["Risk: check grant, limits and exposure"]
     Denied["Record denial reason"]
-    Reserve["Book reservation and original order ID"]
-    Connector["Company connector sends admitted orders only"]
-    Venue["Paper venue: accept, fill or reject"]
-    Ledger["Post fill, position and remaining reservation"]
+    Reserve["Book reservation and original order ID (trading_book_order)"]
+    Connector["Company connector sends admitted orders to bound environment"]
+    Venue["Bound venue (agent_sandbox, paper, or Board-promoted live): accept, fill or reject"]
+    Ledger["Post trading_book_fill, trading_book_position, trading_book_valuation and remaining reservation"]
     Market --> Research --> Program --> Decision
     Decision -->|hold| Hold
     Decision -->|order| Risk
@@ -292,7 +292,7 @@ flowchart TD
     Venue -->|confirmed venue facts| Ledger
 ```
 
-Direct Agent orders and company programs pass the same risk admission. Risk decides eligibility; the investment book creates, changes and releases reservations. A venue fill and its company posting are separate facts. The first delivery ends when the Agent's first paper fill reaches the books. [Market observation](company/profiles/quant/investments/market-snapshot/intent.md) · [Research](company/profiles/quant/investments/research/intent.md) · [Order admission](company/profiles/quant/trading/admit-intent/reserve/spec.md) · [Book fill](company/profiles/quant/fund-books/book-fills/post/spec.md) · [Founder resilience](acceptance/first-shift/spec.md#first-integration-run).
+Direct Agent orders and company programs pass the same risk admission. Risk decides eligibility; the unified `trading_book_*` ledger—keyed by composite `(binding_id, environment)` foreign keys on `execution_environment_binding` across `agent_sandbox`, `company_paper`, and Board-approved `company_live`—records orders, fills, positions, and valuations without commingling tiers. A venue fill and its company posting are separate facts. The first delivery ends when the Agent's first paper fill reaches the books. [Market observation](company/profiles/quant/investments/market-snapshot/intent.md) · [Research](company/profiles/quant/investments/research/intent.md) · [Order admission](company/profiles/quant/trading/admit-intent/reserve/spec.md) · [Book fill](company/profiles/quant/fund-books/book-fills/post/spec.md) · [Founder resilience](acceptance/first-shift/spec.md#first-integration-run).
 
 Reconcile venue-originated account changes against their source. If a position or origin is uncertain, hold affected new risk and keep the investigation open. Never attribute an external effect to an Agent without evidence or invent a balancing fill. [Reconcile external effects](company/profiles/quant/trading/recover-order/reconcile-external/spec.md).
 
@@ -300,20 +300,23 @@ Reconcile venue-originated account changes against their source. If a position o
 
 ```mermaid
 flowchart LR
-    Strategy["Common strategy, authority, risk, order and book contracts"]
+    Strategy["Common strategy, authority, risk, order and trading_book_* contracts"]
     Past["Historical data at a fixed cutoff"] --> Replay["Backtest: simulated clock and fills"]
-    Current["Current market data: read only"] --> Paper["Forward paper: isolated simulated account and fills"]
+    Sandbox["Tier 1 agent_sandbox: isolated per-agent sandbox book"]
+    Current["Current market data: read only"] --> Paper["Tier 2 company_paper: multi-book simulated execution"]
     Strategy --> Replay
+    Strategy --> Sandbox
     Strategy --> Paper
-    Strategy --> Test["External test venue: separately authorized functional test"]
-    Strategy --> Live["Live connector: unavailable without separate grant and qualification"]
-    Replay --> Results["Mode-specific results, costs and uncertainty"]
+    Strategy --> Test["External test venue: venue_qualification_receipt"]
+    Strategy --> Live["Tier 3 company_live: Board-promoted via live_promotion (positions_copied = 0)"]
+    Replay --> Results["Environment-isolated trading_book_* results, costs and uncertainty"]
+    Sandbox --> Results
     Paper --> Results
     Test --> Results
     Live --> Results
 ```
 
-Current data is a read-only source binding; the order destination is a separate execution binding. Recent testnet timestamps do not prove production liquidity or price parity. These environment qualifications are later work, not prerequisites for the first trade. [Backtest](company/profiles/quant/investments/backtest/replay/spec.md) · [Forward paper](company/profiles/quant/trading/live-paper/run/spec.md) · [Execution binding](company/profiles/quant/trading/execution-environment/bind/spec.md) · [Parity test](acceptance/execution-parity/spec.md).
+Current data is a read-only source binding; the order destination is a separate `execution_environment_binding`. Tier 1 `agent_sandbox`, Tier 2 `company_paper` (supporting concurrent multi-book deployments and shadow benchmarks), and Tier 3 `company_live` all persist into the unified `trading_book_{order,fill,position,valuation}` ledger isolated by `(binding_id, environment)`. Promoting `company_paper` to `company_live` requires passing `venue_qualification_receipt`, soak evidence, clean open orders/external actions, and explicit Board approval (`environment_promotion_record.action IN ('promote_live', 'suspend_live', 'demote_to_paper')` with `trading_live_migration_record.positions_copied = 0`). Recent testnet timestamps do not prove production liquidity or price parity. [Backtest](company/profiles/quant/investments/backtest/replay/spec.md) · [Forward paper](company/profiles/quant/trading/live-paper/run/spec.md) · [Execution binding](company/profiles/quant/trading/execution-environment/bind/spec.md) · [Parity test](acceptance/execution-parity/spec.md).
 
 The company provisions, configures and operates the selected runtime and uses its backtest, paper and execution functions. Sourdough owns authority, idempotency, retry and eventual recovery rather than implementing the trading engine. Selection does not mean a runtime is installed or qualified. [Runtime setup](company/profiles/quant/trading/execution-environment/launch/spec.md) · [Engine qualification](company/profiles/quant/trading/execution-environment/qualify-engine/spec.md).
 

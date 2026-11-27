@@ -12,12 +12,12 @@ Separate Sourdough's industry-neutral **Company OS** from pluggable **Domain Wor
   - `AppShell` renders navigation dynamically from `meta.active_domains`:
     - Top actionable notification plane: **`Approvals`** (`/approvals`) with pending badge (plus topbar notification shortcut).
     - Dynamic Workload slot (`0..N` registered `DomainModule` sections):
-      - When `active_domains` includes `"paper"` (`TRADING` module): `Live Trading` (`/`), `Paper Trading` (`/trading/paper`), `Strategies` (`/trading/strategies`).
+      - When `active_domains` includes `"trading"` (with legacy `"paper"` alias normalized at the domain registry boundary per [flow-core-domain-cleanup](../flow-core-domain-cleanup/spec.md)): `Live Trading` (`/`), `Paper Trading` (`/trading/paper`), `Strategies` (`/trading/strategies`).
       - When 2+ workload modules are active: auto-exposes `Overview` (`/`) above module sections.
-      - When 0 workload modules are active (core-only company): hides `TRADING` cleanly and lands on `/agents`.
+      - When 0 workload modules are active (core-only company): hides `Trading` cleanly and lands on `/agents`.
     - **`COMPANY`** (universal across all company types): `Agents` (`/agents`), `Messages` (`/messages`), `Finance` (`/finance`), `Reports` (`/reports`).
     - **`SYSTEM`** (universal governance & infrastructure): `Controls` (`/controls`), `Backups` (`/backups`), `Audit` (`/audit`, hosting Audit Log + Evaluations + Daemon Diagnostics tabs), `Settings` (`/settings`, hosting Appearance, Material, Active Modules, Board RBAC, and Privacy Lock).
-  - All legacy paths (`/office`, `/office/agents/:id`, `/company/approvals`, `/company/strategy-trials`, `/company/finance`, `/company/org`, `/company/execution-tiers`, `/restrictions`, `/system/checkpoints`, `/system/evaluations`, `/system/audit`, `/system/daemon`) remain 100% compatible.
+  - *(Note: Legacy pre-#186 paths and `/company/execution-tiers` were subsequently retired in [flow-core-domain-cleanup](../flow-core-domain-cleanup/spec.md), leaving only the 17 canonical Modular IA route branches in `App.tsx`.)*
 
 ## 3. Universal Dual-Entry Approvals ("Control Plane of the Control Plane")
 
@@ -27,9 +27,9 @@ Separate Sourdough's industry-neutral **Company OS** from pluggable **Domain Wor
 
 ## 4. Conditional Per-Agent Sandbox Visibility
 
-- `read_agents_graph_projection` attaches `sandbox_activity` to an Agent node ONLY when the Agent holds an active trading/paper standing grant (`scope == 'paper'`, not archived) AND has active sandbox state (fills, open orders/positions, or active `quant.agent_sandbox` run).
+- `read_agents_graph_projection` attaches `sandbox_activity` to an Agent node ONLY when the Agent holds an active trading standing grant (`scope IN ('trading', 'paper')`, not archived) AND has active sandbox state (fills, open orders/positions, or active `trading.agent_sandbox` / `quant.agent_sandbox` run).
 - `read_agent_detail_projection` attaches `sandbox_authorized: bool`.
-- `AgentsActivityView` and `AgentDetailView` display the sandbox indicator and `Paper Sandbox` tab strictly when authorized and active (hidden for CEO or non-trading/idle agents).
+- `AgentsActivityView` and `AgentDetailView` display the sandbox indicator and `Trading Sandbox` tab strictly when authorized and active (hidden for CEO or non-trading/idle agents).
 
 ## 5. Acceptance Evidence
 

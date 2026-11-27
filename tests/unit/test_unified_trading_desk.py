@@ -10,23 +10,36 @@ from tempfile import TemporaryDirectory
 
 from sourdough.board_control import BOARD_CONTROL_ROLE, bind_board_principal
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
+from sourdough.trading.accounts import (
+    open_agent_sandbox,
+    open_company_paper_book,
+    record_venue_qualification_receipt,
+    register_live_candidate_binding,
+)
+from sourdough.trading.domain import (
     ENV_EXTERNAL_TEST,
     ENV_LIVE,
     ENV_PAPER,
     ExecutionTierRefused,
     compute_trading_core_digest,
-    execute_paper_to_live_migration,
-    open_company_paper_book,
-    propose_paper_to_live_migration,
+)
+from sourdough.trading.ledger import (
+    read_company_paper_book_portfolio_from_db,
+    read_trading_book_state_from_db,
     record_live_book_order_fill,
     record_trading_book_valuation,
-    record_venue_qualification_receipt,
-    register_live_candidate_binding,
+    submit_agent_sandbox_order,
     submit_company_paper_book_order,
 )
-from sourdough.ipc.projections import read_trading_desk_projection
-from sourdough.storage.db import open_writer, write_tx
+from sourdough.trading.migration import (
+    execute_paper_to_live_migration,
+    propose_paper_to_live_migration,
+)
+from sourdough.trading.projections import (
+    read_order_trace_projection,
+    read_trading_desk_projection,
+)
+from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -399,6 +412,304 @@ class TestUnifiedTradingDesk(unittest.TestCase):
                 ),
                 places=4,
             )
+
+            # Verify live order-trace back_link points to /trading/live.
+            live_trace, _ = read_order_trace_projection(
+                store, company_id, first_fill["order_id"]
+            )
+            self.assertEqual(live_trace["order"]["environment"], ENV_LIVE)
+            self.assertEqual(live_trace["order"]["back_link"], "/trading/live")
+
+            # Verify soak_ready is per-binding in read_trading_book_state_from_db (not company-wide).
+            with hold_company_writer(
+                store, company_id, lease_directory=leases
+            ) as writer:
+                unsoaked_book = open_company_paper_book(
+                    writer,
+                    account_id="paper-sol-unsoaked",
+                    book_name="SOL Unsoaked",
+                    strategy_release_id="rel-sol-v1",
+                    starting_minor_units=20_000_000,
+                    exposure_limit_minor_units=10_000_000,
+                )
+            paper_unsoaked, _ = read_trading_desk_projection(
+                store,
+                company_id,
+                environment=ENV_PAPER,
+                book_id=unsoaked_book.binding_id,
+            )
+            self.assertFalse(paper_unsoaked["selected_book"]["soak_ready"])
+
+    def test_soak_ready_isolated_per_binding_even_when_trading_statement_exists(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-desk-soak-stmt-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+
+            founding = found(
+                store,
+                FoundingTerms("sourdough-soak", "charter-v1", "paper", "profile-v1"),
+            )
+            company_id = founding.company_id
+            ceo_id = founding.founder_id
+
+            with hold_company_writer(
+                store, company_id, lease_directory=leases
+            ) as writer:
+                book_a = open_company_paper_book(
+                    writer,
+                    account_id="paper-book-a",
+                    book_name="Book A Soaked",
+                    strategy_release_id="rel-a-v1",
+                    starting_minor_units=30_000_000,
+                    exposure_limit_minor_units=15_000_000,
+                )
+                book_b = open_company_paper_book(
+                    writer,
+                    account_id="paper-book-b",
+                    book_name="Book B Unsoaked",
+                    strategy_release_id="rel-b-v1",
+                    starting_minor_units=20_000_000,
+                    exposure_limit_minor_units=10_000_000,
+                )
+                submit_company_paper_book_order(
+                    writer,
+                    binding_id=book_a.binding_id,
+                    actor_id=ceo_id,
+                    action_id="act-a-fill-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=6_600_000,
+                    market_price_minor_units=6_500_000,
+                )
+                # Seed window-level trading_statement (no binding_id/company_id).
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    db.execute(
+                        "INSERT INTO trading_operating_window VALUES ('win-1', '24h', 2000, 'win-rev-1')"
+                    )
+                    db.execute(
+                        """INSERT INTO trading_statement VALUES (
+                               'stmt-1', 'win-1', NULL, '{"nav":30000000}', 'stmt-rev-1'
+                           )"""
+                    )
+
+            with closing(open_reader(store)) as db, read_tx(db):
+                port_a = read_company_paper_book_portfolio_from_db(
+                    db, company_id, book_a.binding_id
+                )
+                port_b = read_company_paper_book_portfolio_from_db(
+                    db, company_id, book_b.binding_id
+                )
+                state_a = read_trading_book_state_from_db(
+                    db, company_id, book_a.binding_id
+                )
+                state_b = read_trading_book_state_from_db(
+                    db, company_id, book_b.binding_id
+                )
+            self.assertIsNotNone(port_a)
+            self.assertIsNotNone(port_b)
+            self.assertIsNotNone(state_a)
+            self.assertIsNotNone(state_b)
+            self.assertTrue(port_a["soak_ready"])
+            self.assertFalse(port_b["soak_ready"])
+            self.assertTrue(state_a["soak_ready"])
+            self.assertFalse(state_b["soak_ready"])
+
+            desk_a, _ = read_trading_desk_projection(
+                store, company_id, environment=ENV_PAPER, book_id=book_a.binding_id
+            )
+            desk_b, _ = read_trading_desk_projection(
+                store, company_id, environment=ENV_PAPER, book_id=book_b.binding_id
+            )
+            self.assertTrue(desk_a["selected_book"]["soak_ready"])
+            self.assertFalse(desk_b["selected_book"]["soak_ready"])
+            self.assertEqual(desk_b["governance"]["soak_ready_books_count"], 1)
+
+    def test_exposure_limit_uses_mark_price_without_markdown_bypass_or_markup_false_reject(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-desk-exp-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms("sourdough-exp", "charter-v1", "paper", "profile-v1"),
+            )
+            company_id = founding.company_id
+            ceo_id = founding.founder_id
+
+            with hold_company_writer(
+                store, company_id, lease_directory=leases
+            ) as writer:
+                # 1. Company paper: mark-down must NOT allow negative other_exposure to bypass limit.
+                paper_down = open_company_paper_book(
+                    writer,
+                    account_id="paper-exp-down",
+                    book_name="Paper Down",
+                    starting_minor_units=10_000,
+                    exposure_limit_minor_units=1_000,
+                    fee_bps=0,
+                    slippage_bps=0,
+                )
+                submit_company_paper_book_order(
+                    writer,
+                    binding_id=paper_down.binding_id,
+                    actor_id=ceo_id,
+                    action_id="p-down-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=4,
+                    limit_minor_units=200,
+                    market_price_minor_units=200,
+                )
+                record_trading_book_valuation(
+                    writer,
+                    binding_id=paper_down.binding_id,
+                    label="Mark down",
+                    mark_prices={"BTC-USDT": 50},
+                )
+                with self.assertRaisesRegex(ExecutionTierRefused, "exposure limit"):
+                    submit_company_paper_book_order(
+                        writer,
+                        binding_id=paper_down.binding_id,
+                        actor_id=ceo_id,
+                        action_id="p-down-2",
+                        instrument_id="BTC-USDT",
+                        side="buy",
+                        quantity=4,
+                        limit_minor_units=150,
+                        market_price_minor_units=150,
+                    )
+
+                # 2. Company paper: mark-up must NOT falsely reject valid order under limit.
+                paper_up = open_company_paper_book(
+                    writer,
+                    account_id="paper-exp-up",
+                    book_name="Paper Up",
+                    starting_minor_units=10_000,
+                    exposure_limit_minor_units=1_000,
+                    fee_bps=0,
+                    slippage_bps=0,
+                )
+                submit_company_paper_book_order(
+                    writer,
+                    binding_id=paper_up.binding_id,
+                    actor_id=ceo_id,
+                    action_id="p-up-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=2,
+                    limit_minor_units=200,
+                    market_price_minor_units=200,
+                )
+                record_trading_book_valuation(
+                    writer,
+                    binding_id=paper_up.binding_id,
+                    label="Mark up",
+                    mark_prices={"BTC-USDT": 350},
+                )
+                # New position: qty=3 at mark=300 -> exposure = 900 <= 1000 (allowed!).
+                ok_up = submit_company_paper_book_order(
+                    writer,
+                    binding_id=paper_up.binding_id,
+                    actor_id=ceo_id,
+                    action_id="p-up-2",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=300,
+                    market_price_minor_units=300,
+                )
+                self.assertEqual(ok_up["status"], "filled")
+
+                # 3. Agent sandbox: mark-down bypass and mark-up non-regression.
+                open_agent_sandbox(
+                    writer,
+                    agent_id=ceo_id,
+                    account_id="sbx-exp-1",
+                    starting_minor_units=10_000,
+                    exposure_limit_minor_units=1_000,
+                    fee_bps=0,
+                    slippage_bps=0,
+                )
+                submit_agent_sandbox_order(
+                    writer,
+                    agent_id=ceo_id,
+                    action_id="sbx-down-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=4,
+                    limit_minor_units=200,
+                    market_price_minor_units=200,
+                )
+                submit_agent_sandbox_order(
+                    writer,
+                    agent_id=ceo_id,
+                    action_id="sbx-down-2",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=50,
+                    market_price_minor_units=50,
+                )
+                with self.assertRaisesRegex(ExecutionTierRefused, "exposure limit"):
+                    submit_agent_sandbox_order(
+                        writer,
+                        agent_id=ceo_id,
+                        action_id="sbx-down-3",
+                        instrument_id="BTC-USDT",
+                        side="buy",
+                        quantity=3,
+                        limit_minor_units=200,
+                        market_price_minor_units=200,
+                    )
+                # Mark-up in sandbox: qty=5, avg=170, current mark=200 -> sell 1 at 200 -> 4*200=800 <= 1000.
+                # Or buy another instrument ETH at 150*2=300 (total 5*50=250 + 300 = 550), mark ETH up to 400 ->
+                # if we buy 1 BTC at 200 (mark was 50 -> 5*50=250, new 6*200=1200 > 1000 rejected; 1*150 -> 6*150=900 <= 1000).
+                ok_sbx = submit_agent_sandbox_order(
+                    writer,
+                    agent_id=ceo_id,
+                    action_id="sbx-up-ok",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=150,
+                    market_price_minor_units=150,
+                )
+                self.assertEqual(ok_sbx.status, "filled")
+
+    def test_explicit_unknown_book_id_does_not_fall_back_to_default_book(self) -> None:
+        with TemporaryDirectory(prefix="sd-desk-missing-book-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms("sourdough-missing", "charter-v1", "paper", "profile-v1"),
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as writer:
+                open_company_paper_book(
+                    writer,
+                    account_id="paper-default-only",
+                    book_name="Default Book",
+                    starting_minor_units=10_000_000,
+                    exposure_limit_minor_units=5_000_000,
+                )
+            proj, _ = read_trading_desk_projection(
+                store,
+                founding.company_id,
+                environment=ENV_PAPER,
+                book_id="does-not-exist",
+            )
+            self.assertIsNone(proj["selected_book"])
+            self.assertIsNone(proj["selected_book_id"])
+            self.assertEqual(proj["kpis"]["portfolio_value"]["status"], "standby")
 
 
 if __name__ == "__main__":

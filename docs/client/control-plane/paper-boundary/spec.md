@@ -1,83 +1,62 @@
-# Swappable paper-only execution boundary
+# 3-tier execution environment boundary
 
-Design draft · Verification **UNRUN** · Responsible component: Paper Execution & Control Plane Boundary (`src/sourdough/paper_execution.py`, `src/sourdough/paper_account.py`, `src/sourdough/paper_sender_lease.py`, `src/sourdough/runtime/venue_coordinator.py`)
+Design draft · Verification **UNRUN** · Responsible component: Trading Domain & Control Plane Boundary (`src/sourdough/storage/schema/v1/trading/`, `src/sourdough/trading/domain.py`, `src/sourdough/trading/accounts.py`, `src/sourdough/trading/ledger.py`, `src/sourdough/trading/migration.py`, `src/sourdough/trading/risk.py`, `src/sourdough/trading/sender_lease.py`, `src/sourdough/trading/venue_coordinator.py`)
 
-[Feature intent](../intent.md) · [Meta and read projections](../projections/spec.md) · [Events and commands](../commands-and-events/spec.md) · [Live trading and paper portfolio](../../inspect/investment-panel/spec.md) · [System map](../../../README.md) · [Development lifecycle](../../../engineering/lifecycle.md)
+[Feature intent](../intent.md) · [Meta and read projections](../projections/spec.md) · [Events and commands](../commands-and-events/spec.md) · [Trading Desk & Strategies](../../inspect/investment-panel/spec.md) · [System map](../../../README.md) · [Development lifecycle](../../../engineering/lifecycle.md)
 
 ## Boundary and dependencies
 
-Define the narrow protocol and control-plane boundary isolating all simulated trading observability and operator controls strictly to `environment == "paper"` behind swappable `PaperDestination` and `PaperExecution` adapters. Zero live-trading commands, endpoints, exchange credentials, or capital-transfer controls exist anywhere in the Client UI or UDS Control Plane.
+Define the unified 3-tier execution environment and control-plane boundary separating Core Company OS (`installed_domains = {'core'}`) from the opt-in **Trading** domain (`installed_domains` `'trading'`, `storage/schema/v1/trading/01..03.sql`), and isolating **Tier 1 `agent_sandbox`**, **Tier 2 `company_paper`**, and **Board-gated Tier 3 `company_live`** inside one unified schema (`execution_environment_binding` + `trading_book_{order,fill,position,valuation}`).
 
-Input contracts: [Live trading and paper portfolio](../../inspect/investment-panel/spec.md) · [Bind the simulated account](../../../company/profiles/quant/trading/paper-account/intent.md) · [Execution environment](../../../company/profiles/quant/trading/execution-environment/intent.md) · [Meta and read projections](../projections/spec.md) · [Events and commands](../commands-and-events/spec.md). These are public service contracts, not imports of client UI packages.
+*(Supersedes the earlier paper-only lock specification: legacy tables `paper_binding`, `paper_order`, `paper_fill`, `paper_valuation`, `paper_risk_state`, `company_paper_*`, and `agent_sandbox_*` are retired and removed.)*
+
+Input contracts: [Trading Desk & Strategies](../../inspect/investment-panel/spec.md) · [Bind the simulated account](../../../company/profiles/quant/trading/paper-account/intent.md) · [Execution environment](../../../company/profiles/quant/trading/execution-environment/intent.md) · [Meta and read projections](../projections/spec.md) · [Events and commands](../commands-and-events/spec.md). These are public service contracts, not imports of client UI packages.
 
 ## Design decision and review
 
-### 1. Hard `environment == "paper"` enforcement (`[V1_SQLITE_NEEDS_UDS]`)
+### 1. Core-only exclusion & opt-in `'trading'` activation
 
-- **SQLite DDL invariant (`storage/schema/v1/paper/01_paper_operations.sql:16`)**: `paper_binding` enforces `environment TEXT NOT NULL CHECK (environment = 'paper')`.
-- **Service validation (`paper_account.py:65-92`)**: `account.environment != "paper"` raises `BindingRefused`; core-only companies without the `paper` domain reject all paper projections and paper commands before accessing paper tables.
-- **Control-plane surface exclusion**: `control-plane-v1` exposes zero endpoints, projection fields, or command types for live-capital accounts, live venue keys, order placement by the board, or external capital deposits/withdrawals. `GET /v1/projections/paper-*` responses carry `"environment": "paper"` explicitly.
+- **Core Company OS isolation**: Founding a company (`found()`) installs `'core'` only (`52` `STRICT` tables in `storage/schema/v1/core/01..08.sql`). Core Python modules contain zero Trading imports, zero `trading_book_*` queries, and zero hardcoded trading/paper assumptions.
+- **Fail-closed control-plane gating**: On core-only stores (`"trading"` not in `active_domains`), `CompanyDaemon` omits all Trading projections and commands from `GET /v1/meta`, returns `404` on `/v1/projections/trading-desk`, `/v1/projections/orders/*`, and `/v1/projections/strategies`, and rejects Trading commands and `execution:*` / `trading_risk_pause` restrictions with HTTP `422`.
+- **Canonical domain key**: `storage/schema.py:canonical_domain_name` normalizes legacy `"paper"` API inputs to `"trading"` while new stores record `"trading"` exclusively.
 
-### 2. Swappable protocol boundary (`PaperDestination` / `PaperExecution`, `[V1_SQLITE_NEEDS_UDS]`)
+### 2. Three-tier isolation via composite `(binding_id, environment)` foreign keys
 
-**Concern for the responsible component:** Swapping from a local fixed-quote simulator to an isolated `nautilus_trader` sandbox or replay engine must not alter projection schemas, command lifecycle semantics, or Two-Layer P&L accounting.
+All three execution tiers persist into the unified `trading_book_{order,fill,position,valuation}` ledger in `storage/schema/v1/trading/01_execution_tiers_and_books.sql` without ever commingling tiers or capital:
 
-- **Protocols (`src/sourdough/paper_execution.py:75-106`)**:
-  - `PaperDestination(AccountObserver, Protocol)`: `observe_account`, `check_order_terms`, `submit`.
-  - `PaperExecution(PaperDestination, Protocol)`: `require_independent_from`, `observe_quote`, `observe_research_quote`, `observe_order_sizing`, `observe_fee_bps`, `read_fills`, `read_cancellation`, `read_order_position`.
-  - **Shared DTOs (`paper_execution.py:10-74`)**: `PaperIntent`, `PaperOrderSizing`, `ReplayAvailability`, `VenueExecution`, `VenueCancellation`, `VenuePosition`, `TerminalOutcome` (`"cancelled" | "rejected" | "denied" | "expired"`).
-  - **Journal independence (`require_separate_journal`, `paper_execution.py:128-134`)**: Venue execution state MUST live in a physically separate journal SQLite store distinct from `company.sqlite`.
-- **Concrete swappable adapters**:
-  1. `FixedQuoteVenue` (`src/sourdough/paper_venue.py`, `connector_revision = "fixed-quote-v1"`): Standalone paper venue journal (`venue_account`, `venue_execution`, `venue_fee_policy`, `venue_fill_fee`), `environment == "paper"`.
-  2. `NautilusPaperVenue` (`src/sourdough/nautilus_paper.py`, backed by `nautilus_trader`):
-     - `CONNECTOR = "nautilus-spot-sandbox-v1"` (`sandbox.sqlite`, virtual `BINANCE-001` sandbox account, `environment == "paper"`).
-     - `REPLAY_CONNECTOR = "nautilus-offline-spot-replay-v1"` (`replay.sqlite`, deterministic replay journal, `environment == "paper"`).
+| Tier | `tier` | `environment` | Scope & SQLite / Service Isolation Invariant |
+| --- | --- | --- | --- |
+| **Tier 1 · Agent Sandbox** | `agent_sandbox` | `agent_sandbox` | Per-Agent virtual sandbox (`CHECK ((tier = 'agent_sandbox') = (owner_agent_id IS NOT NULL))`). Surfaced solely under `/agents/:agentId` (`AgentDetailView` `Trading Sandbox` tab) and `order-trace-v1` (`back_link = /agents/{actor_id}`). Zero writes to company paper/live books or corporate GL trading postings. |
+| **Tier 2 · Company Paper** | `company_paper` | `paper` | Supports `N >= 1` concurrent company paper books (`book_name`, `strategy_release_id`, `book_role IN ('active', 'nominated', 'shadow', 'retired')`, `shadow_of_live_binding_id`), backed by simulated/replay venues (`fixed-quote-v1`, `nautilus-spot-sandbox-v1`, `nautilus-offline-spot-replay-v1`). |
+| **Tier 3 · Company Live** | `company_live` | `live` | At most one `active` `company_live` binding per company. Activates **only** via fail-closed Board promotion (`promote_execution_environment` or `decision_question(kind='live_promotion')` -> `execute_paper_to_live_migration`), requiring passing `venue_qualification_receipt`, soak evidence, clean open orders/external actions, and `trading_live_migration_record.positions_copied = 0`. |
 
-### 3. Sender lease, bounded segments, `15s` quote freshness, `cancel != flat`, and sealed vs. live quote honesty
+Every row in `trading_book_order`, `trading_book_fill`, `trading_book_position`, and `trading_book_valuation` carries `environment TEXT NOT NULL CHECK (environment IN ('agent_sandbox', 'paper', 'live'))` and composite `FOREIGN KEY (binding_id, environment) REFERENCES execution_environment_binding(binding_id, environment)`, enforcing strict tier-to-environment isolation at the SQLite kernel level.
 
-- **Single-sender lock (`src/sourdough/paper_sender_lease.py:13-48`, `[V1_SQLITE_NEEDS_UDS]`)**:
-  - `hold_sender_lease(journal)` opens `journal.with_suffix(".writer-lock")` (e.g., `sandbox.writer-lock` for `sandbox.sqlite`; `0o600`, `O_NOFOLLOW`), pins `journal_key(journal)` `(st_dev, st_ino)`, and acquires non-blocking `fcntl.flock(LOCK_EX | LOCK_NB)`.
-  - `verify_sender_lease` / `verify_worker_sender` re-verify `(st_dev, st_ino)` and the lock before worker dispatch (`nautilus_runtime.py:189,215`) and before restore settlement (`paper_restore.py:93,101,113`). `GET /v1/projections/paper-execution` exposes read-only lock status (`locked`, `lock_path`, `journal_key`) without granting write access.
-- **Bounded venue segments (`src/sourdough/runtime/venue_coordinator.py:9-102`, `[V1_SQLITE_NEEDS_UDS]` + `[BACKEND_GAP #8]`)**:
-  - `VenueSegmentPolicy` bounds `MIN_SEGMENT_SECONDS = 8`, `MAX_SEGMENT_SECONDS = 600`, `DRAIN_MARGIN_SECONDS = 5` (`drain_margin_seconds < segment_seconds`), yielding `work_seconds = active_seconds - drain_margin_seconds`.
-  - `BoundedVenueCoordinator` verifies `venue.require_independent_from(store)` and partitions operating windows via `plan_segments(total_seconds)` (as a stateless planner without a `WriterLease` or SQLite connection); the owning `CompanyRuntime` / `paper_account` / `paper_window` `write_tx` coordinator emits `paper.venue_segment_planned` / `paper.venue_segment_rotated` (`[BACKEND_GAP #8]`) under `WriterLease` for `/performance` and `/system/daemon`.
-- **Server-side quote freshness (`QUOTE_MAX_AGE_NS = 15 * 10**9`, `nautilus_paper.py:33,646`, `paper_resume.py:73-113`, `[LIVE_UDS]`)**:
-  - `read_current_risk_cut()` computes `expires_ns = min(event_ns, exchange_trade_ns) + 15_000_000_000`. `POST /v1/commands` (`resume_new_risk`) checks `cut.observed_ns <= time_ns() <= cut.expires_ns` in Phase 2 (`BEGIN IMMEDIATE`) and fails closed (`400`) on expiry without altering `paper_risk_state.suspended = 1`.
-- **Sealed `paper_valuation` snapshots vs. missing live quote stream (`[V1_SQLITE_NEEDS_UDS]` vs. `[BACKEND_GAP #5]`)**:
-  - In `origin/main` (`6694fa9`), `paper_valuation.py:181-264` captures `trading_nav_atoms` only at discrete sealed operating-window slots or explicit `capture_paper_valuation()` calls. There is **no continuous live market quote or intraday unrealized mark-to-market stream** in `CompanyDaemon` (`BACKEND_GAP #5`).
-  - Projections (`company-overview-v1`, `paper-fund-v1`, `paper-statements-v1`) MUST surface `valuation_source` (`"sealed_window" | "on_demand" | "live_quote" | null`) and `live_quote_age_ns` (`null` when absent), and the Client MUST render `"No live market tick"` / `"Unavailable"` rather than fabricating intraday unrealized P&L or `$0.00`.
-- **`cancel != flat` accounting invariant (`work_projection.py:218-232`, `paper_books.py`, `[LIVE_UDS]` / `[V1_SQLITE_NEEDS_UDS]`)**:
-  - When a `VenueCancellation(filled_quantity > 0, outcome="cancelled")` settles, `paper_cancellation` releases only `open_reservation_minor_units = 0` for the cancelled unfilled remainder while `booked_position` continues summing cumulative `paper_fill` quantities (`ordered - cancelled_remainder > 0`). Projections MUST expose `status = "cancelled"`, `open_reservation_minor_units = 0`, and `booked_position > 0` distinctly.
+### 3. Swappable venue adapters, `sender_lease`, `IndependentProcessGuard` & `15s` risk guard
 
-### 4. `change_paper_binding` drain preconditions and runtime configuration/start (`[V1_SQLITE_NEEDS_UDS]` + `[BACKEND_GAP #7]`)
-
-- **`change_paper_binding` (`paper_account.py:270-369`, `[V1_SQLITE_NEEDS_UDS]` + `[BACKEND_GAP #7]` UDS command)**:
-  1. Enforces distinct `revision`, `account_id`, and `destination_id` under matching `charter_revision`; `_require_new_identity` forbids reselecting retired bindings, accounts, or destinations.
-  2. Refuses with `BindingRefused` if `_has_unsubmitted_buy` is true (`"Finish the original buy decision before changeover"`).
-  3. Inserts a pending row into `paper_binding_change` (`effective_at_ns = NULL`), which fences new `paper_order` admissions (`paper_order.py:104-105`), `resume_new_risk` (`paper_resume.py:39-41`), and `activate_strategy_release` (`strategy_comparison.py:1763-1766`).
-  4. Evaluates `_open_effect(connection, current)` (`paper_order.reserved_minor_units != 0 OR duty.state = 'running'`): if open, keeps `effective_at_ns = NULL` and sets `blocked_by = "outstanding-company-effect"`.
-  5. Evaluates `current_destination.observe_drained_account(...)` and `next_destination.observe_drained_account(...)`: if either is `None`, sets `blocked_by = "unverified-flat-destination"`.
-  6. Only when both drain checks pass does it atomically replace `paper_binding` (`environment = 'paper'`) and populate `effective_at_ns`.
-- **`configure_paper_runtime` / `start_paper_runtime` (`[BACKEND_GAP #7]` under `environment == "paper"`)**:
-  - Optional explicitly authorized `POST /v1/commands` operations (`paper-runtime-command-v1`) enabling an operator to configure or start the paper-trading runtime (`nautilus_runtime.py`) when the `paper` profile is installed.
-  - Validation, adapter journal setup, and any connector handles remain strictly inside `nautilus_runtime.py` / `PaperExecution`; UDS commands and projections expose only handle identifiers, readiness (`ready | blocked | unknown`), and `blocked_by` statuses—never secret values or live credentials. Company operation never requires the Client UI to configure or run the paper runtime.
+- **Swappable execution adapters (`src/sourdough/trading/venue.py`, `nautilus_paper.py`)**: Simulated (`fixed-quote-v1`, `nautilus-spot-sandbox-v1`, `nautilus-offline-spot-replay-v1`) and qualified external (`external_test` / `live`) venues share the same `trading_book_*` ledger, order-admission, reconciliation, and `order-trace-v1` contracts while keeping venue journals physically separate from `company.sqlite` (`IndependentProcessGuard`: `require_independent_from(store)`).
+- **Single-sender lock (`src/sourdough/trading/sender_lease.py:13-48`)**: `hold_sender_lease(journal)` / `verify_sender_lease` locks `journal.with_suffix(".writer-lock")` (`0o600`, `O_NOFOLLOW`, `fcntl.flock(LOCK_EX | LOCK_NB)`) keyed by `(st_dev, st_ino)` before worker dispatch and restore settlement.
+- **Bounded venue segments (`src/sourdough/trading/venue_coordinator.py`)**: Partitions managed paper operating windows (`8..600s` segments, `5s` drain margin) without holding `WriterLease`.
+- **Scoped risk gating & `15s` quote freshness (`src/sourdough/trading/risk.py`)**: `TradingRestrictionGuard` gates `execution:all`, `execution:paper`, and `execution:live` (`cause_category = 'trading_risk_pause'`) via core `restriction-command-v1`, verifying zero open `trading_book_order` rows, zero unresolved `external_actions` for `live`, and `<= 15s` quote freshness (`QUOTE_FRESHNESS_MAX_NS = 15 * 10**9`) inside `BEGIN IMMEDIATE` on resume.
+- **`cancel != flat` & missing-coverage honesty**: Partial-fill remainder cancellations release unfilled reservation (`open_reservation_minor_units = 0`) while retaining open `trading_book_position` quantity (`ordered - cancelled_remainder > 0`). Missing close/cost figures serialize as JSON `null` (`"Unavailable"` / `"No reading"`), never `$0.00`.
 
 ## Functional and quality requirements
 
-- **FR.** Enforce `environment == "paper"` in SQLite DDL, runtime binding validation, `/v1/projections/paper-*`, and `/v1/commands`; never expose live-trading routes, commands, or credentials.
-- **FR.** Keep `GET /v1/projections/paper-execution`, `paper-fund`, `paper-statements`, and `change_paper_binding` coupled solely to `PaperDestination` / `PaperExecution` DTOs, `paper_sender_lease`, `BoundedVenueCoordinator`, and `paper_binding_change` drain blockers (`outstanding-company-effect`, `unverified-flat-destination`), and explicitly separate discrete sealed `paper_valuation` snapshots (`V1_SQLITE_NEEDS_UDS`) from absent live quote streams (`BACKEND_GAP #5`).
-- **NFR.** Preserve `cancel != flat` open positions after partial-fill remainder cancellations, enforce `QUOTE_MAX_AGE_NS = 15s` strictly server-side, and keep swapping between `FixedQuoteVenue`, `nautilus-spot-sandbox-v1`, and `nautilus-offline-spot-replay-v1` transparent to UI schemas.
+- **FR.** Enforce strict Core Company OS exclusion (`404` projections / `422` commands when `"trading"` is absent) and strict composite `(binding_id, environment)` isolation across `agent_sandbox`, `paper`, and `live` in SQLite and `trading-desk-v1`.
+- **FR.** Enforce Board-gated `company_live` promotion (`venue_qualification_receipt`, soak evidence, clean open orders/external actions, `positions_copied = 0`, `environment_promotion_record.action IN ('promote_live', 'suspend_live', 'demote_to_paper')`), keeping `agent_sandbox` and `company_paper` active in parallel.
+- **NFR.** Preserve `cancel != flat` accounting, `sender_lease` `.writer-lock` process isolation, `TradingRestrictionGuard` `<= 15s` server-side quote freshness, and zero client-side P&L fabrication.
 
 ## Acceptance and independent evidence
 
 | Case | Setup, action and expected observation |
 | --- | --- |
-| Adapter swap transparency | Run equivalent order/fill/statement cycles under `fixed-quote-v1` and `nautilus-spot-sandbox-v1`. Confirm `/v1/projections/paper-fund` and `/v1/projections/paper-statements` preserve identical DTO schemas while only `/v1/projections/paper-execution` reflects the swapped `connector_revision`. |
-| Drain blockers on `change_paper_binding` | Submit `change_paper_binding` while an open reservation or unverified destination balance exists. Confirm `effective_at_ns` stays `null`, `blocked_by` surfaces `"outstanding-company-effect"` or `"unverified-flat-destination"`, and new orders/resume stay fenced. |
-| Sealed valuation vs. missing live tick & core-only exclusion | Query `/v1/projections/paper-fund` / `/v1/projections/paper-statements` without `BACKEND_GAP #5` live streaming -> confirm `valuation_source = "sealed_window"` and `live_quote_age_ns = null` (rendered `"No live market tick"` / `"Unavailable"`). Query `/v1/projections/paper-execution` or submit `change_paper_binding` on a core-only store without `paper` domain -> confirm fail-closed `404` / `422` without accessing paper tables. |
+| Core-only exclusion | Query `/v1/projections/trading-desk?environment=live` or submit `promote_execution_environment` / `pause_company` (`scope_ref="execution:paper"`) on a store with `installed_domains = {'core'}`. Confirm `404` / `422` before any Trading table access. |
+| Composite `(binding_id, environment)` FK isolation | Attempt to insert a `paper` `trading_book_order` against a `live` or `agent_sandbox` `binding_id`. Confirm SQLite FK rejection. |
+| Zero position copy & `promote_live` | Promote a soaked `company_paper` book to `company_live` via `live_promotion` -> verify `trading_live_migration_record.positions_copied == 0`, Live starts flat at `0.0%`, `environment_promotion_record.action == "promote_live"`, and source paper book transitions cleanly to `shadow` or `retired`. |
+| `TradingRestrictionGuard` `15s` cut | Attempt `resume_company` on `execution:live` with an open order, unresolved external action, or `> 15s` stale quote -> confirm fail-closed refusal keeping the restriction active. |
 
-**Oracle:** Inspect `src/sourdough/paper_execution.py`, `src/sourdough/paper_account.py`, `src/sourdough/paper_valuation.py`, `src/sourdough/paper_sender_lease.py`, `src/sourdough/runtime/venue_coordinator.py`, `src/sourdough/paper_venue.py`, `src/sourdough/nautilus_paper.py`, and `src/sourdough/storage/schema/v1/paper/01_paper_operations.sql`.
+**Oracle:** Inspect `src/sourdough/storage/schema/v1/trading/01_execution_tiers_and_books.sql`, `src/sourdough/trading/{domain,accounts,ledger,migration,risk,sender_lease,venue_coordinator,plugin}.py`, and `src/sourdough/ipc/server.py`.
 
 ## Operations and change review
 
-Adding any new simulated venue adapter MUST implement `PaperExecution`, enforce `require_separate_journal` and `environment == "paper"`, and acquire `hold_sender_lease` before dispatch.
+All Trading tables live under `storage/schema/v1/trading/` and are installed only via `enable_domain_v1(conn, "trading")`. Legacy pre-cleanup stores must run `sourdough migrate-store` (`migrate_v1_store_to_canonical`) atomically before opening.

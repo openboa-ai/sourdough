@@ -7,10 +7,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found, reopen
-from sourdough.first_duty import (
-    DutyRefused,
-    claim_first_duty,
-    require_historical_claim,
+from sourdough.duty_run import DutyRefused
+from sourdough.trading.duty import (
+    claim_paper_first_duty as claim_first_duty,
+    require_historical_paper_claim as require_historical_claim,
     require_paper_authority,
 )
 

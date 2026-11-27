@@ -1,6 +1,6 @@
 # Board Client 3-Tier Execution Accounts & Live Promotion UI (`flow-tier-ui`)
 
-Status: Accepted specification · Target branch: `feat/flow-tier-ui` · Owner: Board Client SPA (`apps/client/`) and IPC projections.
+Status: **Superseded** by [flow-modular-ia](../flow-modular-ia/spec.md) and [flow-core-domain-cleanup](../flow-core-domain-cleanup/spec.md) · Original branch: `feat/flow-tier-ui` · Note: `ExecutionTiersView.tsx`, `/company/execution-tiers`, `/v1/projections/execution-tiers`, and `LiveTradingView.tsx` were removed and consolidated onto `TradingDeskView` (`/`, `/trading/live`, `/trading/paper`) and `trading-desk-v1`.
 
 ## 1. Intent
 

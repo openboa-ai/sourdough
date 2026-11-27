@@ -10,13 +10,16 @@ requires-python = ">=3.14"
 [project.scripts]
 sourdough = "sourdough.cli:main"
 
+[project.entry-points."sourdough.domains"]
+trading = "sourdough.trading.plugin:TradingDomainPlugin"
+
 [tool.setuptools.package-data]
 sourdough = [
     "nautilus-macos-arm64.lock",
     "storage/schema/v1/core/*.sql",
-    "storage/schema/v1/paper/*.sql",
+    "storage/schema/v1/trading/*.sql",
 ]
 "sourdough.storage" = [
     "schema/v1/core/*.sql",
-    "schema/v1/paper/*.sql",
+    "schema/v1/trading/*.sql",
 ]

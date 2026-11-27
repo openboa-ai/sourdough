@@ -1,3 +1,5 @@
+"""Connected Flow 06: Core OS assessment, staffing, onboarding, and SIGKILL recovery."""
+
 import json
 import signal
 import sqlite3
@@ -38,43 +40,19 @@ elif operation == "staffing_duty":
         "role": "reviewer", "execution_profile": need["profile"], "scope": need["scope"],
         "turns": 3,
     })
-elif operation in ("assessment_duty", "hired_research_duty"):
+elif operation == "assessment_duty":
     first = invoke("read_first_duty", {})
     invoke("accept_first_duty", {"revision": first["revision"], "rationale": first["assignment_summary"]})
-    if operation == "assessment_duty":
-        inputs = invoke("read_assessment_inputs", {})
-        invoke("save_private_draft", {
-            "name": "private-research", "content": "Private comparison notes.",
-            "expected_revision": "",
-        })
-        result = invoke("publish_assessment", {
-            "source_revision": inputs["revision"], "record_id": "record",
-            "disposition": "recommend_change", "rationale": "Observed six rather than eight.",
-            "next_check_seconds": 60,
-        })
-    elif first.get("saved_buy"):
-        decision = first["saved_buy"]
-        result = invoke("request_research_order", {"decision_id": decision["decision_id"]})
-    else:
-        inputs = invoke("read_research_inputs", {})
-        start, end = inputs["observations"]
-        gross = end["price_minor_units"] - start["price_minor_units"]
-        fees = sum((record["price_minor_units"] * inputs["fee_bps"] + 5000) // 10000 for record in (start, end))
-        finding = invoke("publish_research_finding", {
-            "snapshot_revision": inputs["revision"], "hypothesis": "Compare available fixture prices.",
-            "start_id": start["observation_id"], "end_id": end["observation_id"],
-            "gross_change_minor_units": gross, "round_trip_fee_minor_units": fees,
-            "net_change_minor_units": gross - fees, "uncertainty": "Only an execution fixture.",
-        })
-        decision = invoke("record_research_decision", {
-            "finding_id": finding["finding_id"], "finding_revision": finding["revision"],
-            "call_id": "fixture-research", "action": "buy", "quantity": 1, "limit_minor_units": 5000,
-            "rationale": "Use the measured positive change for one bounded synthetic order.", "next_check_seconds": 60,
-        })
-        result = (
-            invoke("request_research_order", {"decision_id": decision["decision_id"]})
-            if submit_request else decision
-        )
+    inputs = invoke("read_assessment_inputs", {})
+    invoke("save_private_draft", {
+        "name": "private-research", "content": "Private comparison notes.",
+        "expected_revision": "",
+    })
+    result = invoke("publish_assessment", {
+        "source_revision": inputs["revision"], "record_id": "record",
+        "disposition": "recommend_change", "rationale": "Observed six rather than eight.",
+        "next_check_seconds": 60,
+    })
 elif operation == "assessment_review":
     tools = [tool["name"] for tool in request["harness"]["tools"]]
     assert tools == ["save_private_draft", "read_work_result", "record_review_decision"]
@@ -85,67 +63,22 @@ elif operation == "assessment_review":
         "observation_revision": prior["revision"], "action": "hold", "next_check_seconds": 300,
         "rationale": "Check the original result: " + str(prior["revision"]),
     })
-elif operation == "review_duty":
-    with socket.socket(socket.AF_UNIX) as client:
-        client.connect(request["read_endpoint"])
-        with client.makefile() as stream:
-            prior = json.load(stream)
-    result = {
-        "tool": "record_review_decision", "observation_revision": prior["revision"],
-        "call_id": "fixture-review", "action": "hold", "next_check_seconds": 300,
-        "rationale": "Check the original result: " + str(prior["revision"]),
-    }
 else:
     raise RuntimeError(operation)
 print(json.dumps(result))
 """
 
 WORKER = """
-import os, signal, sqlite3, sys
-from contextlib import closing
+import os, signal, sys
 from pathlib import Path
 from time import time
-from sourdough import assessment_run, cli, company_assessment, hired_paper_run, onboarding
-from sourdough import paper_research, staffing_tools
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough import assessment_run, cli, company_assessment, onboarding, staffing_tools
 marker = Path(sys.argv.pop(1))
 fault_site = sys.argv.pop(1)
 def interrupted():
     if not marker.exists():
         marker.touch()
         os.kill(os.getpid(), signal.SIGKILL)
-class WithheldFill(FixedQuoteVenue):
-    failed_history = False
-    failed_sync = False
-
-    def submit(self, *args):
-        result = super().submit(*args)
-        if fault_site in ("after_fill", "after_fill_with_lookup_timeout"):
-            interrupted()
-        if fault_site == "lost_reply":
-            marker.touch()
-            raise TimeoutError("Destination committed the original order without a reply")
-        return result
-
-    def observe_execution(self, order_id):
-        if fault_site in ("after_fill_with_lookup_timeout", "lost_reply") and not self.failed_history:
-            self.failed_history = True
-            raise TimeoutError("One missed history response")
-        return super().observe_execution(order_id)
-
-    def sync_account_execution(self, account_id, order_id):
-        if fault_site in ("after_fill_with_lookup_timeout", "lost_reply") and not self.failed_sync:
-            self.failed_sync = True
-            raise TimeoutError("One missed account-sync response")
-        return super().sync_account_execution(account_id, order_id)
-
-apply_order = hired_paper_run._apply_paper_order
-def withheld_order(store, claim, intent, venue, writer):
-    if fault_site == "before_send":
-        with closing(sqlite3.connect(venue.journal)) as db:
-            assert db.execute("SELECT count(*) FROM venue_execution").fetchone() == (0,)
-        interrupted()
-    return apply_order(store, claim, intent, venue, writer)
 publish = company_assessment.publish_assessment
 def withheld_assessment(*args, **kwargs):
     result = publish(*args, **kwargs)
@@ -163,22 +96,12 @@ def withheld_choice(*args, **kwargs):
     if fault_site == "after_staffing_choice":
         interrupted()
     return result
-research = paper_research.ResearchTools.invoke
-def withheld_research(tools, name, *args, **kwargs):
-    result = research(tools, name, *args, **kwargs)
-    if name == "record_research_decision" and fault_site == "after_research_decision":
-        interrupted()
-    return result
 def environment_clock():
     return time() + (121 if marker.exists() else 0)
 assessment_run.time = environment_clock
-hired_paper_run.time = environment_clock
-hired_paper_run._apply_paper_order = withheld_order
-cli.FixedQuoteVenue = WithheldFill
 company_assessment.publish_assessment = withheld_assessment
 onboarding.accept_first_duty = withheld_acceptance
 staffing_tools.record_choice = withheld_choice
-paper_research.ResearchTools.invoke = withheld_research
 raise SystemExit(cli.main())
 """
 
@@ -215,31 +138,18 @@ def rows(store, sql, parameters=()):
 
 class ConnectedFlow(unittest.TestCase):
     def test_end_to_end(self):
-        for scope, submit_request, fault_site in (
-            ("assessment", True, "after_publication"),
-            ("assessment", True, "after_acceptance"),
-            ("assessment", True, "after_staffing_choice"),
-            ("paper", True, "after_fill"),
-            ("paper", True, "after_acceptance"),
-            ("paper", True, "after_research_decision"),
-            ("paper", True, "after_fill_with_lookup_timeout"),
-            ("paper", True, "lost_reply"),
-            ("paper", True, "before_send"),
-            ("paper", False, "none"),
+        for fault_site in (
+            "after_publication",
+            "after_acceptance",
+            "after_staffing_choice",
         ):
             with (
-                self.subTest(scope=scope, fault_site=fault_site),
+                self.subTest(fault_site=fault_site),
                 TemporaryDirectory() as local,
             ):
                 root = Path(local)
-                employee, store, venue = (
-                    root / name
-                    for name in ("employee", "company.sqlite", "venue.sqlite")
-                )
-                employee.write_text(
-                    f"#!{sys.executable}\nsubmit_request = {submit_request!r}\n"
-                    + EMPLOYEE
-                )
+                employee, store = root / "employee", root / "company.sqlite"
+                employee.write_text(f"#!{sys.executable}\n" + EMPLOYEE)
                 employee.chmod(0o700)
                 profile = cli("employee-profile", employee)["execution_profile"]
                 founded = cli(
@@ -263,7 +173,7 @@ class ConnectedFlow(unittest.TestCase):
                             "authority": {
                                 "manager_grant_id": founded["grant_id"],
                                 "execution_profile": profile,
-                                "allowed_scope": scope,
+                                "allowed_scope": "assessment",
                                 "slots": 1,
                                 "turns": 5,
                             },
@@ -279,67 +189,23 @@ class ConnectedFlow(unittest.TestCase):
                     )
                 )
                 cli("stage-staffing", store, envelope, *identity)
-                if scope == "assessment":
-                    source.write_text(
-                        json.dumps(
-                            [
-                                {
-                                    "record_id": "record",
-                                    "subject": "Reviewed documents",
-                                    "recorded": 8,
-                                    "observed": 6,
-                                    "available_at": now,
-                                }
-                            ]
-                        )
+                source.write_text(
+                    json.dumps(
+                        [
+                            {
+                                "record_id": "record",
+                                "subject": "Reviewed documents",
+                                "recorded": 8,
+                                "observed": 6,
+                                "available_at": now,
+                            }
+                        ]
                     )
-                    cli("stage-assessment-source", store, source, *identity)
-                    entry = ("supervise-assessment", str(store))
-                else:
-                    cli(
-                        "bind-paper",
-                        store,
-                        venue,
-                        *identity,
-                        "--charter-revision",
-                        "synthetic",
-                        "--revision",
-                        "mandate",
-                        "--account-id",
-                        "test",
-                        "--rules",
-                        "fixture",
-                        "--starting-minor-units",
-                        50000,
-                        "--exposure-minor-units",
-                        25000,
-                        "--quote-minor-units",
-                        5000,
-                        "--fee-bps",
-                        4,
-                    )
-                    source.write_text(
-                        json.dumps(
-                            [
-                                {
-                                    "observation_id": label,
-                                    "price_minor_units": price,
-                                    "observed_at": now + offset,
-                                    "available_at": now + offset + 5,
-                                }
-                                for label, price, offset in (
-                                    ("first", 4800, -120),
-                                    ("last", 5000, -60),
-                                )
-                            ]
-                        )
-                    )
-                    cli("stage-paper-observations", store, source, *identity)
-                    entry = ("supervise-hired-paper", str(store), str(venue))
+                )
+                cli("stage-assessment-source", store, source, *identity)
                 extra_run = fault_site in (
                     "after_acceptance",
                     "after_staffing_choice",
-                    "after_research_decision",
                 )
                 response = subprocess.run(
                     [
@@ -350,15 +216,13 @@ class ConnectedFlow(unittest.TestCase):
                         WORKER,
                         str(root / "cut"),
                         fault_site,
-                        *entry,
+                        "supervise-assessment",
+                        str(store),
                         *identity,
                         "--employee",
                         str(employee),
                         "--idle-seconds",
-                        "6"
-                        if fault_site
-                        in ("after_fill_with_lookup_timeout", "lost_reply")
-                        else "2",
+                        "2",
                         "--turn-budget",
                         "4" if extra_run else "3",
                         "--max-restarts",
@@ -372,32 +236,9 @@ class ConnectedFlow(unittest.TestCase):
                 result, supervisor = [
                     json.loads(line) for line in response.stdout.splitlines()
                 ]
-                if not submit_request:
-                    self.assertEqual(len(supervisor["attempts"]), 1)
-                    self.assertEqual(result["research"]["decision"]["action"], "buy")
-                    self.assertIsNone(result["review"])
-                    self.assertEqual(
-                        rows(venue, "SELECT count(*) FROM venue_execution"), [(0,)]
-                    )
-                    continue
-                if fault_site == "lost_reply":
-                    [worker] = supervisor["attempts"]
-                    self.assertEqual(worker["returncode"], 0)
-                    [recovered] = result["reconciliation"]["recovered"]
-                    self.assertEqual(result["reconciliation"]["unresolved"], 0)
-                    self.assertEqual(
-                        rows(venue, "SELECT order_id,fill_id FROM venue_execution"),
-                        [
-                            (
-                                recovered["posting"]["order_id"],
-                                recovered["posting"]["fill_id"],
-                            )
-                        ],
-                    )
-                else:
-                    original, resumed = supervisor["attempts"]
-                    self.assertEqual(original["returncode"], -signal.SIGKILL)
-                    self.assertLess(original["exited_at_ns"], resumed["ready_at_ns"])
+                original, resumed = supervisor["attempts"]
+                self.assertEqual(original["returncode"], -signal.SIGKILL)
+                self.assertLess(original["exited_at_ns"], resumed["ready_at_ns"])
                 claim = result["review"]["claim"]
                 ((agent_id, first_duty),) = rows(
                     store,
@@ -441,45 +282,14 @@ class ConnectedFlow(unittest.TestCase):
                         ),
                         [(1, 0)],
                     )
-                if scope == "assessment":
-                    self.assertEqual(
-                        rows(store, "SELECT count(*) FROM assessment_publication"),
-                        [(1,)],
-                    )
-                    self.assertFalse(venue.exists())
-                else:
-                    self.assertEqual(
-                        rows(
-                            store, "SELECT count(*) FROM hired_research_order_request"
-                        ),
-                        [(1,)],
-                    )
-                    self.assertEqual(
-                        rows(store, "SELECT count(*) FROM paper_fill"), [(1,)]
-                    )
-                    self.assertEqual(
-                        rows(venue, "SELECT count(*) FROM venue_execution"), [(1,)]
-                    )
-                    if fault_site == "after_research_decision":
-                        self.assertEqual(
-                            rows(
-                                store,
-                                """SELECT decision.run_id!=authorized.run_id, origin.is_current
-                                   FROM paper_research_decision decision
-                                   JOIN duty_run origin ON origin.run_id=decision.run_id
-                                   JOIN hired_research_order_request authorized
-                                     ON authorized.decision_id=decision.decision_id
-                                   JOIN paper_order admitted ON admitted.action_id=decision.decision_id
-                                     AND admitted.run_id=authorized.run_id""",
-                            ),
-                            [(1, 0)],
-                        )
-                    if fault_site == "after_fill_with_lookup_timeout":
-                        self.assertEqual(
-                            rows(
-                                store,
-                                "SELECT attempts, next_query_at, sources FROM paper_reconciliation",
-                            ),
-                            [(2, None, "history,account_sync")],
-                        )
-                        self.assertEqual(result["reconciliation"]["unresolved"], 0)
+                self.assertEqual(
+                    rows(store, "SELECT count(*) FROM assessment_publication"),
+                    [(1,)],
+                )
+                self.assertEqual(
+                    rows(
+                        store,
+                        "SELECT domain FROM installed_domains ORDER BY domain",
+                    ),
+                    [("core",)],
+                )

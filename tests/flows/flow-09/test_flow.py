@@ -8,19 +8,18 @@ from tempfile import TemporaryDirectory
 from time import time_ns
 
 from sourdough.company import FoundingTerms, found
-from sourdough.fund_returns import ReturnScope, measure
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_funding import (
+from sourdough.runtime.registry import DutyContext, DutyRegistry
+from sourdough.runtime.work_kernel import WorkItem, WorkRun
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.fund_returns import ReturnScope, measure
+from sourdough.trading.funding import (
     FUNDING_INTERVAL_NS,
     FundingChart,
     FundingRateEvidence,
     MarkPriceEvidence,
     book_funding_settlement,
 )
-from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.runtime.registry import DutyContext, DutyRegistry
-from sourdough.runtime.work_kernel import WorkItem, WorkRun
-from sourdough.strategy_comparison import (
+from sourdough.trading.strategy_comparison import (
     CHALLENGER_EVAL_DUTY_KIND,
     AnalysisPlan,
     ArmObservation,
@@ -90,20 +89,24 @@ class ConnectedFlow(unittest.TestCase):
             )
             company_id = receipt.company_id
             author_id = receipt.founder_id
-            venue = FixedQuoteVenue(root / "live-venue.sqlite")
-            account = venue.provision(
-                PaperAccount("acct-main", "fixture", "rules", "USDT", 100_000, "paper"),
-                100,
-            )
-            bind(
-                store,
-                PaperMandate(
-                    "binding-paper-1", company_id, "charter-1", account, 50_000
-                ),
-                venue,
-            )
+            with hold_company_writer(
+                store, company_id, lease_directory=leases
+            ) as writer:
+                register_company_paper_tier(
+                    writer,
+                    account_id="acct-main",
+                    destination_id="fixture-dest",
+                    connector_revision="fixture",
+                    instrument_rules_digest="rules",
+                    currency="USDT",
+                    starting_minor_units=100_000,
+                    exposure_limit_minor_units=50_000,
+                    fee_bps=0,
+                    slippage_bps=0,
+                    binding_revision="binding-paper-1",
+                )
 
-            # 1. Book deterministic 8h perpetual funding into core GL + paper_funding_settlement.
+            # 1. Book deterministic 8h perpetual funding into core GL + trading_funding_settlement.
             chart = FundingChart(
                 "funding-v1",
                 "USDT",

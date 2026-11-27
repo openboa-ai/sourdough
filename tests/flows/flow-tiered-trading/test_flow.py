@@ -13,22 +13,22 @@ from sourdough.board_control import (
     bind_board_principal,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
+from sourdough.ipc import CompanyDaemon, ControlPlaneClient
+from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
+from sourdough.trading.accounts import (
+    record_venue_qualification_receipt,
+    register_company_paper_tier,
+    register_live_candidate_binding,
+)
+from sourdough.trading.commands import (
     DEMOTE_LIVE_ENVIRONMENT,
-    ENV_EXTERNAL_TEST,
     EXECUTION_TIER_COMMAND,
     PROMOTE_EXECUTION_ENVIRONMENT,
-    AgentSandboxTools,
-    build_promotion_payload_hash,
-    compute_trading_core_digest,
-    record_venue_qualification_receipt,
-    register_live_candidate_binding,
-    sync_company_paper_from_legacy_binding,
 )
-from sourdough.ipc import CompanyDaemon, ControlPlaneClient
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
+from sourdough.trading.migration import build_promotion_payload_hash
+from sourdough.trading.domain import ENV_EXTERNAL_TEST, compute_trading_core_digest
+from sourdough.trading.ledger import record_trading_book_valuation
+from sourdough.trading.sandbox_tools import AgentSandboxTools
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -39,7 +39,6 @@ class ConnectedFlow(unittest.TestCase):
             store = root / "c.sqlite"
             leases = root / "l"
             sock_dir = root / "s"
-            venue = FixedQuoteVenue(root / "v.sqlite")
 
             founding = found(
                 store,
@@ -69,41 +68,25 @@ class ConnectedFlow(unittest.TestCase):
                     writer, principal_id="board-viewer", role_name=BOARD_VIEWER_ROLE
                 )
 
-                paper_acct = venue.provision(
-                    PaperAccount(
-                        account_id="company-paper-us01",
-                        connector_revision="fixed-quote-v1",
-                        instrument_rules_digest="btc-usdt-spot-v1",
-                        currency="USD",
-                        starting_minor_units=100_000_000,
-                        environment="paper",
-                        destination_id="",
-                    ),
-                    quote_minor_units=6_500_000,
+                paper_binding = register_company_paper_tier(
+                    writer,
+                    account_id="company-paper-us01",
+                    destination_id="fixture-dest",
+                    connector_revision="fixed-quote-v1",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    currency="USD",
+                    starting_minor_units=100_000_000,
+                    exposure_limit_minor_units=50_000_000,
                     fee_bps=4,
+                    slippage_bps=2,
+                    binding_revision="mandate-paper-v1",
                 )
-                bind(
-                    store,
-                    PaperMandate(
-                        revision="mandate-paper-v1",
-                        company_id=company_id,
-                        charter_revision="charter-v1",
-                        account=paper_acct,
-                        exposure_limit_minor_units=50_000_000,
-                    ),
-                    venue,
+                record_trading_book_valuation(
+                    writer,
+                    binding_id=paper_binding.binding_id,
+                    label="SoakCut1",
+                    mark_prices={},
                 )
-                sync_company_paper_from_legacy_binding(
-                    writer, fee_bps=4, slippage_bps=2
-                )
-                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
-                    db.execute(
-                        """INSERT INTO paper_valuation (
-                               capture_id, binding_revision, policy, evidence,
-                               trading_nav_atoms, revision
-                           ) VALUES ('v-soak-1', 'mandate-paper-v1', 'mid',
-                                     '{"label":"SoakCut1"}', 100450000, 'vrev-soak-1')"""
-                    )
 
                 # 2. Both agents independently run personal Tier 1 paper sandboxes via Outer Broker.
                 founder_tools = AgentSandboxTools(writer=writer, agent_id=founder_id)
@@ -185,19 +168,31 @@ class ConnectedFlow(unittest.TestCase):
             ) as daemon:
                 client = ControlPlaneClient(daemon.socket_path)
                 meta = client.meta(principal="board-chair")
-                self.assertIn("execution-tiers-v1", meta["supported_projections"])
+                self.assertNotIn("execution-tiers-v1", meta["supported_projections"])
+                self.assertNotIn("live-trading-v1", meta["supported_projections"])
+                self.assertIn("trading-desk-v1", meta["supported_projections"])
                 self.assertIn(PROMOTE_EXECUTION_ENVIRONMENT, meta["supported_commands"])
                 self.assertIn(DEMOTE_LIVE_ENVIRONMENT, meta["supported_commands"])
 
-                status, _etag, tiers = client.projection(
-                    "execution-tiers", expected_company_id=company_id
+                status, _etag, desk = client.projection(
+                    "trading-desk", expected_company_id=company_id
                 )
                 self.assertEqual(status, 200)
-                assert tiers is not None
-                self.assertTrue(tiers["company_paper_soak_ready"])
-                self.assertIsNone(tiers["company_live"])
-                self.assertEqual(len(tiers["agent_sandboxes"]), 2)
-                self.assertEqual(len(tiers["live_candidates"]), 1)
+                assert desk is not None
+                gov = desk["governance"]
+                self.assertTrue(gov["company_paper_soak_ready"])
+                self.assertIsNone(gov["company_live"])
+                self.assertEqual(len(gov["live_candidates"]), 1)
+
+                st_g, _, graph = client.projection(
+                    "agents-graph", expected_company_id=company_id
+                )
+                self.assertEqual(st_g, 200)
+                assert graph is not None
+                sandboxes = [
+                    n for n in graph["nodes"] if n.get("sandbox_activity") is not None
+                ]
+                self.assertEqual(len(sandboxes), 2)
 
                 # Agent detail projection exposes that agent's private sandbox summary.
                 st_a, _, detail_q = client.projection(
@@ -254,16 +249,22 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(resp_ok["state"], "applied")
 
                 # Verify all 3 tiers coexist active simultaneously!
-                _, _, tiers_live = client.projection(
-                    "execution-tiers", expected_company_id=company_id
+                _, _, desk_live = client.projection(
+                    "trading-desk", expected_company_id=company_id
                 )
-                assert tiers_live is not None
+                assert desk_live is not None
                 self.assertEqual(
-                    tiers_live["company_live"]["binding_id"], live_cand.binding_id
+                    desk_live["governance"]["company_live"]["binding_id"],
+                    live_cand.binding_id,
                 )
-                self.assertEqual(tiers_live["company_live"]["status"], "active")
-                self.assertEqual(tiers_live["company_paper"]["status"], "active")
-                self.assertEqual(len(tiers_live["agent_sandboxes"]), 2)
+                self.assertEqual(
+                    desk_live["governance"]["company_live"]["status"], "active"
+                )
+                _, _, desk_paper = client.projection(
+                    "trading-desk?environment=paper", expected_company_id=company_id
+                )
+                assert desk_paper is not None
+                self.assertEqual(desk_paper["selected_book"]["status"], "active")
 
                 # Emergency demote back to paper-only over UDS!
                 code_dem, resp_dem = client.submit_command(
@@ -284,22 +285,26 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(code_dem, 200)
                 self.assertEqual(resp_dem["state"], "applied")
 
-                _, _, tiers_after = client.projection(
-                    "execution-tiers", expected_company_id=company_id
+                _, _, desk_after = client.projection(
+                    "trading-desk", expected_company_id=company_id
                 )
-                assert tiers_after is not None
-                self.assertIsNone(tiers_after["company_live"])
-                self.assertEqual(tiers_after["company_paper"]["status"], "active")
-                self.assertEqual(len(tiers_after["agent_sandboxes"]), 2)
-                self.assertEqual(len(tiers_after["promotion_history"]), 2)
+                assert desk_after is not None
+                self.assertIsNone(desk_after["governance"]["company_live"])
+                self.assertEqual(len(desk_after["governance"]["promotion_history"]), 2)
 
             # Confirm zero agent sandbox leakage into company investment book!
             with closing(open_reader(store)) as db, read_tx(db):
                 self.assertEqual(
-                    db.execute("SELECT COUNT(*) FROM paper_order").fetchone()[0], 0
+                    db.execute(
+                        "SELECT COUNT(*) FROM trading_book_order WHERE environment != 'agent_sandbox'"
+                    ).fetchone()[0],
+                    0,
                 )
                 self.assertEqual(
-                    db.execute("SELECT COUNT(*) FROM paper_fill").fetchone()[0], 0
+                    db.execute(
+                        "SELECT COUNT(*) FROM trading_book_fill WHERE environment != 'agent_sandbox'"
+                    ).fetchone()[0],
+                    0,
                 )
 
 

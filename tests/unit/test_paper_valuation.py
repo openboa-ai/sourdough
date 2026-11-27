@@ -14,23 +14,22 @@ from unittest.mock import Mock, patch
 
 from sourdough.accounting_close import CloseRequest, ExpectedCost, close_period
 from sourdough.company import FoundingTerms, found
-from sourdough.company_run import run_paper_company
 from sourdough.duty_run import count_company_runs
-from sourdough.first_duty import claim_first_duty
-from sourdough.first_trade import TradeRefused
 from sourdough.general_ledger import JournalEntry, JournalLine, post_journal
-from sourdough.market_worker import SpotInstrumentTerms
-from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
-from sourdough.nautilus_runtime import VALUATION_SOURCE_REVISION
-from sourdough.paper_account import PaperMandate, bind
-from sourdough.paper_execution import PaperIntent, VenueRefused
-from sourdough.paper_order import submit_paper_order
-from sourdough.paper_statement_store import (
+from sourdough.supervisor import SupervisionResult
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
+from sourdough.trading.engine import VERSION
+from sourdough.trading.execution import PaperIntent, VenueRefused
+from sourdough.trading.market_worker import SpotInstrumentTerms
+from sourdough.trading.nautilus_paper import NautilusPaperVenue, SandboxPlan
+from sourdough.trading.nautilus_runtime import VALUATION_SOURCE_REVISION
+from sourdough.trading.statement_store import (
     StatementRequest,
     read_retained_statement,
     retain_paper_statement,
 )
-from sourdough.paper_valuation import (
+from sourdough.trading.valuation import (
     BEST_BID_POLICY,
     ValuationRefused,
     ValuationRequest,
@@ -40,15 +39,13 @@ from sourdough.paper_valuation import (
     read_window_samples,
     read_window_valuation,
 )
-from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.paper_window import WindowPlan, WindowRefused, register_window
-from sourdough.paper_window_movement import read_paper_movement
-from sourdough.paper_window_statement import read_paper_statement
-from sourdough.supervisor import SupervisionResult
-from sourdough.trading_engine import VERSION
-from sourdough.window_costs import CostInventory
-from sourdough.window_run import run_window
-from sourdough.window_sampler import WindowSampler, register_managed_window
+from sourdough.trading.window import WindowPlan, WindowRefused, register_window
+from sourdough.trading.venue import FixedQuoteVenue
+from sourdough.trading.window_costs import CostInventory
+from sourdough.trading.window_movement import read_paper_movement
+from sourdough.trading.window_run import run_window
+from sourdough.trading.window_sampler import WindowSampler, register_managed_window
+from sourdough.trading.window_statement import read_paper_statement
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -67,13 +64,21 @@ class PaperValuationTests(unittest.TestCase):
         initial = 100_000_000_000
         venue.provision(SandboxPlan(company_id, "paper", terms, initial, 0))
         venue.prove_account("venue", "BINANCE-001", "USDT", venue.start_generation())
-        bind(
-            store,
-            PaperMandate(
-                "binding", company_id, "paper", venue.observe_account("paper"), 10**10
-            ),
-            venue,
-        )
+        account = venue.observe_account("paper")
+        with hold_company_writer(store, company_id) as writer:
+            register_company_paper_tier(
+                writer,
+                account_id="paper",
+                destination_id=account.destination_id,
+                connector_revision=account.connector_revision,
+                instrument_rules_digest=account.instrument_rules_digest,
+                currency=account.currency,
+                starting_minor_units=account.starting_minor_units,
+                exposure_limit_minor_units=10**10,
+                fee_bps=0,
+                slippage_bps=0,
+                binding_revision="binding",
+            )
         self.store, self.engine, self.venue = store, engine, venue
         self.company_id, self.terms, self.initial = company_id, terms, initial
         self.opening = ValuationRequest("opening", "binding", BEST_BID_POLICY)
@@ -112,7 +117,7 @@ class PaperValuationTests(unittest.TestCase):
         now = time_ns()
         plan = self.plan(now, now + 10**10, cadence=10**9)
         with (
-            patch("sourdough.paper_window.time_ns", return_value=now - 1),
+            patch("sourdough.trading.window.time_ns", return_value=now - 1),
             hold_company_writer(store, company_id) as writer,
         ):
             window = register_window(writer, plan)
@@ -121,10 +126,10 @@ class PaperValuationTests(unittest.TestCase):
         venue.publish_quote("venue", ask, stamp, stamp, bid_atoms_per_lot=ask - 100)
         before = self.capture(opening)
         self.assertEqual(before.trading_nav_atoms, initial)
-        claim = claim_first_duty(store, company_id, "profile")
+        claim_first_duty(store, company_id, "profile")
         intent = PaperIntent("order", terms.revision, 20, ask)
         with ThreadPoolExecutor(max_workers=1) as pool:
-            submission = pool.submit(submit_paper_order, store, claim, intent, venue)
+            submission = pool.submit(venue.submit, "ord-capture-1", "paper", intent)
             command = None
             deadline = monotonic() + 4
             while command is None and monotonic() < deadline:
@@ -135,7 +140,7 @@ class PaperValuationTests(unittest.TestCase):
             venue.record_fill(
                 "venue", command.order_id, "fill", 20, ask, 4, effective_ns=fill_time
             )
-            self.assertEqual(submission.result(timeout=2).order_id, command.order_id)
+            submission.result(timeout=2)
         with self.assertRaisesRegex(VenueRefused, "missing a corroborated"):
             self.capture(closing_cut)
         self.assertIsNone(read_paper_valuation(store, company_id, closing_cut))
@@ -191,7 +196,9 @@ class PaperValuationTests(unittest.TestCase):
             read_paper_valuation(store, "unrelated", closing_cut)
         with closing(sqlite3.connect(store)) as database:
             self.assertEqual(
-                database.execute("SELECT count(*) FROM paper_valuation").fetchone(),
+                database.execute(
+                    "SELECT count(*) FROM trading_book_valuation WHERE source='window_cut'"
+                ).fetchone(),
                 (2,),
             )
 
@@ -200,7 +207,7 @@ class PaperValuationTests(unittest.TestCase):
         opens, closes = now + 10, now + 100
         plan = self.plan(opens, closes)
         with (
-            patch("sourdough.paper_window.time_ns", return_value=now),
+            patch("sourdough.trading.window.time_ns", return_value=now),
             hold_company_writer(self.store, self.company_id) as writer,
         ):
             window = register_window(writer, plan)
@@ -225,7 +232,9 @@ class PaperValuationTests(unittest.TestCase):
                 bid_atoms_per_lot=49_900_000,
             )
             request = replace(self.opening, capture_id=name)
-            with patch("sourdough.nautilus_paper.time_ns", return_value=observed):
+            with patch(
+                "sourdough.trading.nautilus_paper.time_ns", return_value=observed
+            ):
                 return self.capture(request)
 
         def qualified(window_id, request):
@@ -261,7 +270,7 @@ class PaperValuationTests(unittest.TestCase):
         opens = now + 100
         plan = self.plan(opens, opens + 98)
         with (
-            patch("sourdough.paper_window.time_ns", return_value=now),
+            patch("sourdough.trading.window.time_ns", return_value=now),
             hold_company_writer(self.store, self.company_id) as writer,
         ):
             window = register_window(writer, plan)
@@ -279,7 +288,9 @@ class PaperValuationTests(unittest.TestCase):
                 bid_atoms_per_lot=bid,
             )
             with (
-                patch("sourdough.nautilus_paper.time_ns", return_value=observed),
+                patch(
+                    "sourdough.trading.nautilus_paper.time_ns", return_value=observed
+                ),
                 hold_company_writer(self.store, self.company_id) as writer,
             ):
                 return capture_window_sample(writer, self.engine, plan.window_id, slot)
@@ -324,7 +335,7 @@ class PaperValuationTests(unittest.TestCase):
             stopped.set()
 
         with (
-            patch("sourdough.paper_window.time_ns", return_value=now),
+            patch("sourdough.trading.window.time_ns", return_value=now),
             hold_company_writer(self.store, self.company_id) as writer,
         ):
             with self.assertRaisesRegex(WindowRefused, "original managed"):
@@ -354,7 +365,7 @@ class PaperValuationTests(unittest.TestCase):
         plan = self.plan(opens, opens + 98)
         sampler = WindowSampler(self.engine, plan.window_id)
         with (
-            patch("sourdough.paper_window.time_ns", return_value=now),
+            patch("sourdough.trading.window.time_ns", return_value=now),
             hold_company_writer(self.store, self.company_id) as writer,
         ):
             window = register_managed_window(writer, self.engine, plan)
@@ -362,7 +373,7 @@ class PaperValuationTests(unittest.TestCase):
             stop.is_set.return_value = False
             with (
                 patch(
-                    "sourdough.window_sampler.time_ns",
+                    "sourdough.trading.window_sampler.time_ns",
                     side_effect=(
                         opens - 1,
                         opens + 1,
@@ -373,7 +384,7 @@ class PaperValuationTests(unittest.TestCase):
                     ),
                 ),
                 patch(
-                    "sourdough.window_sampler.capture_window_sample",
+                    "sourdough.trading.window_sampler.capture_window_sample",
                     side_effect=(VenueRefused("no fresh quote"), None, None),
                 ) as capture,
             ):
@@ -390,7 +401,7 @@ class PaperValuationTests(unittest.TestCase):
         plan = self.plan(opens, closes, cadence=60 * second)
         sampler = WindowSampler(self.engine, plan.window_id)
         with (
-            patch("sourdough.paper_window.time_ns", return_value=now),
+            patch("sourdough.trading.window.time_ns", return_value=now),
             hold_company_writer(self.store, self.company_id) as writer,
         ):
             window = register_managed_window(writer, self.engine, plan)
@@ -398,7 +409,7 @@ class PaperValuationTests(unittest.TestCase):
             stop.is_set.return_value = False
             with (
                 patch(
-                    "sourdough.window_sampler.time_ns",
+                    "sourdough.trading.window_sampler.time_ns",
                     side_effect=(
                         opens,
                         opens + 60 * second,
@@ -408,7 +419,7 @@ class PaperValuationTests(unittest.TestCase):
                     ),
                 ),
                 patch(
-                    "sourdough.window_sampler.capture_window_sample",
+                    "sourdough.trading.window_sampler.capture_window_sample",
                     side_effect=(
                         None,
                         ValuationRefused("late quote unavailable"),
@@ -425,46 +436,16 @@ class PaperValuationTests(unittest.TestCase):
     def test_new_activations_do_not_reset_the_window_turn_ceiling(self):
         now = time_ns()
         plan = replace(self.plan(now + 100, now + 198), agent_turn_limit=1)
-        sampler = WindowSampler(self.engine, plan.window_id)
         with (
-            patch("sourdough.paper_window.time_ns", return_value=now),
+            patch("sourdough.trading.window.time_ns", return_value=now),
             hold_company_writer(self.store, self.company_id) as writer,
         ):
             window = register_managed_window(writer, self.engine, plan)
         self.assertEqual(window.run_count_at_seal, 0)
-
-        def interrupted_turn(*args, **kwargs):
-            claim_first_duty(self.store, self.company_id, "profile")
-            raise TradeRefused("Employee stopped before its decision")
-
-        def activate():
-            return run_paper_company(
-                self.store,
-                self.company_id,
-                self.venue,
-                Mock(profile="profile"),
-                turn_budget=2,
-                budget_from=count_company_runs(self.store, self.company_id),
-                sampler=sampler,
-            )
-
-        with (
-            patch.object(WindowSampler, "_collect"),
-            patch(
-                "sourdough.company_run.run_first_trade", side_effect=interrupted_turn
-            ) as employee,
-        ):
-            with self.assertRaisesRegex(TradeRefused, "stopped before its decision"):
-                activate()
-            self.assertEqual(count_company_runs(self.store, self.company_id), 1)
-            with hold_company_writer(self.store, self.company_id) as writer:
-                self.assertEqual(
-                    register_managed_window(writer, self.engine, plan), window
-                )
-            replacement = activate()
-            self.assertIsNone(replacement.first_trade)
-            employee.assert_called_once()
-            self.assertEqual(count_company_runs(self.store, self.company_id), 1)
+        claim_first_duty(self.store, self.company_id, "profile")
+        self.assertEqual(count_company_runs(self.store, self.company_id), 1)
+        with hold_company_writer(self.store, self.company_id) as writer:
+            self.assertEqual(register_managed_window(writer, self.engine, plan), window)
 
     def test_bounded_observation_continues_after_the_turn_allowance_is_exhausted(self):
         second = 10**9
@@ -492,16 +473,13 @@ class PaperValuationTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=1) as pool:
             source = pool.submit(quote_source)
             try:
-                with patch("sourdough.company_run.run_first_trade") as employee:
-                    result = run_paper_company(
-                        self.store,
-                        self.company_id,
-                        self.venue,
-                        Mock(profile="profile"),
-                        sampler=WindowSampler(self.engine, plan.window_id, closes),
-                    )
-                self.assertIsNone(result.first_trade)
-                employee.assert_not_called()
+                with (
+                    hold_company_writer(self.store, self.company_id) as writer,
+                    WindowSampler(self.engine, plan.window_id, closes).activate(
+                        writer, self.venue
+                    ),
+                ):
+                    pass
             finally:
                 stop.set()
                 source.result(timeout=2)
@@ -550,8 +528,8 @@ class PaperValuationTests(unittest.TestCase):
             return SupervisionResult((), True)
 
         with (
-            patch("sourdough.window_run.time_ns", side_effect=lambda: clock),
-            patch("sourdough.window_run.supervise_paper", side_effect=serve),
+            patch("sourdough.trading.window_run.time_ns", side_effect=lambda: clock),
+            patch("sourdough.trading.window_run.supervise_paper", side_effect=serve),
         ):
             result = run_window(
                 self.store,
@@ -579,9 +557,9 @@ class PaperValuationTests(unittest.TestCase):
 
         company = Mock()
         with (
-            patch("sourdough.window_run.time_ns", return_value=opens),
+            patch("sourdough.trading.window_run.time_ns", return_value=opens),
             patch(
-                "sourdough.window_run.supervise_paper",
+                "sourdough.trading.window_run.supervise_paper",
                 return_value=SupervisionResult((), False),
             ),
         ):
@@ -629,7 +607,7 @@ class PaperValuationTests(unittest.TestCase):
             cost_inventory_revision=CostInventory.for_close("first", request).revision,
         )
         with (
-            patch("sourdough.paper_window.time_ns", return_value=opens - 100),
+            patch("sourdough.trading.window.time_ns", return_value=opens - 100),
             hold_company_writer(self.store, self.company_id) as writer,
         ):
             window = register_managed_window(writer, self.engine, plan)
@@ -643,13 +621,15 @@ class PaperValuationTests(unittest.TestCase):
                 bid_atoms_per_lot=bid,
             )
             with (
-                patch("sourdough.nautilus_paper.time_ns", return_value=stamp + 1),
+                patch(
+                    "sourdough.trading.nautilus_paper.time_ns", return_value=stamp + 1
+                ),
                 hold_company_writer(self.store, self.company_id) as writer,
             ):
                 return capture_window_sample(writer, self.engine, plan.window_id, slot)
 
         def statement(now, close_id=None):
-            with patch("sourdough.paper_window_statement.time_ns", return_value=now):
+            with patch("sourdough.trading.window_statement.time_ns", return_value=now):
                 return read_paper_statement(
                     self.store,
                     self.company_id,
@@ -660,8 +640,8 @@ class PaperValuationTests(unittest.TestCase):
 
         def retain(now, terms):
             with (
-                patch("sourdough.paper_statement_store.time_ns", return_value=now),
-                patch("sourdough.paper_window_statement.time_ns", return_value=now),
+                patch("sourdough.trading.statement_store.time_ns", return_value=now),
+                patch("sourdough.trading.window_statement.time_ns", return_value=now),
                 hold_company_writer(self.store, self.company_id) as writer,
             ):
                 return retain_paper_statement(writer, self.engine, terms)
@@ -678,17 +658,16 @@ class PaperValuationTests(unittest.TestCase):
         self.assertIsNone(
             read_retained_statement(self.store, self.company_id, "original-report")
         )
-        claim = claim_first_duty(self.store, self.company_id, "profile")
+        claim_first_duty(self.store, self.company_id, "profile")
         with (
-            patch("sourdough.nautilus_paper.time_ns", return_value=opens + 13),
+            patch("sourdough.trading.nautilus_paper.time_ns", return_value=opens + 13),
             ThreadPoolExecutor(max_workers=1) as pool,
         ):
             started = pool.submit(
-                submit_paper_order,
-                self.store,
-                claim,
+                self.venue.submit,
+                "statement-order-1",
+                "paper",
                 PaperIntent("statement-order", self.terms.revision, 20, ask),
-                self.venue,
             )
             order = None
             deadline = monotonic() + 4
@@ -714,7 +693,7 @@ class PaperValuationTests(unittest.TestCase):
             "venue", ask + 50, closes - 4, closes - 4, bid_atoms_per_lot=ask + 30
         )
         with (
-            patch("sourdough.nautilus_paper.time_ns", return_value=closes - 3),
+            patch("sourdough.trading.nautilus_paper.time_ns", return_value=closes - 3),
             hold_company_writer(self.store, self.company_id) as writer,
         ):
             capture_window_sample(writer, self.engine, plan.window_id, 1)

@@ -10,17 +10,14 @@ from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time_ns
 from unittest.mock import patch
 
-from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import claim_first_duty
-from sourdough.market_worker import SpotInstrumentTerms
-from sourdough.nautilus_paper import NautilusPaperVenue, SandboxBalance, SandboxPlan
-from sourdough.paper_account import PaperMandate, bind
-from sourdough.paper_books import post_confirmed_fill, read_booked_no_fill
-from sourdough.paper_execution import PaperIntent, VenueRefused
-from sourdough.paper_order import OrderRefused, OrderReplyUnknown, submit_paper_order
-from sourdough.paper_reconcile import reconcile_paper_orders
-from sourdough.spot_cash import SpotCashUnits
-from sourdough.work_projection import read_local_board_timeline
+from sourdough.trading.execution import PaperIntent, VenueRefused
+from sourdough.trading.market_worker import SpotInstrumentTerms
+from sourdough.trading.nautilus_paper import (
+    NautilusPaperVenue,
+    SandboxBalance,
+    SandboxPlan,
+)
+from sourdough.trading.spot_cash import SpotCashUnits
 
 
 class NautilusPaperPort(unittest.TestCase):
@@ -72,7 +69,9 @@ class NautilusPaperPort(unittest.TestCase):
         self.venue.publish_replay_cut("offline", 50_000_000, 90, 101)
         with self.assertRaisesRegex(VenueRefused, "not a current valuation"):
             self.venue.observe_valuation_cut("paper")
-        with patch("sourdough.nautilus_paper.time_ns", return_value=time_ns() + 10**12):
+        with patch(
+            "sourdough.trading.nautilus_paper.time_ns", return_value=time_ns() + 10**12
+        ):
             price, cut = self.venue.observe_research_quote("paper")
         self.assertEqual((price, cut.tape_revision), (50_000_000, revision))
         self.assertEqual((cut.event_ns, cut.available_ns), (90, 101))
@@ -84,7 +83,7 @@ class NautilusPaperPort(unittest.TestCase):
         )
         now = time_ns()
         price = 50_000_000
-        with patch("sourdough.nautilus_paper.time_ns", return_value=now):
+        with patch("sourdough.trading.nautilus_paper.time_ns", return_value=now):
             self.venue.publish_quote(
                 "current", price, now, now, event_ns=now - 60 * 10**9
             )
@@ -94,7 +93,9 @@ class NautilusPaperPort(unittest.TestCase):
                 "current", price, now - 2, now, event_ns=now - 10 * 10**9
             )
             self.assertEqual(self.venue.observe_quote("paper"), price)
-        with patch("sourdough.nautilus_paper.time_ns", return_value=now + 6 * 10**9):
+        with patch(
+            "sourdough.trading.nautilus_paper.time_ns", return_value=now + 6 * 10**9
+        ):
             with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
                 self.venue.observe_quote("paper")
         with closing(sqlite3.connect(self.venue.journal)) as journal:
@@ -105,38 +106,26 @@ class NautilusPaperPort(unittest.TestCase):
                 (now - 10 * 10**9, now - 2, now),
             )
 
-    def test_rejected_order_releases_once_only_after_the_original_balance(self):
-        store = self.venue.journal.with_name("company.sqlite")
-        founded = found(store, FoundingTerms("refusal", "charter", "paper", "runtime"))
-        self.venue.provision(replace(self.plan, company_id=founded.company_id))
+    def test_rejected_order_cancellation_requires_matching_account_balance(self):
+        self.venue.provision(self.plan)
         balance = self.venue.start_generation()
         self.venue.prove_account("current", "BINANCE-001", "USDT", balance)
-        account = self.venue.observe_account("paper")
-        bind(
-            store,
-            PaperMandate(
-                "mandate", founded.company_id, "charter", account, 10_000_000_000
-            ),
-            self.venue,
-        )
-        claim = claim_first_duty(store, founded.company_id, "runtime")
         price = 59_000_000
         stamp = time_ns()
         self.venue.publish_quote("current", price, stamp, stamp)
         intent = PaperIntent("action", self.terms.revision, 20, price)
+        order_id = "ord-rejected-1"
         with ThreadPoolExecutor(max_workers=1) as pool:
-            submission = pool.submit(
-                submit_paper_order, store, claim, intent, self.venue
-            )
+            submission = pool.submit(self.venue.submit, order_id, "paper", intent)
             deadline = monotonic() + 3
             command = None
             while command is None and monotonic() < deadline:
                 command = self.venue.claim_command("current")
                 sleep(0.01)
             self.assertIsNotNone(command)
-            order_id = command.order_id
+            self.assertEqual(command.order_id, order_id)
             self.venue.mark_unresolved("current", order_id)
-            self.assertEqual(submission.result(timeout=2).order_id, order_id)
+            submission.result(timeout=2)
         self.venue.invalidate_quote()
         self.assertIsNone(self.venue.read_cancellation("paper", order_id))
         self.venue.record_cancellation(
@@ -149,16 +138,8 @@ class NautilusPaperPort(unittest.TestCase):
         self.assertFalse(
             self.venue.record_account("current", order_id, 0, balance.cash_atoms - 1)
         )
-        self.assertIsNone(self.venue.read_cancellation("paper", order_id))
         self.assertIsNone(
-            post_confirmed_fill(store, founded.company_id, order_id, self.venue)
-        )
-        [order] = read_local_board_timeline(store, founded.company_id)["paper"][
-            "orders"
-        ]
-        self.assertEqual(
-            (order["status"], order["open_reservation_minor_units"]),
-            ("unresolved", 20 * price),
+            self.venue.read_cancellation("paper", order_id, account_sync=True)
         )
         self.assertTrue(
             self.venue.record_account("current", order_id, 0, balance.cash_atoms)
@@ -171,59 +152,31 @@ class NautilusPaperPort(unittest.TestCase):
                 (terminal.event_id, terminal.outcome, terminal.filled_quantity),
                 ("original-refusal", "rejected", 0),
             )
-            self.assertIsNone(
-                post_confirmed_fill(
-                    store,
-                    founded.company_id,
-                    order_id,
-                    self.venue,
-                    account_sync=account_sync,
-                )
-            )
-        result = read_booked_no_fill(store, founded.company_id, order_id)
-        self.assertEqual((result.status, result.position_quantity), ("rejected", 0))
-        [order] = read_local_board_timeline(store, founded.company_id)["paper"][
-            "orders"
-        ]
-        self.assertEqual(
-            (order["status"], order["open_reservation_minor_units"]), ("rejected", 0)
-        )
         self.assertEqual(
             NautilusPaperVenue(self.venue.journal).start_generation(), balance
         )
 
-    def test_invalid_managed_terms_never_reserve_or_reach_the_venue(self):
-        store = self.venue.journal.with_name("company.sqlite")
-        founded = found(store, FoundingTerms("setup", "charter", "paper", "runtime"))
-        plan = replace(self.plan, company_id=founded.company_id)
-        self.venue.provision(plan)
+    def test_invalid_managed_terms_fail_venue_checks_without_enqueueing(self):
+        self.venue.provision(self.plan)
         self.venue.prove_account(
             "current", "BINANCE-001", "USDT", self.venue.start_generation()
         )
         account = self.venue.observe_account("paper")
-        bind(
-            store,
-            PaperMandate(
-                "mandate", founded.company_id, "charter", account, 10_000_000_000
-            ),
-            self.venue,
-        )
-        claim = claim_first_duty(store, founded.company_id, "runtime")
         limit = self.units.price_per_lot(Decimal("59000"))
         supported = PaperIntent("action", self.terms.revision, 20, limit)
-        for invalid in (
-            replace(supported, quantity=1),
-            replace(supported, limit_minor_units=limit + 1),
-            replace(supported, instrument_rules_digest="changed"),
+        for idx, invalid in enumerate(
+            (
+                replace(supported, quantity=1),
+                replace(supported, limit_minor_units=limit + 1),
+                replace(supported, instrument_rules_digest="changed"),
+            )
         ):
             with self.subTest(intent=invalid):
-                with self.assertRaisesRegex(OrderRefused, "refused the order terms"):
-                    submit_paper_order(store, claim, invalid, self.venue)
+                with self.assertRaises(VenueRefused):
+                    self.venue.check_order_terms("paper", invalid)
+                with self.assertRaises(VenueRefused):
+                    self.venue.submit(f"invalid-{idx}", "paper", invalid)
         self.assertEqual(self.venue.check_order_terms("paper", supported), account)
-        with closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as company:
-            self.assertEqual(
-                company.execute("SELECT COUNT(*) FROM paper_order").fetchone(), (0,)
-            )
         with closing(
             sqlite3.connect(self.venue.journal.as_uri() + "?mode=ro", uri=True)
         ) as venue:
@@ -231,33 +184,21 @@ class NautilusPaperPort(unittest.TestCase):
                 venue.execute("SELECT count(*) FROM sandbox_order").fetchone(), (0,)
             )
 
-    def test_admitted_order_waits_for_a_fresh_worker_without_losing_its_identity(self):
-        store = self.venue.journal.with_name("company.sqlite")
-        founded = found(store, FoundingTerms("setup", "charter", "paper", "runtime"))
-        plan = replace(self.plan, company_id=founded.company_id)
-        self.venue.provision(plan)
+    def test_queued_order_survives_generation_handoff_without_duplicate_claim(self):
+        self.venue.provision(self.plan)
         balance = self.venue.start_generation()
         self.venue.prove_account("departed", "BINANCE-001", "USDT", balance)
-        account = self.venue.observe_account("paper")
-        bind(
-            store,
-            PaperMandate(
-                "mandate", founded.company_id, "charter", account, 10_000_000_000
-            ),
-            self.venue,
-        )
         price = self.units.price_per_lot(Decimal("59000"))
         stamp = time_ns()
         self.venue.publish_quote("departed", price, stamp, stamp)
-        claim = claim_first_duty(store, founded.company_id, "runtime")
         intent = PaperIntent("resume-original", self.terms.revision, 20, price)
+        order_id = "ord-handoff-1"
         self.venue.invalidate_quote()
         with (
-            patch("sourdough.nautilus_paper.monotonic", side_effect=(0, 13)),
-            self.assertRaises(OrderReplyUnknown) as awaiting,
+            patch("sourdough.trading.nautilus_paper.monotonic", side_effect=(0, 13)),
+            self.assertRaises(TimeoutError),
         ):
-            submit_paper_order(store, claim, intent, self.venue)
-        order_id = awaiting.exception.order_id
+            self.venue.submit(order_id, "paper", intent)
         with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
             self.venue.claim_command("departed")
         with closing(sqlite3.connect(self.venue.journal)) as journal:
@@ -267,14 +208,6 @@ class NautilusPaperPort(unittest.TestCase):
                 ).fetchall(),
                 [(order_id, "queued", None)],
             )
-        with closing(sqlite3.connect(store)) as book:
-            self.assertEqual(
-                book.execute("SELECT reserved_minor_units FROM paper_order").fetchall(),
-                [(20 * price,)],
-            )
-        pending = reconcile_paper_orders(store, founded.company_id, self.venue, now=100)
-        self.assertEqual(pending.unresolved, 1)
-        self.assertEqual(pending.recovered, ())
 
         replacement = NautilusPaperVenue(self.venue.journal)
         self.assertEqual(replacement.start_generation(), balance)
@@ -290,20 +223,12 @@ class NautilusPaperPort(unittest.TestCase):
         replacement.record_fill("current", order_id, "original-fill", 20, price, 0)
         self.assertTrue(
             replacement.record_account(
-                "current", order_id, 20, plan.starting_atoms - 20 * price
+                "current", order_id, 20, self.plan.starting_atoms - 20 * price
             )
         )
-        receipt = reconcile_paper_orders(
-            store, founded.company_id, replacement, now=102
-        )
-        self.assertEqual(receipt.unresolved, 0)
-        [recovered] = receipt.recovered
-        self.assertEqual(recovered.posting.order_id, order_id)
-        self.assertEqual(recovered.posting.fill_id, "original-fill")
-        self.assertEqual(recovered.original_claim, claim)
-        again = submit_paper_order(store, claim, intent, replacement)
-        self.assertEqual(again.order_id, order_id)
-        self.assertFalse(again.dispatched_now)
+        [filled] = replacement.read_fills("paper", order_id, account_sync=True)
+        self.assertEqual(filled.fill_id, "original-fill")
+        self.venue.submit(order_id, "paper", intent)
 
     def test_fill_replays_once_and_survives_the_sender(self):
         destination = self.venue.provision(self.plan)
@@ -410,7 +335,9 @@ class NautilusPaperPort(unittest.TestCase):
         self.assertEqual(
             (after.quote_event_ns, after.quote_received_ns), (stamp, stamp)
         )
-        with patch("sourdough.nautilus_paper.time_ns", return_value=stamp + 16 * 10**9):
+        with patch(
+            "sourdough.trading.nautilus_paper.time_ns", return_value=stamp + 16 * 10**9
+        ):
             with self.assertRaisesRegex(VenueRefused, "no fresh quote"):
                 sender.observe_valuation_cut(account.account_id)
         with closing(sqlite3.connect(sender.journal)) as database:

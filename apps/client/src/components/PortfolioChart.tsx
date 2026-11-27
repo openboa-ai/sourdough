@@ -151,7 +151,7 @@ export function PortfolioChart({
   points,
   currency,
   asOfLabel,
-  title = "Paper Cumulative Performance",
+  title = "Cumulative Performance",
   subtitlePct,
   subtitlePnl,
   emptyMessage,
@@ -874,7 +874,7 @@ export function PortfolioChart({
                     ref={plotRef}
                     role="img"
                     tabIndex={-1}
-                    aria-label="Paper cumulative performance chart on zero baseline"
+                    aria-label={`${title} chart on zero baseline`}
                     onPointerMove={handlePointerHover}
                     onKeyDown={handleImageKeyDown}
                   >

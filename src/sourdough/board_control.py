@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
+import stat
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
@@ -20,7 +23,11 @@ from typing import Any
 from uuid import uuid4
 
 from .company import _identity
-from .paper_risk import AuthorizeBoard
+from .runtime.domains import (
+    RestrictionClearContext,
+    RestrictionClearHook,
+    RestrictionGuard,
+)
 from .runtime.work_kernel import (
     WorkKernelRefused,
     cancel_work_item,
@@ -36,12 +43,9 @@ from .storage.kernel import (
     append_audit_event,
     read_command_receipt,
 )
-from .strategy_comparison import (
-    StrategyComparisonRefused,
-    activate_strategy_release,
-    rollback_strategy_deployment,
-)
 from .writer_lease import WriterLease
+
+AuthorizeBoard = Callable[[Connection, str, str], str | None]
 
 CEO_CHAT_COMMAND = "ceo-chat-command-v1"
 SEND_CEO_MESSAGE = "send_ceo_message"
@@ -52,10 +56,6 @@ SUBMIT_DECISION_ANSWER = "submit_decision_answer"
 RESTRICTION_COMMAND = "restriction-command-v1"
 PAUSE_COMPANY = "pause_company"
 RESUME_COMPANY = "resume_company"
-
-STRATEGY_COMMAND = "strategy-command-v1"
-ACTIVATE_STRATEGY_RELEASE = "activate_strategy_release"
-ROLLBACK_STRATEGY_DEPLOYMENT = "rollback_strategy_deployment"
 
 WORK_COMMAND = "work-command-v1"
 INTERRUPT_RUN = "interrupt_run"
@@ -71,8 +71,12 @@ BIND_BOARD_PRINCIPAL = "bind_board_principal"
 BOARD_VIEWER_ROLE = "board_viewer"
 BOARD_CONTROL_ROLE = "board_control"
 _VALID_ROLES = frozenset({BOARD_VIEWER_ROLE, BOARD_CONTROL_ROLE})
+VALID_APPLICATION_STATUSES = frozenset(
+    {"pending", "applied", "declined", "not_applicable", "failed"}
+)
+VALID_DELIVERY_STATUSES = frozenset({"pending", "delivered", "acknowledged"})
 
-_ALLOWED_AVATAR_VARIANTS = frozenset(
+ALLOWED_AVATAR_VARIANTS = frozenset(
     {
         "wide-oval-top",
         "wide-oval-bottom",
@@ -114,6 +118,7 @@ _ALLOWED_AVATAR_VARIANTS = frozenset(
         "round-heart-left",
     }
 )
+_ALLOWED_AVATAR_VARIANTS = ALLOWED_AVATAR_VARIANTS
 
 
 class BoardControlRefused(Exception):
@@ -300,7 +305,7 @@ def make_board_authorizer(
     authorize_board: AuthorizeBoard | None = None,
     principal_hint: str | None = None,
 ) -> AuthorizeBoard:
-    """Create a paper_risk-compatible AuthorizeBoard backed by board_binding."""
+    """Create an AuthorizeBoard callback backed by board_binding."""
 
     def _authorize(
         connection: Connection, company_id: str, operation: str
@@ -825,6 +830,12 @@ def record_decision_application_result(
     safe_qid = _require_text(question_id, "question_id", max_len=128)
     safe_app = _require_text(application_status, "application_status", max_len=64)
     safe_deliv = _require_text(delivery_status, "delivery_status", max_len=64)
+    if not isinstance(effect_summary, str):
+        raise BoardControlRefused("effect_summary must be a string")
+    if safe_app not in VALID_APPLICATION_STATUSES:
+        raise BoardControlRefused(f"Unsupported application_status: {safe_app}")
+    if safe_deliv not in VALID_DELIVERY_STATUSES:
+        raise BoardControlRefused(f"Unsupported delivery_status: {safe_deliv}")
     timestamp = time_ns() if now_ns is None else now_ns
     writer.verify()
     with closing(open_writer(writer.store)) as db, write_tx(db):
@@ -1131,6 +1142,7 @@ def apply_company_restriction(
     principal_hint: str | None = None,
     peer_pid: int | None = None,
     now_ns: int | None = None,
+    restriction_guards: Sequence[RestrictionGuard] = (),
 ) -> BoardCommandOutcome:
     """Activate a distinct cause-scoped restriction without altering other active stops."""
     safe_cmd = _require_text(command_id, "command_id", max_len=128)
@@ -1139,8 +1151,8 @@ def apply_company_restriction(
     safe_rev = _require_nonneg_int(
         expected_restriction_revision, "expected_restriction_revision"
     )
-    safe_cat = _require_text(cause_category, "cause_category", max_len=64)
-    safe_scope = _require_text(scope_ref, "scope_ref", max_len=128)
+    safe_cat = _require_text(cause_category, "cause_category", max_len=64).lower()
+    safe_scope = _require_text(scope_ref, "scope_ref", max_len=128).lower()
     safe_reason = _require_text(reason, "reason", max_len=2000)
     if not isinstance(operator_releasable, bool):
         raise BoardControlRefused("operator_releasable must be a boolean")
@@ -1213,6 +1225,23 @@ def apply_company_restriction(
             return _outcome_from_receipt(receipt)
 
         next_rev = current_rev + 1
+        matching_guards = [
+            guard for guard in restriction_guards if guard.handles_scope(safe_scope)
+        ]
+        if (
+            safe_scope.startswith("execution:") or safe_cat == "trading_risk_pause"
+        ) and not matching_guards:
+            raise BoardControlRefused(
+                f"No domain guard registered for scoped restriction '{safe_scope}'"
+            )
+        for guard in matching_guards:
+            guard.validate_apply(
+                db,
+                company_id=writer.company_id,
+                scope_ref=safe_scope,
+                cause_category=safe_cat,
+            )
+
         if existing is None:
             db.execute(
                 """INSERT INTO restriction_cause (
@@ -1303,6 +1332,9 @@ def clear_company_restriction(
     principal_hint: str | None = None,
     peer_pid: int | None = None,
     now_ns: int | None = None,
+    restriction_guards: Sequence[RestrictionGuard] = (),
+    pre_clear_hooks: Sequence[RestrictionClearHook] = (),
+    engine_directory: Path | None = None,
 ) -> BoardCommandOutcome:
     """Clear strictly one restriction_id, leaving all other active stops untouched."""
     safe_cmd = _require_text(command_id, "command_id", max_len=128)
@@ -1344,7 +1376,8 @@ def clear_company_restriction(
 
         current_charter = _current_charter_revision(db, writer.company_id)
         existing = db.execute(
-            """SELECT restriction_revision, active, operator_releasable
+            """SELECT restriction_revision, active, operator_releasable,
+                      cause_category, scope_ref
                FROM restriction_cause
                WHERE company_id = ? AND restriction_id = ?""",
             (writer.company_id, safe_rid),
@@ -1356,6 +1389,8 @@ def clear_company_restriction(
             int(existing[1]),
             int(existing[2]),
         )
+        cause_cat = str(existing[3]).strip().lower()
+        scope_ref = str(existing[4]).strip().lower()
         if releasable == 0:
             raise BoardControlForbidden(
                 "This restriction cause is system-held and cannot be cleared directly"
@@ -1382,6 +1417,39 @@ def clear_company_restriction(
                 now_ns=timestamp,
             )
             return _outcome_from_receipt(receipt)
+
+        matching_guards = [
+            guard for guard in restriction_guards if guard.handles_scope(scope_ref)
+        ]
+        if (
+            (scope_ref.startswith("execution:") or cause_cat == "trading_risk_pause")
+            and not matching_guards
+            and not pre_clear_hooks
+        ):
+            raise BoardControlRefused(
+                f"No domain guard loaded for scoped restriction '{scope_ref}'"
+            )
+        for guard in matching_guards:
+            guard.validate_clear(
+                db,
+                company_id=writer.company_id,
+                scope_ref=scope_ref,
+                cause_category=cause_cat,
+                now_ns=timestamp,
+                engine_directory=engine_directory,
+            )
+        if pre_clear_hooks:
+            ctx = RestrictionClearContext(
+                connection=db,
+                company_id=writer.company_id,
+                restriction_id=safe_rid,
+                cause_category=cause_cat,
+                scope_ref=scope_ref,
+                engine_directory=engine_directory,
+                now_ns=timestamp,
+            )
+            for hook in pre_clear_hooks:
+                hook(ctx)
 
         next_rev = current_rev + 1
         db.execute(
@@ -1591,96 +1659,6 @@ def execute_work_control_command(
             now_ns=timestamp,
         )
         return _outcome_from_receipt(receipt)
-
-
-def execute_strategy_command(
-    writer: WriterLease,
-    *,
-    command_id: str,
-    command_type: str,
-    preconditions: dict[str, Any],
-    payload: dict[str, Any],
-    authorize: AuthorizeBoard | None = None,
-    principal_hint: str | None = None,
-    peer_pid: int | None = None,
-) -> BoardCommandOutcome:
-    """Delegate strategy activation or forward rollback to strategy_comparison.py."""
-    safe_cmd = _require_text(command_id, "command_id", max_len=128)
-    auth_fn = make_board_authorizer(
-        authorize_board=authorize, principal_hint=principal_hint
-    )
-
-    def _deploy_auth(
-        db: Connection, company_id: str, op: str, _release_id: str
-    ) -> str | None:
-        return auth_fn(db, company_id, op)
-
-    try:
-        if command_type == ACTIVATE_STRATEGY_RELEASE:
-            release_id = _require_text(
-                payload.get("release_id"), "release_id", max_len=128
-            )
-            binding_rev = _require_text(
-                preconditions.get("binding_revision"), "binding_revision", max_len=128
-            )
-            comparison_id = payload.get("comparison_id")
-            expected_active = preconditions.get("expected_active_deployment_id")
-            deployment = activate_strategy_release(
-                writer,
-                command_id=safe_cmd,
-                release_id=release_id,
-                binding_revision=binding_rev,
-                authorize_deploy=_deploy_auth,
-                comparison_id=comparison_id,
-                expected_active_deployment_id=expected_active,
-            )
-        elif command_type == ROLLBACK_STRATEGY_DEPLOYMENT:
-            target_release = _require_text(
-                payload.get("target_release_id"), "target_release_id", max_len=128
-            )
-            expected_active = _require_text(
-                preconditions.get("expected_active_deployment_id"),
-                "expected_active_deployment_id",
-                max_len=128,
-            )
-            deployment = rollback_strategy_deployment(
-                writer,
-                command_id=safe_cmd,
-                target_release_id=target_release,
-                expected_active_deployment_id=expected_active,
-                authorize_deploy=_deploy_auth,
-            )
-        else:
-            raise BoardControlRefused("Unsupported strategy command")
-    except StrategyComparisonRefused as error:
-        msg = str(error)
-        low = msg.lower()
-        if (
-            "authority" in low
-            or "authorized" in low
-            or "grant is required" in low
-            or "cannot self-activate" in low
-        ):
-            raise BoardControlForbidden(msg) from error
-        if "already in use" in low or "conflict" in low:
-            raise BoardControlConflict(msg) from error
-        raise BoardControlRefused(msg) from error
-
-    return BoardCommandOutcome(
-        command_id=safe_cmd,
-        command_type=command_type,
-        state="applied",
-        disposition="applied",
-        denial_code=None,
-        effective_revision=1,
-        recorded_at_ns=deployment.activated_at_ns,
-        peer_pid=peer_pid,
-        result={
-            "deployment_id": deployment.deployment_id,
-            "release_id": deployment.release_id,
-            "status": deployment.status,
-        },
-    )
 
 
 def execute_cut_checkpoint_command(
@@ -1923,6 +1901,89 @@ def read_scoped_command_receipt(
         "recorded_at_ns": outcome.recorded_at_ns,
         "peer_pid": outcome.peer_pid,
     }
+
+
+def read_local_command_receipt_status(
+    store: Path,
+    company_id: str,
+    command_id: str,
+    *,
+    operation: str | None = None,
+) -> dict[str, object]:
+    """Read a board command receipt status read-only without disclosing actor or private reason."""
+    safe_cmd = _require_text(command_id, "command_id", max_len=128)
+    safe_op = (
+        _require_text(operation, "operation", max_len=128)
+        if operation is not None
+        else None
+    )
+    try:
+        initial = store.stat(follow_symlinks=False)
+    except OSError as error:
+        raise BoardControlRefused("Company store is unavailable") from error
+    if not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.geteuid():
+        raise BoardControlRefused(
+            "Only the local company store owner can inspect command receipts"
+        )
+    with closing(open_reader(store)) as connection, read_tx(connection):
+        if _identity(connection) != company_id:
+            raise BoardControlRefused("Company identity mismatch")
+        row = connection.execute(
+            """SELECT company_id, command_id, actor_id, peer_pid, command_type,
+                      contract_version, payload_sha256, preconditions_json, state,
+                      denial_code, result_json, applied_seq, created_at_ns, finalized_at_ns
+               FROM command_receipt
+               WHERE company_id = ? AND command_id = ?""",
+            (company_id, safe_cmd),
+        ).fetchone()
+        if row is None:
+            response: dict[str, object] = {
+                "status": "not_found",
+                "company_id": company_id,
+                "command_id": safe_cmd,
+            }
+        else:
+            receipt = CommandReceipt(*row)
+            if safe_op is not None and receipt.command_type != safe_op:
+                raise BoardControlRefused(
+                    "Command receipt does not match the requested operation"
+                )
+            effective_revision: int | None = None
+            if receipt.state in ("applied", "denied"):
+                effective_revision = _outcome_from_receipt(receipt).effective_revision
+            elif receipt.state != "accepted":
+                raise BoardControlRefused("Unsupported board command receipt state")
+            response = {
+                "status": "found",
+                "company_id": company_id,
+                "command_id": safe_cmd,
+                "command_type": receipt.command_type,
+                "state": receipt.state,
+                "denial_code": receipt.denial_code,
+                "effective_revision": effective_revision,
+                "applied_seq": receipt.applied_seq,
+                "created_at_ns": int(receipt.created_at_ns),
+                "finalized_at_ns": (
+                    None
+                    if receipt.finalized_at_ns is None
+                    else int(receipt.finalized_at_ns)
+                ),
+            }
+        try:
+            current = store.stat(follow_symlinks=False)
+        except OSError as error:
+            raise BoardControlRefused(
+                "Company store changed while inspecting command receipt"
+            ) from error
+        if (initial.st_dev, initial.st_ino, initial.st_uid) != (
+            current.st_dev,
+            current.st_ino,
+            current.st_uid,
+        ):
+            raise BoardControlRefused(
+                "Company store changed while inspecting command receipt"
+            )
+    return response
 
 
 def _maybe_replay_receipt(

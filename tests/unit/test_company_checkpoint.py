@@ -10,9 +10,9 @@ from zipfile import ZipFile
 
 from sourdough.abandoned_work import requeue_uncommitted_work
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import claim_first_duty
 from sourdough.storage.checkpoint import compute_logical_watermark
 from sourdough.storage.db import open_reader, read_tx
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 from sourdough.writer_lease import hold_company_writer
 
 

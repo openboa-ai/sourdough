@@ -28,7 +28,7 @@ The full local-company scope includes research, hiring when justified, shared as
 | Keep for workforce qualification or economic claims, not for the first trade | Preserve the second, freshly hired Agent's uninterrupted paper run and the core-only binding as distinct evidence. To measure absolute economics, require complete cost/flow accounting, reconciled positions, a registered operating revision and reliable risk stops. To claim improvement, also freeze the incumbent before comparing the candidate. Do not wait for every employee function. |
 | Measure learning independently | Retain L1 adoption/rejection/rollback. Use the separate recursive comparison to test whether company experience improves how later methods are produced. The economic control arm must still be able to run with learning frozen. |
 | Defer from the critical path, do not delete coverage | Full client, richer conversation, full staffing/offboarding workflows beyond the tested hire, multiple runtime implementations, strategy deployment fleet and disaster migration. Keep H1/W1/L1/O1/P1 and broader specs; schedule each extension when its absence blocks an obligation, an experiment or an explicit qualification claim. |
-| Exclude from this design | Mandatory departments, one machine per employee, an Agent per deterministic calculation, model-weight training, and live capital activation. Do not build a generic company platform or universal connector catalogue before testing the fund. |
+| Exclude from this design | Mandatory departments, one machine per employee, an Agent per deterministic calculation, model-weight training, and unapproved live capital activation (live execution requires separate venue qualification and explicit Board promotion). Do not build a universal connector catalogue before testing the fund. |
 
 ## Build and evidence order
 
@@ -75,13 +75,13 @@ The first two branches are organizational meanings. The entries beneath them are
 ```text
 Sourdough
 ├─ Company — mandate, ownership, obligations
-│  ├─ Systems — organization, authority, work, resources, connectors, accounting, finance, operations
-│  └─ Business profiles — Quant is the first specialization
+│  ├─ Systems — organization, authority, work, resources, connectors, accounting, finance, operations (`installed_domains` `'core'`)
+│  └─ Business domains — Trading (`'trading'` via `DomainPlugin`) / Quant specialization
 └─ Employee — responsibility, judgment, working relationships
    └─ Agent — configuration, harness, desk, learning
 ```
 
-The Board Client is optional for autonomous operation but is the only human interface to company queries and control. Acceptance and engineering organize proof and delivery, not company activity. Start with the [situations](capabilities.md) for outcomes or use the ownership tables below to find the single writer of a fact.
+The Board Client is optional for autonomous operation and serves as the human interface to company queries and control. Core Company OS (`core` SQL pack `01..08`, `52` tables) operates independently with zero domain assumptions; the Quant / Trading domain (`trading` SQL pack `01..03`, `16` tables) activates opt-in via `DomainPlugin`. Acceptance and engineering organize proof and delivery, not company activity. Start with the [situations](capabilities.md) for outcomes or use the ownership tables below to find the single writer of a fact.
 
 ### Company
 
@@ -94,22 +94,22 @@ The Board Client is optional for autonomous operation but is the only human inte
 | Owner | Authoritative output | Decision boundary | Intents / specs |
 | --- | --- | --- | ---: |
 | [C1 · Company mandate and organization](company/systems/organization/README.md) | Charter, roster, staffing and retirement | Binds a new Agent ID to a profile; does not choose tools or authenticate a turn. | 4 / 7 |
-| [C2 · Identity and authority](company/systems/authority/README.md) | Verified principal, effective grant and cutoff | Decides whether this actor may act; a role, profile or budget is not permission. | 2 / 3 |
-| [C3 · Work and Agent communication](company/systems/work/README.md) | Work claim, next wake, conversation and accepted handoff | Schedules and transfers duties; delivery of a message is not acceptance. | 4 / 6 |
+| [C2 · Identity and authority](company/systems/authority/README.md) | Verified principal, effective grant and cutoff | Decides whether this actor may act; a role, profile or budget is not permission. | 2 / 4 |
+| [C3 · Work and Agent communication](company/systems/work/README.md) | Work claim, next wake, conversation and accepted handoff | Schedules and transfers duties; delivery of a message is not acceptance. | 4 / 9 |
 | [C5 · Company resource inventory and custody](company/systems/resources/README.md) | Company asset inventory, custodian and access assignments | Owns custody and provisioning; authority and finance decide grants and budget. | 2 / 3 |
 | [C6 · External resource connectors](company/systems/connectors/README.md) | External resource binding, operation and observation receipt | Transports admitted effects; cannot interpret a timeout as a rejected order. | 1 / 2 |
 | [C7 · Accounting and financial records](company/systems/accounting/README.md) | Balanced journals, reconciled actuals and period close | Books economic sources once; does not allocate capital or compute investment returns. | 2 / 2 |
 | [C8 · Finance and treasury](company/systems/finance/README.md) | Budget, cost reservation, liquidity forecast and shortfall | Authorizes a spending envelope; does not post actual cash or reserve trade exposure. | 2 / 3 |
 | [C9 · Operations, projections and recovery](company/systems/operations/README.md) | Service health, incidents, changes, maintenance, recovery and work projection | Restores service or assigns repair; cannot fabricate a fill or require a client. | 5 / 5 |
 
-#### Business profile: Quant Hedge Fund
+#### Business domain: Trading (Quant specialization)
 
-[Quant profile guide](company/profiles/quant/README.md)
+[Quant profile guide](company/profiles/quant/README.md) · Opt-in `'trading'` domain (`DomainPlugin`, `storage/schema/v1/trading/`).
 
 | Owner | Authoritative output | Decision boundary | Intents / specs |
 | --- | --- | --- | ---: |
 | [Q1 · Quant research and portfolio management](company/profiles/quant/investments/README.md) | As-of data, finding, historical replay, portfolio target and strategy deployment | Proposes an investment decision; cannot admit an order or book a position. | 5 / 8 |
-| [Q2 · Trade execution, market risk and venues](company/profiles/quant/trading/README.md) | Shared execution binding, company-managed runtime, current-market paper, risk admission, order lifecycle and reconciliation duty | Decides risk admission and queries the venue; Q3 alone writes reservation state and postings, the venue owns fills. | 9 / 13 |
+| [Q2 · Trade execution, market risk and venues](company/profiles/quant/trading/README.md) | Shared execution binding, company-managed runtime, current-market paper, risk admission, order lifecycle and reconciliation duty | Decides risk admission and queries the venue; Q3 alone writes reservation state and postings, the venue owns fills. | 9 / 14 |
 | [Q3 · Positions, fund performance and investment reporting](company/profiles/quant/fund-books/README.md) | Deduplicated investment postings, positions, reservations, performance and lineage | Writes account reservation state, computes net return and maps cash sources to C7; client never computes a second return. | 3 / 7 |
 
 ### Employee
@@ -131,7 +131,7 @@ The Board Client is optional for autonomous operation but is the only human inte
 
 | Owner | Authoritative output | Decision boundary | Intents / specs |
 | --- | --- | --- | ---: |
-| [U1 · Board Client](client/README.md) | Local view state, command submission, receipt display, local control-plane contracts, Executive IA (Live Trading, Office Floor, CEO Direct Line, Company, quiet System), and client design-system alignment | Presents permitted projections and strict Board-vs-CEO governance; only the server can accept commands or repair the books. | 5 / 14 |
+| [U1 · Board Client](client/README.md) | Local view state, command submission, receipt display, local control-plane contracts, Modular IA (`Approvals`, dynamic `Trading` module when installed, `Company`, `System`, strict 4-slot global header), and client design-system alignment | Presents permitted projections and strict Board-vs-CEO governance; only the server can accept commands or repair the books. | 5 / 14 |
 
 Every feature has one system parent. Follow the parent page for the complete list and the responsibilities of each development unit. Paths follow their owning domain; links across systems express dependencies, not multiple ownership. See the [composition contract](architecture.md) for runtime and connector ports, accounting boundaries, and the two proof environments. [SDLC](engineering/lifecycle.md) is how changes are delivered, not another product system.
 

@@ -5,8 +5,8 @@ from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found
 from sourdough.duty_run import count_company_runs, has_turn_capacity
-from sourdough.paper_execution import VenueRefused
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.execution import VenueRefused
+from sourdough.trading.venue import FixedQuoteVenue
 from sourdough.runtime.engine import CompanyRuntime, build_default_registry
 from sourdough.runtime.registry import (
     DutyContext,
@@ -14,7 +14,7 @@ from sourdough.runtime.registry import (
     DutyOutcome,
     RuntimeRefused,
 )
-from sourdough.runtime.venue_coordinator import (
+from sourdough.trading.venue_coordinator import (
     BoundedVenueCoordinator,
     VenueSegmentPolicy,
 )
@@ -449,8 +449,9 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                     )
 
     def test_cross_path_active_agent_exclusion_and_expired_peer_response_skip(self):
-        from sourdough.first_duty import DutyRefused, claim_first_duty
+        from sourdough.duty_run import DutyRefused
         from sourdough.runtime.work_kernel import WorkKernelRefused
+        from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
 
         # Upgrade founding grant to paper scope so claim_first_duty is otherwise eligible
         with closing(open_writer(self.store)) as conn, write_tx(conn):
@@ -729,3 +730,47 @@ class UnifiedCompanyRuntime(unittest.TestCase):
                 ).fetchone(),
                 ("waiting",),
             )
+
+    def test_run_bound_handler_enforces_independent_process_guard(self):
+        class _Guard:
+            def __init__(self, reject: bool) -> None:
+                self.reject = reject
+                self.checked: list[Path] = []
+
+            def require_independent_from(self, company_store: Path) -> None:
+                self.checked.append(company_store)
+                if self.reject:
+                    raise RuntimeRefused("process not independent")
+
+        runtime = CompanyRuntime(
+            self.store,
+            self.company_id,
+            build_default_registry(
+                {"work.bound": lambda _ctx: DutyOutcome("completed")}
+            ),
+            lease_directory=self.leases,
+        )
+        executed = False
+
+        def _handler(_writer):
+            nonlocal executed
+            executed = True
+            return "ok"
+
+        bad_guard = _Guard(reject=True)
+        with self.assertRaisesRegex(RuntimeRefused, "process not independent"):
+            runtime.run_bound_handler(
+                "work.bound", _handler, process_guard=bad_guard, now_ns=1_000
+            )
+        self.assertEqual(bad_guard.checked, [self.store.absolute()])
+        self.assertFalse(executed)
+
+        good_guard = _Guard(reject=False)
+        self.assertEqual(
+            runtime.run_bound_handler(
+                "work.bound", _handler, process_guard=good_guard, now_ns=2_000
+            ),
+            "ok",
+        )
+        self.assertEqual(good_guard.checked, [self.store.absolute()])
+        self.assertTrue(executed)

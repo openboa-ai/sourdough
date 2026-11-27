@@ -1,42 +1,49 @@
-"""Production DutyRegistry handlers wiring multi-provider Agents, Board triggers, and execution tiers."""
+"""Production DutyRegistry handlers wiring multi-provider Agents, Board triggers, and domain plugins."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
 from pathlib import Path
 from time import time_ns
 from typing import TYPE_CHECKING, Any
 
 from ..agent_desk import desk_directory
-from ..agent_runtime.cost_accounting import settle_shift_cost_to_ledger
 from ..agent_runtime.protocol import (
     AgentProfileBinding,
     OuterToolBroker,
     ShiftRequest,
+    ToolHandler,
     ToolSpec,
     hydrate_shift_context,
 )
+from ..agent_runtime.cost_accounting import settle_shift_cost_to_ledger
 
 if TYPE_CHECKING:
     from ..agent_runtime.registry import AgentAdapterRegistry
 from ..board_control import (
+    ALLOWED_AVATAR_VARIANTS,
+    BoardControlRefused,
     mark_ceo_message_delivered,
     record_ceo_reply,
     record_decision_application_result,
     upsert_agent_profile,
 )
-from ..execution_tiers import (
-    AgentSandboxTools,
-    ExecutionTierRefused,
-    execute_paper_to_live_migration,
-    open_agent_sandbox,
-    read_execution_tiers_snapshot,
-)
 from ..storage.db import open_reader, open_writer, read_tx, write_tx
+from ..storage.schema import installed_domains
 from ..writer_lease import WriterLease
+from .domains import (
+    DecisionActionContext,
+    DecisionActionRegistry,
+    DomainActionRefused,
+    DomainPlugin,
+    DutyRuntimeServices,
+    ProfileBindingLookup,
+    ToolContribution,
+    ToolQueryContext,
+    merge_tool_contributions,
+)
 from .registry import (
     DutyContext,
     DutyDescriptor,
@@ -44,85 +51,15 @@ from .registry import (
     DutyRegistry,
     RuntimeRefused,
 )
-from .work_kernel import WorkItem, create_work_item
+from .work_kernel import create_work_item
 
 DUTY_CEO_RESPOND_MESSAGE = "ceo.respond_message"
 DUTY_BOARD_APPLY_DECISION = "board.apply_decision"
-DUTY_QUANT_AGENT_SANDBOX = "quant.agent_sandbox"
-DUTY_QUANT_PAPER_DECISION = "quant.paper_decision"
-DUTY_QUANT_RECONCILE = "quant.reconcile"
-
-ProfileBindingLookup = (
-    Mapping[str, AgentProfileBinding] | Callable[[str], AgentProfileBinding]
-)
 
 _CEO_READONLY_TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="read_company_status",
         description="Read current company agent count, active restrictions, and open work summary.",
-        parameters={"type": "object", "properties": {}, "required": []},
-    ),
-    ToolSpec(
-        name="read_execution_tiers",
-        description="Read Tier 1 agent sandboxes, Tier 2 company paper, and Tier 3 company live state.",
-        parameters={"type": "object", "properties": {}, "required": []},
-    ),
-)
-
-_SANDBOX_TOOL_SPECS: tuple[ToolSpec, ...] = (
-    ToolSpec(
-        name="open_agent_sandbox",
-        description="Open this Agent's isolated Tier 1 paper sandbox account.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "account_id": {"type": "string"},
-                "currency": {"type": "string"},
-                "starting_minor_units": {"type": "integer"},
-                "exposure_limit_minor_units": {"type": "integer"},
-                "fee_bps": {"type": "integer"},
-                "slippage_bps": {"type": "integer"},
-                "quote_source": {"type": "string"},
-            },
-            "required": ["account_id"],
-        },
-    ),
-    ToolSpec(
-        name="submit_agent_sandbox_order",
-        description="Submit a simulated order strictly inside this Agent's isolated Tier 1 sandbox.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "action_id": {"type": "string"},
-                "instrument_id": {"type": "string"},
-                "side": {"type": "string"},
-                "quantity": {"type": "integer"},
-                "limit_minor_units": {"type": "integer"},
-                "market_price_minor_units": {"type": "integer"},
-                "fill_mode": {"type": "string"},
-            },
-            "required": [
-                "action_id",
-                "instrument_id",
-                "side",
-                "quantity",
-                "limit_minor_units",
-                "market_price_minor_units",
-            ],
-        },
-    ),
-    ToolSpec(
-        name="cancel_agent_sandbox_order",
-        description="Cancel a resting order inside this Agent's isolated Tier 1 sandbox.",
-        parameters={
-            "type": "object",
-            "properties": {"order_id": {"type": "string"}},
-            "required": ["order_id"],
-        },
-    ),
-    ToolSpec(
-        name="read_agent_sandbox_portfolio",
-        description="Inspect cash, positions, fees, and realized PnL of this Agent's Tier 1 sandbox.",
         parameters={"type": "object", "properties": {}, "required": []},
     ),
 )
@@ -155,13 +92,9 @@ def _read_agent_state(store: Path, company_id: str, agent_id: str) -> tuple[str,
                ORDER BY id LIMIT 1""",
             (agent_id,),
         ).fetchone()
-        grant_scope = str(grant_row[0]) if grant_row is not None else "paper"
-        return str(row[0]), grant_scope
-
-
-def _read_tiers(store: Path, company_id: str) -> dict[str, Any]:
-    with closing(open_reader(store)) as db, read_tx(db):
-        return read_execution_tiers_snapshot(db, company_id)
+        if grant_row is None or not str(grant_row[0]).strip():
+            raise RuntimeRefused(f"Agent '{agent_id}' has no active standing grant")
+        return str(row[0]), str(grant_row[0])
 
 
 def _read_company_status(store: Path, company_id: str) -> dict[str, Any]:
@@ -194,21 +127,6 @@ def _read_company_status(store: Path, company_id: str) -> dict[str, Any]:
         "active_restrictions": restrictions,
         "open_work_items": due_work,
     }
-
-
-def _no_company_risk_restriction(
-    conn: sqlite3.Connection, item: WorkItem
-) -> tuple[bool, str | None]:
-    row = conn.execute(
-        """SELECT restriction_id FROM restriction_cause
-           WHERE company_id = ? AND active = 1
-             AND scope_ref IN ('company:all', 'execution:all', 'execution:paper')
-           LIMIT 1""",
-        (item.company_id,),
-    ).fetchone()
-    if row is not None:
-        return False, f"blocked_by_restriction:{row[0]}"
-    return True, None
 
 
 def sync_board_triggers(
@@ -274,11 +192,12 @@ def sync_board_triggers(
                 impact = json.loads(str(impact_json))
             except json.JSONDecodeError:
                 continue
-            if not isinstance(impact, dict) or not isinstance(
-                impact.get("action"), str
-            ):
+            if not isinstance(impact, dict):
                 continue
-            if not impact["action"].strip():
+            raw_action = impact.get("action")
+            if raw_action is None:
+                continue
+            if isinstance(raw_action, str) and not raw_action.strip():
                 continue
             _, reused = create_work_item(
                 db,
@@ -308,10 +227,22 @@ def build_production_duty_registry(
     adapter_registry: AgentAdapterRegistry,
     profile_bindings: ProfileBindingLookup,
     default_budget_ceiling_minor: int = 10_000,
+    domain_plugins: Sequence[DomainPlugin] = (),
     extra_handlers: Mapping[str, Callable[[DutyContext], DutyOutcome]] | None = None,
 ) -> DutyRegistry:
-    """Build the production DutyRegistry connecting live LLM adapters and domain owners."""
+    """Build the production DutyRegistry connecting live LLM adapters and domain plugins."""
     registry = DutyRegistry()
+    decision_actions = DecisionActionRegistry()
+    for plugin in domain_plugins:
+        for action_name, handler in plugin.contribute_decision_actions().items():
+            decision_actions.register(action_name, handler)
+
+    def _contribute_tools(tool_ctx: ToolQueryContext) -> ToolContribution:
+        contributions = tuple(
+            plugin.contribute_tools(tool_ctx) for plugin in domain_plugins
+        )
+        specs, handlers = merge_tool_contributions((), {}, contributions)
+        return ToolContribution(specs=specs, handlers=handlers)
 
     def _run_ceo_respond_message(ctx: DutyContext) -> DutyOutcome:
         payload = json.loads(ctx.work_item.payload_json)
@@ -328,6 +259,7 @@ def build_production_duty_registry(
         profile = _resolve_profile(profile_bindings, agent_id)
 
         with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
+            active_domains = frozenset(installed_domains(db))
             history_rows = db.execute(
                 """SELECT sender_kind, body FROM ceo_message
                    WHERE company_id = ?
@@ -349,19 +281,31 @@ def build_production_duty_registry(
             mandate_summary="Founder-CEO direct advisory response to the Board.",
             history_notes=history_notes,
         )
+        base_handlers: dict[str, ToolHandler] = {
+            "read_company_status": lambda _args: _read_company_status(
+                ctx.writer.store, ctx.company_id
+            ),
+        }
+        contrib = _contribute_tools(
+            ToolQueryContext(
+                store=ctx.writer.store,
+                company_id=ctx.company_id,
+                writer=ctx.writer,
+                agent_id=agent_id,
+                duty_kind=DUTY_CEO_RESPOND_MESSAGE,
+                grant_scope=grant_scope,
+                installed_domains=active_domains,
+            )
+        )
+        tool_specs, tool_handlers = merge_tool_contributions(
+            _CEO_READONLY_TOOLS, base_handlers, (contrib,)
+        )
         broker = OuterToolBroker(
             company_id=ctx.company_id,
             agent_id=agent_id,
             run_id=ctx.run.run_id,
             fencing_token=ctx.run.fencing_token,
-            handlers={
-                "read_company_status": lambda _args: _read_company_status(
-                    ctx.writer.store, ctx.company_id
-                ),
-                "read_execution_tiers": lambda _args: _read_tiers(
-                    ctx.writer.store, ctx.company_id
-                ),
-            },
+            handlers=tool_handlers,
         )
         budget_ceiling = (
             ctx.run.budget_ceiling_minor
@@ -376,7 +320,7 @@ def build_production_duty_registry(
             fencing_token=ctx.run.fencing_token,
             instruction=f"Respond concisely as Founder-CEO to Board message ({message_id}): {board_body}",
             context=context_pack,
-            tools=_CEO_READONLY_TOOLS,
+            tools=tool_specs,
             budget_ceiling_minor_units=budget_ceiling,
             desk_path=desk,
             store_path=ctx.writer.store,
@@ -423,103 +367,133 @@ def build_production_duty_registry(
     def _run_board_apply_decision(ctx: DutyContext) -> DutyOutcome:
         payload = json.loads(ctx.work_item.payload_json)
         question_id = str(payload.get("question_id") or ctx.work_item.source_id)
+        kind = str(payload.get("kind") or "")
+        revision = int(payload.get("revision") or 1)
         impact = payload.get("impact")
         if not isinstance(impact, dict):
             impact = {}
-        action = str(impact.get("action") or "")
+        raw_action = impact.get("action")
+        if raw_action is None:
+            action = ""
+        elif isinstance(raw_action, str):
+            action = raw_action.strip()
+        else:
+            action = repr(raw_action)
         summary = "no_op"
 
-        if action == "update_agent_budget":
-            target_agent = str(impact["agent_id"])
-            new_budget = int(impact["monthly_budget_minor"])
-            with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
-                row = db.execute(
-                    """SELECT display_name, role_label, avatar_variant
-                       FROM agent_profile
-                       WHERE company_id = ? AND agent_id = ?""",
-                    (ctx.company_id, target_agent),
-                ).fetchone()
-            display_name = (
-                str(row[0])
-                if row is not None
-                else str(impact.get("display_name") or target_agent)
-            )
-            role_label = (
-                str(row[1])
-                if row is not None
-                else str(impact.get("role_label") or "Quant")
-            )
-            avatar_variant = str(row[2]) if row is not None else "wide-oval-top"
-            upsert_agent_profile(
+        def _record_failure(failure_summary: str) -> DutyOutcome:
+            record_decision_application_result(
                 ctx.writer,
-                agent_id=target_agent,
-                display_name=display_name,
-                role_label=role_label,
-                avatar_variant=avatar_variant,
-                monthly_budget_minor=new_budget,
+                question_id=question_id,
+                application_status="failed",
+                delivery_status="delivered",
+                effect_summary=failure_summary,
                 now_ns=ctx.now_ns,
             )
-            summary = f"updated monthly_budget_minor={new_budget} for {target_agent}"
-        elif action == "open_agent_sandbox":
-            target_agent = str(impact["agent_id"])
-            binding = open_agent_sandbox(
-                ctx.writer,
-                agent_id=target_agent,
-                account_id=str(impact["account_id"]),
-                currency=str(impact.get("currency", "USD")),
-                starting_minor_units=int(
-                    impact.get("starting_minor_units", 10_000_000)
-                ),
-                fee_bps=int(impact.get("fee_bps", 4)),
-                slippage_bps=int(impact.get("slippage_bps", 2)),
+            return DutyOutcome(
+                disposition="completed",
+                result={
+                    "question_id": question_id,
+                    "action": action,
+                    "application_status": "failed",
+                    "effect_summary": failure_summary,
+                },
             )
-            summary = f"opened sandbox {binding.binding_id} for {target_agent}"
-        elif action == "migrate_paper_to_live":
+
+        if action == "update_agent_budget":
             try:
-                mig = execute_paper_to_live_migration(
+                raw_agent = impact["agent_id"]
+                if not isinstance(raw_agent, str) or not raw_agent.strip():
+                    raise BoardControlRefused("Invalid or missing agent_id")
+                target_agent = raw_agent.strip()
+                raw_budget = impact["monthly_budget_minor"]
+                if type(raw_budget) is not int:
+                    raise BoardControlRefused("Invalid monthly_budget_minor")
+                new_budget = raw_budget
+                raw_display = impact.get("display_name")
+                if raw_display is not None and not isinstance(raw_display, str):
+                    raise BoardControlRefused("Invalid display_name")
+                raw_role = impact.get("role_label")
+                if raw_role is not None and not isinstance(raw_role, str):
+                    raise BoardControlRefused("Invalid role_label")
+                with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
+                    row = db.execute(
+                        """SELECT display_name, role_label, avatar_variant
+                           FROM agent_profile
+                           WHERE company_id = ? AND agent_id = ?""",
+                        (ctx.company_id, target_agent),
+                    ).fetchone()
+                display_name = (
+                    str(row[0])
+                    if row is not None
+                    else (
+                        raw_display.strip()
+                        if isinstance(raw_display, str) and raw_display.strip()
+                        else target_agent
+                    )
+                )
+                role_label = (
+                    str(row[1])
+                    if row is not None
+                    else (
+                        raw_role.strip()
+                        if isinstance(raw_role, str) and raw_role.strip()
+                        else "Agent"
+                    )
+                )
+                raw_variant = (
+                    str(row[2]).strip()
+                    if row is not None and row[2] is not None
+                    else ""
+                )
+                avatar_variant = (
+                    raw_variant
+                    if raw_variant in ALLOWED_AVATAR_VARIANTS
+                    else "wide-oval-top"
+                )
+                upsert_agent_profile(
                     ctx.writer,
-                    source_paper_binding_id=str(impact["source_paper_binding_id"]),
-                    target_live_binding_id=str(impact["target_live_binding_id"]),
-                    qualification_receipt_id=str(impact["qualification_receipt_id"]),
-                    migration_mode=str(impact.get("migration_mode") or "clean_start"),
-                    source_paper_disposition=str(
-                        impact.get("source_paper_disposition") or "keep_shadow"
-                    ),
-                    reason=str(
-                        impact.get("reason")
-                        or f"Board approved live migration decision {question_id}"
-                    ),
-                    question_id=question_id,
-                    actor_id="board_apply_decision",
+                    agent_id=target_agent,
+                    display_name=display_name,
+                    role_label=role_label,
+                    avatar_variant=avatar_variant,
+                    monthly_budget_minor=new_budget,
                     now_ns=ctx.now_ns,
                 )
                 summary = (
-                    f"migrated paper book {mig['source_paper_binding_id']} -> "
-                    f"live {mig['target_live_binding_id']} "
-                    f"(mode={mig['migration_mode']}, source={mig['source_book_final_role']}, "
-                    f"positions_copied=0)"
+                    f"updated monthly_budget_minor={new_budget} for {target_agent}"
                 )
-            except ExecutionTierRefused as exc:
-                failure_summary = f"migration_refused: {exc}"
-                record_decision_application_result(
-                    ctx.writer,
-                    question_id=question_id,
-                    application_status="failed",
-                    delivery_status="delivered",
-                    effect_summary=failure_summary,
-                    now_ns=ctx.now_ns,
-                )
-                return DutyOutcome(
-                    disposition="completed",
-                    result={
-                        "question_id": question_id,
-                        "action": action,
-                        "application_status": "failed",
-                        "effect_summary": failure_summary,
-                    },
-                )
+            except (
+                BoardControlRefused,
+                DomainActionRefused,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                return _record_failure(f"{action}_refused: {exc}")
         else:
-            summary = f"recorded approved advisory decision ({action or 'advisory'})"
+            domain_handler = decision_actions.get(action)
+            if domain_handler is not None:
+                try:
+                    summary = domain_handler(
+                        DecisionActionContext(
+                            writer=ctx.writer,
+                            company_id=ctx.company_id,
+                            question_id=question_id,
+                            kind=kind,
+                            revision=revision,
+                            impact=impact,
+                            now_ns=ctx.now_ns,
+                        )
+                    )
+                except (DomainActionRefused, BoardControlRefused) as exc:
+                    return _record_failure(f"{action}_refused: {exc}")
+            elif action in ("", "advisory"):
+                summary = (
+                    f"recorded approved advisory decision ({action or 'advisory'})"
+                )
+            else:
+                return _record_failure(f"unsupported_decision_action: {action}")
 
         record_decision_application_result(
             ctx.writer,
@@ -538,184 +512,6 @@ def build_production_duty_registry(
             },
         )
 
-    def _run_quant_agent_sandbox(ctx: DutyContext) -> DutyOutcome:
-        payload = json.loads(ctx.work_item.payload_json)
-        instruction = str(
-            payload.get("instruction")
-            or "Run your isolated Tier 1 sandbox strategy experiment and summarize results."
-        )
-        agent_id = ctx.work_item.owner_agent_id
-        persisted_profile, grant_scope = _read_agent_state(
-            ctx.writer.store, ctx.company_id, agent_id
-        )
-        profile = _resolve_profile(profile_bindings, agent_id)
-        sandbox_tools = AgentSandboxTools(writer=ctx.writer, agent_id=agent_id)
-        broker = OuterToolBroker(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            fencing_token=ctx.run.fencing_token,
-            handlers={
-                "open_agent_sandbox": lambda a: sandbox_tools.invoke(
-                    "open_agent_sandbox", a
-                ),
-                "submit_agent_sandbox_order": lambda a: sandbox_tools.invoke(
-                    "submit_agent_sandbox_order", a
-                ),
-                "cancel_agent_sandbox_order": lambda a: sandbox_tools.invoke(
-                    "cancel_agent_sandbox_order", a
-                ),
-                "read_agent_sandbox_portfolio": lambda a: sandbox_tools.invoke(
-                    "read_agent_sandbox_portfolio", a
-                ),
-            },
-        )
-        desk = desk_directory(ctx.writer.store, agent_id)
-        desk.mkdir(parents=True, exist_ok=True)
-        context_pack = hydrate_shift_context(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            fencing_token=ctx.run.fencing_token,
-            grant_scope=grant_scope,
-            mandate_summary="Autonomous isolated Tier 1 per-Agent sandbox experiment.",
-        )
-        budget_ceiling = (
-            ctx.run.budget_ceiling_minor
-            if ctx.run.budget_ceiling_minor > 0
-            else default_budget_ceiling_minor
-        )
-        req = ShiftRequest(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            turn_id="turn-1",
-            fencing_token=ctx.run.fencing_token,
-            instruction=instruction,
-            context=context_pack,
-            tools=_SANDBOX_TOOL_SPECS,
-            budget_ceiling_minor_units=budget_ceiling,
-            desk_path=desk,
-            store_path=ctx.writer.store,
-        )
-        result = adapter_registry.execute_shift(
-            persisted_profile_id=persisted_profile,
-            profile=profile,
-            request=req,
-            broker=broker,
-        )
-        settlement = settle_shift_cost_to_ledger(
-            ctx.writer,
-            profile=profile,
-            run_id=ctx.run.run_id,
-            turn_id="turn-1",
-            usage=result.usage,
-            budget_ceiling_minor_units=budget_ceiling,
-        )
-        return DutyOutcome(
-            disposition="completed",
-            result={
-                "agent_id": agent_id,
-                "provider": result.provider,
-                "model": result.model,
-                "tool_calls_executed": result.tool_calls_executed,
-                "output_text": result.output_text,
-                "cost_minor_units": settlement.cost_minor_units,
-                "journal_entry_id": settlement.journal_entry_id,
-            },
-        )
-
-    def _run_quant_paper_decision(ctx: DutyContext) -> DutyOutcome:
-        payload = json.loads(ctx.work_item.payload_json)
-        instruction = str(
-            payload.get("instruction")
-            or "Evaluate company paper execution tier posture and record decision summary."
-        )
-        agent_id = ctx.work_item.owner_agent_id
-        persisted_profile, grant_scope = _read_agent_state(
-            ctx.writer.store, ctx.company_id, agent_id
-        )
-        profile = _resolve_profile(profile_bindings, agent_id)
-        broker = OuterToolBroker(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            fencing_token=ctx.run.fencing_token,
-            handlers={
-                "read_company_status": lambda _args: _read_company_status(
-                    ctx.writer.store, ctx.company_id
-                ),
-                "read_execution_tiers": lambda _args: _read_tiers(
-                    ctx.writer.store, ctx.company_id
-                ),
-            },
-        )
-        desk = desk_directory(ctx.writer.store, agent_id)
-        desk.mkdir(parents=True, exist_ok=True)
-        context_pack = hydrate_shift_context(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            fencing_token=ctx.run.fencing_token,
-            grant_scope=grant_scope,
-            mandate_summary="Company Tier 2 paper decision shift.",
-        )
-        budget_ceiling = (
-            ctx.run.budget_ceiling_minor
-            if ctx.run.budget_ceiling_minor > 0
-            else default_budget_ceiling_minor
-        )
-        req = ShiftRequest(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            turn_id="turn-1",
-            fencing_token=ctx.run.fencing_token,
-            instruction=instruction,
-            context=context_pack,
-            tools=_CEO_READONLY_TOOLS,
-            budget_ceiling_minor_units=budget_ceiling,
-            desk_path=desk,
-            store_path=ctx.writer.store,
-        )
-        result = adapter_registry.execute_shift(
-            persisted_profile_id=persisted_profile,
-            profile=profile,
-            request=req,
-            broker=broker,
-        )
-        settlement = settle_shift_cost_to_ledger(
-            ctx.writer,
-            profile=profile,
-            run_id=ctx.run.run_id,
-            turn_id="turn-1",
-            usage=result.usage,
-            budget_ceiling_minor_units=budget_ceiling,
-        )
-        return DutyOutcome(
-            disposition="completed",
-            result={
-                "agent_id": agent_id,
-                "provider": result.provider,
-                "output_text": result.output_text,
-                "cost_minor_units": settlement.cost_minor_units,
-                "journal_entry_id": settlement.journal_entry_id,
-            },
-        )
-
-    def _run_quant_reconcile(ctx: DutyContext) -> DutyOutcome:
-        snapshot = _read_tiers(ctx.writer.store, ctx.company_id)
-        return DutyOutcome(
-            disposition="completed",
-            result={
-                "paper_domain_installed": snapshot["paper_domain_installed"],
-                "company_paper_active": snapshot["company_paper"] is not None,
-                "company_live_active": snapshot["company_live"] is not None,
-                "active_agent_sandboxes": len(snapshot["agent_sandboxes"]),
-                "reconciled_at_ns": ctx.now_ns,
-            },
-        )
-
     registry.register(
         DutyDescriptor(
             duty_kind=DUTY_CEO_RESPOND_MESSAGE,
@@ -728,25 +524,18 @@ def build_production_duty_registry(
             execute=_run_board_apply_decision,
         )
     )
-    registry.register(
-        DutyDescriptor(
-            duty_kind=DUTY_QUANT_AGENT_SANDBOX,
-            execute=_run_quant_agent_sandbox,
-        )
+    services = DutyRuntimeServices(
+        adapter_registry=adapter_registry,
+        profile_bindings=profile_bindings,
+        default_budget_ceiling_minor=default_budget_ceiling_minor,
+        read_agent_state=_read_agent_state,
+        resolve_profile=_resolve_profile,
+        read_company_status=_read_company_status,
+        contribute_tools=_contribute_tools,
     )
-    registry.register(
-        DutyDescriptor(
-            duty_kind=DUTY_QUANT_PAPER_DECISION,
-            execute=_run_quant_paper_decision,
-            precondition=_no_company_risk_restriction,
-        )
-    )
-    registry.register(
-        DutyDescriptor(
-            duty_kind=DUTY_QUANT_RECONCILE,
-            execute=_run_quant_reconcile,
-        )
-    )
+    for plugin in domain_plugins:
+        for descriptor in plugin.contribute_duties(services):
+            registry.register(descriptor)
     for duty_kind, fn in (extra_handlers or {}).items():
         registry.register(DutyDescriptor(duty_kind=duty_kind, execute=fn))
     return registry

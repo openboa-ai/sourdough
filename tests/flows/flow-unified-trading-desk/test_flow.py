@@ -26,20 +26,25 @@ from sourdough.board_control import (
     bind_board_principal,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
-    ENV_EXTERNAL_TEST,
-    compute_trading_core_digest,
+from sourdough.trading.accounts import (
     open_company_paper_book,
-    propose_paper_to_live_migration,
-    record_live_book_order_fill,
-    record_trading_book_valuation,
     record_venue_qualification_receipt,
     register_live_candidate_binding,
+)
+from sourdough.trading.domain import (
+    ENV_EXTERNAL_TEST,
+    compute_trading_core_digest,
+)
+from sourdough.trading.ledger import (
+    record_live_book_order_fill,
+    record_trading_book_valuation,
     submit_company_paper_book_order,
 )
+from sourdough.trading.migration import propose_paper_to_live_migration
 from sourdough.ipc import ClientWebBridge
 from sourdough.runtime.handlers import build_production_duty_registry
 from sourdough.runtime.resident import ResidentCompanyService
+from sourdough.trading import TradingDomainPlugin
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -217,9 +222,11 @@ class ConnectedFlow(unittest.TestCase):
                 model="gpt-5-codex",
                 revision="v1",
             )
+            plugins = (TradingDomainPlugin(),)
             duty_registry = build_production_duty_registry(
                 adapter_registry=adapters,
                 profile_bindings=lambda _aid: profile,
+                domain_plugins=plugins,
             )
 
             # Phase 1: Live Standby + Multi-Book Paper Desk + Board Approval Migration over HTTP.
@@ -231,6 +238,7 @@ class ConnectedFlow(unittest.TestCase):
                     socket_dir=sock_dir,
                     lease_directory=leases,
                     tick_interval_seconds=0.05,
+                    domain_plugins=plugins,
                 ) as resident,
                 ClientWebBridge(
                     resident.socket_path,
@@ -372,6 +380,7 @@ class ConnectedFlow(unittest.TestCase):
                     socket_dir=sock_dir,
                     lease_directory=leases,
                     tick_interval_seconds=0.05,
+                    domain_plugins=plugins,
                 ) as resident,
                 ClientWebBridge(
                     resident.socket_path,

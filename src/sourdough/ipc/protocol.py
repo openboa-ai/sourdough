@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
+from urllib.parse import unquote
 
 CONTROL_PLANE_VERSION = "control-plane-v1"
 WORK_TIMELINE_V1 = "work-timeline-v1"
@@ -80,6 +81,24 @@ def _is_private(info: os.stat_result) -> bool:
 
 def _has_ctl_or_newline(text: str) -> bool:
     return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+
+
+def valid_path_segment(raw: str) -> str | None:
+    """Decode and validate a single URL path segment against traversal, whitespace, and CTLs."""
+    if "/" in raw or not raw:
+        return None
+    decoded = unquote(raw)
+    if (
+        "/" in decoded
+        or "\\" in decoded
+        or "\x00" in decoded
+        or decoded in (".", "..")
+        or not decoded.strip()
+        or len(decoded) > 128
+        or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in decoded)
+    ):
+        return None
+    return decoded
 
 
 def _valid_header_name(name: str) -> bool:

@@ -9,9 +9,9 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from sourdough.board_control import PAUSE_COMPANY, RESTRICTION_COMMAND
 from sourdough.company import FoundingTerms, found
 from sourdough.ipc import CompanyDaemon, ControlPlaneClient
-from sourdough.paper_risk import PAPER_RISK_COMMAND, SUSPEND_NEW_RISK
 from sourdough.writer_lease import WriterRefused, hold_company_writer
 
 
@@ -111,7 +111,7 @@ class ConnectedFlow(unittest.TestCase):
                     "--command-id",
                     "missing-cmd",
                     "--operation",
-                    SUSPEND_NEW_RISK,
+                    PAUSE_COMPANY,
                 )
                 self.assertEqual(receipt_proc.returncode, 0, receipt_proc.stderr)
                 self.assertEqual(json.loads(receipt_proc.stdout)["status"], "not_found")
@@ -121,13 +121,18 @@ class ConnectedFlow(unittest.TestCase):
                 denied_code, _ = client.submit_command(
                     company_id=company_id,
                     command_id="unauth-1",
-                    command_type=SUSPEND_NEW_RISK,
-                    contract_version=PAPER_RISK_COMMAND,
+                    command_type=PAUSE_COMPANY,
+                    contract_version=RESTRICTION_COMMAND,
                     preconditions={
                         "charter_revision": "charter-1",
-                        "expected_revision": 0,
+                        "restriction_id": "stop-unauth",
+                        "expected_restriction_revision": 0,
                     },
-                    payload={"reason": "must be refused"},
+                    payload={
+                        "scope_ref": "company:all",
+                        "cause_category": "board_pause",
+                        "reason": "must be refused",
+                    },
                 )
                 self.assertEqual(denied_code, 403)
             finally:
@@ -142,9 +147,7 @@ class ConnectedFlow(unittest.TestCase):
             #    a separate child Python process and persists that child's kernel PID.
             def authorize_board(db, cid, op):
                 return (
-                    "board-lead"
-                    if cid == company_id and op == SUSPEND_NEW_RISK
-                    else None
+                    "board-lead" if cid == company_id and op == PAUSE_COMPANY else None
                 )
 
             with CompanyDaemon(
@@ -154,15 +157,27 @@ class ConnectedFlow(unittest.TestCase):
                 lease_directory=leases,
                 authorize_board=authorize_board,
             ) as daemon:
+                retired_code, _ = ControlPlaneClient(daemon.socket_path).submit_command(
+                    company_id=company_id,
+                    command_id="retired-risk-cmd",
+                    command_type="suspend_new_risk",
+                    contract_version="paper-risk-command-v1",
+                    preconditions={
+                        "charter_revision": "charter-1",
+                        "expected_revision": 0,
+                    },
+                    payload={"reason": "retired"},
+                )
+                self.assertEqual(retired_code, 422)
                 child_script = (
                     "import json, os, sys; from pathlib import Path; "
                     "from sourdough.ipc import ControlPlaneClient; "
                     "c = ControlPlaneClient(Path(sys.argv[1])); "
                     "code, body = c.submit_command("
-                    "company_id=sys.argv[2], command_id='child-suspend-1', "
-                    "command_type='suspend_new_risk', contract_version='paper-risk-command-v1', "
-                    "preconditions={'charter_revision': 'charter-1', 'expected_revision': 0}, "
-                    "payload={'reason': 'cross-process board stop'}); "
+                    f"company_id=sys.argv[2], command_id='child-suspend-1', "
+                    f"command_type='{PAUSE_COMPANY}', contract_version='{RESTRICTION_COMMAND}', "
+                    "preconditions={'charter_revision': 'charter-1', 'restriction_id': 'stop-1', 'expected_restriction_revision': 0}, "
+                    "payload={'scope_ref': 'company:all', 'cause_category': 'board_pause', 'reason': 'cross-process board stop'}); "
                     "print(json.dumps({'pid': os.getpid(), 'code': code, 'body': body}))"
                 )
                 child = subprocess.run(
@@ -209,7 +224,10 @@ class ConnectedFlow(unittest.TestCase):
                     if line.strip()
                 ]
                 self.assertTrue(
-                    any(e["event_type"] == "paper.risk_suspended" for e in events)
+                    any(
+                        e["event_type"] == "governance.restriction_applied"
+                        for e in events
+                    )
                 )
 
             with closing(sqlite3.connect(store)) as db:

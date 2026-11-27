@@ -182,3 +182,73 @@ class RetirementFence(unittest.TestCase):
                 observed.execute("SELECT count(*) FROM shared_publication").fetchone(),
                 (1,),
             )
+
+    def test_retired_agent_excluded_from_tier_snapshot_and_blocked_from_cancelling_sandbox_order(
+        self,
+    ):
+        from sourdough.storage.db import open_reader, read_tx
+        from sourdough.trading.accounts import open_agent_sandbox
+        from sourdough.trading.domain import ExecutionTierRefused
+        from sourdough.trading.ledger import (
+            cancel_agent_sandbox_order,
+            submit_agent_sandbox_order,
+        )
+        from sourdough.trading.migration import read_execution_tiers_snapshot
+
+        folder = Path(self.enterContext(TemporaryDirectory()))
+        store = folder / "company.sqlite"
+        leases = folder / "leases"
+        company = found(
+            store, FoundingTerms("retirement-sbx", "charter", "paper", "profile")
+        )
+        company_id = company.company_id
+        with hold_company_writer(store, company_id, lease_directory=leases) as writer:
+            with closing(_connect(store, "rw")) as connection, connection:
+                for agent, scope in (
+                    ("manager", TERMINATION_SCOPE),
+                    ("quant-1", "trading"),
+                ):
+                    connection.execute(
+                        "INSERT INTO agent VALUES (?,?,'profile')", (agent, company_id)
+                    )
+                    connection.execute(
+                        "INSERT INTO standing_grant VALUES (?,?,?)",
+                        (f"{agent}-grant", agent, scope),
+                    )
+                    connection.execute(
+                        "INSERT INTO private_desk VALUES (?,'revision')", (agent,)
+                    )
+            open_agent_sandbox(writer, agent_id="quant-1", account_id="sbx-q1")
+            resting = submit_agent_sandbox_order(
+                writer,
+                agent_id="quant-1",
+                action_id="rest-q1",
+                instrument_id="BTC-USDT",
+                side="buy",
+                quantity=1,
+                limit_minor_units=90,
+                market_price_minor_units=100,
+                fill_mode="resting",
+            )
+            with closing(open_reader(store)) as db, read_tx(db):
+                before = read_execution_tiers_snapshot(db, company_id)
+            self.assertEqual(
+                [s["agent_id"] for s in before["agent_sandboxes"]], ["quant-1"]
+            )
+
+            rev = employment_revision(writer, "manager", "manager-grant", "quant-1")
+            retire_agent(
+                writer,
+                "manager",
+                "manager-grant",
+                Retirement("ret-q1", "quant-1", rev, "Assignment ended."),
+            )
+
+            with closing(open_reader(store)) as db, read_tx(db):
+                after = read_execution_tiers_snapshot(db, company_id)
+            self.assertEqual(after["agent_sandboxes"], [])
+
+            with self.assertRaisesRegex(ExecutionTierRefused, "Retired agent"):
+                cancel_agent_sandbox_order(
+                    writer, agent_id="quant-1", order_id=resting.order_id
+                )

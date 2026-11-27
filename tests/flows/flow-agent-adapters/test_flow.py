@@ -29,7 +29,7 @@ from sourdough.agent_runtime import (
 )
 from sourdough.agent_desk import desk_directory
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import AgentSandboxTools
+from sourdough.trading.sandbox_tools import AgentSandboxTools
 from sourdough.ipc import CompanyDaemon, ControlPlaneClient
 from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
 from sourdough.writer_lease import hold_company_writer
@@ -552,13 +552,17 @@ class ConnectedFlow(unittest.TestCase):
                     lease_directory=leases,
                 ) as daemon:
                     client = ControlPlaneClient(daemon.socket_path)
-                    status, _etag, tiers = client.projection(
-                        "execution-tiers", expected_company_id=company_id
+                    status, _etag, graph = client.projection(
+                        "agents-graph", expected_company_id=company_id
                     )
                     self.assertEqual(status, 200)
-                    sandbox_ids = {s["agent_id"] for s in tiers["agent_sandboxes"]}
+                    sandboxes = [
+                        (node["agent_id"], node["sandbox_activity"])
+                        for node in graph["nodes"]
+                        if node.get("sandbox_activity") is not None
+                    ]
                     self.assertEqual(
-                        sandbox_ids,
+                        {aid for aid, _ in sandboxes},
                         {
                             founding.founder_id,
                             "agent-openai",
@@ -566,7 +570,7 @@ class ConnectedFlow(unittest.TestCase):
                             "agent-gemini",
                         },
                     )
-                    for sbx in tiers["agent_sandboxes"]:
+                    for _aid, sbx in sandboxes:
                         self.assertEqual(sbx["fill_count"], 1)
                         self.assertEqual(sbx["open_positions_count"], 1)
         finally:

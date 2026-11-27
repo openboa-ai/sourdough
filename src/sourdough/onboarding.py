@@ -1,7 +1,7 @@
 """Prepare the hired Agent's desk and bind acceptance to its first duty."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
@@ -13,7 +13,6 @@ from .agent_desk import ensure_private_desk
 from .company import _connect
 from .company_assets import enroll_project_participant
 from .duty_run import (
-    PAPER_EXECUTION,
     DutyClaim,
     DutyRefused,
     has_turn_capacity,
@@ -25,8 +24,19 @@ from .writer_lease import WriterLease
 
 MAX_PROVISIONING_ATTEMPTS = 3
 PROVISIONING_RETRY_SECONDS = 60
-_SCOPE = {"assessment": "assessment", PAPER_EXECUTION: "paper"}
+_CORE_SCOPE: dict[str, str] = {"assessment": "assessment"}
 ResumeWork = Callable[[Connection, str], bool]
+
+
+def _resolve_scopes(purpose_scopes: Mapping[str, str] | None) -> dict[str, str]:
+    if not purpose_scopes:
+        return dict(_CORE_SCOPE)
+    merged = dict(_CORE_SCOPE)
+    for purpose, scope in purpose_scopes.items():
+        if purpose in merged and merged[purpose] != scope:
+            raise DutyRefused(f"Conflicting scope mapping for purpose '{purpose}'")
+        merged[purpose] = scope
+    return merged
 
 
 @dataclass(frozen=True)
@@ -59,8 +69,10 @@ def pending_onboarding(
     purpose: str,
     *,
     resume_work: ResumeWork | None = None,
+    purpose_scopes: Mapping[str, str] | None = None,
 ) -> DutyClaim | None:
-    if purpose not in _SCOPE:
+    scopes = _resolve_scopes(purpose_scopes)
+    if purpose not in scopes:
         raise DutyRefused("Unsupported first duty purpose")
     writer.verify()
     with closing(_connect(writer.store, "ro")) as connection:
@@ -82,7 +94,7 @@ def pending_onboarding(
             admission_join = "LEFT JOIN hire_admission_run admitted ON admitted.request_id=h.request_id"
             manager_run = "coalesce(admitted.run_id,choice.run_id)"
         first_duty_fields = "NULL, NULL"
-        arguments = [writer.company_id, execution_profile, _SCOPE[purpose]]
+        arguments = [writer.company_id, execution_profile, scopes[purpose]]
         if "hire_onboarding" in tables:
             join = "LEFT JOIN hire_onboarding o ON o.agent_id=h.agent_id"
             first_duty_fields = "o.state, o.first_duty_id"
@@ -169,13 +181,15 @@ def provision_hire(
     ready: Callable[[str], bool],
     *,
     now: int,
+    purpose_scopes: Mapping[str, str] | None = None,
 ) -> OnboardingStatus:
+    scopes = _resolve_scopes(purpose_scopes)
     writer.verify()
     with closing(_connect(writer.store, "rw")) as connection:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
             profile, _, scope = _active_hire(connection, writer.company_id, agent_id)
-            if _SCOPE.get(purpose) != scope:
+            if scopes.get(purpose) != scope:
                 raise DutyRefused("First duty purpose does not match the hire scope")
             connection.execute(
                 """INSERT OR IGNORE INTO hire_onboarding (agent_id, purpose, state, attempts)
@@ -259,7 +273,9 @@ def claim_hired_first(
     *,
     resume: bool = False,
     resume_work: ResumeWork | None = None,
+    purpose_scopes: Mapping[str, str] | None = None,
 ) -> DutyClaim | None:
+    scopes = _resolve_scopes(purpose_scopes)
     writer.verify()
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -283,7 +299,7 @@ def claim_hired_first(
         ):
             return None
         duty_id, purpose, state, onboarding_state = row
-        if _SCOPE.get(purpose) != scope:
+        if scopes.get(purpose) != scope:
             raise DutyRefused("First duty purpose does not match the hire scope")
         if onboarding_state == "accepted" and (
             resume_work is None or not resume_work(connection, duty_id)

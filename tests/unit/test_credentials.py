@@ -1,6 +1,6 @@
 import unittest
 
-from sourdough.credentials import (
+from sourdough.trading.credentials import (
     ApiCredentialPair,
     CompositeCredentialProvider,
     CredentialRefused,
@@ -9,7 +9,7 @@ from sourdough.credentials import (
     assert_handle_matches_environment,
     parse_credential_handle,
 )
-from sourdough.execution_tiers import ENV_EXTERNAL_TEST, ENV_LIVE, ENV_PAPER
+from sourdough.trading.domain import ENV_EXTERNAL_TEST, ENV_LIVE, ENV_PAPER
 
 
 class CredentialBoundaryTests(unittest.TestCase):

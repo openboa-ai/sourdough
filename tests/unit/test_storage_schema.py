@@ -13,7 +13,9 @@ from sourdough.storage.db import (
     read_tx,
     write_tx,
 )
+from sourdough.storage.migration import rebuild_core_v1_tables
 from sourdough.storage.schema import (
+    canonical_domain_name,
     enable_domain_v1,
     installed_domains,
     is_domain_installed,
@@ -70,7 +72,7 @@ class CanonicalV1Schema(unittest.TestCase):
         self.assertFalse(second)
 
         with closing(open_reader(self.store)) as reader, read_tx(reader):
-            self.assertEqual(verify_v1_schema(reader), frozenset({"core", "paper"}))
+            self.assertEqual(verify_v1_schema(reader), frozenset({"core", "trading"}))
             self.assertTrue(is_domain_installed(reader, "paper"))
             non_strict = reader.execute(
                 """SELECT name FROM pragma_table_list
@@ -81,7 +83,7 @@ class CanonicalV1Schema(unittest.TestCase):
             events = reader.execute(
                 "SELECT entity_id, event_type FROM audit_event WHERE event_type = 'domain.activated'"
             ).fetchall()
-            self.assertEqual(events, [("paper", "domain.activated")])
+            self.assertEqual(events, [("trading", "domain.activated")])
 
     def test_non_canonical_user_versions_fail_closed_across_apis(self):
         receipt = found(self.store, self.terms)
@@ -151,3 +153,136 @@ class CanonicalV1Schema(unittest.TestCase):
                     enable_domain_v1(writer, "core")
                 with self.assertRaisesRegex(StorageRefused, "Unsupported"):
                     enable_domain_v1(writer, "unknown")
+
+    def test_canonical_domain_name_and_trading_activation_aliases(self):
+        self.assertEqual(canonical_domain_name("core"), "core")
+        self.assertEqual(canonical_domain_name("trading"), "trading")
+        self.assertEqual(canonical_domain_name("paper"), "trading")
+        with self.assertRaisesRegex(StorageRefused, "Unsupported"):
+            canonical_domain_name("unknown")
+
+        receipt = found(
+            self.store, FoundingTerms("setup", "charter-v1", "manage", "profile-v1")
+        )
+        with closing(open_writer(self.store)) as writer, write_tx(writer):
+            self.assertTrue(
+                enable_domain_v1(
+                    writer, "trading", company_id=receipt.company_id, actor_id="test"
+                )
+            )
+            self.assertFalse(
+                enable_domain_v1(
+                    writer, "paper", company_id=receipt.company_id, actor_id="test"
+                )
+            )
+        with closing(open_reader(self.store)) as reader, read_tx(reader):
+            self.assertTrue(is_domain_installed(reader, "trading"))
+            self.assertTrue(is_domain_installed(reader, "paper"))
+            self.assertEqual(verify_v1_schema(reader), frozenset({"core", "trading"}))
+
+    def test_core_v1_constraints_and_rebuild_core_v1_tables(self):
+        receipt = found(self.store, self.terms)
+        with closing(open_writer(self.store)) as writer, write_tx(writer):
+            with self.assertRaises(sqlite3.IntegrityError):
+                writer.execute(
+                    "UPDATE duty SET state = 'bogus' WHERE id = ?",
+                    (receipt.due_work_id,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                writer.execute(
+                    """INSERT INTO work_follow_up (
+                           duty_id, previous_duty_id, due_at, result_kind,
+                           result_id, result_revision, available_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    ("fu-1", receipt.due_work_id, 10, "r", "id", "rev", 1),
+                )
+            writer.execute(
+                """INSERT INTO decision_question (
+                       question_id, company_id, kind, title, summary,
+                       impact_json, options_json, revision, payload_hash,
+                       state, created_by_agent_id, created_at_ns,
+                       application_status, delivery_status
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "q-failed",
+                    receipt.company_id,
+                    "advisory",
+                    "Test",
+                    "Summary",
+                    "{}",
+                    "[]",
+                    1,
+                    "h1",
+                    "applied",
+                    receipt.founder_id,
+                    100,
+                    "failed",
+                    "delivered",
+                ),
+            )
+
+        mig_store = self.store.with_name("mig.sqlite")
+        mig_store.write_bytes(self.store.read_bytes())
+        with closing(sqlite3.connect(mig_store)) as raw:
+            raw.execute("PRAGMA foreign_keys = OFF")
+            with raw:
+                raw.execute("DROP TABLE work_follow_up")
+                raw.execute(
+                    """CREATE TABLE work_follow_up (
+                           duty_id TEXT PRIMARY KEY NOT NULL REFERENCES duty(id),
+                           previous_duty_id TEXT NOT NULL UNIQUE REFERENCES duty(id),
+                           due_at INTEGER NOT NULL,
+                           purpose TEXT NOT NULL DEFAULT 'position_review',
+                           result_kind TEXT NOT NULL,
+                           result_id TEXT NOT NULL,
+                           result_revision TEXT NOT NULL,
+                           available_at INTEGER NOT NULL
+                       ) STRICT"""
+                )
+        with self.assertRaisesRegex(StorageRefused, "sqlite_schema"):
+            open_reader(mig_store)
+        with closing(sqlite3.connect(mig_store)) as raw:
+            raw.execute("PRAGMA foreign_keys = OFF")
+            raw.execute("BEGIN IMMEDIATE")
+            domains = rebuild_core_v1_tables(raw)
+            raw.commit()
+        self.assertEqual(domains, frozenset({"core"}))
+        with closing(open_reader(mig_store)) as reader, read_tx(reader):
+            self.assertEqual(verify_v1_schema(reader), frozenset({"core"}))
+
+    def test_rebuild_core_v1_tables_rejects_invalid_installed_domains_with_storage_refused(
+        self,
+    ):
+        found(self.store, self.terms)
+        bad_store = self.store.with_name("bad-domain.sqlite")
+        bad_store.write_bytes(self.store.read_bytes())
+        with closing(sqlite3.connect(bad_store)) as raw:
+            raw.execute("PRAGMA foreign_keys = OFF")
+            with raw:
+                raw.execute("DROP TABLE installed_domains")
+                raw.execute(
+                    """CREATE TABLE installed_domains (
+                           domain TEXT PRIMARY KEY,
+                           schema_version INTEGER NOT NULL,
+                           pack_sha256 TEXT NOT NULL,
+                           sqlite_schema_sha256 TEXT NOT NULL,
+                           activated_at_ns INTEGER NOT NULL
+                       ) STRICT"""
+                )
+                raw.execute(
+                    "INSERT INTO installed_domains VALUES ('core', 1, 'a', 'b', 1)"
+                )
+                raw.execute(
+                    "INSERT INTO installed_domains VALUES ('bogus', 1, 'a', 'b', 1)"
+                )
+            before_rows = raw.execute(
+                "SELECT domain, schema_version FROM installed_domains ORDER BY domain"
+            ).fetchall()
+            raw.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(StorageRefused, "installed_domains.domain"):
+                rebuild_core_v1_tables(raw)
+            raw.rollback()
+            after_rows = raw.execute(
+                "SELECT domain, schema_version FROM installed_domains ORDER BY domain"
+            ).fetchall()
+            self.assertEqual(after_rows, before_rows)

@@ -33,9 +33,6 @@ from sourdough.board_control import (
 from sourdough.company import FoundingTerms, found
 from sourdough.ipc import ControlPlaneClient
 from sourdough.runtime import (
-    DUTY_QUANT_AGENT_SANDBOX,
-    DUTY_QUANT_PAPER_DECISION,
-    DUTY_QUANT_RECONCILE,
     CompanyRuntime,
     ResidentCompanyService,
     build_production_duty_registry,
@@ -43,6 +40,13 @@ from sourdough.runtime import (
     sync_board_triggers,
 )
 from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
+from sourdough.storage.schema import enable_domain_v1
+from sourdough.trading import (
+    DUTY_QUANT_AGENT_SANDBOX,
+    DUTY_QUANT_PAPER_DECISION,
+    DUTY_QUANT_RECONCILE,
+    TradingDomainPlugin,
+)
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -215,6 +219,7 @@ class ResidentRuntimeTests(unittest.TestCase):
                 founder_id: self.ceo_profile,
                 quant_id: self.quant_profile,
             },
+            domain_plugins=(TradingDomainPlugin(),),
         )
 
     def test_step_with_writer_sync_triggers_and_restriction_gating(self) -> None:
@@ -459,6 +464,417 @@ class ResidentRuntimeTests(unittest.TestCase):
                     registry,
                     tick_interval_seconds=0,
                 )
+
+    def test_missing_standing_grant_raises_runtime_refused(self) -> None:
+        from sourdough.runtime import RuntimeRefused
+        from sourdough.runtime.handlers import _read_agent_state
+
+        with TemporaryDirectory(prefix="sd-no-grant-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            founding = found(
+                store,
+                FoundingTerms(
+                    "sourdough-core",
+                    "charter-v1",
+                    "manage",
+                    self.ceo_profile.profile_id(),
+                ),
+            )
+            with closing(open_writer(store)) as db, write_tx(db):
+                db.execute(
+                    "UPDATE standing_grant SET scope = 'revoked' WHERE agent_id = ?",
+                    (founding.founder_id,),
+                )
+            with self.assertRaisesRegex(RuntimeRefused, "standing grant"):
+                _read_agent_state(store, founding.company_id, founding.founder_id)
+
+    def test_board_apply_decision_defaults_role_label_and_records_domain_failures(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-dec-fail-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms(
+                    "sourdough-fund",
+                    "charter-v1",
+                    "paper",
+                    self.ceo_profile.profile_id(),
+                ),
+            )
+            registry = self._build_registry(founding.founder_id, "q1")
+            runtime = CompanyRuntime(
+                store, founding.company_id, registry, lease_directory=leases
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as writer:
+                bind_board_principal(
+                    writer,
+                    principal_id="board-1",
+                    role_name=BOARD_CONTROL_ROLE,
+                    now_ns=10,
+                )
+                h_budget = record_decision_question(
+                    writer,
+                    question_id="q-budget",
+                    kind="budget",
+                    title="Set founder budget",
+                    summary="Approve?",
+                    options=("approve", "decline"),
+                    impact={
+                        "action": "update_agent_budget",
+                        "agent_id": founding.founder_id,
+                        "monthly_budget_minor": 250_000,
+                    },
+                    created_by_agent_id=founding.founder_id,
+                    now_ns=20,
+                )
+                submit_decision_answer(
+                    writer,
+                    command_id="cmd-budget",
+                    question_id="q-budget",
+                    expected_revision=1,
+                    expected_payload_hash=h_budget,
+                    choice="approve",
+                    reason="ok",
+                    principal_hint="board-1",
+                    now_ns=30,
+                )
+                h_sandbox = record_decision_question(
+                    writer,
+                    question_id="q-sandbox",
+                    kind="execution",
+                    title="Invalid sandbox",
+                    summary="Approve?",
+                    options=("approve", "decline"),
+                    impact={
+                        "action": "open_agent_sandbox",
+                        "agent_id": founding.founder_id,
+                    },
+                    created_by_agent_id=founding.founder_id,
+                    now_ns=40,
+                )
+                submit_decision_answer(
+                    writer,
+                    command_id="cmd-sandbox",
+                    question_id="q-sandbox",
+                    expected_revision=1,
+                    expected_payload_hash=h_sandbox,
+                    choice="approve",
+                    reason="ok",
+                    principal_hint="board-1",
+                    now_ns=50,
+                )
+                h_migrate = record_decision_question(
+                    writer,
+                    question_id="q-migrate",
+                    kind="migration",
+                    title="Invalid live migration",
+                    summary="Approve?",
+                    options=("approve", "decline"),
+                    impact={
+                        "action": "migrate_paper_to_live",
+                        "source_paper_binding_id": "missing-src",
+                        "target_live_binding_id": "missing-dst",
+                        "qualification_receipt_id": "missing-qual",
+                    },
+                    created_by_agent_id=founding.founder_id,
+                    now_ns=60,
+                )
+                submit_decision_answer(
+                    writer,
+                    command_id="cmd-migrate",
+                    question_id="q-migrate",
+                    expected_revision=1,
+                    expected_payload_hash=h_migrate,
+                    choice="approve",
+                    reason="ok",
+                    principal_hint="board-1",
+                    now_ns=70,
+                )
+                sync_board_triggers(writer, founding.company_id, now_ns=80)
+
+            summary = runtime.step(max_dispatches=6, now_ns=90)
+            self.assertEqual(len(summary.executed_runs), 3)
+
+            with closing(open_reader(store)) as db, read_tx(db):
+                role_label = db.execute(
+                    "SELECT role_label FROM agent_profile WHERE company_id = ? AND agent_id = ?",
+                    (founding.company_id, founding.founder_id),
+                ).fetchone()[0]
+                self.assertEqual(role_label, "Agent")
+                statuses = dict(
+                    db.execute(
+                        "SELECT question_id, application_status FROM decision_question WHERE company_id = ?",
+                        (founding.company_id,),
+                    ).fetchall()
+                )
+                self.assertEqual(statuses["q-budget"], "applied")
+                self.assertEqual(statuses["q-sandbox"], "failed")
+                self.assertEqual(statuses["q-migrate"], "failed")
+
+    def test_board_apply_decision_fails_closed_on_invalid_budget_unknown_action_and_null_sandbox(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-dec-fail-closed-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms(
+                    "sourdough-fund",
+                    "charter-v1",
+                    "trading",
+                    self.ceo_profile.profile_id(),
+                ),
+            )
+            with closing(open_writer(store)) as db, write_tx(db):
+                enable_domain_v1(
+                    db, "trading", company_id=founding.company_id, actor_id="test"
+                )
+            registry = self._build_registry(founding.founder_id, "q1")
+            runtime = CompanyRuntime(
+                store, founding.company_id, registry, lease_directory=leases
+            )
+            bad_cases = [
+                (
+                    "q-neg-budget",
+                    {
+                        "action": "update_agent_budget",
+                        "agent_id": founding.founder_id,
+                        "monthly_budget_minor": -50,
+                    },
+                ),
+                (
+                    "q-missing-budget-key",
+                    {
+                        "action": "update_agent_budget",
+                        "agent_id": founding.founder_id,
+                    },
+                ),
+                (
+                    "q-unknown-agent",
+                    {
+                        "action": "update_agent_budget",
+                        "agent_id": "missing-agent",
+                        "monthly_budget_minor": 100,
+                    },
+                ),
+                (
+                    "q-bool-budget",
+                    {
+                        "action": "update_agent_budget",
+                        "agent_id": founding.founder_id,
+                        "monthly_budget_minor": True,
+                    },
+                ),
+                (
+                    "q-unregistered-action",
+                    {
+                        "action": "unsupported_custom_action",
+                        "target": "x",
+                    },
+                ),
+                (
+                    "q-null-sandbox-account",
+                    {
+                        "action": "open_agent_sandbox",
+                        "agent_id": founding.founder_id,
+                        "account_id": None,
+                    },
+                ),
+                (
+                    "q-null-sandbox-currency",
+                    {
+                        "action": "open_agent_sandbox",
+                        "agent_id": founding.founder_id,
+                        "account_id": "sbx-acc-1",
+                        "currency": None,
+                    },
+                ),
+            ]
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as writer:
+                bind_board_principal(
+                    writer,
+                    principal_id="board-1",
+                    role_name=BOARD_CONTROL_ROLE,
+                    now_ns=10,
+                )
+                for idx, (qid, impact) in enumerate(bad_cases, start=1):
+                    q_hash = record_decision_question(
+                        writer,
+                        question_id=qid,
+                        kind="governance",
+                        title=f"Case {qid}",
+                        summary="Verify fail-closed settlement",
+                        options=("approve", "decline"),
+                        impact=impact,
+                        created_by_agent_id=founding.founder_id,
+                        now_ns=20 + idx,
+                    )
+                    submit_decision_answer(
+                        writer,
+                        command_id=f"cmd-{qid}",
+                        question_id=qid,
+                        expected_revision=1,
+                        expected_payload_hash=q_hash,
+                        choice="approve",
+                        reason="Approve",
+                        principal_hint="board-1",
+                        now_ns=50 + idx,
+                    )
+                q_adv_hash = record_decision_question(
+                    writer,
+                    question_id="q-advisory-ok",
+                    kind="advisory",
+                    title="Advisory",
+                    summary="Advisory note",
+                    options=("approve", "decline"),
+                    impact={"action": "advisory"},
+                    created_by_agent_id=founding.founder_id,
+                    now_ns=80,
+                )
+                submit_decision_answer(
+                    writer,
+                    command_id="cmd-advisory-ok",
+                    question_id="q-advisory-ok",
+                    expected_revision=1,
+                    expected_payload_hash=q_adv_hash,
+                    choice="approve",
+                    reason="Approve",
+                    principal_hint="board-1",
+                    now_ns=85,
+                )
+                self.assertEqual(
+                    sync_board_triggers(writer, founding.company_id, now_ns=90),
+                    len(bad_cases) + 1,
+                )
+
+            summary = runtime.step(max_dispatches=20, now_ns=100)
+            self.assertEqual(len(summary.executed_runs), len(bad_cases) + 1)
+
+            # Zero retries on subsequent sync + step ticks.
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as writer:
+                self.assertEqual(
+                    sync_board_triggers(writer, founding.company_id, now_ns=110), 0
+                )
+            retry_summary = runtime.step(max_dispatches=20, now_ns=120)
+            self.assertEqual(retry_summary.executed_runs, ())
+
+            with closing(open_reader(store)) as db, read_tx(db):
+                statuses = {
+                    qid: (app_st, deliv_st)
+                    for qid, app_st, deliv_st in db.execute(
+                        """SELECT question_id, application_status, delivery_status
+                           FROM decision_question
+                           WHERE company_id = ?""",
+                        (founding.company_id,),
+                    ).fetchall()
+                }
+                for qid, _impact in bad_cases:
+                    self.assertEqual(statuses[qid], ("failed", "delivered"))
+                self.assertEqual(statuses["q-advisory-ok"], ("applied", "delivered"))
+
+                work_states = db.execute(
+                    """SELECT source_id, state
+                       FROM work_items
+                       WHERE company_id = ? AND duty_kind = 'board.apply_decision'""",
+                    (founding.company_id,),
+                ).fetchall()
+                self.assertTrue(all(state == "settled" for _, state in work_states))
+
+                sandbox_count = db.execute(
+                    """SELECT COUNT(*) FROM execution_environment_binding
+                       WHERE company_id = ? AND tier = 'agent_sandbox'""",
+                    (founding.company_id,),
+                ).fetchone()[0]
+                self.assertEqual(sandbox_count, 0)
+
+    def test_update_agent_budget_normalizes_legacy_avatar_variant(self) -> None:
+        from sourdough.board_control import (
+            ALLOWED_AVATAR_VARIANTS,
+            record_decision_question,
+            submit_decision_answer,
+        )
+        from sourdough.runtime import sync_board_triggers
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms("budget-avatar-co", "charter-1", "manage", "profile-1"),
+            )
+            registry = self._build_registry(founding.founder_id, "q1")
+            runtime = CompanyRuntime(
+                store, founding.company_id, registry, lease_directory=leases
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as writer:
+                bind_board_principal(
+                    writer, principal_id="board-1", role_name=BOARD_CONTROL_ROLE
+                )
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    db.execute(
+                        """INSERT INTO agent_profile (
+                               agent_id, company_id, display_name, role_label,
+                               avatar_variant, monthly_budget_minor, updated_at_ns
+                           ) VALUES (?, ?, 'Founder', 'CEO', 'cobalt', 50000, 10)""",
+                        (founding.founder_id, founding.company_id),
+                    )
+                q_hash = record_decision_question(
+                    writer,
+                    question_id="q-budget-legacy-avatar",
+                    kind="governance",
+                    title="Update budget",
+                    summary="Increase monthly budget",
+                    options=("approve", "decline"),
+                    impact={
+                        "action": "update_agent_budget",
+                        "agent_id": founding.founder_id,
+                        "monthly_budget_minor": 120_000,
+                    },
+                    created_by_agent_id=founding.founder_id,
+                    now_ns=20,
+                )
+                submit_decision_answer(
+                    writer,
+                    command_id="cmd-budget-legacy",
+                    question_id="q-budget-legacy-avatar",
+                    expected_revision=1,
+                    expected_payload_hash=q_hash,
+                    choice="approve",
+                    reason="Approved",
+                    principal_hint="board-1",
+                    now_ns=30,
+                )
+                sync_board_triggers(writer, founding.company_id, now_ns=40)
+
+            summary = runtime.step(max_dispatches=5, now_ns=50)
+            self.assertEqual(len(summary.executed_runs), 1)
+            with closing(open_reader(store)) as db, read_tx(db):
+                st = db.execute(
+                    "SELECT application_status FROM decision_question WHERE question_id = 'q-budget-legacy-avatar'"
+                ).fetchone()
+                self.assertEqual(st, ("applied",))
+                prof = db.execute(
+                    "SELECT avatar_variant, monthly_budget_minor FROM agent_profile WHERE agent_id = ?",
+                    (founding.founder_id,),
+                ).fetchone()
+                self.assertIsNotNone(prof)
+                self.assertIn(prof[0], ALLOWED_AVATAR_VARIANTS)
+                self.assertEqual(prof[1], 120_000)
 
 
 if __name__ == "__main__":

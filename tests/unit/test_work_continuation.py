@@ -8,14 +8,18 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, _connect, found
-from sourdough.first_duty import DutyRefused, claim_first_duty, require_paper_authority
+from sourdough.duty_run import DutyRefused
+from sourdough.trading.duty import (
+    claim_paper_first_duty as claim_first_duty,
+    claim_paper_follow_up as claim_follow_up,
+    finish_paper_first_duty as finish_first_duty,
+    require_paper_authority,
+    settle_paper_review as settle_review,
+)
 from sourdough.work import (
     ResultReference,
     ReviewDecision,
-    claim_follow_up,
-    finish_first_duty,
     read_follow_up_result,
-    settle_review,
 )
 
 

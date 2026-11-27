@@ -11,11 +11,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found, reopen
-from sourdough.paper_execution import VenueRefused
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.execution import VenueRefused
+from sourdough.trading.venue import FixedQuoteVenue
 from sourdough.runtime.engine import CompanyRuntime, build_default_registry
 from sourdough.runtime.registry import DutyContext, DutyOutcome
-from sourdough.runtime.venue_coordinator import (
+from sourdough.trading.venue_coordinator import (
     BoundedVenueCoordinator,
     VenueSegmentPolicy,
 )
@@ -49,6 +49,9 @@ from sourdough.storage.kernel import (
     read_command_receipt,
 )
 from sourdough.storage.schema import is_domain_installed, verify_v1_schema
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.ledger import submit_company_paper_book_order
+from sourdough.writer_lease import hold_company_writer
 
 
 def _cli(*args: object) -> dict:
@@ -191,56 +194,34 @@ class ConnectedFlow(unittest.TestCase):
         company_id = company["company_id"]
         founder_id = company["founder_id"]
 
-        _cli(
-            "bind-paper",
-            store,
-            venue_db,
-            "--company-id",
-            company_id,
-            "--charter-revision",
-            "charter-v1",
-            "--revision",
-            "mandate-v1",
-            "--account-id",
-            "acct-1",
-            "--rules",
-            "rules-v1",
-            "--starting-minor-units",
-            5000,
-            "--exposure-minor-units",
-            1000,
-            "--quote-minor-units",
-            100,
-        )
-        trade = _cli(
-            "first-duty",
-            store,
-            venue_db,
-            "--company-id",
-            company_id,
-            "--employee",
-            peer,
-        )
-        self.assertEqual(trade["position_quantity"], 2)
-
-        operated = _cli(
-            "operate-paper",
-            store,
-            venue_db,
-            "--company-id",
-            company_id,
-            "--employee",
-            peer,
-            "--turn-budget",
-            2,
-            "--idle-seconds",
-            0,
-        )
-        self.assertIsNotNone(operated["review"])
-        self.assertEqual(operated["review"]["decision"]["action"], "hold")
+        with hold_company_writer(store, company_id, lease_directory=leases) as writer:
+            binding = register_company_paper_tier(
+                writer,
+                account_id="acct-1",
+                destination_id="fixture-dest",
+                connector_revision="fixture",
+                instrument_rules_digest="rules-v1",
+                currency="USD",
+                starting_minor_units=5000,
+                exposure_limit_minor_units=1000,
+                fee_bps=0,
+                slippage_bps=0,
+                binding_revision="mandate-v1",
+            )
+            submit_company_paper_book_order(
+                writer,
+                binding_id=binding.binding_id,
+                actor_id=founder_id,
+                action_id="wave-a-act-1",
+                instrument_id="rules-v1",
+                side="buy",
+                quantity=2,
+                limit_minor_units=100,
+                market_price_minor_units=100,
+            )
 
         timeline = _cli("inspect-work", store, "--company-id", company_id)
-        self.assertEqual(timeline["paper"]["booked_position"], 2)
+        self.assertEqual(timeline["domains"]["trading"]["paper"]["booked_position"], 2)
 
         # 3. Three-entity Work kernel: standing responsibility, condition replacement,
         # anti-self-wake, zero-compute wait, and lease fencing
@@ -483,7 +464,9 @@ class ConnectedFlow(unittest.TestCase):
         restored_timeline = _cli(
             "inspect-work", restored_db, "--company-id", company_id
         )
-        self.assertEqual(restored_timeline["paper"]["booked_position"], 2)
+        self.assertEqual(
+            restored_timeline["domains"]["trading"]["paper"]["booked_position"], 2
+        )
         with self.assertRaisesRegex(StorageRefused, "retired"):
             open_writer(store)
 

@@ -15,22 +15,21 @@ from unittest.mock import patch
 from sourdough.accounting_close import CloseRequest, ExpectedCost, close_period
 from sourdough.cli import main
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import claim_first_duty
 from sourdough.general_ledger import JournalEntry, JournalLine, post_journal
-from sourdough.market_worker import SpotInstrumentTerms
-from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
-from sourdough.nautilus_runtime import VALUATION_SOURCE_REVISION
-from sourdough.paper_account import PaperMandate, bind
-from sourdough.paper_execution import PaperIntent
-from sourdough.paper_order import submit_paper_order
-from sourdough.paper_valuation import (
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
+from sourdough.trading.engine import VERSION
+from sourdough.trading.execution import PaperIntent
+from sourdough.trading.market_worker import SpotInstrumentTerms
+from sourdough.trading.nautilus_paper import NautilusPaperVenue, SandboxPlan
+from sourdough.trading.nautilus_runtime import VALUATION_SOURCE_REVISION
+from sourdough.trading.valuation import (
     BEST_BID_POLICY,
     ValuationRefused,
     capture_window_sample,
 )
-from sourdough.paper_window import WindowPlan
-from sourdough.trading_engine import VERSION
-from sourdough.window_costs import CostInventory
+from sourdough.trading.window import WindowPlan
+from sourdough.trading.window_costs import CostInventory
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -51,13 +50,21 @@ class ConnectedFlow(unittest.TestCase):
         venue.provision(SandboxPlan(company_id, "paper", terms, capital, 0))
         generation = "controlled-venue"
         venue.prove_account(generation, "BINANCE-001", "USDT", venue.start_generation())
-        bind(
-            store,
-            PaperMandate(
-                "bound", company_id, "charter", venue.observe_account("paper"), exposure
-            ),
-            venue,
-        )
+        account = venue.observe_account("paper")
+        with hold_company_writer(store, company_id) as writer:
+            register_company_paper_tier(
+                writer,
+                account_id="paper",
+                destination_id=account.destination_id,
+                connector_revision=account.connector_revision,
+                instrument_rules_digest=account.instrument_rules_digest,
+                currency=account.currency,
+                starting_minor_units=account.starting_minor_units,
+                exposure_limit_minor_units=exposure,
+                fee_bps=0,
+                slippage_bps=0,
+                binding_revision="bound",
+            )
         day = date(2027, 1, 15)
         day_ns = 86_400 * 10**9
         opens = (day - date(1970, 1, 1)).days * day_ns
@@ -120,39 +127,40 @@ class ConnectedFlow(unittest.TestCase):
             ]
             with (
                 patch("sys.argv", argv),
-                patch("sourdough.paper_statement_store.time_ns", return_value=now),
-                patch("sourdough.paper_window_statement.time_ns", return_value=now),
+                patch("sourdough.trading.statement_store.time_ns", return_value=now),
+                patch("sourdough.trading.window_statement.time_ns", return_value=now),
                 redirect_stdout(output),
             ):
                 self.assertEqual(main(), 0)
             return json.loads(output.getvalue())
 
-        with patch("sourdough.paper_window.time_ns", return_value=opens - 100):
+        with patch("sourdough.trading.window.time_ns", return_value=opens - 100):
             registered = command("seal-paper-window", "--plan", str(plan_file))
         self.assertLess(registered["registered_ns"], opens)
 
         def sample(slot, stamp, bid):
             venue.publish_quote(generation, ask, stamp, stamp, bid_atoms_per_lot=bid)
             with (
-                patch("sourdough.nautilus_paper.time_ns", return_value=stamp + 1),
+                patch(
+                    "sourdough.trading.nautilus_paper.time_ns", return_value=stamp + 1
+                ),
                 hold_company_writer(store, company_id) as writer,
             ):
                 capture_window_sample(writer, engine, window_id, slot)
 
         ask, quantity, fee = 60_000_000, 20, 4
         sample(0, opens + 10, ask - 10)
-        duty = claim_first_duty(store, company_id, "profile")
+        claim_first_duty(store, company_id, "profile")
         fill_time = opens + 13
         with (
-            patch("sourdough.nautilus_paper.time_ns", return_value=fill_time),
+            patch("sourdough.trading.nautilus_paper.time_ns", return_value=fill_time),
             ThreadPoolExecutor(max_workers=1) as pool,
         ):
             pending = pool.submit(
-                submit_paper_order,
-                store,
-                duty,
+                venue.submit,
+                "order-f08-1",
+                "paper",
                 PaperIntent("test-buy", terms.revision, quantity, ask),
-                venue,
             )
             local_command = None
             deadline = monotonic() + 4

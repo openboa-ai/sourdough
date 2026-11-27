@@ -1,4 +1,5 @@
-import { Badge, Button, Card, Inline, PageHeader, Result, Stack, Text } from "@openboa/yogurt";
+import { useEffect } from "react";
+import { Badge, Button, Card, Inline, PageHeader, Result, Skeleton, Stack, Text } from "@openboa/yogurt";
 import { Yogurt } from "@openboa/yogurt/yogurt";
 import { AppShell } from "./components/AppShell";
 import {
@@ -14,18 +15,17 @@ import {
   FinanceView,
   OrgReportsView,
   RestrictionsView,
-  StrategiesView,
 } from "./views/CompanyViews";
-import { LiveTradingView } from "./views/LiveTradingView";
 import { MessagesView } from "./views/MessagesView";
-import { OrderTraceView } from "./views/OrderTraceView";
 import { SettingsView } from "./views/SettingsView";
 import {
   AuditHubView,
   BootstrapView,
   SystemSafetyView,
 } from "./views/SystemViews";
-import { TradingDeskView } from "./views/TradingDeskView";
+import { OrderTraceView } from "./views/trading/OrderTraceView";
+import { StrategiesView } from "./views/trading/StrategiesView";
+import { TradingDeskView } from "./views/trading/TradingDeskView";
 
 function CompanyOverviewView({ modules }: { modules: DomainModuleDefinition[] }) {
   const { navigate, meta } = useApp();
@@ -77,79 +77,81 @@ function CompanyOverviewView({ modules }: { modules: DomainModuleDefinition[] })
 }
 
 function RouteSwitch() {
-  const { route, meta, navigate } = useApp();
+  const { route, routeSearchParams, meta, navigate } = useApp();
   const { pathname: path } = splitRoute(route);
   const activeModules = resolveActiveDomainModules(meta?.active_domains);
   const homeMode = resolveHomeMode(activeModules);
+  const tradingActive = activeModules.some((m) => m.id === "trading");
+
+  useEffect(() => {
+    if (
+      meta &&
+      !meta.board_access.bootstrap_locked &&
+      homeMode === "core_only" &&
+      (path === "/" || path === "/bootstrap")
+    ) {
+      navigate("/agents", { replace: true });
+    }
+  }, [meta, homeMode, path, navigate]);
 
   if (meta?.board_access.bootstrap_locked || (!meta && path === "/bootstrap")) {
     return <BootstrapView />;
+  }
+  if (!meta) {
+    return <Skeleton label="Connecting to local control plane" lines={5} />;
   }
   if (path === "/bootstrap" || path === "/") {
     if (homeMode === "multi_overview") {
       return <CompanyOverviewView modules={activeModules} />;
     }
-    if (homeMode === "core_only" && meta) {
+    if (homeMode === "core_only") {
       return <AgentsActivityView />;
     }
     return <TradingDeskView mode="live" />;
   }
-  if (path === "/trading/live" || path === "/company/execution-tiers") {
+  if (tradingActive && path === "/trading/live") {
     return <TradingDeskView mode="live" />;
   }
-  if (path === "/trading/paper" || path === "/paper") {
+  if (tradingActive && path === "/trading/paper") {
     return <TradingDeskView mode="paper" />;
   }
-  if (path === "/performance") {
-    return <LiveTradingView />;
-  }
-  const orderId = decodeSingleSegment(path, "/orders/");
+  const orderId = tradingActive ? decodeSingleSegment(path, "/orders/") : null;
   if (orderId) {
     return <OrderTraceView orderId={orderId} />;
   }
-  if (path === "/trading/strategies" || path === "/company/strategy-trials") {
+  if (tradingActive && path === "/trading/strategies") {
     return <StrategiesView />;
   }
-  if (
-    path === "/approvals" ||
-    decodeSingleSegment(path, "/approvals/") !== null ||
-    path === "/company/approvals" ||
-    decodeSingleSegment(path, "/company/approvals/") !== null
-  ) {
+  if (path === "/approvals" || decodeSingleSegment(path, "/approvals/") !== null) {
     return <ApprovalsView />;
   }
-  if (path === "/agents" || path === "/office") {
+  if (path === "/agents") {
     return <AgentsActivityView />;
   }
-  const agentId =
-    decodeSingleSegment(path, "/agents/") ??
-    decodeSingleSegment(path, "/office/agents/");
+  const agentId = decodeSingleSegment(path, "/agents/");
   if (agentId) {
     return <AgentDetailView agentId={agentId} />;
   }
-  if (path === "/messages" || path === "/ceo") {
+  if (path === "/messages") {
     return <MessagesView />;
   }
-  if (path === "/finance" || path === "/company/finance") {
+  if (path === "/finance") {
     return <FinanceView />;
   }
-  if (path === "/reports" || path === "/company/org") {
+  if (path === "/reports") {
     return <OrgReportsView />;
   }
-  if (path === "/controls" || path === "/restrictions") {
+  if (path === "/controls") {
     return <RestrictionsView />;
   }
-  if (path === "/backups" || path === "/system/checkpoints") {
+  if (path === "/backups") {
     return <SystemSafetyView />;
   }
-  if (path === "/audit" || path === "/system/audit") {
-    return <AuditHubView initialTab="log" />;
-  }
-  if (path === "/system/evaluations") {
-    return <AuditHubView initialTab="evals" />;
-  }
-  if (path === "/system/daemon") {
-    return <AuditHubView initialTab="daemon" />;
+  if (path === "/audit") {
+    const rawTab = routeSearchParams.get("tab");
+    const initialTab =
+      rawTab === "evals" || rawTab === "daemon" || rawTab === "log" ? rawTab : "log";
+    return <AuditHubView initialTab={initialTab} />;
   }
   if (path === "/settings") {
     return <SettingsView />;
@@ -158,7 +160,11 @@ function RouteSwitch() {
     <Result
       title="Page not found"
       action={
-        <Button emphasis="soft" shape="pill" onClick={() => navigate("/")}>
+        <Button
+          emphasis="soft"
+          shape="pill"
+          onClick={() => navigate(homeMode === "core_only" ? "/agents" : "/")}
+        >
           Back to Home
         </Button>
       }

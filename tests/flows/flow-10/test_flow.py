@@ -1,5 +1,5 @@
 import json
-import runpy
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -15,12 +15,90 @@ from sourdough.runtime.work_kernel import sync_work_item
 from sourdough.writer_lease import hold_company_writer
 
 
-FIXTURE = runpy.run_path(
-    str(Path(__file__).resolve().parents[1] / "flow-06/test_flow.py")
-)
-EMPLOYEE = FIXTURE["EMPLOYEE"]
-cli = FIXTURE["cli"]
-rows = FIXTURE["rows"]
+EMPLOYEE = r"""
+import json, socket, sys
+request = json.load(sys.stdin)
+operation = request["operation"]
+def invoke(name, args):
+    with socket.socket(socket.AF_UNIX) as client:
+        client.connect(request["read_endpoint"])
+        client.sendall(json.dumps({"name": name, "arguments": args}).encode() + b"\n")
+        with client.makefile() as stream:
+            response = json.load(stream)
+    assert "error" not in response, response
+    return response
+if operation == "identify":
+    result = {"provider": "fixture", "model": "scripted", "revision": "1"}
+elif operation == "ready":
+    result = {"ready": True}
+elif operation == "staffing_duty":
+    need = invoke("read_staffing_need", {})
+    choice = need.get("saved_choice") or invoke("record_staffing_choice", {
+        "evidence_revision": need["revision"], "action": "hire",
+        "rationale": "Backlog exceeds available capacity.",
+        "alternatives": ["reassign", "defer"], "next_check_seconds": 300,
+    })
+    result = invoke("request_hire", {
+        "request_id": "fixture-hire", "choice_id": choice["choice_id"],
+        "role": "reviewer", "execution_profile": need["profile"], "scope": need["scope"],
+        "turns": 3,
+    })
+elif operation == "assessment_duty":
+    first = invoke("read_first_duty", {})
+    invoke("accept_first_duty", {"revision": first["revision"], "rationale": first["assignment_summary"]})
+    inputs = invoke("read_assessment_inputs", {})
+    invoke("save_private_draft", {
+        "name": "private-research", "content": "Private comparison notes.",
+        "expected_revision": "",
+    })
+    result = invoke("publish_assessment", {
+        "source_revision": inputs["revision"], "record_id": "record",
+        "disposition": "recommend_change", "rationale": "Observed six rather than eight.",
+        "next_check_seconds": 60,
+    })
+elif operation == "assessment_review":
+    tools = [tool["name"] for tool in request["harness"]["tools"]]
+    assert tools == ["save_private_draft", "read_work_result", "record_review_decision"]
+    drafts = request["harness"]["drafts"]
+    assert len(drafts) == 1 and drafts[0]["content"] == "Private comparison notes."
+    prior = invoke("read_work_result", {})
+    result = invoke("record_review_decision", {
+        "observation_revision": prior["revision"], "action": "hold", "next_check_seconds": 300,
+        "rationale": "Check the original result: " + str(prior["revision"]),
+    })
+elif operation == "review_duty":
+    with socket.socket(socket.AF_UNIX) as client:
+        client.connect(request["read_endpoint"])
+        with client.makefile() as stream:
+            prior = json.load(stream)
+    result = {
+        "tool": "record_review_decision", "observation_revision": prior["revision"],
+        "call_id": "fixture-review", "action": "hold", "next_check_seconds": 300,
+        "rationale": "Check the original result: " + str(prior["revision"]),
+    }
+else:
+    raise RuntimeError(operation)
+print(json.dumps(result))
+"""
+
+
+def cli(command, *arguments):
+    result = subprocess.run(
+        [sys.executable, "-IB", "-m", "sourdough.cli", command, *map(str, arguments)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr)
+    return json.loads(result.stdout)
+
+
+def rows(store, sql, parameters=()):
+    with closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as db:
+        return db.execute(sql, parameters).fetchall()
+
+
 SUPERVISOR = """
 import sys
 from sourdough import cli

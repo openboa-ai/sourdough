@@ -18,7 +18,7 @@ Start with **what has changed for the company or its employees**, not an API, de
 - Quant specialization: [Suspend new investment risk](company/profiles/quant/trading/board-control/intent.md).
 - optional client: [Inspect authorized company state](client/inspect/intent.md).
 - optional client: [Request a governance change](client/commands/intent.md).
-- optional client: [Govern through CEO Direct Line and Board approvals](client/governance/intent.md).
+- optional client: [Govern through Board approvals, controls, and CEO dialogue](client/governance/intent.md).
 - optional client: [Serve the local control plane](client/control-plane/intent.md).
 - optional client: [Align Client presentation with the Yogurt design system](client/design-system/intent.md).
 
@@ -75,6 +75,7 @@ Start with **what has changed for the company or its employees**, not an API, de
 - Company → systems: [Bind a scoped resource](company/systems/connectors/connect-resource/intent.md).
 - Company → systems: [Provision a scoped resource](company/systems/resources/provision-resource/intent.md), [activate a company-owned change](company/systems/operations/manage-change/intent.md), or [request external product maintenance](company/systems/operations/request-maintenance/intent.md).
 - Quant specialization: [Bind the simulated account](company/profiles/quant/trading/paper-account/intent.md).
+- Quant specialization: [Bind and promote execution environments](company/profiles/quant/trading/execution-environment/intent.md) (`agent_sandbox`, `company_paper`, and Board-promoted `company_live`).
 - Quant specialization: [Reserve risk for an intent](company/profiles/quant/trading/admit-intent/intent.md).
 - Quant specialization: [Submit and observe at the venue](company/profiles/quant/trading/simulated-venue/intent.md).
 - Quant specialization: [Cancel the unfilled remainder](company/profiles/quant/trading/cancel-order/intent.md).

@@ -2,6 +2,8 @@ import type { AgentVariant, GazeState } from "@openboa/yogurt";
 
 export type BoardRole = "board_viewer" | "board_control" | null;
 
+export type ExecutionEnvironment = "agent_sandbox" | "paper" | "external_test" | "live";
+
 export interface BoardAccess {
   bootstrap_locked: boolean;
   role: BoardRole;
@@ -24,8 +26,6 @@ export interface ControlPlaneMeta {
   board_access: BoardAccess;
   pending_approvals_count: number;
   active_restrictions_count: number;
-  paper_risk_suspended: boolean;
-  paper_risk_effective_revision: number;
   supported_projections: string[];
   supported_commands: Record<string, string[]>;
 }
@@ -74,134 +74,62 @@ export interface OrderFillItem {
   fill_id: string;
   quantity: number;
   price_minor_units: number;
-  fee_minor_units: number | null;
-  position_quantity: number | null;
-  available_at: number | null;
+  fee_minor_units: number;
+  notional_minor_units: number;
+  realized_pnl_minor_units: number;
+  filled_at_ns: number;
+  delivery_status: "acknowledged" | "pending" | null;
 }
 
-export interface OrderCancellationItem {
-  event_id: string;
-  filled_quantity: number;
-  released: boolean;
-  position_quantity: number | null;
-  available_at: number | null;
-  outcome: string;
+export interface OrderTraceExternalAction {
+  idempotency_key: string;
+  status: string;
+  connector: string;
+  operation: string;
+  receipt: unknown;
 }
 
-export interface ExecutionOrderItem {
+export interface OrderTraceOrderItem {
   order_id: string;
-  run_id: string;
-  duty_id: string | null;
-  decision_id: string | null;
-  rationale: string | null;
-  action: string;
-  decided_at: number | null;
+  binding_id: string;
+  book_name: string;
+  tier: "agent_sandbox" | "company_paper" | "company_live" | string;
+  environment: ExecutionEnvironment;
   account_id: string;
+  destination_id: string;
+  currency: string;
   instrument: string;
-  mandate_revision: string;
+  instrument_id: string;
+  side: string;
+  action: string;
+  actor_id: string;
   agent_id: string | null;
   agent_name: string;
   agent_role: string;
+  run_id: string | null;
+  duty_id: string | null;
+  duty_kind: string | null;
+  decision_id: string | null;
+  mandate_revision: string | null;
+  action_id: string;
+  external_order_id: string | null;
   ordered_qty: number;
   filled_qty: number;
   remaining_qty: number;
   limit_minor_units: number;
+  market_price_minor_units: number;
   avg_fill_minor_units: number | null;
-  reserved_minor_units: number;
-  total_fee_minor_units: number | null;
+  total_fee_minor_units: number;
   status: string;
-  cancellation: OrderCancellationItem | null;
-  residual_position_qty: number | null;
+  cancelled_at_ns: number | null;
+  cancel_reason: string | null;
+  residual_position_qty: number;
   cancel_not_flat: boolean;
   fills: OrderFillItem[];
-  reconciliation?: {
-    attempts: number;
-    next_query_at: number | null;
-    fill_id: string | null;
-    sources: unknown[];
-  } | null;
-}
-
-export interface OpenPositionItem {
-  instrument: string;
-  account_id: string;
-  quantity: number;
-  avg_entry_minor_units: number;
-  latest_order_id: string;
-  agent_id: string | null;
-  agent_name: string;
-  from_cancelled_order: boolean;
-}
-
-export interface LiveTradingProjection {
-  projection: string;
-  company_id: string;
-  charter_revision: string;
-  as_of_ns: number;
-  event_seq: number;
-  active_domains: string[];
-  paper_enabled: boolean;
-  environment: string;
-  board_role: BoardRole;
-  risk_gate: {
-    suspended: boolean;
-    paper_risk_suspended?: boolean;
-    effective_revision: number;
-    active_restriction_count: number;
-  };
-  kpis: {
-    portfolio_value: {
-      value_minor: number | null;
-      starting_minor?: number | null;
-      return_pct: number | null;
-      currency: string;
-      status: string;
-      source: string;
-    };
-    trading_bor_pnl: {
-      value_minor: number | null;
-      currency: string;
-      status: string;
-      source: string;
-    };
-    agent_llm_opex: {
-      value_minor: number | null;
-      currency: string;
-      status: string;
-      source: string;
-    };
-    company_net_pnl: {
-      value_minor: number | null;
-      currency: string;
-      status: string;
-      source: string;
-    };
-  };
-  since_last_visit: {
-    since_seq: number;
-    new_event_count: number;
-    by_domain: Record<string, number>;
-    highlights: AuditEventItem[];
-  };
-  cumulative_return_series: ReturnPoint[];
-  pnl_reconciliation_bridge: PnlBridgeStep[];
-  execution_tape: ExecutionOrderItem[];
-  open_positions: OpenPositionItem[];
-  adapter_status: {
-    environment: string;
-    account_id: string;
-    connector_revision: string;
-    destination_id: string;
-    mandate_revision: string;
-    exposure_limit_minor_units: number | null;
-    starting_minor_units: number | null;
-    currency: string;
-    last_quote_minor_units: number | null;
-    last_quote_observed_at: number | null;
-  } | null;
-  active_restrictions: RestrictionItem[];
-  open_close_issues?: Array<Record<string, unknown>>;
-  close_count?: number;
+  external_action: OrderTraceExternalAction | null;
+  created_at_ns: number;
+  updated_at_ns: number;
+  back_link: string;
 }
 
 export interface OrderTraceProjection {
@@ -209,7 +137,7 @@ export interface OrderTraceProjection {
   company_id: string;
   as_of_ns: number;
   event_seq: number;
-  order: ExecutionOrderItem;
+  order: OrderTraceOrderItem;
   causal_steps: Array<{
     stage: string;
     id: string;
@@ -509,7 +437,7 @@ export interface StrategiesProjection {
   company_id: string;
   as_of_ns: number;
   event_seq: number;
-  paper_enabled: boolean;
+  trading_enabled: boolean;
   active_deployment: {
     deployment_id: string;
     release_id: string;
@@ -555,13 +483,14 @@ export interface StrategiesProjection {
     evaluated_at_ns: number | null;
   }>;
   adapter: {
+    binding_id: string;
     binding_revision: string;
     account_id: string;
     connector_revision: string;
     exposure_limit_minor_units: number;
     currency: string;
     starting_minor_units: number;
-    environment: string;
+    environment: ExecutionEnvironment;
     destination_id: string;
   } | null;
 }
@@ -571,7 +500,7 @@ export interface FinanceProjection {
   company_id: string;
   as_of_ns: number;
   event_seq: number;
-  paper_enabled: boolean;
+  trading_enabled: boolean;
   account_balances: Array<{ account: string; balance_minor: number }>;
   journals: Array<{
     entry_id: string;
@@ -648,13 +577,13 @@ export interface RestrictionsProjection {
   event_seq: number;
   active_causes: RestrictionItem[];
   history: RestrictionItem[];
-  paper_risk: {
-    suspended: boolean;
+  trading_risk: {
+    paper_suspended: boolean;
+    live_suspended: boolean;
     effective_revision: number;
     unresolved_orders_count: number;
-    pending_binding_change: boolean;
+    unresolved_external_actions_count: number;
     settled_company_ok: boolean;
-    last_quote_observed_at: number | null;
     server_freshness_note: string;
   } | null;
 }
@@ -801,7 +730,7 @@ export interface ExecutionTierBindingItem {
   binding_id: string;
   company_id: string;
   tier: "agent_sandbox" | "company_paper" | "company_live";
-  environment: "paper" | "external_test" | "live";
+  environment: ExecutionEnvironment;
   owner_agent_id: string | null;
   account_id: string;
   destination_id: string;
@@ -815,6 +744,12 @@ export interface ExecutionTierBindingItem {
   quote_source: string;
   credential_handle_ref: string | null;
   status: string;
+  binding_revision?: string;
+  book_name?: string | null;
+  strategy_release_id?: string | null;
+  book_role?: string | null;
+  shadow_of_live_binding_id?: string | null;
+  nominated_question_id?: string | null;
   created_at_ns?: number;
   updated_at_ns?: number;
 }
@@ -900,56 +835,9 @@ export interface EnvironmentPromotionRecordItem {
   recorded_at_ns: number;
 }
 
-export interface CompanyPaperBookItem {
-  binding_id: string;
-  account_id: string;
-  book_name: string;
-  strategy_release_id: string | null;
-  role: "active" | "nominated" | "shadow" | "retired";
-  status: string;
-  shadow_of_live_binding_id: string | null;
-  nominated_question_id: string | null;
-  currency: string;
-  starting_minor_units: number;
-  exposure_limit_minor_units: number;
-  fee_bps: number;
-  slippage_bps: number;
-  quote_source: string;
-  cash_minor_units: number;
-  gross_exposure_minor_units: number;
-  realized_pnl_minor_units: number;
-  total_fees_minor_units: number;
-  fill_count: number;
-  open_positions_count: number;
-  open_orders_count: number;
-  soak_ready: boolean;
-  positions: Array<{
-    instrument_id: string;
-    quantity: number;
-    avg_entry_minor_units: number;
-    realized_pnl_minor_units: number;
-    total_fees_minor_units: number;
-    updated_at_ns: number;
-  }>;
-  orders: Array<{
-    order_id: string;
-    action_id: string;
-    instrument_id: string;
-    side: string;
-    quantity: number;
-    limit_minor_units: number;
-    status: string;
-    filled_quantity: number;
-    fill_price_minor_units: number | null;
-    fee_minor_units: number;
-    created_at_ns: number;
-  }>;
-}
-
 export interface PaperLiveMigrationItem {
   migration_id: string;
   question_id: string | null;
-  source_paper_binding_id: string;
   source_book_name: string;
   target_live_binding_id: string;
   target_account_id: string;
@@ -963,25 +851,6 @@ export interface PaperLiveMigrationItem {
   recorded_at_ns: number;
 }
 
-export interface ExecutionTiersProjection {
-  projection: string;
-  company_id: string;
-  charter_revision: string;
-  as_of_ns: number;
-  event_seq: number;
-  paper_domain_installed: boolean;
-  company_paper: ExecutionTierBindingItem | null;
-  company_paper_books?: CompanyPaperBookItem[];
-  company_paper_soak_ready: boolean;
-  company_live: ExecutionTierBindingItem | null;
-  live_candidates: LiveCandidateBindingItem[];
-  agent_sandboxes: AgentSandboxSummaryItem[];
-  qualification_receipts: QualificationReceiptItem[];
-  promotion_history: EnvironmentPromotionRecordItem[];
-  migration_history?: PaperLiveMigrationItem[];
-  current_core_digest: string;
-}
-
 export interface TradingDeskBookSummary {
   binding_id: string;
   account_id: string;
@@ -993,7 +862,6 @@ export interface TradingDeskBookSummary {
   strategy_release_id: string | null;
   role: string;
   status: string;
-  source_paper_binding_id: string | null;
   shadow_of_live_binding_id: string | null;
   nominated_question_id: string | null;
   currency: string;
@@ -1061,6 +929,16 @@ export interface ShadowBenchmarkData {
   series: ReturnPoint[];
 }
 
+export interface TradingRiskRestrictionItem {
+  restriction_id: string;
+  cause_category: string;
+  scope_ref: string;
+  restriction_revision: number;
+  operator_releasable: boolean;
+  reason: string;
+  recorded_at_ns: number;
+}
+
 export interface TradingDeskProjection {
   projection: string;
   company_id: string;
@@ -1068,7 +946,7 @@ export interface TradingDeskProjection {
   as_of_ns: number;
   event_seq: number;
   active_domains: string[];
-  paper_enabled: boolean;
+  trading_enabled: boolean;
   environment: "live" | "paper";
   selected_book_id: string | null;
   selected_book: TradingDeskBookSummary | null;
@@ -1119,6 +997,7 @@ export interface TradingDeskProjection {
     suspended: boolean;
     effective_revision: number;
     active_restriction_count: number;
+    active_restrictions: TradingRiskRestrictionItem[];
   };
   governance: {
     company_live: ExecutionTierBindingItem | null;
@@ -1126,7 +1005,7 @@ export interface TradingDeskProjection {
     qualification_receipts: QualificationReceiptItem[];
     promotion_history: EnvironmentPromotionRecordItem[];
     migration_history: PaperLiveMigrationItem[];
-    company_paper_soak_ready: boolean;
+    paper_soak_ready: boolean;
     paper_books_count: number;
     soak_ready_books_count: number;
     current_core_digest: string;

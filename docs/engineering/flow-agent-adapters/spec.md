@@ -25,9 +25,9 @@ Provide a unified, provider-agnostic `AgentRuntimeAdapter` port and four concret
 ## 4. Lifecycle failures & recovery
 
 - Transport timeouts, HTTP `429`/`5xx`, or malformed JSON raise `AgentTransportInterrupted` without retrying side-effecting calls automatically or erasing already-committed tool receipts.
-- A retry shift reuses the company's idempotent `action_id` receipts (e.g., `AgentSandboxTools` / `paper_order`) without duplicating economic effects.
+- A retry shift reuses the company's idempotent `action_id` receipts (e.g., `AgentSandboxTools` / `trading_book_order`) without duplicating economic effects.
 
 ## 5. Acceptance evidence
 
 - Unit tests: `tests/unit/test_agent_runtime_adapters.py` covering all 4 adapters (`codex_cli`, `openai`, `anthropic`, `gemini`) against local loopback mock HTTP/CLI servers, broker spoofing denial, profile mismatch fail-closed denial, context receipt preservation, transport interruption recovery, and exact GL cost posting.
-- Connected flow test: `tests/flows/flow-agent-adapters/test_flow.py` (`ConnectedFlow.test_end_to_end`) running 4 distinct Agents (one per provider) on one company store, executing isolated Tier 1 sandbox trades through `OuterToolBroker`, posting balanced GL costs, confirming zero secret leakage in SQLite, and observing all 4 sandboxes on `/v1/projections/execution-tiers`.
+- Connected flow test: `tests/flows/flow-agent-adapters/test_flow.py` (`ConnectedFlow.test_end_to_end`) running 4 distinct Agents (one per provider) on one company store, executing isolated Tier 1 sandbox trades through `OuterToolBroker`, posting balanced GL costs, confirming zero secret leakage in SQLite, and observing all 4 sandboxes on `/v1/projections/trading-desk` and `/v1/projections/agents/{id}`.

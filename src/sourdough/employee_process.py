@@ -5,15 +5,14 @@ import os
 import socketserver
 import subprocess
 import sys
-from collections.abc import Callable
-from dataclasses import asdict
+from collections.abc import Callable, Sequence
 from hashlib import file_digest, sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
+from typing import Any
 
-from .first_duty import DutyRefused
-from .first_trade import OrderTool, TradeRefused, TradingContext
+from .duty_run import DutyRefused
 from .harness import ScopedRun, run_in_desk_sandbox
 from .writer_lease import WriterRefused
 
@@ -21,12 +20,16 @@ MAX_TOOL_REQUEST_BYTES = 64 * 1024
 LOCAL_MACOS_SANDBOX = "local-macos"
 
 
+class EmployeeProcessRefused(Exception):
+    """Employee process binding or exchange failed."""
+
+
 class _ReadWorkResult(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         self.request.settimeout(1)
         try:
             result = self.server.read_result()
-        except (DutyRefused, TradeRefused):
+        except (DutyRefused, EmployeeProcessRefused):
             result = {"error": "Work result is not available to this claim"}
         self.request.sendall(json.dumps(result).encode())
 
@@ -72,16 +75,16 @@ class EmployeeProcess:
         selection = self._exchange({"operation": "identify"})
         runtime_fields = {"provider", "model", "revision"}
         if set(selection) not in (runtime_fields, runtime_fields | {"sandbox_backend"}):
-            raise TradeRefused("Employee runtime binding is unresolved")
+            raise EmployeeProcessRefused("Employee runtime binding is unresolved")
         if not all(
             isinstance(value, str) and value.strip() for value in selection.values()
         ):
-            raise TradeRefused("Employee runtime binding is unresolved")
+            raise EmployeeProcessRefused("Employee runtime binding is unresolved")
         if (
             "sandbox_backend" in selection
             and selection["sandbox_backend"] != LOCAL_MACOS_SANDBOX
         ):
-            raise TradeRefused("Employee sandbox backend is not qualified")
+            raise EmployeeProcessRefused("Employee sandbox backend is not qualified")
         return selection
 
     def _profile(self, selection: dict | None = None) -> str:
@@ -92,64 +95,77 @@ class EmployeeProcess:
         terms = json.dumps([executable, selection], sort_keys=True).encode()
         return "process-v2:" + sha256(terms).hexdigest()
 
-    def _exchange(self, request: dict) -> dict:
+    def _exchange(self, request: dict, *, timeout: int | None = None) -> dict:
+        effective_timeout = (
+            timeout
+            if timeout is not None
+            else (100 if request.get("operation") == "assessment_duty" else 60)
+        )
         try:
             result = subprocess.run(
                 [str(self.executable)],
                 input=json.dumps(request),
                 capture_output=True,
                 text=True,
-                timeout=100
-                if request["operation"]
-                in ("research_duty", "assessment_duty", "hired_research_duty")
-                else 60,
+                timeout=effective_timeout,
                 check=True,
                 cwd="/",
                 env={"PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.defpath}"},
             )
             response = json.loads(result.stdout)
         except (OSError, subprocess.SubprocessError, ValueError) as error:
-            raise TradeRefused(
+            raise EmployeeProcessRefused(
                 "Employee process did not complete its exchange"
             ) from error
         if not isinstance(response, dict):
-            raise TradeRefused("Invalid employee response")
+            raise EmployeeProcessRefused("Invalid employee response")
         return response
 
     def check_ready(self) -> None:
         if self._profile() != self.profile:
-            raise TradeRefused("Employee model binding changed")
+            raise EmployeeProcessRefused("Employee model binding changed")
         if self._exchange({"operation": "ready"}) != {"ready": True}:
-            raise TradeRefused("Employee process is unavailable")
+            raise EmployeeProcessRefused("Employee process is unavailable")
 
-    def run(self, context: TradingContext, order_tool: OrderTool) -> None:
+    def run_first_duty_exchange(
+        self,
+        *,
+        context: dict[str, Any],
+        tools: Sequence[str],
+        operation: str = "first_duty",
+        timeout: int = 60,
+    ) -> dict[str, Any]:
         if self._profile() != self.profile:
-            raise TradeRefused("Employee model binding changed")
-        response = self._exchange(
+            raise EmployeeProcessRefused("Employee model binding changed")
+        return self._exchange(
             {
-                "operation": "first_duty",
-                "context": asdict(context),
-                "tools": ["paper_buy"],
-            }
+                "operation": operation,
+                "context": context,
+                "tools": list(tools),
+            },
+            timeout=timeout,
         )
-        if response == {"action": "hold"}:
-            return
-        if set(response) != {"tool", "call_id", "quantity", "limit_minor_units"} or (
-            response["tool"] != "paper_buy"
-        ):
-            raise TradeRefused("Unexpected employee tool request")
-        order_tool(
-            response["call_id"], response["quantity"], response["limit_minor_units"]
-        )
+
+    def follow_up_exchange(
+        self,
+        operation: str,
+        read_result: Callable[[], dict],
+        *,
+        timeout: int = 60,
+    ) -> dict:
+        return self._follow_up(operation, read_result, timeout=timeout)
+
+    def scoped_tool_exchange(
+        self,
+        operation: str,
+        invoke: Callable[[str, dict], dict],
+        *,
+        timeout: int = 60,
+    ) -> dict:
+        return self._scoped_exchange(operation, _ToolEndpoint, invoke, timeout=timeout)
 
     def review(self, read_result: Callable[[], dict]) -> dict:
         return self._follow_up("review_duty", read_result)
-
-    def trade(self, read_result: Callable[[], dict]) -> dict:
-        return self._follow_up("trade_duty", read_result)
-
-    def research(self, invoke: Callable[[str, dict], dict]) -> dict:
-        return self._scoped_exchange("research_duty", _ToolEndpoint, invoke)
 
     def staffing(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("staffing_duty", _ToolEndpoint, invoke)
@@ -157,21 +173,41 @@ class EmployeeProcess:
     def onboarding(self, invoke: Callable[[str, dict], dict]) -> dict:
         return self._scoped_exchange("onboarding_duty", _ToolEndpoint, invoke)
 
-    def run_scoped(self, operation: str, run: ScopedRun) -> dict:
+    def run_scoped(
+        self, operation: str, run: ScopedRun, *, timeout: int | None = None
+    ) -> dict:
         if run.claim.execution_profile != self.profile:
-            raise TradeRefused("Scoped run belongs to another execution profile")
+            raise EmployeeProcessRefused(
+                "Scoped run belongs to another execution profile"
+            )
         return self._scoped_exchange(
-            operation, _ToolEndpoint, run.call, harness=run.manifest()
+            operation,
+            _ToolEndpoint,
+            run.call,
+            harness=run.manifest(),
+            timeout=timeout,
         )
 
     def run_sandboxed_scoped(
-        self, operation: str, run: ScopedRun, *, store: Path
+        self,
+        operation: str,
+        run: ScopedRun,
+        *,
+        store: Path,
+        timeout: int | None = None,
     ) -> dict:
         """Run a scoped employee process inside the macOS Desk sandbox connected to the Outer Broker."""
         if run.claim.execution_profile != self.profile:
-            raise TradeRefused("Scoped run belongs to another execution profile")
+            raise EmployeeProcessRefused(
+                "Scoped run belongs to another execution profile"
+            )
         if self._profile() != self.profile:
-            raise TradeRefused("Employee model binding changed")
+            raise EmployeeProcessRefused("Employee model binding changed")
+        effective_timeout = (
+            timeout
+            if timeout is not None
+            else (100 if operation == "assessment_duty" else 60)
+        )
         manifest = run.manifest()
         with TemporaryDirectory(prefix="sd-sb-") as directory:
             scratch = Path(directory).resolve()
@@ -196,38 +232,46 @@ class EmployeeProcess:
                         scratch_dir=scratch,
                         extra_read_files=(self.executable,),
                         input_data=json.dumps(request),
-                        timeout=100
-                        if operation
-                        in ("research_duty", "assessment_duty", "hired_research_duty")
-                        else 60,
+                        timeout=effective_timeout,
                     )
                     if result.returncode != 0:
-                        raise TradeRefused(
+                        raise EmployeeProcessRefused(
                             "Sandboxed employee process did not complete its exchange"
                         )
                     response = json.loads(result.stdout)
                 except (OSError, subprocess.SubprocessError, ValueError) as error:
-                    raise TradeRefused(
+                    raise EmployeeProcessRefused(
                         "Sandboxed employee process did not complete its exchange"
                     ) from error
                 finally:
                     endpoint.shutdown()
                     thread.join()
         if not isinstance(response, dict):
-            raise TradeRefused("Invalid employee response")
+            raise EmployeeProcessRefused("Invalid employee response")
         return response
 
-    def research_hired(self, invoke: Callable[[str, dict], dict]) -> dict:
-        return self._scoped_exchange("hired_research_duty", _ToolEndpoint, invoke)
-
-    def _follow_up(self, operation: str, read_result: Callable[[], dict]) -> dict:
-        return self._scoped_exchange(operation, _ResultEndpoint, read_result)
+    def _follow_up(
+        self,
+        operation: str,
+        read_result: Callable[[], dict],
+        *,
+        timeout: int | None = None,
+    ) -> dict:
+        return self._scoped_exchange(
+            operation, _ResultEndpoint, read_result, timeout=timeout
+        )
 
     def _scoped_exchange(
-        self, operation: str, endpoint_type, callback, *, harness: dict | None = None
+        self,
+        operation: str,
+        endpoint_type,
+        callback,
+        *,
+        harness: dict | None = None,
+        timeout: int | None = None,
     ) -> dict:
         if self._profile() != self.profile:
-            raise TradeRefused("Employee model binding changed")
+            raise EmployeeProcessRefused("Employee model binding changed")
         with TemporaryDirectory(prefix="sd-") as directory:
             address = str(Path(directory) / "result.sock")
             with endpoint_type(address, callback) as endpoint:
@@ -239,7 +283,7 @@ class EmployeeProcess:
                     request = {"operation": operation, "read_endpoint": address}
                     if harness is not None:
                         request["harness"] = harness
-                    return self._exchange(request)
+                    return self._exchange(request, timeout=timeout)
                 finally:
                     endpoint.shutdown()
                     thread.join()

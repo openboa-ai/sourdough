@@ -9,18 +9,18 @@ _SQL_MUTATION_RE = re.compile(
     r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+\"?([a-z][a-z0-9_]*)\"?(?:\s*\(|\s+VALUES\b|\s+SELECT\b|\s+DEFAULT\b)"
     r"|UPDATE(?:\s+OR\s+\w+)?\s+\"?([a-z][a-z0-9_]*)\"?\s+SET\b"
     r"|DELETE\s+FROM\s+\"?([a-z][a-z0-9_]*)\"?"
-    r"|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+\"?([a-z][a-z0-9_]*)\"?(?:\s*\(|\s+AS\b)"
+    r"|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?!IF\b)\"?([a-z][a-z0-9_]*)\"?(?:\s*\(|\s+AS\b)"
     r"|ALTER\s+TABLE\s+\"?([a-z][a-z0-9_]*)\"?\s+(?:ADD|RENAME|DROP)\b"
-    r"|DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+\"?([a-z][a-z0-9_]*)\"?"
+    r"|DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+(?!IF\b)\"?([a-z][a-z0-9_]*)\"?"
     r")",
     re.IGNORECASE,
 )
 
 _SQL_DDL_RE = re.compile(
     r"\b(?:"
-    r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+\"?([a-z][a-z0-9_]*)\"?(?:\s*\(|\s+AS\b)"
+    r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?!IF\b)\"?([a-z][a-z0-9_]*)\"?(?:\s*\(|\s+AS\b)"
     r"|ALTER\s+TABLE\s+\"?([a-z][a-z0-9_]*)\"?\s+(?:ADD|RENAME|DROP)\b"
-    r"|DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+\"?([a-z][a-z0-9_]*)\"?"
+    r"|DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+(?!IF\b)\"?([a-z][a-z0-9_]*)\"?"
     r")",
     re.IGNORECASE,
 )
@@ -28,18 +28,21 @@ _SQL_DDL_RE = re.compile(
 # Modules that manage physically separate SQLite databases outside company.sqlite.
 SEPARATE_DB_MODULES: frozenset[str] = frozenset(
     {
-        "paper_venue.py",
-        "market_worker.py",
-        "nautilus_paper.py",
+        "trading/venue.py",
+        "trading/market_worker.py",
+        "trading/nautilus_paper.py",
         "trial_registry.py",
     }
 )
+
+# Dedicated schema migration modules permitted to execute transactional table rebuild DDL.
+SCHEMA_MIGRATION_MODULES: frozenset[str] = frozenset({"storage/migration.py"})
 
 # Maps each authoritative SQLite table to the set of module paths (relative to
 # src/sourdough/) authorized to execute SQL mutations against it.
 DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Storage & kernel tables
-    "installed_domains": frozenset({"storage/schema.py"}),
+    "installed_domains": frozenset({"storage/schema.py", "storage/migration.py"}),
     "audit_event": frozenset({"storage/kernel.py"}),
     "command_receipt": frozenset({"storage/kernel.py"}),
     "external_actions": frozenset({"storage/kernel.py"}),
@@ -86,9 +89,9 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
             "abandoned_work.py",
             "onboarding.py",
             "staffing.py",
-            "paper_research.py",
             "company_assessment.py",
             "retirement.py",
+            "storage/migration.py",
             "work_handoff.py",
             "work_peer_response.py",
         }
@@ -105,7 +108,9 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
             "work_peer_response.py",
         }
     ),
-    "work_follow_up": frozenset({"work.py", "abandoned_work.py", "work_handoff.py"}),
+    "work_follow_up": frozenset(
+        {"work.py", "abandoned_work.py", "storage/migration.py", "work_handoff.py"}
+    ),
     "work_result_read": frozenset({"work.py"}),
     "work_review_decision": frozenset({"work.py"}),
     "assessment_source": frozenset({"company_assessment.py"}),
@@ -121,72 +126,76 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Board Client governance, messaging, restriction & profile tables
     "board_binding": frozenset({"board_control.py"}),
     "ceo_message": frozenset({"board_control.py"}),
-    "decision_question": frozenset({"board_control.py"}),
-    "restriction_cause": frozenset({"board_control.py"}),
+    "decision_question": frozenset({"board_control.py", "storage/migration.py"}),
+    "restriction_cause": frozenset({"board_control.py", "storage/migration.py"}),
     "agent_profile": frozenset({"board_control.py"}),
-    # Opt-in paper domain tables (company store)
-    "paper_binding": frozenset({"paper_account.py"}),
-    "paper_binding_change": frozenset({"paper_account.py"}),
-    "paper_order": frozenset({"paper_order.py", "paper_books.py"}),
-    "paper_fill": frozenset({"paper_books.py"}),
-    "paper_fill_fee": frozenset({"paper_books.py"}),
-    "paper_fill_accounting_source": frozenset({"paper_books.py"}),
-    "paper_fee_delivery": frozenset({"paper_fee_bridge.py"}),
-    "paper_valuation": frozenset({"paper_valuation.py"}),
-    "paper_operating_window": frozenset({"paper_window.py"}),
-    "paper_statement": frozenset({"paper_statement_store.py"}),
-    "paper_cancellation": frozenset({"paper_reconcile.py", "paper_books.py"}),
-    "paper_reconciliation": frozenset({"paper_reconcile.py"}),
-    "paper_position_observation": frozenset({"paper_decision.py", "paper_books.py"}),
-    "paper_decision": frozenset({"paper_decision.py"}),
-    "paper_review_quote": frozenset({"paper_decision.py", "paper_review.py"}),
-    "paper_research_plan": frozenset({"paper_research.py"}),
-    "paper_research_snapshot": frozenset({"paper_research.py"}),
-    "paper_research_finding": frozenset({"paper_research.py"}),
-    "paper_research_decision": frozenset({"paper_research.py"}),
-    "hired_research_order_request": frozenset({"paper_research.py"}),
-    "paper_risk_state": frozenset({"paper_risk.py"}),
-    "paper_pit_catalog_manifest": frozenset({"strategy_comparison.py"}),
-    "paper_strategy_release": frozenset({"strategy_comparison.py"}),
-    "paper_funding_settlement": frozenset({"paper_funding.py"}),
-    "paper_challenger_trial": frozenset({"strategy_comparison.py"}),
-    "paper_strategy_deployment": frozenset({"strategy_comparison.py"}),
-    # Three-tier execution accounts, per-Agent sandboxes, multi-book paper & migration receipts
-    "execution_environment_binding": frozenset({"execution_tiers.py"}),
-    "agent_sandbox_order": frozenset({"execution_tiers.py"}),
-    "agent_sandbox_fill": frozenset({"execution_tiers.py"}),
-    "agent_sandbox_position": frozenset({"execution_tiers.py"}),
-    "venue_qualification_receipt": frozenset({"execution_tiers.py"}),
-    "environment_promotion_record": frozenset({"execution_tiers.py"}),
-    "company_paper_book": frozenset({"execution_tiers.py"}),
-    "company_paper_order": frozenset({"execution_tiers.py"}),
-    "company_paper_fill": frozenset({"execution_tiers.py"}),
-    "company_paper_position": frozenset({"execution_tiers.py"}),
-    "paper_live_migration_record": frozenset({"execution_tiers.py"}),
-    "trading_book_order": frozenset({"execution_tiers.py"}),
-    "trading_book_fill": frozenset({"execution_tiers.py"}),
-    "trading_book_position": frozenset({"execution_tiers.py"}),
-    "trading_book_valuation": frozenset({"execution_tiers.py"}),
-    # Separate venue / market SQLite databases (outside company store)
-    "replay_decision_cut": frozenset({"nautilus_paper.py"}),
-    "venue_account": frozenset({"paper_venue.py"}),
-    "venue_execution": frozenset({"paper_venue.py"}),
-    "venue_fee_policy": frozenset({"paper_venue.py"}),
-    "venue_fill_fee": frozenset({"paper_venue.py"}),
-    "spot_instrument_terms": frozenset(
-        {"paper_venue.py", "nautilus_paper.py", "market_worker.py"}
+    # Canonical opt-in Trading domain tables (company store)
+    "execution_environment_binding": frozenset(
+        {"trading/accounts.py", "trading/migration.py", "storage/migration.py"}
     ),
-    "market_scope": frozenset({"market_worker.py"}),
-    "market_trade": frozenset({"market_worker.py"}),
-    "sandbox_identity": frozenset({"nautilus_paper.py"}),
-    "sandbox_config": frozenset({"nautilus_paper.py"}),
-    "sandbox_activation": frozenset({"nautilus_paper.py"}),
-    "sandbox_quote": frozenset({"nautilus_paper.py"}),
-    "sandbox_order": frozenset({"nautilus_paper.py"}),
-    "sandbox_fill_observation": frozenset({"nautilus_paper.py"}),
-    "sandbox_fill_time": frozenset({"nautilus_paper.py"}),
-    "sandbox_cancellation": frozenset({"nautilus_paper.py"}),
-    "sandbox_account_observation": frozenset({"nautilus_paper.py"}),
+    "trading_book_order": frozenset({"trading/ledger.py", "storage/migration.py"}),
+    "trading_book_fill": frozenset({"trading/ledger.py", "storage/migration.py"}),
+    "trading_book_position": frozenset({"trading/ledger.py", "storage/migration.py"}),
+    "trading_book_valuation": frozenset(
+        {"trading/ledger.py", "trading/valuation.py", "storage/migration.py"}
+    ),
+    "venue_qualification_receipt": frozenset(
+        {"trading/accounts.py", "storage/migration.py"}
+    ),
+    "environment_promotion_record": frozenset(
+        {"trading/accounts.py", "storage/migration.py"}
+    ),
+    "trading_live_migration_record": frozenset(
+        {"trading/migration.py", "storage/migration.py"}
+    ),
+    "trading_operating_window": frozenset(
+        {"trading/window.py", "storage/migration.py"}
+    ),
+    "trading_statement": frozenset(
+        {"trading/statement_store.py", "storage/migration.py"}
+    ),
+    "trading_funding_settlement": frozenset(
+        {"trading/funding.py", "storage/migration.py"}
+    ),
+    "trading_fee_delivery": frozenset(
+        {"trading/fee_bridge.py", "storage/migration.py"}
+    ),
+    "trading_pit_catalog_manifest": frozenset(
+        {"trading/strategy_comparison.py", "storage/migration.py"}
+    ),
+    "trading_strategy_release": frozenset(
+        {"trading/strategy_comparison.py", "storage/migration.py"}
+    ),
+    "trading_challenger_trial": frozenset(
+        {"trading/strategy_comparison.py", "storage/migration.py"}
+    ),
+    "trading_strategy_deployment": frozenset(
+        {"trading/strategy_comparison.py", "storage/migration.py"}
+    ),
+    # Separate venue / market SQLite databases (outside company store)
+    "replay_decision_cut": frozenset({"trading/nautilus_paper.py"}),
+    "venue_account": frozenset({"trading/venue.py"}),
+    "venue_execution": frozenset({"trading/venue.py"}),
+    "venue_fee_policy": frozenset({"trading/venue.py"}),
+    "venue_fill_fee": frozenset({"trading/venue.py"}),
+    "spot_instrument_terms": frozenset(
+        {
+            "trading/venue.py",
+            "trading/nautilus_paper.py",
+            "trading/market_worker.py",
+        }
+    ),
+    "market_scope": frozenset({"trading/market_worker.py"}),
+    "market_trade": frozenset({"trading/market_worker.py"}),
+    "sandbox_identity": frozenset({"trading/nautilus_paper.py"}),
+    "sandbox_config": frozenset({"trading/nautilus_paper.py"}),
+    "sandbox_activation": frozenset({"trading/nautilus_paper.py"}),
+    "sandbox_quote": frozenset({"trading/nautilus_paper.py"}),
+    "sandbox_order": frozenset({"trading/nautilus_paper.py"}),
+    "sandbox_fill_observation": frozenset({"trading/nautilus_paper.py"}),
+    "sandbox_fill_time": frozenset({"trading/nautilus_paper.py"}),
+    "sandbox_cancellation": frozenset({"trading/nautilus_paper.py"}),
+    "sandbox_account_observation": frozenset({"trading/nautilus_paper.py"}),
     # Separate offline evaluator SQLite database (strictly outside company store)
     "trial_suite": frozenset({"trial_registry.py"}),
     "trial_reservation": frozenset({"trial_registry.py"}),
@@ -235,7 +244,7 @@ def audit_domain_write_ownership(src_root: Path) -> list[str]:
                 violations.append(
                     f"{rel}: unauthorized mutation of table '{table}' (owners: {sorted(owners)})"
                 )
-        if rel not in SEPARATE_DB_MODULES:
+        if rel not in SEPARATE_DB_MODULES and rel not in SCHEMA_MIGRATION_MODULES:
             for ddl_table in sorted(_extract_tables(source, _SQL_DDL_RE)):
                 violations.append(
                     f"{rel}: inline company-store DDL prohibited for '{ddl_table}' (declare in storage/schema/v1/)"

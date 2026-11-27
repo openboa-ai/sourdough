@@ -1,174 +1,316 @@
-import json
+"""Connected Flow 11: Unified risk pause/resume (restriction-command-v1), restore fencing, and trading_book_fill."""
+
 import sqlite3
-import subprocess
-import sys
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import monotonic, sleep, time_ns
+from time import time_ns
 
+from sourdough.board_control import (
+    BOARD_CONTROL_ROLE,
+    PAUSE_COMPANY,
+    RESTRICTION_COMMAND,
+    RESUME_COMPANY,
+    bind_board_principal,
+)
 from sourdough.company import FoundingRefused, FoundingTerms, found
-from sourdough.company_checkpoint import checkpoint_company
-from sourdough.first_duty import claim_first_duty
-from sourdough.market_worker import SpotInstrumentTerms
-from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
-from sourdough.paper_account import PaperMandate, bind
-from sourdough.paper_execution import PaperIntent, VenueRefused
-from sourdough.paper_order import OrderRefused, submit_paper_order
-from sourdough.paper_restore import restore_managed_paper_checkpoint
-from sourdough.paper_risk import SUSPEND_NEW_RISK, PaperSuspension, suspend_paper_risk
-from sourdough.paper_sender_lease import hold_sender_lease
-from sourdough.trading_engine import VERSION
+from sourdough.company_checkpoint import CheckpointRefused
+from sourdough.company_restore import restore_core_checkpoint
+from sourdough.ipc import CompanyDaemon, ControlPlaneClient
+from sourdough.storage.checkpoint import checkpoint_store, restore_store
+from sourdough.storage.db import open_writer, write_tx
+from sourdough.trading.accounts import open_company_paper_book
+from sourdough.trading.domain import ExecutionTierRefused
+from sourdough.trading.engine import VERSION
+from sourdough.trading.execution import VenueRefused
+from sourdough.trading.ledger import submit_company_paper_book_order
+from sourdough.trading.market_worker import SpotInstrumentTerms
+from sourdough.trading.nautilus_paper import NautilusPaperVenue, SandboxPlan
+from sourdough.trading.risk import SCOPE_EXECUTION_ALL, TRADING_RISK_CAUSE_CATEGORY
+from sourdough.trading.sender_lease import hold_sender_lease
 from sourdough.writer_lease import hold_company_writer
 
 
-def inspect_work(store, company_id):
-    response = subprocess.run(
-        [
-            sys.executable,
-            "-IB",
-            "-m",
-            "sourdough.cli",
-            "inspect-work",
-            str(store),
-            "--company-id",
-            company_id,
-            "--contract-revision",
-            "work-timeline-v1",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    return json.loads(response.stdout)
-
-
 class ConnectedFlow(unittest.TestCase):
-    def test_end_to_end(self):
-        root = Path(self.enterContext(TemporaryDirectory()))
+    def test_end_to_end(self) -> None:
+        root = Path(self.enterContext(TemporaryDirectory(prefix="sd-f11-")))
+        sock_root = Path(
+            self.enterContext(TemporaryDirectory(prefix="sd-", dir="/tmp"))
+        )
         source = root / "company.sqlite"
-        checkpoint = root / "checkpoint"
+        leases = root / "leases"
+        sock_dir = sock_root / "s"
+        checkpoint = root / "checkpoint.sd"
         replacement = root / "replacement.sqlite"
         engine = root / "engine"
+
         company = found(source, FoundingTerms("board", "charter", "paper", "profile"))
         company_id = company.company_id
+        founder_id = company.founder_id
+
         runtime = engine / f"nautilus-{VERSION}"
         runtime.mkdir(parents=True)
         venue = NautilusPaperVenue(runtime / "sandbox.sqlite")
         terms = SpotInstrumentTerms(
             "BTCUSDT", "BTC", "USDT", "0.01", "0.00001", "0.00001", "5"
         )
-        capital, price, quantity = 100_000_000_000, 60_000_000, 20
-        venue.provision(SandboxPlan(company_id, "paper", terms, capital, 0))
+        venue.provision(SandboxPlan(company_id, "paper", terms, 100_000_000_000, 0))
         generation = "fixture-sender"
         venue.prove_account(generation, "BINANCE-001", "USDT", venue.start_generation())
-        bind(
+        stale_ns = time_ns() - 30_000_000_000
+        venue.publish_quote(generation, 60_000_000, stale_ns, stale_ns)
+
+        # 1. Open Company Paper Book, record one filled order + one resting open order.
+        with hold_company_writer(source, company_id, lease_directory=leases) as writer:
+            bind_board_principal(
+                writer, principal_id="board-chair", role_name=BOARD_CONTROL_ROLE
+            )
+            book = open_company_paper_book(
+                writer,
+                account_id="paper-acct-1",
+                book_name="Flow 11 Paper Book",
+                starting_minor_units=100_000_000,
+                exposure_limit_minor_units=50_000_000,
+            )
+            filled_order = submit_company_paper_book_order(
+                writer,
+                binding_id=book.binding_id,
+                actor_id=founder_id,
+                action_id="initial-fill",
+                instrument_id="BTC-USDT",
+                side="buy",
+                quantity=2,
+                limit_minor_units=6_100_000,
+                market_price_minor_units=6_000_000,
+                fill_mode="immediate",
+            )
+            open_order = submit_company_paper_book_order(
+                writer,
+                binding_id=book.binding_id,
+                actor_id=founder_id,
+                action_id="resting-open",
+                instrument_id="BTC-USDT",
+                side="buy",
+                quantity=1,
+                limit_minor_units=5_800_000,
+                market_price_minor_units=6_000_000,
+                fill_mode="resting",
+            )
+            self.assertEqual(filled_order["status"], "filled")
+            self.assertEqual(open_order["status"], "open")
+
+        # 2. Suspend execution via restriction-command-v1 over CompanyDaemon UDS.
+        with CompanyDaemon(
             source,
-            PaperMandate(
-                "binding", company_id, "charter", venue.observe_account("paper"), 10**10
-            ),
-            venue,
-        )
-        stamp = time_ns()
-        venue.publish_quote(generation, price, stamp, stamp)
-        claim = claim_first_duty(source, company_id, "profile")
-        original = PaperIntent("original", terms.revision, quantity, price)
+            company_id,
+            socket_dir=sock_dir,
+            lease_directory=leases,
+            engine_directory=engine,
+        ) as daemon:
+            client = ControlPlaneClient(daemon.socket_path)
+            code, resp = client.submit_command(
+                company_id=company_id,
+                command_id="pause-exec-1",
+                command_type=PAUSE_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter",
+                    "restriction_id": "rest-exec-all",
+                    "expected_restriction_revision": 0,
+                },
+                payload={
+                    "scope_ref": SCOPE_EXECUTION_ALL,
+                    "cause_category": TRADING_RISK_CAUSE_CATEGORY,
+                    "reason": "Review open exposure",
+                },
+                principal="board-chair",
+            )
+            self.assertEqual(code, 200, resp)
+            self.assertEqual(resp["state"], "applied")
 
-        def authorize_fixture(database, requested_company, operation):
-            persisted = database.execute("SELECT id FROM company").fetchone()[0]
-            if (
-                persisted == requested_company == company_id
-                and operation == SUSPEND_NEW_RISK
+            _, _, desk = client.projection(
+                "trading-desk?environment=paper", expected_company_id=company_id
+            )
+            assert desk is not None
+            self.assertTrue(desk["risk_gate"]["suspended"])
+
+            # Resume must fail closed while open order exists in trading_book_order.
+            code_open, body_open = client.submit_command(
+                company_id=company_id,
+                command_id="resume-blocked-open",
+                command_type=RESUME_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter",
+                    "restriction_id": "rest-exec-all",
+                    "expected_restriction_revision": 1,
+                },
+                payload={"reason": "Premature resume"},
+                principal="board-chair",
+            )
+            self.assertEqual(code_open, 400)
+            self.assertIn("open order", body_open["error"])
+
+        # 3. Verify suspended order submission fails closed and restore gates active sender/domain guard.
+        with hold_company_writer(source, company_id, lease_directory=leases) as writer:
+            with self.assertRaisesRegex(
+                ExecutionTierRefused, "blocked by active restriction"
             ):
-                return "fixture-board"
-            return None
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            admission = pool.submit(submit_paper_order, source, claim, original, venue)
-            command = None
-            deadline = monotonic() + 4
-            while command is None and monotonic() < deadline:
-                command = venue.claim_command(generation)
-                if command is None:
-                    sleep(0.01)
-            self.assertIsNotNone(command)
-
-            suspension = PaperSuspension(
-                "suspend", "charter", 0, "Review open exposure"
-            )
-            with hold_company_writer(source, company_id) as writer:
-                receipt = suspend_paper_risk(writer, suspension, authorize_fixture)
-                self.assertEqual(receipt.disposition, "applied")
-                with self.assertRaisesRegex(OrderRefused, "risk is suspended"):
-                    submit_paper_order(
-                        source,
-                        claim,
-                        PaperIntent("new-risk", terms.revision, quantity, price),
-                        venue,
-                        writer=writer,
-                    )
-            checkpoint_company(source, company_id, checkpoint)
-            company_cut, venue_cut = source.read_bytes(), venue.journal.read_bytes()
-            pending = inspect_work(source, company_id)
-            self.assertEqual(
-                pending["risk_control"]["last_applied"]["request_id"], "suspend"
-            )
-            self.assertEqual(pending["paper"]["unresolved_orders"], 1)
-            self.assertEqual(pending["paper"]["booked_position"], 0)
-            self.assertEqual(source.read_bytes(), company_cut)
-            self.assertEqual(venue.journal.read_bytes(), venue_cut)
-            with hold_sender_lease(venue.journal):
-                with self.assertRaisesRegex(VenueRefused, "active or pending sender"):
-                    restore_managed_paper_checkpoint(
-                        source, company_id, checkpoint, replacement, engine
-                    )
-            self.assertFalse(replacement.exists())
-            venue.record_fill(
-                generation, command.order_id, "original-fill", quantity, price, 0
-            )
-            self.assertTrue(
-                venue.record_account(
-                    generation, command.order_id, quantity, capital - quantity * price
+                submit_company_paper_book_order(
+                    writer,
+                    binding_id=book.binding_id,
+                    actor_id=founder_id,
+                    action_id="new-risk",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=6_100_000,
+                    market_price_minor_units=6_000_000,
                 )
-            )
-            self.assertEqual(admission.result(timeout=2).order_id, command.order_id)
 
-        venue_cut = venue.journal.read_bytes()
-        restore = restore_managed_paper_checkpoint(
-            source, company_id, checkpoint, replacement, engine
+        checkpoint_store(source, company_id, checkpoint, lease_directory=leases)
+        with self.assertRaisesRegex(
+            CheckpointRefused, "independent restore reconciler"
+        ):
+            restore_core_checkpoint(source, company_id, checkpoint, replacement)
+
+        def fail_on_active_sender(_conn: sqlite3.Connection) -> None:
+            with hold_sender_lease(venue.journal):
+                pass
+
+        with hold_sender_lease(venue.journal):
+            with self.assertRaisesRegex(VenueRefused, "active or pending sender"):
+                restore_store(
+                    source,
+                    company_id,
+                    checkpoint,
+                    replacement,
+                    check_original=fail_on_active_sender,
+                    lease_directory=leases,
+                )
+        self.assertFalse(replacement.exists())
+
+        # 4. Settle/cancel open order, re-checkpoint, and restore idempotently with source retirement.
+        with hold_company_writer(source, company_id, lease_directory=leases) as writer:
+            with closing(open_writer(source, lease=writer)) as db, write_tx(db):
+                db.execute(
+                    "UPDATE trading_book_order SET status = 'cancelled', cancelled_at_ns = ? WHERE order_id = ?",
+                    (time_ns(), open_order["order_id"]),
+                )
+
+        checkpoint_settled = root / "checkpoint-settled.sd"
+        checkpoint_store(source, company_id, checkpoint_settled, lease_directory=leases)
+        restored = restore_store(
+            source,
+            company_id,
+            checkpoint_settled,
+            replacement,
+            lease_directory=leases,
         )
         self.assertEqual(
-            restore_managed_paper_checkpoint(
-                source, company_id, checkpoint, replacement, engine
+            restore_store(
+                source,
+                company_id,
+                checkpoint_settled,
+                replacement,
+                lease_directory=leases,
             ),
-            restore,
+            restored,
         )
         with self.assertRaisesRegex(FoundingRefused, "retired"):
-            with hold_company_writer(source, company_id):
+            with hold_company_writer(source, company_id, lease_directory=leases):
                 self.fail("The source regained writer authority")
-        restored_cut = replacement.read_bytes()
-        settled = inspect_work(replacement, company_id)
-        self.assertEqual(settled["risk_control"], pending["risk_control"])
-        self.assertEqual(settled["risk_control"]["state"], "suspended")
-        self.assertEqual(settled["paper"]["unresolved_orders"], 0)
-        self.assertEqual(settled["paper"]["booked_position"], quantity)
+
         with closing(
             sqlite3.connect(replacement.as_uri() + "?mode=ro", uri=True)
         ) as database:
             self.assertEqual(
                 database.execute(
-                    "SELECT order_id,fill_id,quantity FROM paper_fill"
+                    "SELECT order_id, fill_id, quantity FROM trading_book_fill"
                 ).fetchall(),
-                [(command.order_id, "original-fill", quantity)],
+                [(filled_order["order_id"], filled_order["fill_id"], 2)],
             )
             self.assertEqual(
                 database.execute(
-                    "SELECT agent_id FROM duty WHERE state='scheduled'"
+                    """SELECT scope_ref, cause_category, active
+                       FROM restriction_cause
+                       WHERE company_id = ? AND restriction_id = 'rest-exec-all'""",
+                    (company_id,),
                 ).fetchall(),
-                [(company.founder_id,)],
+                [(SCOPE_EXECUTION_ALL, TRADING_RISK_CAUSE_CATEGORY, 1)],
             )
-        self.assertEqual(replacement.read_bytes(), restored_cut)
-        self.assertEqual(venue.journal.read_bytes(), venue_cut)
+            self.assertEqual(
+                database.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+
+        # 5. On restored store: stale quote (>15s) rejects resume; fresh quote clears and allows new fill.
+        with CompanyDaemon(
+            replacement,
+            company_id,
+            socket_dir=sock_dir,
+            lease_directory=leases,
+            engine_directory=engine,
+        ) as daemon:
+            client = ControlPlaneClient(daemon.socket_path)
+            code_stale, body_stale = client.submit_command(
+                company_id=company_id,
+                command_id="resume-stale-quote",
+                command_type=RESUME_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter",
+                    "restriction_id": "rest-exec-all",
+                    "expected_restriction_revision": 1,
+                },
+                payload={"reason": "Stale quote attempt"},
+                principal="board-chair",
+            )
+            self.assertEqual(code_stale, 400)
+            self.assertIn("fresh quote", body_stale["error"])
+
+            fresh_ns = time_ns()
+            with venue._connect("rw") as vconn, vconn:
+                vconn.execute(
+                    "UPDATE sandbox_quote SET event_ns = ?, exchange_trade_ns = ?, received_ns = ?",
+                    (fresh_ns, fresh_ns, fresh_ns),
+                )
+
+            code_ok, resp_ok = client.submit_command(
+                company_id=company_id,
+                command_id="resume-fresh-quote",
+                command_type=RESUME_COMPANY,
+                contract_version=RESTRICTION_COMMAND,
+                preconditions={
+                    "charter_revision": "charter",
+                    "restriction_id": "rest-exec-all",
+                    "expected_restriction_revision": 1,
+                },
+                payload={"reason": "Fresh quote verified"},
+                principal="board-chair",
+            )
+            self.assertEqual(code_ok, 200, resp_ok)
+            self.assertEqual(resp_ok["state"], "applied")
+
+            _, _, desk_after = client.projection(
+                "trading-desk?environment=paper", expected_company_id=company_id
+            )
+            assert desk_after is not None
+            self.assertFalse(desk_after["risk_gate"]["suspended"])
+
+        with hold_company_writer(
+            replacement, company_id, lease_directory=leases
+        ) as writer:
+            resumed_fill = submit_company_paper_book_order(
+                writer,
+                binding_id=book.binding_id,
+                actor_id=founder_id,
+                action_id="post-resume-fill",
+                instrument_id="BTC-USDT",
+                side="buy",
+                quantity=1,
+                limit_minor_units=6_100_000,
+                market_price_minor_units=6_000_000,
+                fill_mode="immediate",
+            )
+            self.assertEqual(resumed_fill["status"], "filled")

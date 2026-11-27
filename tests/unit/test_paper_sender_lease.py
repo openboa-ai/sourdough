@@ -4,14 +4,14 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sourdough.paper_execution import VenueRefused
-from sourdough.paper_sender_lease import hold_sender_lease, verify_sender_lease
+from sourdough.trading.execution import VenueRefused
+from sourdough.trading.sender_lease import hold_sender_lease, verify_sender_lease
 
 
 _VERIFY = """
 import sys
 from pathlib import Path
-from sourdough.paper_sender_lease import verify_worker_sender
+from sourdough.trading.sender_lease import verify_worker_sender
 verify_worker_sender(Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3])
 """
 

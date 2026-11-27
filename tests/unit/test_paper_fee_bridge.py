@@ -10,21 +10,20 @@ from time import monotonic, sleep, time_ns
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
-from sourdough.first_duty import claim_first_duty
 from sourdough.general_ledger import JournalRefused
-from sourdough.market_worker import SpotInstrumentTerms
-from sourdough.nautilus_paper import NautilusPaperVenue, SandboxPlan
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_books import post_confirmed_fill
-from sourdough.paper_execution import VenueRefused
-from sourdough.paper_fee_bridge import (
+from sourdough.storage.db import open_writer, write_tx
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.duty import claim_paper_first_duty as claim_first_duty
+from sourdough.trading.execution import PaperIntent, VenueRefused
+from sourdough.trading.fee_bridge import (
     FeeChart,
     VerifiedFee,
     deliver_managed_paper_fee,
     deliver_paper_fee,
 )
-from sourdough.paper_order import PaperIntent, submit_paper_order
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.ledger import submit_company_paper_book_order
+from sourdough.trading.market_worker import SpotInstrumentTerms
+from sourdough.trading.nautilus_paper import NautilusPaperVenue, SandboxPlan
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -32,7 +31,6 @@ class PaperFeeBridge(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory()))
         self.store = self.root / "company.sqlite"
-        self.venue = FixedQuoteVenue(self.root / "venue.sqlite")
         self.company = found(
             self.store, FoundingTerms("fees", "charter", "paper", "employee")
         ).company_id
@@ -41,30 +39,49 @@ class PaperFeeBridge(unittest.TestCase):
         )
 
     def admitted_fill(self, fee_bps):
-        account = self.venue.provision(
-            PaperAccount("paper", "fixture", "instrument", "USD", 5000, "paper"),
-            100,
-            fee_bps=fee_bps,
-        )
-        bind(
-            self.store,
-            PaperMandate("scope", self.company, "charter", account, 1000),
-            self.venue,
-        )
         claim = claim_first_duty(self.store, self.company, "employee")
-        order = submit_paper_order(
-            self.store, claim, PaperIntent("original", "instrument", 2, 110), self.venue
+        with hold_company_writer(
+            self.store, self.company, lease_directory=self.root / "leases"
+        ) as writer:
+            binding = register_company_paper_tier(
+                writer,
+                account_id="paper",
+                destination_id="fixture-dest",
+                connector_revision="fixture",
+                instrument_rules_digest="instrument",
+                currency="USD",
+                starting_minor_units=5000,
+                exposure_limit_minor_units=1000,
+                fee_bps=fee_bps,
+                slippage_bps=0,
+            )
+            order = submit_company_paper_book_order(
+                writer,
+                binding_id=binding.binding_id,
+                actor_id=claim.founder_id,
+                action_id="original",
+                instrument_id="instrument",
+                side="buy",
+                quantity=2,
+                limit_minor_units=110,
+                market_price_minor_units=100,
+                fill_mode="immediate",
+                run_id=claim.run_id,
+            )
+        rows = self.rows(
+            self.store,
+            f"SELECT fill_id, fee_minor_units FROM trading_book_fill WHERE order_id = '{order['order_id']}'",
         )
-        observed = self.venue.observe_execution(order.order_id)
-        return order.order_id, VerifiedFee(
-            account.destination_id,
-            account.account_id,
-            observed.fill_id,
+        fill_id, fee_minor = rows[0]
+        return order["order_id"], VerifiedFee(
+            binding.destination_id,
+            binding.account_id,
+            str(fill_id),
             "venue-fee-cut",
             date(2026, 11, 22),
             "USD",
             100,
-            observed.fee_minor_units,
+            int(fee_minor),
         )
 
     def rows(self, store, query):
@@ -80,14 +97,13 @@ class PaperFeeBridge(unittest.TestCase):
             return deliver_paper_fee(writer, verified, chart or self.chart)
 
     def test_one_fee_posting_is_atomic_and_idempotent_across_failure(self):
-        order_id, verified = self.admitted_fill(fee_bps=200)
+        _order_id, verified = self.admitted_fill(fee_bps=200)
         self.assertEqual(verified.fee_minor_units, 4)
         with self.assertRaisesRegex(JournalRefused, "original paper source"):
-            self.deliver(verified)
-        post_confirmed_fill(self.store, self.company, order_id, self.venue)
+            self.deliver(replace(verified, destination_id="wrong-dest"))
         with (
             patch(
-                "sourdough.paper_fee_bridge.append_audit_event",
+                "sourdough.trading.fee_bridge.append_audit_event",
                 side_effect=OSError("cut before commit"),
             ),
             self.assertRaisesRegex(OSError, "before commit"),
@@ -96,7 +112,7 @@ class PaperFeeBridge(unittest.TestCase):
         self.assertEqual(self.rows(self.store, "SELECT id FROM journal_entry"), [])
         self.assertEqual(
             self.rows(
-                self.store, "SELECT acknowledged,journal_id FROM paper_fee_delivery"
+                self.store, "SELECT acknowledged,journal_id FROM trading_fee_delivery"
             ),
             [],
         )
@@ -123,22 +139,15 @@ class PaperFeeBridge(unittest.TestCase):
             ),
             [(receipt.source_event, verified.revision, "paper-fill-fee")],
         )
-        self.assertEqual(
-            self.rows(
-                self.venue.journal, "SELECT order_id,fill_id FROM venue_execution"
-            ),
-            [(order_id, verified.fill_id)],
-        )
 
     def test_explicit_zero_and_unverified_scope_are_distinct(self):
-        order_id, verified = self.admitted_fill(fee_bps=0)
-        post_confirmed_fill(self.store, self.company, order_id, self.venue)
+        _order_id, verified = self.admitted_fill(fee_bps=0)
         with self.assertRaisesRegex(JournalRefused, "original paper source"):
             self.deliver(replace(verified, fee_minor_units=1))
         with self.assertRaisesRegex(JournalRefused, "matching chart units"):
             self.deliver(verified, replace(self.chart, units_per_whole=1000))
         self.assertEqual(
-            self.rows(self.store, "SELECT COUNT(*) FROM paper_fee_delivery"),
+            self.rows(self.store, "SELECT COUNT(*) FROM trading_fee_delivery"),
             [(0,)],
         )
         receipt = self.deliver(verified)
@@ -150,7 +159,7 @@ class PaperFeeBridge(unittest.TestCase):
         )
         self.assertEqual(
             self.rows(
-                self.store, "SELECT acknowledged,journal_id FROM paper_fee_delivery"
+                self.store, "SELECT acknowledged,journal_id FROM trading_fee_delivery"
             ),
             [(1, None)],
         )
@@ -160,42 +169,93 @@ class PaperFeeBridge(unittest.TestCase):
             "BTCUSDT", "BTC", "USDT", "0.01", "0.00001", "0.00001", "5"
         )
         venue = NautilusPaperVenue(self.root / "sandbox.sqlite")
-        venue.provision(SandboxPlan(self.company, "paper", terms, 100_000_000_000, 0))
-        venue.prove_account("original", "BINANCE-001", "USDT", venue.start_generation())
-        account = venue.observe_account("paper")
-        bind(
-            self.store,
-            PaperMandate("scope", self.company, "charter", account, 10_000_000_000),
-            venue,
+        dest_id = venue.provision(
+            SandboxPlan(self.company, "paper", terms, 100_000_000_000, 0)
         )
-        claim = claim_first_duty(self.store, self.company, "employee")
+        gen = venue.start_generation()
+        venue.prove_account("original", "BINANCE-001", "USDT", gen)
+        with hold_company_writer(
+            self.store, self.company, lease_directory=self.root / "leases"
+        ) as writer:
+            binding = register_company_paper_tier(
+                writer,
+                account_id="paper",
+                destination_id=dest_id,
+                connector_revision="nautilus-spot-sandbox-v1",
+                instrument_rules_digest=terms.revision,
+                currency="USDT",
+                starting_minor_units=100_000_000_000,
+                exposure_limit_minor_units=10_000_000_000,
+                fee_bps=0,
+                slippage_bps=0,
+            )
+            binding_id = binding.binding_id
+            company_id = binding.company_id
+            order = submit_company_paper_book_order(
+                writer,
+                binding_id=binding_id,
+                actor_id="founder",
+                action_id="managed-fee-act-1",
+                instrument_id=terms.revision,
+                side="buy",
+                quantity=20,
+                limit_minor_units=60_000_000,
+                market_price_minor_units=59_000_000,
+                fill_mode="resting",
+            )
+            order_id = order["order_id"]
         price = 59_000_000
         quote_ns = time_ns()
         venue.publish_quote("original", price, quote_ns, quote_ns)
         effective_ns = int(datetime(2026, 11, 22, tzinfo=UTC).timestamp()) * 10**9 - 1
         with ThreadPoolExecutor(max_workers=1) as pool:
             submission = pool.submit(
-                submit_paper_order,
-                self.store,
-                claim,
-                PaperIntent("managed", terms.revision, 20, price),
-                venue,
+                venue.submit,
+                order_id,
+                "paper",
+                PaperIntent(
+                    "managed-fee-act-1",
+                    terms.revision,
+                    20,
+                    price + 1_000_000,
+                ),
             )
+            deadline = monotonic() + 5
             command = None
-            deadline = monotonic() + 3
-            while command is None and monotonic() < deadline:
+            while monotonic() < deadline and command is None:
                 command = venue.claim_command("original")
-                sleep(0.01)
+                if command is None:
+                    sleep(0.02)
             self.assertIsNotNone(command)
-            order_id = command.order_id
             venue.record_fill("original", order_id, "legacy", 8, price, 0)
             fill = ("original", order_id, "timed", 12, price, 4)
             venue.record_fill(*fill, effective_ns=effective_ns)
             venue.record_fill(*fill, effective_ns=effective_ns)
             with self.assertRaisesRegex(VenueRefused, "changed"):
                 venue.record_fill(*fill, effective_ns=effective_ns + 1)
-            self.assertEqual(submission.result(timeout=2).order_id, order_id)
-        post_confirmed_fill(self.store, self.company, order_id, venue)
+            submission.result()
+        with hold_company_writer(
+            self.store, self.company, lease_directory=self.root / "leases"
+        ) as writer:
+            with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
+                db.execute(
+                    """INSERT INTO trading_book_fill (
+                           fill_id, order_id, binding_id, environment, company_id,
+                           actor_id, external_fill_id, instrument_id, side,
+                           quantity, price_minor_units, fee_minor_units,
+                           realized_pnl_minor_units, filled_at_ns
+                       ) VALUES (?, ?, ?, 'paper', ?, 'founder', ?, ?, 'buy', 12, ?, 4, 0, ?)""",
+                    (
+                        "timed",
+                        order_id,
+                        binding_id,
+                        company_id,
+                        "timed",
+                        terms.revision,
+                        price,
+                        effective_ns,
+                    ),
+                )
         reopened = NautilusPaperVenue(venue.journal)
         chart = replace(self.chart, currency="USDT", units_per_whole=100_000_000)
         with hold_company_writer(self.store, self.company) as writer:

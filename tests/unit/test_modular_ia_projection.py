@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 
 from sourdough.board_control import upsert_agent_profile
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import AgentSandboxTools
+from sourdough.trading.sandbox_tools import AgentSandboxTools
 from sourdough.ipc.projections import (
     read_agent_detail_projection,
     read_agents_graph_projection,

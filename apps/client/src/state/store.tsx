@@ -27,6 +27,7 @@ import type {
   ControlPlaneMeta,
   LocalCommandIntent,
 } from "../api/types";
+import { resolveActiveDomainModules, resolveHomeMode } from "../domains/registry";
 
 export type LinkState = "connecting" | "live" | "stale" | "unauthorized" | "error";
 
@@ -47,8 +48,6 @@ interface AppContextValue {
   route: string;
   routePathname: string;
   routeSearchParams: URLSearchParams;
-  performanceMode: boolean;
-  daemonMode: boolean;
   activeApprovalQuestionId: string | null;
   navigate: (
     path: string,
@@ -98,7 +97,7 @@ interface AppContextValue {
 const AppContext = createContext<AppContextValue | null>(null);
 
 const ALLOWED_ASK_CONTEXT_KINDS = new Set([
-  "paper_order",
+  "trading_order",
   "agent",
   "shared_publication",
   "decision_question",
@@ -178,30 +177,21 @@ function parseAskContextFromSearch(search: string): ContextRef | null {
 }
 
 function isMessagesPathname(pathname: string): boolean {
-  return pathname === "/messages" || pathname === "/ceo";
+  return pathname === "/messages";
 }
 
 function isTier1Path(pathname: string): boolean {
   return (
     pathname.startsWith("/orders/") ||
     pathname.startsWith("/agents/") ||
-    pathname.startsWith("/office/agents/") ||
-    pathname.startsWith("/approvals/") ||
-    pathname.startsWith("/company/approvals/") ||
-    pathname === "/performance" ||
-    pathname === "/system/daemon"
+    pathname.startsWith("/approvals/")
   );
 }
 
 function defaultEscapeBackTarget(pathname: string): string | null {
-  if (pathname.startsWith("/orders/") || pathname === "/performance") return "/trading/paper";
-  if (pathname.startsWith("/agents/") || pathname.startsWith("/office/agents/")) {
-    return "/agents";
-  }
-  if (pathname.startsWith("/approvals/") || pathname.startsWith("/company/approvals/")) {
-    return "/approvals";
-  }
-  if (pathname === "/system/daemon") return "/audit";
+  if (pathname.startsWith("/orders/")) return "/trading/paper";
+  if (pathname.startsWith("/agents/")) return "/agents";
+  if (pathname.startsWith("/approvals/")) return "/approvals";
   return null;
 }
 
@@ -384,12 +374,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     () => new URLSearchParams(routeSearch.startsWith("?") ? routeSearch.slice(1) : routeSearch),
     [routeSearch]
   );
-  const performanceMode = routePathname === "/performance";
-  const daemonMode = routePathname === "/system/daemon";
   const activeApprovalQuestionId = useMemo(
-    () =>
-      decodeSingleSegment(routePathname, "/approvals/") ??
-      decodeSingleSegment(routePathname, "/company/approvals/"),
+    () => decodeSingleSegment(routePathname, "/approvals/"),
     [routePathname]
   );
 
@@ -825,9 +811,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       (prevLocked === true || prevLocked === undefined) &&
       splitRoute(routeRef.current).pathname === "/bootstrap"
     ) {
-      navigate("/", { replace: true });
+      const homeMode = resolveHomeMode(resolveActiveDomainModules(meta?.active_domains));
+      navigate(homeMode === "core_only" ? "/agents" : "/", { replace: true });
     }
-  }, [meta?.board_access.bootstrap_locked, navigate]);
+  }, [meta?.board_access.bootstrap_locked, meta?.active_domains, navigate]);
 
   // Startup bootstrap + pending outbox recovery.
   useEffect(() => {
@@ -1312,8 +1299,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       route,
       routePathname,
       routeSearchParams,
-      performanceMode,
-      daemonMode,
       activeApprovalQuestionId,
       navigate,
       focusReturnId,
@@ -1356,8 +1341,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       route,
       routePathname,
       routeSearchParams,
-      performanceMode,
-      daemonMode,
       activeApprovalQuestionId,
       navigate,
       focusReturnId,

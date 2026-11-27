@@ -12,34 +12,37 @@ from sourdough.board_control import (
     bind_board_principal,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
+from sourdough.trading.accounts import (
+    demote_live_environment,
+    open_agent_sandbox,
+    open_company_paper_book,
+    promote_execution_environment,
+    record_venue_qualification_receipt,
+    register_company_paper_tier,
+    register_live_candidate_binding,
+    reset_agent_sandbox,
+)
+from sourdough.trading.domain import (
     ENV_EXTERNAL_TEST,
     ENV_LIVE,
     ENV_PAPER,
     TIER_AGENT_SANDBOX,
     TIER_COMPANY_LIVE,
     TIER_COMPANY_PAPER,
-    AgentSandboxTools,
     ExecutionTierRefused,
     build_promotion_payload_hash,
-    cancel_agent_sandbox_order,
     compute_trading_core_digest,
-    demote_live_environment,
-    open_agent_sandbox,
-    promote_execution_environment,
-    read_agent_sandbox_portfolio,
-    record_venue_qualification_receipt,
-    register_company_paper_tier,
-    register_live_candidate_binding,
-    reset_agent_sandbox,
-    submit_agent_sandbox_order,
-    sync_company_paper_from_legacy_binding,
 )
-from sourdough.market_worker import SpotInstrumentTerms
-from sourdough.nautilus_paper import SandboxPlan
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_execution import VenueRefused
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.execution import VenueRefused
+from sourdough.trading.ledger import (
+    cancel_agent_sandbox_order,
+    read_agent_sandbox_portfolio,
+    record_trading_book_valuation,
+    submit_agent_sandbox_order,
+)
+from sourdough.trading.market_worker import SpotInstrumentTerms
+from sourdough.trading.nautilus_paper import SandboxPlan
+from sourdough.trading.sandbox_tools import AgentSandboxTools
 from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
 from sourdough.writer_lease import hold_company_writer
 
@@ -76,39 +79,35 @@ class ExecutionTiersTests(unittest.TestCase):
             )
 
     def _seed_paper_soak(self, writer) -> None:
-        venue = FixedQuoteVenue(self.root / "venue.sqlite")
-        account = venue.provision(
-            PaperAccount(
+        from sourdough.storage.schema import is_domain_installed
+
+        paper_row = None
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            if is_domain_installed(db, "trading"):
+                paper_row = db.execute(
+                    """SELECT binding_id FROM execution_environment_binding
+                       WHERE company_id = ? AND tier = 'company_paper' AND status = 'active'
+                       LIMIT 1""",
+                    (self.company_id,),
+                ).fetchone()
+        if paper_row is not None:
+            bid = str(paper_row[0])
+        else:
+            bid = open_company_paper_book(
+                writer,
                 account_id="company-paper-acct",
-                connector_revision="fixed-quote-v1",
-                instrument_rules_digest="btc-spot-v1",
-                currency="USD",
+                book_name="Company Paper Soak",
                 starting_minor_units=50_000_000,
-                environment="paper",
-                destination_id="",
-            ),
-            quote_minor_units=6_000_000,
-            fee_bps=4,
-        )
-        bind(
-            self.store,
-            PaperMandate(
-                revision="paper-rev-1",
-                company_id=self.company_id,
-                charter_revision="charter-v1",
-                account=account,
                 exposure_limit_minor_units=25_000_000,
-            ),
-            venue,
+                fee_bps=4,
+                slippage_bps=2,
+            ).binding_id
+        record_trading_book_valuation(
+            writer,
+            binding_id=bid,
+            label="Day1",
+            mark_prices={"BTC-USDT": 6_120_000},
         )
-        sync_company_paper_from_legacy_binding(writer, fee_bps=4, slippage_bps=2)
-        with closing(open_writer(self.store, lease=writer)) as db, write_tx(db):
-            db.execute(
-                """INSERT INTO paper_valuation (
-                       capture_id, binding_revision, policy, evidence,
-                       trading_nav_atoms, revision
-                   ) VALUES ('val-1', 'paper-rev-1', 'mid', '{"label":"Day1"}', 50120000, 'vrev-1')"""
-            )
 
     def test_nautilus_sandbox_plan_accepts_realistic_fee_and_slippage_bounds(self):
         terms = SpotInstrumentTerms(
@@ -254,10 +253,16 @@ class ExecutionTiersTests(unittest.TestCase):
         # Verify zero contamination of company official books!
         with closing(open_reader(self.store)) as db, read_tx(db):
             self.assertEqual(
-                db.execute("SELECT COUNT(*) FROM paper_order").fetchone()[0], 0
+                db.execute(
+                    "SELECT COUNT(*) FROM trading_book_order WHERE environment != 'agent_sandbox'"
+                ).fetchone()[0],
+                0,
             )
             self.assertEqual(
-                db.execute("SELECT COUNT(*) FROM paper_fill").fetchone()[0], 0
+                db.execute(
+                    "SELECT COUNT(*) FROM trading_book_fill WHERE environment != 'agent_sandbox'"
+                ).fetchone()[0],
+                0,
             )
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM journal_entry").fetchone()[0], 0
@@ -431,13 +436,7 @@ class ExecutionTiersTests(unittest.TestCase):
                 )
 
             # Seed paper soak valuation now!
-            with closing(open_writer(self.store, lease=writer)) as db, write_tx(db):
-                db.execute(
-                    """INSERT INTO paper_valuation (
-                           capture_id, binding_revision, policy, evidence,
-                           trading_nav_atoms, revision
-                       ) VALUES ('val-1', 'paper-rev-1', 'mid', '{"label":"Day1"}', 50120000, 'vrev-1')"""
-                )
+            self._seed_paper_soak(writer)
 
             # Paper-only qualification receipt is refused!
             paper_qual_hash = build_promotion_payload_hash(

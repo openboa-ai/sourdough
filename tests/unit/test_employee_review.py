@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from sourdough.duty_run import DutyRefused
 from sourdough.employee_process import EmployeeProcess, _ResultEndpoint
-from sourdough.first_duty import DutyRefused
 
 
 class EmployeeReview(unittest.TestCase):

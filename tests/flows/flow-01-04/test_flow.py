@@ -1,3 +1,5 @@
+"""Connected Flow 01-04: Company founding -> Company Paper Book -> unified trading_book_* order/fill."""
+
 import json
 import sqlite3
 import subprocess
@@ -7,11 +9,16 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from sourdough.trading.accounts import open_company_paper_book
+from sourdough.trading.ledger import submit_company_paper_book_order
+from sourdough.writer_lease import hold_company_writer
+
 
 class ConnectedFlow(unittest.TestCase):
     def test_end_to_end(self):
         folder = Path(self.enterContext(TemporaryDirectory()))
-        store, venue = folder / "company.sqlite", folder / "venue.sqlite"
+        store = folder / "company.sqlite"
+        leases = folder / "leases"
         peer = folder / "scripted-peer"
         peer.write_text(
             f"#!{sys.executable}\n"
@@ -19,12 +26,9 @@ class ConnectedFlow(unittest.TestCase):
             "request = json.load(sys.stdin)\n"
             "if request['operation'] == 'identify':\n"
             "    print(json.dumps({'provider':'test','model':'scripted','revision':'1'}))\n"
-            "elif request['operation'] == 'ready':\n"
-            "    print(json.dumps({'ready': True}))\n"
             "else:\n"
-            "    assert request['context']['quote_minor_units'] == 100\n"
-            "    print(json.dumps({'tool': 'paper_buy', 'call_id': 'test-call',"
-            " 'quantity': 2, 'limit_minor_units': 110}))\n"
+            "    print(json.dumps({'ready': True}))\n",
+            encoding="utf-8",
         )
         peer.chmod(0o700)
 
@@ -51,52 +55,93 @@ class ConnectedFlow(unittest.TestCase):
             "--execution-profile",
             profile,
         )
-        identity = ("--company-id", company["company_id"])
-        cli(
-            "bind-paper",
-            store,
-            venue,
-            *identity,
-            "--charter-revision",
-            "charter",
-            "--revision",
-            "mandate",
-            "--account-id",
-            "account",
-            "--rules",
-            "rules",
-            "--starting-minor-units",
-            5000,
-            "--exposure-minor-units",
-            1000,
-            "--quote-minor-units",
-            100,
-        )
-        result = cli("first-duty", store, venue, *identity, "--employee", peer)
-        self.assertEqual(result["position_quantity"], 2)
-        self.assertEqual(result["claim"]["founder_id"], company["founder_id"])
-        self.assertEqual(result["claim"]["duty_id"], company["due_work_id"])
-        with (
-            closing(sqlite3.connect(f"{store.as_uri()}?mode=ro", uri=True)) as book,
-            closing(sqlite3.connect(f"{venue.as_uri()}?mode=ro", uri=True)) as edge,
-        ):
-            order = book.execute(
-                "SELECT order_id, run_id, action_id, account_id, quantity FROM paper_order"
-            ).fetchall()
-            order_id = result["order"]["order_id"]
+        company_id = company["company_id"]
+        founder_id = company["founder_id"]
+
+        with closing(sqlite3.connect(f"{store.as_uri()}?mode=ro", uri=True)) as db:
             self.assertEqual(
-                order,
-                [(order_id, result["claim"]["run_id"], "test-call", "account", 2)],
+                db.execute(
+                    "SELECT domain FROM installed_domains ORDER BY domain"
+                ).fetchall(),
+                [("core",)],
             )
-            observed = edge.execute(
-                "SELECT order_id, fill_id, quantity, fill_price_minor_units FROM venue_execution"
-            ).fetchall()
+
+        with hold_company_writer(store, company_id, lease_directory=leases) as writer:
+            binding = open_company_paper_book(
+                writer,
+                account_id="account",
+                book_name="First Paper Book",
+                currency="USD",
+                starting_minor_units=5000,
+                exposure_limit_minor_units=1000,
+                fee_bps=0,
+                slippage_bps=0,
+                binding_revision="mandate",
+            )
+            result = submit_company_paper_book_order(
+                writer,
+                binding_id=binding.binding_id,
+                actor_id=founder_id,
+                action_id="test-call",
+                instrument_id="BTC-USD",
+                side="buy",
+                quantity=2,
+                limit_minor_units=110,
+                market_price_minor_units=100,
+            )
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(result["filled_quantity"], 2)
+        order_id = result["order_id"]
+        fill_id = result["fill_id"]
+
+        with closing(sqlite3.connect(f"{store.as_uri()}?mode=ro", uri=True)) as book:
             self.assertEqual(
-                observed, [(order_id, result["order"]["posting"]["fill_id"], 2, 100)]
+                book.execute(
+                    "SELECT domain FROM installed_domains ORDER BY domain"
+                ).fetchall(),
+                [("core",), ("trading",)],
             )
             self.assertEqual(
                 book.execute(
-                    "SELECT order_id, fill_id, quantity, price_minor_units FROM paper_fill"
+                    "SELECT binding_id, tier, environment, account_id FROM execution_environment_binding WHERE binding_id = ?",
+                    (binding.binding_id,),
                 ).fetchall(),
-                observed,
+                [(binding.binding_id, "company_paper", "paper", "account")],
             )
+            self.assertEqual(
+                book.execute(
+                    "SELECT order_id, binding_id, environment, actor_id, action_id, quantity, status FROM trading_book_order"
+                ).fetchall(),
+                [
+                    (
+                        order_id,
+                        binding.binding_id,
+                        "paper",
+                        founder_id,
+                        "test-call",
+                        2,
+                        "filled",
+                    )
+                ],
+            )
+            self.assertEqual(
+                book.execute(
+                    "SELECT order_id, fill_id, environment, quantity, price_minor_units FROM trading_book_fill"
+                ).fetchall(),
+                [(order_id, fill_id, "paper", 2, 100)],
+            )
+            self.assertEqual(
+                book.execute(
+                    "SELECT binding_id, environment, instrument_id, quantity FROM trading_book_position"
+                ).fetchall(),
+                [(binding.binding_id, "paper", "BTC-USD", 2)],
+            )
+            self.assertEqual(book.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+        timeline = cli("inspect-work", store, "--company-id", company_id)
+        paper_view = timeline["domains"]["trading"]["paper"]
+        self.assertEqual(paper_view["booked_position"], 2)
+        self.assertEqual(len(paper_view["orders"]), 1)
+        self.assertEqual(paper_view["orders"][0]["order_id"], order_id)
+        self.assertEqual(paper_view["orders"][0]["fill_id"], fill_id)

@@ -8,8 +8,6 @@ from uuid import uuid4
 
 from .company import _identity
 
-PAPER_EXECUTION = "paper_execution"
-POSITION_REVIEW = "position_review"
 ASSESSMENT_REVIEW = "assessment_review"
 STAFFING_REVIEW = "staffing_review"
 

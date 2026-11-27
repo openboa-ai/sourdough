@@ -7,13 +7,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.company import FoundingTerms, found
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_venue import FixedQuoteVenue
 from sourdough.runtime.registry import DutyContext, DutyRegistry
 from sourdough.runtime.work_kernel import WorkItem, WorkRun
 from sourdough.storage.db import open_writer, write_tx
 from sourdough.storage.kernel import admit_command_receipt
-from sourdough.strategy_comparison import (
+from sourdough.trading.accounts import register_company_paper_tier
+from sourdough.trading.strategy_comparison import (
     ACTIVATE_STRATEGY_CMD,
     CHALLENGER_EVAL_DUTY_KIND,
     STRATEGY_DEPLOY_CONTRACT,
@@ -65,21 +64,28 @@ class StrategyComparisonTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory()))
         self.store = self.root / "live-company.sqlite"
-        self.venue = FixedQuoteVenue(self.root / "live-venue.sqlite")
         self.leases = self.root / "leases"
         receipt = found(
             self.store, FoundingTerms("quant-co", "charter-1", "paper", "profile")
         )
         self.company = receipt.company_id
         self.author_id = receipt.founder_id
-        account = self.venue.provision(
-            PaperAccount("paper", "fixture", "rules", "USD", 10_000, "paper"), 100
-        )
-        self.binding = bind(
-            self.store,
-            PaperMandate("binding-1", self.company, "charter-1", account, 5_000),
-            self.venue,
-        )
+        with hold_company_writer(
+            self.store, self.company, lease_directory=self.leases
+        ) as writer:
+            self.binding = register_company_paper_tier(
+                writer,
+                account_id="paper",
+                destination_id="fixture-dest",
+                connector_revision="fixture",
+                instrument_rules_digest="rules",
+                currency="USD",
+                starting_minor_units=10_000,
+                exposure_limit_minor_units=5_000,
+                fee_bps=0,
+                slippage_bps=0,
+                binding_revision="binding-1",
+            )
 
         self.catalog_dir = self.root / "catalog"
         self.catalog_dir.mkdir()
@@ -510,7 +516,9 @@ class StrategyComparisonTests(unittest.TestCase):
 
         with self._writer() as writer:
             # Wrong binding_revision is refused!
-            with self.assertRaisesRegex(StrategyComparisonRefused, "paper mandate"):
+            with self.assertRaisesRegex(
+                StrategyComparisonRefused, "current active trading binding"
+            ):
                 activate_strategy_release(
                     writer,
                     command_id="dep-bad-bind",
@@ -539,7 +547,7 @@ class StrategyComparisonTests(unittest.TestCase):
                     writer,
                     command_id="dep-pre-denied",
                     release_id=incumbent.release_id,
-                    binding_revision=self.binding.revision,
+                    binding_revision=self.binding.binding_revision,
                     authorize_deploy=deployer,
                 )
 
@@ -548,7 +556,7 @@ class StrategyComparisonTests(unittest.TestCase):
                 writer,
                 command_id="dep-inc-1",
                 release_id=incumbent.release_id,
-                binding_revision=self.binding.revision,
+                binding_revision=self.binding.binding_revision,
                 authorize_deploy=deployer,
             )
             self.assertEqual(
@@ -556,7 +564,7 @@ class StrategyComparisonTests(unittest.TestCase):
                     writer,
                     command_id="dep-inc-1",
                     release_id=incumbent.release_id,
-                    binding_revision=self.binding.revision,
+                    binding_revision=self.binding.binding_revision,
                     authorize_deploy=deployer,
                 ),
                 first,
@@ -665,7 +673,7 @@ class StrategyComparisonTests(unittest.TestCase):
                 writer,
                 command_id="dep-chal-2",
                 release_id=challenger.release_id,
-                binding_revision=self.binding.revision,
+                binding_revision=self.binding.binding_revision,
                 comparison_id="cmp-duty",
                 expected_active_deployment_id=first.deployment_id,
                 authorize_deploy=deployer,
@@ -706,7 +714,7 @@ class StrategyComparisonTests(unittest.TestCase):
                     writer,
                     command_id="dep-replay-cmp",
                     release_id=challenger.release_id,
-                    binding_revision=self.binding.revision,
+                    binding_revision=self.binding.binding_revision,
                     comparison_id="cmp-duty",
                     expected_active_deployment_id=restored.deployment_id,
                     authorize_deploy=deployer,

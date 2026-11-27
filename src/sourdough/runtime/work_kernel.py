@@ -170,6 +170,21 @@ def has_active_grant(
     return row is not None
 
 
+DUTY_TO_WORK_ITEM_STATE: dict[str, str] = {
+    "due": "due",
+    "scheduled": "scheduled",
+    "running": "running",
+    "waiting": "waiting",
+    "settled": "settled",
+    "incomplete": "blocked",
+    "archived": "cancelled",
+    "handed_off": "cancelled",
+}
+_VALID_WORK_ITEM_STATES = frozenset(
+    {"due", "scheduled", "running", "waiting", "settled", "cancelled", "blocked"}
+)
+
+
 def sync_work_item(
     connection: sqlite3.Connection,
     *,
@@ -184,20 +199,12 @@ def sync_work_item(
 ) -> None:
     """Ensure a canonical work_items row exists for a company duty."""
     timestamp = time_ns() if now_ns is None else now_ns
-    mapped_state = (
-        state
-        if state
-        in (
-            "due",
-            "scheduled",
-            "running",
-            "waiting",
-            "settled",
-            "cancelled",
-            "blocked",
-        )
-        else "cancelled"
-    )
+    if state in DUTY_TO_WORK_ITEM_STATE:
+        mapped_state = DUTY_TO_WORK_ITEM_STATE[state]
+    elif state in _VALID_WORK_ITEM_STATES:
+        mapped_state = state
+    else:
+        raise WorkKernelRefused(f"Unsupported duty or work item state: {state!r}")
     connection.execute(
         """INSERT INTO work_items (
                work_item_id, company_id, owner_agent_id, duty_kind, state,

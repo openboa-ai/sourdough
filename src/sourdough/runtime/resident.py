@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, time_ns
 
+from ..board_control import AuthorizeBoard
 from ..ipc.server import CompanyDaemon, DaemonInfo
-from ..paper_risk import AuthorizeBoard
+from .domains import DomainPlugin
 from .engine import CompanyRuntime, RuntimeStepSummary
 from .handlers import sync_board_triggers
 from .registry import DutyRegistry, RuntimeRefused
@@ -48,6 +49,7 @@ class ResidentCompanyService:
         enable_board_trigger_intake: bool = True,
         lease_ttl_ns: int = 300_000_000_000,
         clock: Callable[[], int] | None = None,
+        domain_plugins: Sequence[DomainPlugin] = (),
     ) -> None:
         if tick_interval_seconds <= 0:
             raise RuntimeRefused("tick_interval_seconds must be positive")
@@ -83,6 +85,7 @@ class ResidentCompanyService:
             bootstrap_challenge=bootstrap_challenge,
             request_timeout=request_timeout,
             on_commit=self.trigger_now,
+            domain_plugins=domain_plugins,
         )
         self._runtime = CompanyRuntime(
             self._store,
@@ -208,6 +211,7 @@ class ResidentCompanyService:
             max_dispatches=self._max_dispatches_per_tick,
             tx_lock=lock,
             on_commit=lambda: self._daemon.notify_commit(invoke_hook=False),
+            stop_event=self._stop_event,
         )
         tick_ts = self._clock()
         with self._state_cond:

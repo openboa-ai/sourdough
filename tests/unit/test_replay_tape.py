@@ -4,11 +4,11 @@ from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sourdough.paper_execution import VenueRefused
-from sourdough.replay_tape import ReplayTape
+from sourdough.trading.execution import VenueRefused
+from sourdough.trading.replay_tape import ReplayTape
 
 
-FIXTURE = Path(__file__).resolve().parents[1] / "flows/flow-07/causal-quotes.json"
+FIXTURE = Path(__file__).with_name("causal-quotes.json")
 
 
 class ReplayTapeInput(unittest.TestCase):

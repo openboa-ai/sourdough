@@ -16,21 +16,21 @@ from sourdough.board_control import (
     upsert_agent_profile,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
+from sourdough.ipc import ClientWebBridge, CompanyDaemon
+from sourdough.storage.db import open_writer, write_tx
+from sourdough.trading.accounts import (
+    record_venue_qualification_receipt,
+    register_company_paper_tier,
+    register_live_candidate_binding,
+)
+from sourdough.trading.commands import (
     DEMOTE_LIVE_ENVIRONMENT,
-    ENV_EXTERNAL_TEST,
     EXECUTION_TIER_COMMAND,
     PROMOTE_EXECUTION_ENVIRONMENT,
-    AgentSandboxTools,
-    compute_trading_core_digest,
-    record_venue_qualification_receipt,
-    register_live_candidate_binding,
-    sync_company_paper_from_legacy_binding,
 )
-from sourdough.ipc import ClientWebBridge, CompanyDaemon
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_venue import FixedQuoteVenue
-from sourdough.storage.db import open_writer, write_tx
+from sourdough.trading.domain import ENV_EXTERNAL_TEST, compute_trading_core_digest
+from sourdough.trading.ledger import record_trading_book_valuation
+from sourdough.trading.sandbox_tools import AgentSandboxTools
 from sourdough.writer_lease import hold_company_writer
 
 
@@ -68,7 +68,6 @@ class ConnectedFlow(unittest.TestCase):
             leases = root / "l"
             sock_dir = Path(sock_tmp)
             pending_dir = root / "pending"
-            venue = FixedQuoteVenue(root / "v.sqlite")
 
             founding = found(
                 store,
@@ -101,41 +100,25 @@ class ConnectedFlow(unittest.TestCase):
                 )
 
                 # Tier 2 company paper + soak valuation.
-                paper_acct = venue.provision(
-                    PaperAccount(
-                        account_id="company-paper-ui",
-                        connector_revision="fixed-quote-v1",
-                        instrument_rules_digest="btc-usdt-spot-v1",
-                        currency="USD",
-                        starting_minor_units=100_000_000,
-                        environment="paper",
-                        destination_id="",
-                    ),
-                    quote_minor_units=6_500_000,
+                paper_binding = register_company_paper_tier(
+                    writer,
+                    account_id="company-paper-ui",
+                    destination_id="fixture-dest",
+                    connector_revision="fixed-quote-v1",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    currency="USD",
+                    starting_minor_units=100_000_000,
+                    exposure_limit_minor_units=50_000_000,
                     fee_bps=4,
+                    slippage_bps=2,
+                    binding_revision="mandate-ui-v1",
                 )
-                bind(
-                    store,
-                    PaperMandate(
-                        revision="mandate-ui-v1",
-                        company_id=company_id,
-                        charter_revision="charter-v1",
-                        account=paper_acct,
-                        exposure_limit_minor_units=50_000_000,
-                    ),
-                    venue,
+                record_trading_book_valuation(
+                    writer,
+                    binding_id=paper_binding.binding_id,
+                    label="SoakUI",
+                    mark_prices={},
                 )
-                sync_company_paper_from_legacy_binding(
-                    writer, fee_bps=4, slippage_bps=2
-                )
-                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
-                    db.execute(
-                        """INSERT INTO paper_valuation (
-                               capture_id, binding_revision, policy, evidence,
-                               trading_nav_atoms, revision
-                           ) VALUES ('v-ui-soak', 'mandate-ui-v1', 'mid',
-                                     '{"label":"SoakUI"}', 100500000, 'vrev-ui-1')"""
-                    )
 
                 # Tier 1 per-Agent sandbox trade.
                 tools = AgentSandboxTools(writer=writer, agent_id=quant_id)
@@ -148,7 +131,7 @@ class ConnectedFlow(unittest.TestCase):
                         "slippage_bps": 2,
                     },
                 )
-                tools.invoke(
+                sbx_order = tools.invoke(
                     "submit_agent_sandbox_order",
                     {
                         "action_id": "atlas-act-ui-1",
@@ -159,6 +142,7 @@ class ConnectedFlow(unittest.TestCase):
                         "market_price_minor_units": 6_500_000,
                     },
                 )
+                sandbox_order_id = sbx_order["order_id"]
 
                 # Tier 3 live candidate + passing qualification receipt.
                 register_live_candidate_binding(
@@ -205,18 +189,19 @@ class ConnectedFlow(unittest.TestCase):
                 base = bridge.info.url.rstrip("/")
                 tok = bridge.info.session_token
 
-                # 1. Board Client reads /api/v1/projections/execution-tiers & /api/v1/projections/agents/{id}.
-                st, tiers = _bridge_json(
-                    f"{base}/api/v1/projections/execution-tiers", tok
+                # 1. Retired /execution-tiers returns 404; Board Client reads /trading-desk?environment=live & /agents/{id} & /orders/{id}.
+                with self.assertRaises(urllib.error.HTTPError) as retired_err:
+                    _bridge_json(f"{base}/api/v1/projections/execution-tiers", tok)
+                self.assertEqual(retired_err.exception.code, 404)
+
+                st, desk = _bridge_json(
+                    f"{base}/api/v1/projections/trading-desk?environment=live", tok
                 )
                 self.assertEqual(st, 200)
-                self.assertTrue(tiers["company_paper_soak_ready"])
-                self.assertIsNone(tiers["company_live"])
-                self.assertEqual(len(tiers["agent_sandboxes"]), 1)
-                self.assertEqual(
-                    tiers["agent_sandboxes"][0]["agent_display_name"], "Atlas Quant"
-                )
-                cand = tiers["live_candidates"][0]
+                gov = desk["governance"]
+                self.assertTrue(gov["company_paper_soak_ready"])
+                self.assertIsNone(gov["company_live"])
+                cand = gov["live_candidates"][0]
                 self.assertEqual(
                     cand["matching_qualification_receipt_id"], "qual-ui-pass-1"
                 )
@@ -228,6 +213,13 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(st_ag, 200)
                 self.assertEqual(ag_detail["agent_sandbox"]["fill_count"], 1)
                 self.assertEqual(len(ag_detail["agent_sandbox"]["positions"]), 1)
+
+                st_ord, ord_trace = _bridge_json(
+                    f"{base}/api/v1/projections/orders/{sandbox_order_id}", tok
+                )
+                self.assertEqual(st_ord, 200)
+                self.assertEqual(ord_trace["order"]["environment"], "agent_sandbox")
+                self.assertNotIn("Paper Order", json.dumps(ord_trace))
 
                 # 2. Board Client promotes candidate via HTTP-to-UDS command using server-provided hash.
                 st_p, promo = _bridge_json(
@@ -241,7 +233,7 @@ class ConnectedFlow(unittest.TestCase):
                         "command_type": PROMOTE_EXECUTION_ENVIRONMENT,
                         "contract_version": EXECUTION_TIER_COMMAND,
                         "preconditions": {
-                            "charter_revision": tiers["charter_revision"],
+                            "charter_revision": desk["charter_revision"],
                             "target_binding_id": cand["binding_id"],
                             "qualification_receipt_id": cand[
                                 "matching_qualification_receipt_id"
@@ -255,11 +247,12 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(promo["state"], "applied")
 
                 _, after_promo = _bridge_json(
-                    f"{base}/api/v1/projections/execution-tiers", tok
+                    f"{base}/api/v1/projections/trading-desk?environment=live", tok
                 )
-                self.assertIsNotNone(after_promo["company_live"])
+                self.assertIsNotNone(after_promo["governance"]["company_live"])
                 self.assertEqual(
-                    after_promo["company_live"]["binding_id"], "binance-live-ui"
+                    after_promo["governance"]["company_live"]["binding_id"],
+                    "binance-live-ui",
                 )
 
                 # 3. Board Client demotes Tier 3 back to paper-only safely.
@@ -274,7 +267,7 @@ class ConnectedFlow(unittest.TestCase):
                         "command_type": DEMOTE_LIVE_ENVIRONMENT,
                         "contract_version": EXECUTION_TIER_COMMAND,
                         "preconditions": {
-                            "charter_revision": tiers["charter_revision"],
+                            "charter_revision": desk["charter_revision"],
                             "target_binding_id": "binance-live-ui",
                         },
                         "payload": {
@@ -287,10 +280,12 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(demote["state"], "applied")
 
                 _, after_demote = _bridge_json(
-                    f"{base}/api/v1/projections/execution-tiers", tok
+                    f"{base}/api/v1/projections/trading-desk?environment=live", tok
                 )
-                self.assertIsNone(after_demote["company_live"])
-                self.assertEqual(len(after_demote["promotion_history"]), 2)
+                self.assertIsNone(after_demote["governance"]["company_live"])
+                self.assertEqual(
+                    len(after_demote["governance"]["promotion_history"]), 2
+                )
 
 
 if __name__ == "__main__":

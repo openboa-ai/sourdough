@@ -6,18 +6,22 @@ from tempfile import TemporaryDirectory
 
 from sourdough.abandoned_work import requeue_uncommitted_work
 from sourdough.company import FoundingTerms, found
-from sourdough.duty_run import POSITION_REVIEW, DutyRefused
-from sourdough.first_duty import claim_first_duty, require_paper_authority
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_order import PaperIntent, submit_paper_order
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.duty_run import DutyRefused
+from sourdough.trading.accounts import open_company_paper_book
+from sourdough.trading.duty import (
+    POSITION_REVIEW,
+    claim_paper_first_duty as claim_first_duty,
+    claim_paper_follow_up as claim_follow_up,
+    finish_paper_first_duty as finish_first_duty,
+    has_trading_committed_result,
+    require_paper_authority,
+    settle_paper_review as settle_review,
+)
+from sourdough.trading.ledger import submit_company_paper_book_order
 from sourdough.work import (
     ResultReference,
     ReviewDecision,
-    claim_follow_up,
-    finish_first_duty,
     read_follow_up_result,
-    settle_review,
 )
 from sourdough.writer_lease import hold_company_writer
 
@@ -34,7 +38,11 @@ class RecoverAbandonedWork(unittest.TestCase):
         with hold_company_writer(
             self.store, self.company_id, lease_directory=self.root / "lease"
         ) as writer:
-            return requeue_uncommitted_work(writer, **filters)
+            return requeue_uncommitted_work(
+                writer,
+                committed_predicates=(has_trading_committed_result,),
+                **filters,
+            )
 
     def start(self):
         return claim_first_duty(self.store, self.company_id, "profile")
@@ -84,21 +92,34 @@ class RecoverAbandonedWork(unittest.TestCase):
             )
 
     def test_duty_with_external_effect_is_not_requeued(self):
-        venue = FixedQuoteVenue(self.root / "venue.sqlite")
-        account = venue.provision(
-            PaperAccount("paper", "local", "rules", "USD", 1000, "paper"), 100
-        )
-        bind(
-            self.store,
-            PaperMandate("mandate", self.company_id, "charter", account, 500),
-            venue,
-        )
-        opening = self.start()
-        order = submit_paper_order(
-            self.store, opening, PaperIntent("action", "rules", 1, 100), venue
-        )
+        with hold_company_writer(
+            self.store, self.company_id, lease_directory=self.root / "lease"
+        ) as writer:
+            binding = open_company_paper_book(
+                writer,
+                binding_id="paper-main",
+                book_name="Main Paper",
+                account_id="paper-acct",
+                currency="USD",
+                starting_minor_units=10_000,
+                exposure_limit_minor_units=5_000,
+            )
+            opening = self.start()
+            order = submit_company_paper_book_order(
+                writer,
+                binding_id=binding.binding_id,
+                actor_id=opening.founder_id,
+                action_id="action-1",
+                instrument_id="BTC-USDT",
+                side="buy",
+                quantity=1,
+                limit_minor_units=200,
+                market_price_minor_units=100,
+                fill_mode="immediate",
+                run_id=opening.run_id,
+            )
+        self.assertEqual(order["status"], "filled")
         self.assertEqual(self.requeue(), ())
-        self.assertIsNotNone(venue.observe_execution(order.order_id))
         with closing(sqlite3.connect(self.store)) as connection:
             self.assertEqual(
                 connection.execute("SELECT count(*) FROM duty_run").fetchone(), (1,)
@@ -106,6 +127,23 @@ class RecoverAbandonedWork(unittest.TestCase):
             self.assertEqual(
                 connection.execute("SELECT state FROM duty").fetchone(), ("running",)
             )
+
+    def test_core_only_requeue_ignores_unregistered_domain_tables(self):
+        core_store = self.root / "core-only.sqlite"
+        core_receipt = found(
+            core_store, FoundingTerms("core", "charter-v1", "manage", "profile-v1")
+        )
+        from sourdough.first_duty import claim_first_duty
+
+        claim = claim_first_duty(
+            core_store,
+            core_receipt.company_id,
+            "profile-v1",
+            scope="manage",
+            purpose="core_duty",
+        )
+        with hold_company_writer(core_store, core_receipt.company_id) as writer:
+            self.assertEqual(requeue_uncommitted_work(writer), (claim.run_id,))
 
     def test_hired_review_recovery_does_not_fence_the_founder_review(self):
         opening = self.start()

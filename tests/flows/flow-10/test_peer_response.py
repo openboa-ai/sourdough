@@ -1,8 +1,9 @@
 import json
-import runpy
+import sqlite3
 import subprocess
 import sys
 import unittest
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import time
@@ -11,11 +12,23 @@ from sourdough.company_assets import assign_project
 from sourdough.writer_lease import hold_company_writer
 
 
-FIXTURE = runpy.run_path(
-    str(Path(__file__).resolve().parents[1] / "flow-06/test_flow.py")
-)
-cli = FIXTURE["cli"]
-rows = FIXTURE["rows"]
+def cli(command, *arguments):
+    result = subprocess.run(
+        [sys.executable, "-IB", "-m", "sourdough.cli", command, *map(str, arguments)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr)
+    return json.loads(result.stdout)
+
+
+def rows(store, sql, parameters=()):
+    with closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as db:
+        return db.execute(sql, parameters).fetchall()
+
+
 EMPLOYEE = r"""
 import json, socket, sys
 

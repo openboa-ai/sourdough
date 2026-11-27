@@ -20,6 +20,7 @@ from .db import (
     SCHEMA_VERSION,
     StorageRefused,
     StoreRetirement,
+    connect_sqlite,
     open_reader,
     open_writer,
     read_retirement,
@@ -262,7 +263,7 @@ def _verify_trusted_schema_objects(connection: sqlite3.Connection) -> frozenset[
 def _normalize_database_to_delete_mode(database: Path) -> None:
     """Convert a staged SQLite file to DELETE journal mode and verify zero sidecars."""
     with closing(
-        sqlite3.connect(
+        connect_sqlite(
             f"{database.absolute().as_uri()}?mode=rw",
             uri=True,
             autocommit=True,
@@ -296,7 +297,7 @@ def snapshot_normalized_store(store: Path, destination: Path) -> None:
     try:
         with (
             closing(open_reader(store)) as source,
-            closing(sqlite3.connect(destination, autocommit=True)) as snapshot,
+            closing(connect_sqlite(destination, autocommit=True)) as snapshot,
         ):
             source.backup(snapshot, pages=128, progress=progress, sleep=0.05)
     except (StorageRefused, sqlite3.Error) as error:

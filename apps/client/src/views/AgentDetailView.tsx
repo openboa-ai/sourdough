@@ -31,6 +31,7 @@ import {
   type Fact,
   type RuntimeState,
 } from "@openboa/yogurt";
+import { normalizeAvatarVariant } from "../api/avatar";
 import {
   ApiError,
   fetchProjection,
@@ -654,6 +655,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
       (sandbox.fill_count > 0 ||
         sandbox.orders.length > 0 ||
         sandbox.positions.some((p) => Math.abs(p.quantity) > 0) ||
+        activeRun?.duty_kind === "trading.agent_sandbox" ||
         activeRun?.duty_kind === "quant.agent_sandbox")
   );
   const showSandboxTab = Boolean(activeData.sandbox_authorized && hasSandboxActivity);
@@ -816,7 +818,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
       <PageHeader
         leading={
           <AgentAvatar
-            agent={profile.avatar_variant}
+            agent={normalizeAvatarVariant(profile.avatar_variant)}
             state={profile.avatar_state}
             size={44}
             label={profile.display_name}
@@ -1124,7 +1126,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                                     emphasis="quiet"
                                     size="compact"
                                     shape="pill"
-                                    onClick={() => navigate("/company/org")}
+                                    onClick={() => navigate("/reports")}
                                   >
                                     Asset {msg.asset_id}
                                   </Button>
@@ -1232,9 +1234,9 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                                   emphasis="quiet"
                                   size="compact"
                                   shape="pill"
-                                  onClick={() => navigate("/company/org")}
+                                  onClick={() => navigate("/reports")}
                                 >
-                                  View in Org
+                                  View in Reports
                                 </Button>
                               </Inline>
                             </Stack>
@@ -1283,7 +1285,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                                   emphasis="quiet"
                                   size="compact"
                                   shape="pill"
-                                  onClick={() => navigate("/company/org")}
+                                  onClick={() => navigate("/reports")}
                                 >
                                   Asset {h.asset_id}
                                 </Button>
@@ -1320,11 +1322,11 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                   id: "sandbox",
                   label:
                     sandbox.fill_count > 0
-                      ? `Paper Sandbox (${sandbox.fill_count} ${sandbox.fill_count === 1 ? "fill" : "fills"})`
-                      : "Paper Sandbox",
+                      ? `Trading Sandbox (${sandbox.fill_count} ${sandbox.fill_count === 1 ? "fill" : "fills"})`
+                      : "Trading Sandbox",
                   panel: (
                     <Stack gap={12}>
-                      <Notice title="Isolated personal paper sandbox" tone="neutral">
+                      <Notice title="Isolated personal trading sandbox" tone="neutral">
                         This virtual account belongs exclusively to {profile.display_name} for
                         strategy testing. Orders here never touch shared company paper books or
                         live venues.
@@ -1347,7 +1349,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                         >
                           <div className="sd-facts-wrap">
                             <RecordFacts
-                              source="agent_sandbox"
+                              source="execution_environment_binding + trading_book"
                               asOf={`seq #${activeData.event_seq}`}
                               facts={sandboxFacts}
                             />
@@ -1359,7 +1361,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                               <Text variant="help">No sandbox positions recorded yet.</Text>
                             ) : (
                               <DataTable
-                                caption="Agent personal paper sandbox positions"
+                                caption="Agent personal trading sandbox positions"
                                 columns={sandboxPosCols}
                                 rows={sandboxPosRows}
                               />
@@ -1370,7 +1372,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                               <Text variant="help">No sandbox orders recorded yet.</Text>
                             ) : (
                               <DataTable
-                                caption="Agent personal paper sandbox orders"
+                                caption="Agent personal trading sandbox orders"
                                 columns={sandboxOrderCols}
                                 rows={sandboxOrderRows}
                               />

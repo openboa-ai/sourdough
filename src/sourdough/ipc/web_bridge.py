@@ -247,6 +247,7 @@ def delete_pending_intent(
 class _LoopbackHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 64
 
 
 class ClientWebBridge:
@@ -311,6 +312,25 @@ class ClientWebBridge:
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
+            def finish(self) -> None:
+                try:
+                    super().finish()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def send_error(
+                self,
+                code: int,
+                message: str | None = None,
+                explain: str | None = None,
+            ) -> None:
+                del explain
+                status = 405 if code == 501 else int(code)
+                detail = message or (
+                    "Method not allowed" if status == 405 else "Bad request"
+                )
+                self._send_json(status, {"error": detail})
+
             def _send_bytes(
                 self,
                 status: int,
@@ -322,22 +342,27 @@ class ClientWebBridge:
                 style_nonce: str | None = None,
             ) -> None:
                 self.close_connection = True
-                self.send_response(status)
-                self.send_header("Connection", "close")
-                self.send_header("Content-Length", str(len(body)))
-                if status != 304:
-                    self.send_header("Content-Type", content_type)
-                self.send_header("Content-Security-Policy", _csp_header(style_nonce))
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Referrer-Policy", "no-referrer")
-                if no_store:
-                    self.send_header("Cache-Control", "no-store")
-                if extra_headers:
-                    for key, value in extra_headers.items():
-                        self.send_header(key, value)
-                self.end_headers()
-                if body and status != 304:
-                    self.wfile.write(body)
+                try:
+                    self.send_response(status)
+                    self.send_header("Connection", "close")
+                    self.send_header("Content-Length", str(len(body)))
+                    if status != 304:
+                        self.send_header("Content-Type", content_type)
+                    self.send_header(
+                        "Content-Security-Policy", _csp_header(style_nonce)
+                    )
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Referrer-Policy", "no-referrer")
+                    if no_store:
+                        self.send_header("Cache-Control", "no-store")
+                    if extra_headers:
+                        for key, value in extra_headers.items():
+                            self.send_header(key, value)
+                    self.end_headers()
+                    if body and status != 304 and self.command != "HEAD":
+                        self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
 
             def _send_json(
                 self,
@@ -408,17 +433,27 @@ class ClientWebBridge:
                 return None
 
             def _read_body(self) -> bytes | None:
-                raw_len = self.headers.get("Content-Length")
-                if raw_len is None:
+                cl_values = self.headers.get_all("Content-Length") or []
+                if len(cl_values) > 1:
+                    self._send_json(400, {"error": "Duplicate Content-Length header"})
+                    return None
+                if not cl_values:
                     return b""
-                if not raw_len.isdigit():
+                raw_len = cl_values[0].strip()
+                if not raw_len.isascii() or not raw_len.isdigit():
                     self._send_json(400, {"error": "Invalid Content-Length"})
                     return None
                 length = int(raw_len)
                 if length > MAX_BODY_BYTES:
                     self._send_json(413, {"error": "Request body too large"})
                     return None
-                return self.rfile.read(length) if length > 0 else b""
+                if length == 0:
+                    return b""
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    self._send_json(400, {"error": "Incomplete request body"})
+                    return None
+                return body
 
             def _resolve_scope(self) -> tuple[str, str]:
                 meta = bridge._client.meta(principal=bridge._principal)
@@ -544,6 +579,13 @@ class ClientWebBridge:
 
                 self._send_json(405, {"error": "Method not allowed"})
 
+            def _valid_ascii_wire_text(self, value: str) -> bool:
+                try:
+                    value.encode("ascii")
+                except UnicodeEncodeError:
+                    return False
+                return not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
             def _proxy_uds(self, method: str) -> None:
                 parsed = urlsplit(self.path)
                 uds_path = parsed.path[len("/api") :]
@@ -551,6 +593,15 @@ class ClientWebBridge:
                     self._send_json(404, {"error": "API endpoint not found"})
                     return
                 target = f"{uds_path}?{parsed.query}" if parsed.query else uds_path
+                if (
+                    not target.startswith("/")
+                    or target.startswith("//")
+                    or "#" in target
+                    or any(ch.isspace() for ch in target)
+                    or not self._valid_ascii_wire_text(target)
+                ):
+                    self._send_json(400, {"error": "Invalid request target"})
+                    return
                 body = b""
                 if method == "POST":
                     raw = self._read_body()
@@ -563,8 +614,17 @@ class ClientWebBridge:
                     ("Idempotency-Key", "Idempotency-Key"),
                     ("Content-Type", "Content-Type"),
                 ):
-                    val = self.headers.get(h_in)
+                    vals = self.headers.get_all(h_in) or []
+                    if h_in == "Idempotency-Key" and len(vals) > 1:
+                        self._send_json(
+                            400, {"error": "Duplicate Idempotency-Key header"}
+                        )
+                        return
+                    val = vals[0] if vals else None
                     if val:
+                        if not self._valid_ascii_wire_text(val):
+                            self._send_json(400, {"error": f"Invalid {h_out} header"})
+                            return
                         fwd_headers[h_out] = val
                 if bridge._principal:
                     fwd_headers["X-Sourdough-Principal"] = bridge._principal
@@ -574,7 +634,16 @@ class ClientWebBridge:
                     )
                 except IpcRefused as error:
                     msg = str(error)
-                    status = 403 if "HTTP 403" in msg else 503
+                    if "HTTP 403" in msg:
+                        status = 403
+                    elif (
+                        "Non-ASCII" in msg
+                        or "Invalid request header" in msg
+                        or "Invalid client HTTP" in msg
+                    ):
+                        status = 400
+                    else:
+                        status = 503
                     self._send_json(status, {"error": msg})
                     return
 
@@ -743,6 +812,12 @@ class ClientWebBridge:
 
             def do_GET(self) -> None:
                 self._route("GET")
+
+            def do_HEAD(self) -> None:
+                self._route("HEAD")
+
+            def do_OPTIONS(self) -> None:
+                self._route("OPTIONS")
 
             def do_POST(self) -> None:
                 self._route("POST")

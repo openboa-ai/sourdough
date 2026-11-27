@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sourdough.company import FoundingTerms, found
-from sourdough.trading_engine import (
+from sourdough.trading.engine import (
     LOCK,
     VERSION,
     EngineRefused,
@@ -39,10 +39,10 @@ class TradingEngineSetup(unittest.TestCase):
 
     def test_unsupported_os_is_blocked_before_install(self):
         with (
-            patch("sourdough.trading_engine.platform.system", return_value="Darwin"),
-            patch("sourdough.trading_engine.platform.machine", return_value="arm64"),
-            patch("sourdough.trading_engine.platform.mac_ver", return_value=("15.7",)),
-            patch("sourdough.trading_engine._run") as invoke,
+            patch("sourdough.trading.engine.platform.system", return_value="Darwin"),
+            patch("sourdough.trading.engine.platform.machine", return_value="arm64"),
+            patch("sourdough.trading.engine.platform.mac_ver", return_value=("15.7",)),
+            patch("sourdough.trading.engine._run") as invoke,
             self.assertRaisesRegex(EngineRefused, "macOS 26"),
         ):
             prepare_engine(self.writer, self.engine)
@@ -51,9 +51,9 @@ class TradingEngineSetup(unittest.TestCase):
 
     def test_install_failure_does_not_publish_an_installation(self):
         with (
-            patch("sourdough.trading_engine._require_supported_platform"),
+            patch("sourdough.trading.engine._require_supported_platform"),
             patch(
-                "sourdough.trading_engine._run",
+                "sourdough.trading.engine._run",
                 side_effect=EngineRefused("Wheel preparation failed"),
             ),
             self.assertRaisesRegex(EngineRefused, "Wheel preparation failed"),
@@ -69,8 +69,8 @@ class TradingEngineSetup(unittest.TestCase):
             json.dumps({"company_id": "other", "lock_digest": "another"})
         )
         with (
-            patch("sourdough.trading_engine._require_supported_platform"),
-            patch("sourdough.trading_engine._run") as invoke,
+            patch("sourdough.trading.engine._require_supported_platform"),
+            patch("sourdough.trading.engine._run") as invoke,
             self.assertRaisesRegex(EngineRefused, "another scope or pin"),
         ):
             prepare_engine(self.writer, self.engine)
@@ -105,8 +105,8 @@ class TradingEngineSetup(unittest.TestCase):
             }
         )
         with (
-            patch("sourdough.trading_engine._require_supported_platform"),
-            patch("sourdough.trading_engine._run", return_value=probe) as invoke,
+            patch("sourdough.trading.engine._require_supported_platform"),
+            patch("sourdough.trading.engine._run", return_value=probe) as invoke,
         ):
             receipt = _inspect_installation(installed, self.writer.company_id, lock)
             (installed / "installation.json").write_text(json.dumps(asdict(receipt)))

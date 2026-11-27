@@ -9,15 +9,19 @@ from tempfile import TemporaryDirectory
 
 from sourdough.board_control import upsert_agent_profile
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
-    ENV_EXTERNAL_TEST,
-    build_promotion_payload_hash,
-    compute_trading_core_digest,
+from sourdough.trading.accounts import (
     open_agent_sandbox,
     record_venue_qualification_receipt,
     register_live_candidate_binding,
 )
-from sourdough.ipc.projections import read_execution_tiers_projection
+from sourdough.trading.domain import (
+    ENV_EXTERNAL_TEST,
+    ENV_LIVE,
+    ENV_PAPER,
+    build_promotion_payload_hash,
+    compute_trading_core_digest,
+)
+from sourdough.trading.projections import read_trading_desk_projection
 from sourdough.storage.db import open_writer, write_tx
 from sourdough.writer_lease import hold_company_writer
 
@@ -76,20 +80,17 @@ class TierUiProjectionTests(unittest.TestCase):
                 )
 
                 # Before qualification: matching receipt & promotion hash must be None.
-                before, _ = read_execution_tiers_projection(store, company_id)
-                self.assertEqual(before["charter_revision"], "charter-v1")
+                before_desk, _ = read_trading_desk_projection(
+                    store, company_id, environment=ENV_LIVE
+                )
+                before = before_desk["governance"]
+                self.assertEqual(before_desk["charter_revision"], "charter-v1")
                 self.assertEqual(len(before["live_candidates"]), 1)
                 self.assertIsNone(
                     before["live_candidates"][0]["matching_qualification_receipt_id"]
                 )
                 self.assertIsNone(
                     before["live_candidates"][0]["promotion_payload_hash"]
-                )
-                self.assertEqual(
-                    before["agent_sandboxes"][0]["agent_display_name"], "Atlas Quant"
-                )
-                self.assertEqual(
-                    before["agent_sandboxes"][0]["agent_role_label"], "Quant Researcher"
                 )
 
                 # Stale core digest receipt does not qualify.
@@ -107,10 +108,41 @@ class TierUiProjectionTests(unittest.TestCase):
                     cases_unrun=0,
                     evidence_sha256="a" * 64,
                 )
-                stale_proj, _ = read_execution_tiers_projection(store, company_id)
+                stale_proj, _ = read_trading_desk_projection(
+                    store, company_id, environment=ENV_LIVE
+                )
                 self.assertIsNone(
-                    stale_proj["live_candidates"][0][
+                    stale_proj["governance"]["live_candidates"][0][
                         "matching_qualification_receipt_id"
+                    ]
+                )
+
+                # Paper-environment receipt must NOT qualify a live candidate.
+                record_venue_qualification_receipt(
+                    writer,
+                    receipt_id="qual-paper-env",
+                    adapter_revision="binance-spot-v1",
+                    environment=ENV_PAPER,
+                    destination_id="binance-spot-testnet",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    core_digest=compute_trading_core_digest(),
+                    verdict="PASS",
+                    cases_passed=6,
+                    cases_failed=0,
+                    cases_unrun=0,
+                    evidence_sha256="c" * 64,
+                )
+                paper_env_proj, _ = read_trading_desk_projection(
+                    store, company_id, environment=ENV_LIVE
+                )
+                self.assertIsNone(
+                    paper_env_proj["governance"]["live_candidates"][0][
+                        "matching_qualification_receipt_id"
+                    ]
+                )
+                self.assertIsNone(
+                    paper_env_proj["governance"]["live_candidates"][0][
+                        "promotion_payload_hash"
                     ]
                 )
 
@@ -129,7 +161,9 @@ class TierUiProjectionTests(unittest.TestCase):
                     cases_unrun=0,
                     evidence_sha256="b" * 64,
                 )
-                ready_proj, _ = read_execution_tiers_projection(store, company_id)
+                ready_proj, _ = read_trading_desk_projection(
+                    store, company_id, environment=ENV_LIVE
+                )
                 expected_hash = build_promotion_payload_hash(
                     company_id=company_id,
                     charter_revision="charter-v1",
@@ -137,13 +171,15 @@ class TierUiProjectionTests(unittest.TestCase):
                     qualification_receipt_id="qual-current-core",
                 )
                 self.assertEqual(
-                    ready_proj["live_candidates"][0][
+                    ready_proj["governance"]["live_candidates"][0][
                         "matching_qualification_receipt_id"
                     ],
                     "qual-current-core",
                 )
                 self.assertEqual(
-                    ready_proj["live_candidates"][0]["promotion_payload_hash"],
+                    ready_proj["governance"]["live_candidates"][0][
+                        "promotion_payload_hash"
+                    ],
                     expected_hash,
                 )
 

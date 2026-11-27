@@ -792,7 +792,9 @@ export function SystemEvalsView({ embedded = false }: { embedded?: boolean } = {
 
 const AUDIT_DOMAINS = [
   "all",
-  "paper",
+  "trading",
+  "accounting",
+  "assets",
   "org",
   "work",
   "ceo",
@@ -808,14 +810,26 @@ export function SystemAuditView({
   embedded?: boolean;
   mode?: "audit" | "daemon";
 } = {}) {
-  const { refreshSeq, meta, daemonMode, navigate, reportApiError, registerEscapeBack } = useApp();
-  const effectiveDaemon = mode ? mode === "daemon" : daemonMode;
+  const { refreshSeq, meta, navigate, reportApiError, registerEscapeBack } = useApp();
+  const effectiveDaemon = mode === "daemon";
   const [data, setData] = useState<SystemAuditProjection | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retrySeq, setRetrySeq] = useState(0);
   const [auditQuery, setAuditQuery] = useState("");
   const [selectedDomain, setSelectedDomain] = useState<string>("all");
+
+  const tradingActive = meta?.active_domains.includes("trading") ?? false;
+  const visibleAuditDomains = useMemo(
+    () => AUDIT_DOMAINS.filter((d) => d !== "trading" || tradingActive),
+    [tradingActive]
+  );
+
+  useEffect(() => {
+    if (!tradingActive && selectedDomain === "trading") {
+      setSelectedDomain("all");
+    }
+  }, [tradingActive, selectedDomain]);
 
   useEffect(() => {
     if (!effectiveDaemon || embedded) return;
@@ -1159,7 +1173,7 @@ export function SystemAuditView({
             focusReturnId="system-daemon-entry"
             items={[
               { id: "audit", label: "Audit", href: "/audit" },
-              { id: "daemon", label: "Daemon Diagnostics", href: "/system/daemon" },
+              { id: "daemon", label: "Daemon Diagnostics", href: "/audit?tab=daemon" },
             ]}
           />
           <PageHeader
@@ -1186,7 +1200,7 @@ export function SystemAuditView({
                   shape="pill"
                   data-focus-id="system-daemon-entry"
                   onClick={() =>
-                    navigate("/system/daemon", { focusReturnId: "system-daemon-entry" })
+                    navigate("/audit?tab=daemon", { focusReturnId: "system-daemon-entry" })
                   }
                 >
                   Daemon Diagnostics
@@ -1211,7 +1225,7 @@ export function SystemAuditView({
         >
           <Stack gap={12}>
             <Inline gap={6} wrap>
-              {AUDIT_DOMAINS.map((domain) => (
+              {visibleAuditDomains.map((domain) => (
                 <Button
                   key={domain}
                   size="compact"
@@ -1409,7 +1423,7 @@ export function BootstrapView() {
               ],
               whatStaysUntouched: [
                 { label: "Company charter", value: meta.charter_revision },
-                { label: "Paper boundary", value: "Strictly Paper environment" },
+                { label: "Store key", value: meta.store_key },
               ],
               technicalDetails: [
                 { label: "command_type", value: "register_owner" },

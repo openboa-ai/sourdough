@@ -9,25 +9,30 @@ from tempfile import TemporaryDirectory
 
 from sourdough.board_control import (
     BOARD_CONTROL_ROLE,
+    BoardControlRefused,
     apply_company_restriction,
     bind_board_principal,
     clear_company_restriction,
 )
 from sourdough.company import FoundingTerms, found
-from sourdough.execution_tiers import (
-    ENV_EXTERNAL_TEST,
-    ExecutionTierRefused,
-    compute_trading_core_digest,
-    execute_paper_to_live_migration,
+from sourdough.trading.accounts import (
     open_company_paper_book,
-    propose_paper_to_live_migration,
-    read_execution_tiers_snapshot,
+    promote_execution_environment,
     record_venue_qualification_receipt,
     register_live_candidate_binding,
-    submit_company_paper_book_order,
 )
-from sourdough.paper_account import PaperAccount, PaperMandate, bind
-from sourdough.paper_venue import FixedQuoteVenue
+from sourdough.trading.domain import (
+    ENV_EXTERNAL_TEST,
+    ExecutionTierRefused,
+    build_promotion_payload_hash,
+    compute_trading_core_digest,
+)
+from sourdough.trading.ledger import submit_company_paper_book_order
+from sourdough.trading.migration import (
+    execute_paper_to_live_migration,
+    propose_paper_to_live_migration,
+    read_execution_tiers_snapshot,
+)
 from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
 from sourdough.writer_lease import hold_company_writer
 
@@ -38,7 +43,6 @@ class TestMultiBookPaperAndLiveMigration(unittest.TestCase):
             root = Path(tmp)
             store = root / "c.sqlite"
             leases = root / "l"
-            venue = FixedQuoteVenue(root / "v.sqlite")
 
             founding = found(
                 store,
@@ -52,32 +56,6 @@ class TestMultiBookPaperAndLiveMigration(unittest.TestCase):
             ) as writer:
                 bind_board_principal(
                     writer, principal_id="board-chair", role_name=BOARD_CONTROL_ROLE
-                )
-
-                # Legacy paper_binding required only to test paper_order uncertain-order blocking gate.
-                paper_acct = venue.provision(
-                    PaperAccount(
-                        account_id="legacy-paper-base",
-                        connector_revision="fixed-quote-v1",
-                        instrument_rules_digest="btc-usdt-spot-v1",
-                        currency="USD",
-                        starting_minor_units=100_000_000,
-                        environment="paper",
-                        destination_id="",
-                    ),
-                    quote_minor_units=6_500_000,
-                    fee_bps=4,
-                )
-                bind(
-                    store,
-                    PaperMandate(
-                        revision="mandate-mig-v1",
-                        company_id=company_id,
-                        charter_revision="charter-v1",
-                        account=paper_acct,
-                        exposure_limit_minor_units=50_000_000,
-                    ),
-                    venue,
                 )
 
                 # 1. Open 3 concurrent Company Paper Books simultaneously!
@@ -260,24 +238,20 @@ class TestMultiBookPaperAndLiveMigration(unittest.TestCase):
                     principal_hint="board-chair",
                 )
 
-                # 4. Unresolved legacy paper_order blocks migration fail-closed!
-                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
-                    db.execute(
-                        """INSERT INTO duty_run (
-                               run_id, duty_id, grant_id, grant_scope, purpose, is_current
-                           ) VALUES ('run-mig-1', ?, ?, 'paper', 'migration-test', 1)""",
-                        (founding.due_work_id, founding.grant_id),
-                    )
-                    db.execute(
-                        """INSERT INTO paper_order (
-                               order_id, run_id, mandate_revision, account_id,
-                               action_id, instrument_rules_digest, quantity,
-                               limit_minor_units, reserved_minor_units
-                           ) VALUES ('ord-unres-1', 'run-mig-1', 'mandate-mig-v1',
-                                     'legacy-paper-base', 'act-unres-1',
-                                     'btc-usdt-spot-v1', 2, 6500000, 13000000)"""
-                    )
-                with self.assertRaises(ExecutionTierRefused):
+                # 4. Open trading_book_order on source binding blocks migration fail-closed!
+                open_ord = submit_company_paper_book_order(
+                    writer,
+                    binding_id=book_btc.binding_id,
+                    actor_id=ceo_id,
+                    action_id="act-unres-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=2,
+                    limit_minor_units=6_000_000,
+                    market_price_minor_units=6_500_000,
+                    fill_mode="resting",
+                )
+                with self.assertRaisesRegex(ExecutionTierRefused, "unresolved order"):
                     execute_paper_to_live_migration(
                         writer,
                         source_paper_binding_id=book_btc.binding_id,
@@ -287,10 +261,10 @@ class TestMultiBookPaperAndLiveMigration(unittest.TestCase):
                         source_paper_disposition="keep_shadow",
                         question_id="q-mig-btc-live",
                     )
-                # Once filled completely, unresolved order gate clears cleanly!
                 with closing(open_writer(store, lease=writer)) as db, write_tx(db):
                     db.execute(
-                        "INSERT INTO paper_fill (fill_id, order_id, quantity, price_minor_units) VALUES ('fill-unres-1', 'ord-unres-1', 2, 6500000)"
+                        "UPDATE trading_book_order SET status = 'cancelled', cancelled_at_ns = 100 WHERE order_id = ?",
+                        (open_ord["order_id"],),
                     )
 
                 # 5. Safe clean_start + keep_shadow migration succeeds!
@@ -332,17 +306,19 @@ class TestMultiBookPaperAndLiveMigration(unittest.TestCase):
                         source_paper_disposition="retire_source",
                     )
 
-                # 7. Under drain_incumbent + retire_source, an unresolved order blocks swap until cancelled, then swaps cleanly!
-                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
-                    db.execute(
-                        """INSERT INTO paper_order (
-                               order_id, run_id, mandate_revision, account_id,
-                               action_id, instrument_rules_digest, quantity,
-                               limit_minor_units, reserved_minor_units
-                           ) VALUES ('ord-work-1', 'run-mig-1', 'mandate-mig-v1',
-                                     'legacy-paper-base', 'act-work-1',
-                                     'btc-usdt-spot-v1', 1, 6400000, 6400000)"""
-                    )
+                # 7. Under drain_incumbent + retire_source, an open order on source/incumbent blocks swap until cancelled, then swaps cleanly!
+                open_ord2 = submit_company_paper_book_order(
+                    writer,
+                    binding_id=book_eth.binding_id,
+                    actor_id=ceo_id,
+                    action_id="act-work-1",
+                    instrument_id="ETH-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=3_000_000,
+                    market_price_minor_units=3_200_000,
+                    fill_mode="resting",
+                )
                 with self.assertRaises(ExecutionTierRefused):
                     execute_paper_to_live_migration(
                         writer,
@@ -354,10 +330,8 @@ class TestMultiBookPaperAndLiveMigration(unittest.TestCase):
                     )
                 with closing(open_writer(store, lease=writer)) as db, write_tx(db):
                     db.execute(
-                        """INSERT INTO paper_cancellation (
-                               order_id, event_id, outcome, released,
-                               filled_quantity, position_quantity, available_at
-                           ) VALUES ('ord-work-1', 'canc-work-1', 'cancelled_flat', 1, 0, 0, 100)"""
+                        "UPDATE trading_book_order SET status = 'cancelled', cancelled_at_ns = 100 WHERE order_id = ?",
+                        (open_ord2["order_id"],),
                     )
 
                 mig2 = execute_paper_to_live_migration(
@@ -385,6 +359,138 @@ class TestMultiBookPaperAndLiveMigration(unittest.TestCase):
                 # Source book_eth retired as requested.
                 self.assertEqual(books2[book_eth.binding_id]["role"], "retired")
                 self.assertEqual(books2[book_eth.binding_id]["status"], "retired")
+
+    def test_qualification_rejects_unrun_cases_and_adapter_revision_mismatch(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-mig-qual-strict-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms("sourdough-qual", "charter-v1", "paper", "profile-v1"),
+            )
+            company_id = founding.company_id
+            ceo_id = founding.founder_id
+
+            with hold_company_writer(
+                store, company_id, lease_directory=leases
+            ) as writer:
+                bind_board_principal(
+                    writer, principal_id="board-chair", role_name=BOARD_CONTROL_ROLE
+                )
+                paper_book = open_company_paper_book(
+                    writer,
+                    account_id="paper-q-1",
+                    book_name="Soak Paper",
+                    starting_minor_units=20_000_000,
+                    exposure_limit_minor_units=10_000_000,
+                )
+                submit_company_paper_book_order(
+                    writer,
+                    binding_id=paper_book.binding_id,
+                    actor_id=ceo_id,
+                    action_id="soak-q-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=1_010_000,
+                    market_price_minor_units=1_000_000,
+                )
+                live_cand = register_live_candidate_binding(
+                    writer,
+                    binding_id="live-q-cand",
+                    account_id="binance-q",
+                    destination_id="binance-spot-prod",
+                    connector_revision="binance-spot-v2",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    currency="USD",
+                    starting_minor_units=20_000_000,
+                    exposure_limit_minor_units=10_000_000,
+                    credential_handle_ref="keychain:openboa/binance/q",
+                )
+                core_digest = compute_trading_core_digest()
+                record_venue_qualification_receipt(
+                    writer,
+                    receipt_id="qual-unrun",
+                    adapter_revision="binance-spot-v2",
+                    environment=ENV_EXTERNAL_TEST,
+                    destination_id="binance-spot-testnet",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    core_digest=core_digest,
+                    verdict="PASS",
+                    cases_passed=5,
+                    cases_failed=0,
+                    cases_unrun=3,
+                    evidence_sha256="a" * 64,
+                )
+                record_venue_qualification_receipt(
+                    writer,
+                    receipt_id="qual-wrong-adapter",
+                    adapter_revision="binance-spot-v1",
+                    environment=ENV_EXTERNAL_TEST,
+                    destination_id="binance-spot-testnet",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    core_digest=core_digest,
+                    verdict="PASS",
+                    cases_passed=5,
+                    cases_failed=0,
+                    cases_unrun=0,
+                    evidence_sha256="b" * 64,
+                )
+
+                with self.assertRaisesRegex(BoardControlRefused, "unrun"):
+                    promote_execution_environment(
+                        writer,
+                        command_id="prom-unrun",
+                        charter_revision="charter-v1",
+                        target_binding_id=live_cand.binding_id,
+                        qualification_receipt_id="qual-unrun",
+                        expected_payload_hash=build_promotion_payload_hash(
+                            company_id=company_id,
+                            charter_revision="charter-v1",
+                            target_binding=live_cand,
+                            qualification_receipt_id="qual-unrun",
+                        ),
+                        reason="Must fail on unrun cases",
+                        principal_hint="board-chair",
+                    )
+
+                with self.assertRaisesRegex(BoardControlRefused, "adapter_revision"):
+                    promote_execution_environment(
+                        writer,
+                        command_id="prom-wrong-adapter",
+                        charter_revision="charter-v1",
+                        target_binding_id=live_cand.binding_id,
+                        qualification_receipt_id="qual-wrong-adapter",
+                        expected_payload_hash=build_promotion_payload_hash(
+                            company_id=company_id,
+                            charter_revision="charter-v1",
+                            target_binding=live_cand,
+                            qualification_receipt_id="qual-wrong-adapter",
+                        ),
+                        reason="Must fail on adapter mismatch",
+                        principal_hint="board-chair",
+                    )
+
+                with self.assertRaisesRegex(ExecutionTierRefused, "adapter_revision"):
+                    propose_paper_to_live_migration(
+                        writer,
+                        question_id="q-wrong-adapter",
+                        source_paper_binding_id=paper_book.binding_id,
+                        target_live_binding_id=live_cand.binding_id,
+                        qualification_receipt_id="qual-wrong-adapter",
+                        created_by_agent_id=ceo_id,
+                    )
+
+                with self.assertRaisesRegex(ExecutionTierRefused, "adapter_revision"):
+                    execute_paper_to_live_migration(
+                        writer,
+                        source_paper_binding_id=paper_book.binding_id,
+                        target_live_binding_id=live_cand.binding_id,
+                        qualification_receipt_id="qual-wrong-adapter",
+                    )
 
 
 if __name__ == "__main__":
