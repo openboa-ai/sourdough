@@ -1803,6 +1803,79 @@ def activate_method_delta(
             audience_scope=delta.audience_scope,
             audience_target_id=delta.audience_target_id,
         )
+        if request_id is not None:
+            existing_act = db.execute(
+                """SELECT request_id, operation, method_id, revision_sha256,
+                          qualification_id, audience_scope, audience_target_id,
+                          activation_seq, principal_id, grant_id, quarantined,
+                          quarantine_reason, recorded_at_ns
+                   FROM method_activation
+                   WHERE company_id = ? AND request_id = ?""",
+                (company_id, request_id),
+            ).fetchone()
+            if existing_act is not None:
+                (
+                    e_req,
+                    e_op,
+                    e_mid,
+                    e_rev,
+                    e_qid,
+                    e_scope,
+                    e_target,
+                    e_seq,
+                    e_actor,
+                    e_grant,
+                    e_quar,
+                    e_qreason,
+                    e_ts,
+                ) = existing_act
+                if (
+                    str(e_op) != operation
+                    or str(e_mid) != delta.method_id
+                    or str(e_rev) != delta.revision_sha256
+                    or str(e_actor) != actor_id
+                    or str(e_grant) != grant_id
+                    or (qualification_id is not None and str(e_qid) != qualification_id)
+                ):
+                    raise MethodRefused("Activation request identity conflict")
+                cmd_row = db.execute(
+                    """SELECT result_json FROM command_receipt
+                       WHERE company_id = ? AND command_id = ?
+                         AND command_type = ?""",
+                    (company_id, request_id, f"method_learning.{operation}"),
+                ).fetchone()
+                snap_id_replayed = ""
+                if cmd_row is not None and cmd_row[0]:
+                    try:
+                        parsed_res = json.loads(str(cmd_row[0]))
+                        if isinstance(parsed_res, dict) and isinstance(
+                            parsed_res.get("active_snapshot_id"), str
+                        ):
+                            snap_id_replayed = parsed_res["active_snapshot_id"]
+                    except json.JSONDecodeError:
+                        pass
+                return (
+                    MethodActivation(
+                        activation_id=str(e_req),
+                        request_id=str(e_req),
+                        company_id=company_id,
+                        operation=str(e_op),
+                        method_id=str(e_mid),
+                        revision_sha256=str(e_rev),
+                        delta_id=f"{e_mid}:{e_rev}",
+                        qualification_id=str(e_qid),
+                        audience_scope=str(e_scope),
+                        audience_target_id=None if e_target is None else str(e_target),
+                        activation_seq=int(e_seq),
+                        active_snapshot_id=snap_id_replayed,
+                        principal_id=str(e_actor),
+                        grant_id=str(e_grant),
+                        quarantined=bool(e_quar),
+                        quarantine_reason=None if e_qreason is None else str(e_qreason),
+                        recorded_at_ns=int(e_ts),
+                    ),
+                    company_id,
+                )
         if delta.status != "candidate":
             raise MethodRefused(
                 f"Cannot activate method delta in '{delta.status}' status"

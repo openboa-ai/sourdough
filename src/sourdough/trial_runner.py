@@ -1479,9 +1479,7 @@ def run_recursive_learning_cycle(
             trigger_spec={"duty_kind": "work.discovery_review"},
             body=(
                 "v1: If v2 in active_methods, follow v2. Else skip other tools and call "
-                "record_work_decision(action_kind='apply_baseline',rationale='v1',"
-                "evidence=[{'kind':'work_run','resource_id':run_id,'revision':'1',"
-                "'available_at_ns':1,'observed_at_ns':2}])."
+                "record_work_decision(action_kind='apply_baseline',rationale='v1',evidence=[])."
             ),
             audience_scope="company",
             source_refs=[f"work_run:{gen1_source_run_id}"],

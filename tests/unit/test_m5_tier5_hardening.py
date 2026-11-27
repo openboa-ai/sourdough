@@ -6052,6 +6052,169 @@ class TestM5Tier5Hardening(unittest.TestCase):
         self.assertTrue(pred(ResidentHealth(True, 1, 1, 0, 1_000, None)))
         self.assertTrue(pred(ResidentHealth(False, 0, 0, 0, None, "stopped")))
 
+    def test_pr191_r10_activate_method_delta_idempotent_retry_and_conflict(
+        self,
+    ) -> None:
+        """PR #191 R10 P2: activate_method_delta retries with same request_id return committed receipt."""
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, run, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            src = (f"work_run:{run.run_id}",)
+            d1 = distill_method_delta(
+                w,
+                claim,
+                method_id="m-idem-r10",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="company",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Idempotent activation v1.",
+                falsification_criteria="Fails if retry breaks.",
+                source_refs=src,
+                now_ns=1_100,
+            )
+            qualify_method_delta(
+                w,
+                d1.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_150,
+            )
+            d2 = distill_method_delta(
+                w,
+                claim,
+                method_id="m-other-r10",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="company",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Other method.",
+                falsification_criteria="Fails if conflict passes.",
+                source_refs=src,
+                now_ns=1_160,
+            )
+            qualify_method_delta(
+                w,
+                d2.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_170,
+            )
+
+            # 1. ADD activation + matching retry returns identical MethodActivation
+            act1 = activate_method_delta(
+                w,
+                d1.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                request_id="req-act-r10-1",
+                now_ns=1_200,
+            )
+            act1_retry = activate_method_delta(
+                w,
+                d1.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                request_id="req-act-r10-1",
+                now_ns=1_250,
+            )
+            self.assertEqual(act1_retry, act1)
+
+            # 2. Reusing request_id with changed delta/terms fails closed
+            with self.assertRaisesRegex(MethodRefused, "conflict"):
+                activate_method_delta(
+                    w,
+                    d2.delta_id,
+                    actor_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    request_id="req-act-r10-1",
+                    now_ns=1_300,
+                )
+
+            # 3. DEPRECATE activation (delta transitions to 'retired') ALSO replays idempotently
+            dep = distill_method_delta(
+                w,
+                claim,
+                method_id="m-idem-r10",
+                delta_kind="DEPRECATE",
+                item_kind="work_method",
+                audience_scope="company",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Retire v1.",
+                falsification_criteria="N/A.",
+                superseded_revision=d1.revision_sha256,
+                source_refs=src,
+                now_ns=1_350,
+            )
+            qualify_method_delta(
+                w,
+                dep.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_360,
+            )
+            dep_act = activate_method_delta(
+                w,
+                dep.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                request_id="req-dep-r10-1",
+                now_ns=1_400,
+            )
+            dep_retry = activate_method_delta(
+                w,
+                dep.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                request_id="req-dep-r10-1",
+                now_ns=1_450,
+            )
+            self.assertEqual(dep_retry, dep_act)
+
+    def test_pr191_r10_live_incumbent_procedure_prescribes_valid_decision(
+        self,
+    ) -> None:
+        """PR #191 R10 P2: incumbent procedure in run_recursive_learning_cycle never prescribes invalid work_run revision."""
+        eval_store = self.root / "eval_r10" / "evaluator.sqlite"
+        eval_store.parent.mkdir(parents=True, exist_ok=True)
+        with hold_company_writer(self.store, self.company_id) as w:
+            res = run_recursive_learning_cycle(
+                w,
+                evaluator_store=eval_store,
+                company_id=self.company_id,
+                meta_agent_id=self.founder_id,
+                promotion_actor_id=self.founder_id,
+                promotion_grant_id=self.grant_id,
+                trial_root=self.root / "trials_r10",
+                min_families=6,
+            )
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            inc_body = str(
+                ro.execute(
+                    """SELECT body_text FROM method_delta
+                       WHERE company_id = ? AND method_id = ?
+                       ORDER BY created_at_ns DESC LIMIT 1""",
+                    (self.company_id, res.incumbent_procedure_id),
+                ).fetchone()[0]
+            )
+        self.assertNotIn("'revision':'1'", inc_body)
+        self.assertIn("evidence=[]", inc_body)
+
 
 if __name__ == "__main__":
     unittest.main()
