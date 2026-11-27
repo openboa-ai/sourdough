@@ -3998,7 +3998,11 @@ def record_work_decision(
     evidence_refs = [
         {
             "kind": ev.kind,
-            "resource_id": ev.resource_id,
+            "resource_id": (
+                f"private_draft:opaque:{sha256(f'{agent_id}:{ev.resource_id}'.encode('utf-8')).hexdigest()[:24]}"
+                if ev.kind == "private_draft"
+                else ev.resource_id
+            ),
             "revision": ev.revision,
             "observed_at_ns": ev.observed_at_ns,
             "available_at_ns": ev.available_at_ns,

@@ -8469,6 +8469,303 @@ class TestM5Tier5Hardening(unittest.TestCase):
                     len(admitted_unscoped_burst), DEFAULT_DISCOVERY_WAKE_BUDGET - 1
                 )
 
+    def test_pr191_r18_method_patch_inherits_superseded_shared_publication_restrictions(
+        self,
+    ) -> None:
+        """PR #191 R18 P2: PATCH linked only via superseded_revision must inherit predecessor shared_publication restrictions."""
+        from sourdough.method_learning import resolve_active_methods
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            proj_rev_1 = assign_project(
+                w,
+                self.grant_id,
+                "proj-r18-patch",
+                (self.founder_id,),
+                publishers=(self.founder_id,),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, f_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+            d1 = save_draft(
+                w,
+                f_claim,
+                f_claim.purpose,
+                name="alice-r18-pub",
+                content="RESTRICTED_ALICE_ONLY_R18",
+                expected_revision=None,
+            )
+            pub = publish_selection(
+                w,
+                f_claim,
+                f_claim.purpose,
+                Selection(
+                    "pub-r18-only",
+                    "alice-r18-pub",
+                    d1.revision,
+                    "proj-r18-patch",
+                    proj_rev_1,
+                    (self.founder_id,),
+                    0,
+                    len(d1.content),
+                ),
+            )
+            base_delta = distill_method_delta(
+                w,
+                f_claim,
+                delta_kind="ADD",
+                target_kind="work_method",
+                method_id="m-r18-patch-chain",
+                trigger_spec={"duty_kind": "work.assessment_review"},
+                body="Initial project rule from Alice-only publication.",
+                audience_scope="project",
+                audience_target_id="proj-r18-patch",
+                source_refs=[f"shared_publication:{pub.asset_id}"],
+                now_ns=2_000,
+            )
+            base_q = qualify_method_delta(
+                w,
+                base_delta.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                now_ns=2_100,
+            )
+            activate_method_delta(
+                w,
+                base_delta.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                qualification_id=base_q.qualification_id,
+                now_ns=2_200,
+            )
+
+            # Activate a PATCH linked ONLY via superseded_revision, citing only work_run (no parent_method_ids!).
+            patch_delta = distill_method_delta(
+                w,
+                f_claim,
+                delta_kind="PATCH",
+                target_kind="work_method",
+                method_id="m-r18-patch-chain",
+                trigger_spec={"duty_kind": "work.assessment_review"},
+                body="Patched project rule retaining restricted guidance.",
+                audience_scope="project",
+                audience_target_id="proj-r18-patch",
+                source_refs=[f"work_run:{f_claim.run_id}"],
+                superseded_revision=base_delta.revision_sha256,
+                now_ns=2_300,
+            )
+            patch_q = qualify_method_delta(
+                w,
+                patch_delta.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                now_ns=2_400,
+            )
+            activate_method_delta(
+                w,
+                patch_delta.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                qualification_id=patch_q.qualification_id,
+                now_ns=2_500,
+            )
+
+            # Expand project membership by adding Bob.
+            bob_id, _ = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="bob-r18-patch",
+                profile_id=self.profile.profile_id(),
+            )
+            assign_project(
+                w,
+                self.grant_id,
+                "proj-r18-patch",
+                (self.founder_id, bob_id),
+                publishers=(self.founder_id,),
+                expected_revision=proj_rev_1,
+            )
+            self.assertEqual(
+                resolve_active_methods(w, self.company_id, agent_id=bob_id), ()
+            )
+            alice_active = resolve_active_methods(
+                w, self.company_id, agent_id=self.founder_id
+            )
+            self.assertEqual(
+                [m.revision_sha256 for m in alice_active], [patch_delta.revision_sha256]
+            )
+
+    def test_pr191_r18_private_draft_citations_persisted_as_opaque_refs_in_company_sqlite(
+        self,
+    ) -> None:
+        """PR #191 R18 P2: private draft names must be stored as opaque digests in method_delta and work_decision."""
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, f_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            draft = save_draft(
+                w,
+                f_claim,
+                f_claim.purpose,
+                name="secret-acquisition-plan",
+                content="Confidential M&A notes.",
+                expected_revision=None,
+            )
+            # 1. Valid private_draft citation on one_agent method_delta -> stored as opaque digest!
+            cand = distill_method_delta(
+                w,
+                f_claim,
+                delta_kind="ADD",
+                target_kind="work_method",
+                method_id="m-r18-priv-ref",
+                trigger_spec={"duty_kind": "work.discovery_review"},
+                body="Private heuristic.",
+                audience_scope="one_agent",
+                source_refs=["private_draft:secret-acquisition-plan"],
+                now_ns=1_500,
+            )
+            self.assertEqual(cand.status, "candidate")
+            self.assertTrue(cand.source_refs[0].startswith("private_draft:opaque:"))
+            self.assertNotIn("secret-acquisition-plan", cand.source_refs[0])
+
+            # 2. Missing private_draft citation -> uncertainty_note also uses opaque digest!
+            missing_cand = distill_method_delta(
+                w,
+                f_claim,
+                delta_kind="ADD",
+                target_kind="work_method",
+                method_id="m-r18-missing-ref",
+                trigger_spec={"duty_kind": "work.discovery_review"},
+                body="Missing draft heuristic.",
+                audience_scope="one_agent",
+                source_refs=["private_draft:missing-secret-target"],
+                now_ns=1_600,
+            )
+            self.assertEqual(missing_cand.status, "disputed")
+            self.assertNotIn("missing-secret-target", missing_cand.uncertainty_note)
+
+            # 3. Redaction report stripped_items also uses opaque refs (no raw filenames!).
+            red = redact_for_shared_scope(
+                w,
+                f_claim,
+                raw_body="See desks/agent/secret-acquisition-plan.json for details.",
+                source_refs=[
+                    "private_draft:secret-acquisition-plan",
+                    f"work_run:{f_claim.run_id}",
+                ],
+                target_scope="company",
+                now_ns=1_700,
+            )
+            self.assertNotIn("secret-acquisition-plan", json.dumps(red.stripped_items))
+
+            # 4. work_decision citing private_draft validates real file, persists opaque ref!
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Verified private draft.",
+                    evidence=(
+                        DecisionEvidence(
+                            "private_draft",
+                            "secret-acquisition-plan",
+                            draft.revision,
+                            1_800,
+                            1_800,
+                        ),
+                    ),
+                    decision_at_ns=1_900,
+                )
+
+        with closing(open_reader(self.store)) as ro_db, read_tx(ro_db):
+            md_rows = ro_db.execute(
+                "SELECT source_refs_json, uncertainty_note, redaction_report_json FROM method_delta"
+            ).fetchall()
+            wd_rows = ro_db.execute(
+                "SELECT evidence_refs_json FROM work_decision"
+            ).fetchall()
+            audit_rows = ro_db.execute(
+                "SELECT payload_json FROM audit_event"
+            ).fetchall()
+        combined = json.dumps({"md": md_rows, "wd": wd_rows, "audit": audit_rows})
+        self.assertNotIn("secret-acquisition-plan", combined)
+        self.assertNotIn("missing-secret-target", combined)
+        self.assertIn("private_draft:opaque:", json.dumps(wd_rows))
+
+    def test_pr191_r18_security_checkpoint_audit_omits_private_desk_paths_and_verifies_digest(
+        self,
+    ) -> None:
+        """PR #191 R18 Security P2: company.checkpoint_cut audit_event must not persist private Desk paths in company.sqlite."""
+        from sourdough.company_checkpoint import (
+            checkpoint_company,
+            inspect_company_checkpoint,
+        )
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, f_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+            save_draft(
+                w,
+                f_claim,
+                f_claim.purpose,
+                name="secret-acquisition-target",
+                content="Private target details.",
+                expected_revision=None,
+            )
+
+        archive_path = self.root / "r18-checkpoint.zip"
+        manifest = checkpoint_company(self.store, self.company_id, archive_path)
+        # Full path manifest remains inside the owner-restricted (0600) archive
+        inspected = inspect_company_checkpoint(archive_path, self.company_id)
+        self.assertEqual(inspected.desk_digest, manifest.desk_digest)
+        self.assertTrue(
+            any("secret-acquisition-target" in p for p in inspected.desk_files)
+        )
+        # Shared company.sqlite audit_event MUST store only digests + count, NEVER private Desk paths!
+        with closing(open_reader(self.store)) as ro_db, read_tx(ro_db):
+            cut_rows = ro_db.execute(
+                """SELECT payload_json FROM audit_event
+                   WHERE company_id = ? AND event_type = 'company.checkpoint_cut'""",
+                (self.company_id,),
+            ).fetchall()
+        self.assertEqual(len(cut_rows), 1)
+        cut_payload = json.loads(str(cut_rows[0][0]))
+        self.assertNotIn("desk_files", cut_payload)
+        self.assertIn("desk_files_digest", cut_payload)
+        self.assertEqual(cut_payload["desk_file_count"], len(manifest.desk_files))
+        self.assertNotIn("secret-acquisition-target", str(cut_rows[0][0]))
+
 
 if __name__ == "__main__":
     unittest.main()

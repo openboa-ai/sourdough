@@ -580,6 +580,9 @@ def checkpoint_store(
                     raise CheckpointRefused(
                         f"Desk directory belongs to unregistered Agent(s): {', '.join(unknown)}"
                     )
+            desk_files_digest = sha256(
+                json.dumps(list(desk_files), separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
             append_audit_event(
                 live_writer,
                 company_id=company_id,
@@ -590,7 +593,8 @@ def checkpoint_store(
                 actor_id="checkpoint",
                 payload={
                     "desk_digest": desk_digest,
-                    "desk_files": list(desk_files),
+                    "desk_files_digest": desk_files_digest,
+                    "desk_file_count": len(desk_files),
                     "agent_desk_digests": agent_desk_digests,
                 },
             )
@@ -784,10 +788,25 @@ def _extract_checkpoint(
                 raise CheckpointRefused(
                     "Malformed checkpoint cut audit event"
                 ) from error
+            expected_files_digest = sha256(
+                json.dumps(list(manifest.desk_files), separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if isinstance(cut_payload, dict) and "desk_files_digest" in cut_payload:
+                files_match = cut_payload.get(
+                    "desk_files_digest"
+                ) == expected_files_digest and cut_payload.get(
+                    "desk_file_count"
+                ) == len(manifest.desk_files)
+            elif isinstance(cut_payload, dict):
+                files_match = cut_payload.get("desk_files") == list(manifest.desk_files)
+            else:
+                files_match = False
             if (
                 not isinstance(cut_payload, dict)
                 or cut_payload.get("desk_digest") != manifest.desk_digest
-                or cut_payload.get("desk_files") != list(manifest.desk_files)
+                or not files_match
                 or cut_payload.get("agent_desk_digests", {})
                 != manifest.agent_desk_digests
             ):

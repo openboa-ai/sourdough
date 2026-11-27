@@ -251,9 +251,10 @@ def _redact_evidence_refs_for_board(raw_json: str) -> list[Any]:
         if isinstance(entry, Mapping) and str(entry.get("kind", "")) == "private_draft":
             item = dict(entry)
             raw_res = str(item.get("resource_id", ""))
-            item["resource_id"] = (
-                f"private_draft:{sha256(raw_res.encode('utf-8')).hexdigest()[:16]}"
-            )
+            if not raw_res.startswith("private_draft:opaque:"):
+                item["resource_id"] = (
+                    f"private_draft:{sha256(raw_res.encode('utf-8')).hexdigest()[:16]}"
+                )
             redacted.append(item)
         else:
             redacted.append(entry)

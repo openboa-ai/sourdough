@@ -358,6 +358,12 @@ def _find_unredacted_shared_leaks(text: str) -> list[str]:
     return findings
 
 
+def _opaque_private_ref(kind: str, agent_id: str, draft_stem: str) -> str:
+    """Return a durable opaque digest reference so private Desk filenames never enter company.sqlite."""
+    digest = sha256(f"{agent_id}:{draft_stem}".encode("utf-8")).hexdigest()[:24]
+    return f"{kind}:opaque:{digest}"
+
+
 def _parse_private_desk_ref(ident: str, *, agent_id: str, ref: str) -> str:
     if "/" in ident:
         owner, draft_name = ident.split("/", 1)
@@ -429,6 +435,7 @@ def _verify_source_refs(
                 raise MethodRefused(
                     f"Private Desk reference '{ref}' must be redacted before entering '{audience_scope}' scope"
                 )
+            opaque_ref = _opaque_private_ref(kind, agent_id, draft_stem)
             if store_path is not None:
                 draft_file = (
                     desk_directory(store_path, agent_id)
@@ -437,7 +444,8 @@ def _verify_source_refs(
                     / f"{draft_stem}.json"
                 )
                 if draft_file.is_symlink() or not draft_file.is_file():
-                    missing.append(ref)
+                    missing.append(opaque_ref)
+            ref = opaque_ref
 
         elif kind == "shared_publication":
             asset_id, *rev_parts = ident.split("@", 1)
@@ -1111,8 +1119,15 @@ def redact_for_shared_scope(
             ref = raw_ref.strip()
             kind, ident = ref.split(":", 1)
             if kind in ("private_desk", "private_draft"):
-                _parse_private_desk_ref(ident, agent_id=claim.founder_id, ref=ref)
-                stripped_items.append(f"source_ref:{ref}")
+                if ident.startswith("opaque:"):
+                    stripped_items.append(f"source_ref:{ref}")
+                else:
+                    draft_stem = _parse_private_desk_ref(
+                        ident, agent_id=claim.founder_id, ref=ref
+                    )
+                    stripped_items.append(
+                        f"source_ref:{_opaque_private_ref(kind, claim.founder_id, draft_stem)}"
+                    )
             else:
                 retained_refs.append(ref)
 
@@ -1137,7 +1152,8 @@ def redact_for_shared_scope(
             )
 
         def _strip_private(match: re.Match[str]) -> str:
-            stripped_items.append(f"body_path:{match.group(0)}")
+            path_digest = sha256(match.group(0).encode("utf-8")).hexdigest()[:16]
+            stripped_items.append(f"body_path:opaque:{path_digest}")
             return "[redacted-private-ref]"
 
         def _strip_secret(match: re.Match[str]) -> str:
@@ -2584,6 +2600,21 @@ def _collect_transitive_shared_publication_ids(
     asset_ids: set[str] = set()
     visited: set[tuple[str, str]] = {(delta.method_id, delta.revision_sha256)}
     queue: list[MethodDelta] = [delta]
+    _, parents_by_node = _all_lineage_edges(db, company_id)
+
+    def _enqueue_node(pm: str, pr: str) -> None:
+        key = (pm, pr)
+        if key in visited:
+            return
+        row = db.execute(
+            f"""SELECT {_DELTA_COLUMNS}
+                FROM method_delta
+                WHERE company_id = ? AND method_id = ? AND revision_sha256 = ?""",
+            (company_id, pm, pr),
+        ).fetchone()
+        if row is not None:
+            visited.add(key)
+            queue.append(_row_to_delta(row))
 
     def _enqueue_parent_ref(raw: str) -> None:
         ref = raw.strip()
@@ -2593,18 +2624,7 @@ def _collect_transitive_shared_publication_ids(
             if sep in ref:
                 pm, pr = ref.rsplit(sep, 1)
                 if _SHA256_RE.fullmatch(pr):
-                    key = (pm, pr)
-                    if key in visited:
-                        return
-                    row = db.execute(
-                        f"""SELECT {_DELTA_COLUMNS}
-                            FROM method_delta
-                            WHERE company_id = ? AND method_id = ? AND revision_sha256 = ?""",
-                        (company_id, pm, pr),
-                    ).fetchone()
-                    if row is not None:
-                        visited.add(key)
-                        queue.append(_row_to_delta(row))
+                    _enqueue_node(pm, pr)
                     return
         # Revisionless parent reference: check all revisions of that method_id in this company.
         for row in db.execute(
@@ -2635,6 +2655,10 @@ def _collect_transitive_shared_publication_ids(
         for parent_ref in cur.parent_method_ids:
             if isinstance(parent_ref, str):
                 _enqueue_parent_ref(parent_ref)
+        if cur.superseded_revision:
+            _enqueue_node(cur.method_id, cur.superseded_revision)
+        for pm, pr in parents_by_node.get((cur.method_id, cur.revision_sha256), ()):
+            _enqueue_node(pm, pr)
     return asset_ids
 
 
