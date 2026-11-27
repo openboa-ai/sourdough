@@ -20,6 +20,9 @@ from sourdough.runtime.domains import DomainPluginRegistry, load_domain_plugins
 from sourdough.runtime.handlers import (
     DUTY_BOARD_APPLY_DECISION,
     DUTY_CEO_RESPOND_MESSAGE,
+    DUTY_WORK_ASSESSMENT_REVIEW,
+    DUTY_WORK_HANDOFF_FOLLOWUP,
+    DUTY_WORK_PEER_RESPONSE,
     build_production_duty_registry,
 )
 from sourdough.storage.db import open_writer, write_tx
@@ -201,7 +204,13 @@ class CoreDomainIsolationTests(unittest.TestCase):
         )
         self.assertEqual(
             set(registry.registered_kinds()),
-            {DUTY_CEO_RESPOND_MESSAGE, DUTY_BOARD_APPLY_DECISION},
+            {
+                DUTY_CEO_RESPOND_MESSAGE,
+                DUTY_BOARD_APPLY_DECISION,
+                DUTY_WORK_PEER_RESPONSE,
+                DUTY_WORK_ASSESSMENT_REVIEW,
+                DUTY_WORK_HANDOFF_FOLLOWUP,
+            },
         )
 
     def test_core_work_projection_without_plugins_emits_empty_domains(self):

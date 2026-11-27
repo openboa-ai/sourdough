@@ -73,6 +73,9 @@ class ShiftRunResult:
     settlement: TurnCostSettlement
     episode: AgentEpisode | None
     desk_path: Path
+    run_status: str = "completed"
+    wait_until_ns: int | None = None
+    wait_event_key: str | None = None
 
 
 def _ensure_private_dir(path: Path, stop_at: Path) -> None:
@@ -373,6 +376,9 @@ class ShiftRunner:
         settlement: TurnCostSettlement | None = None
         settlement_error: BaseException | None = None
         episode: AgentEpisode | None = None
+        final_run_status = "completed"
+        final_wait_until_ns: int | None = None
+        final_wait_event_key: str | None = None
 
         try:
             shift_result = self._adapter_registry.execute_shift(
@@ -414,10 +420,26 @@ class ShiftRunner:
                 )
             )
             if shift_result is not None and settlement_error is None:
-                ep_status = "completed"
-                ep_summary = (
-                    shift_result.output_text.strip()
-                    or f"Completed {ctx.work_item.duty_kind}"
+                with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
+                    run_state_row = db.execute(
+                        """SELECT status, wait_until_ns, wait_event_key
+                           FROM work_runs
+                           WHERE run_id = ? AND fencing_token = ?""",
+                        (ctx.run.run_id, ctx.run.fencing_token),
+                    ).fetchone()
+                if run_state_row is not None and str(run_state_row[0]) == "waiting":
+                    final_run_status = "waiting"
+                    final_wait_until_ns = (
+                        None if run_state_row[1] is None else int(run_state_row[1])
+                    )
+                    final_wait_event_key = (
+                        None if run_state_row[2] is None else str(run_state_row[2])
+                    )
+                ep_status = final_run_status
+                ep_summary = shift_result.output_text.strip() or (
+                    f"Waiting on {final_wait_event_key or ctx.work_item.duty_kind}"
+                    if final_run_status == "waiting"
+                    else f"Completed {ctx.work_item.duty_kind}"
                 )
             elif isinstance(shift_error, AgentBudgetExceeded) or (
                 isinstance(settlement_error, AgentBudgetExceeded)
@@ -486,4 +508,7 @@ class ShiftRunner:
             settlement=settlement,
             episode=episode,
             desk_path=desk,
+            run_status=final_run_status,
+            wait_until_ns=final_wait_until_ns,
+            wait_event_key=final_wait_event_key,
         )

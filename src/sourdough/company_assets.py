@@ -1,6 +1,7 @@
 """Publish an explicitly selected private draft excerpt into company custody."""
 
 import json
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
@@ -10,7 +11,12 @@ from uuid import uuid4
 from .agent_desk import draft_at_revision, require_desk
 from .company import _connect
 from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, WorkRunClaim
-from .runtime.work_kernel import sync_work_item, upsert_project_peer_responsibility
+from .runtime.work_kernel import (
+    has_project_peer_policy,
+    list_project_peer_responders,
+    sync_project_peer_responsibilities,
+    sync_work_item,
+)
 from .storage.kernel import append_audit_event
 from .writer_lease import WriterLease
 
@@ -88,22 +94,44 @@ def _sync_project_peer_routes(
     manager_grant: str,
     project_id: str,
     members: tuple[str, ...],
+    *,
+    peer_responders: tuple[str, ...] | None = None,
+    preserve_existing_responders: bool = False,
 ) -> None:
     row = database.execute(
         "SELECT agent_id FROM standing_grant WHERE id = ?", (manager_grant,)
     ).fetchone()
-    if row is None:
-        return
-    manager_id = str(row[0])
-    requesters = (
-        [m for m in members if m != manager_id] if manager_id in members else []
-    )
-    upsert_project_peer_responsibility(
+    manager_id = str(row[0]) if row is not None else None
+    empty_policy_owner_id: str | None = None
+    if peer_responders is not None:
+        active_responders: tuple[str, ...] = peer_responders
+        if not active_responders and manager_id is not None and manager_id in members:
+            empty_policy_owner_id = manager_id
+    elif preserve_existing_responders:
+        existing = list_project_peer_responders(
+            database, company_id=company_id, project_id=project_id
+        )
+        if existing:
+            active_responders = tuple(r for r in existing if r in members)
+        elif has_project_peer_policy(
+            database, company_id=company_id, project_id=project_id
+        ):
+            active_responders = ()
+        elif manager_id is not None and manager_id in members:
+            active_responders = (manager_id,)
+        else:
+            active_responders = ()
+    else:
+        if manager_id is None:
+            return
+        active_responders = (manager_id,) if manager_id in members else ()
+    sync_project_peer_responsibilities(
         database,
         company_id=company_id,
-        owner_agent_id=manager_id,
         project_id=project_id,
-        allowed_requesters=requesters,
+        members=members,
+        active_responders=active_responders,
+        empty_policy_owner_id=empty_policy_owner_id,
     )
 
 
@@ -123,7 +151,12 @@ def enroll_project_participant(
     )
     if agent_id in members:
         _sync_project_peer_routes(
-            database, company_id, manager_grant, project_id, members
+            database,
+            company_id,
+            manager_grant,
+            project_id,
+            members,
+            preserve_existing_responders=True,
         )
         return
     if len(members) >= _MAX_PROJECT_MEMBERS:
@@ -137,7 +170,14 @@ def enroll_project_participant(
             project_id,
         ),
     )
-    _sync_project_peer_routes(database, company_id, manager_grant, project_id, enrolled)
+    _sync_project_peer_routes(
+        database,
+        company_id,
+        manager_grant,
+        project_id,
+        enrolled,
+        preserve_existing_responders=True,
+    )
 
 
 def assign_project(
@@ -148,8 +188,23 @@ def assign_project(
     *,
     publishers: tuple[str, ...],
     expected_revision: str | None = None,
+    peer_responders: Sequence[str] | None = None,
 ) -> str:
     """Internal company setup operation, never an Agent tool or an implicit membership grant."""
+    responders: tuple[str, ...] | None = None
+    if peer_responders is not None:
+        if isinstance(peer_responders, (str, bytes)) or not isinstance(
+            peer_responders, Sequence
+        ):
+            raise DutyRefused("Invalid shared project scope")
+        responder_items = list(peer_responders)
+        if (
+            not all(_label(r) for r in responder_items)
+            or len(set(responder_items)) != len(responder_items)
+            or not set(responder_items) <= set(members)
+        ):
+            raise DutyRefused("Invalid shared project scope")
+        responders = tuple(sorted(responder_items))
     if (
         not _label(project_id)
         or not 1 <= len(members) <= _MAX_PROJECT_MEMBERS
@@ -174,10 +229,47 @@ def assign_project(
             "SELECT revision,members,publishers FROM shared_project WHERE project_id=?",
             (project_id,),
         ).fetchone()
-        revision = _revision(
-            (writer.company_id, project_id, expected_revision, members, publishers)
+        revision = (
+            _revision(
+                (writer.company_id, project_id, expected_revision, members, publishers)
+            )
+            if responders is None
+            else _revision(
+                (
+                    writer.company_id,
+                    project_id,
+                    expected_revision,
+                    members,
+                    publishers,
+                    responders,
+                )
+            )
         )
+        if responders is not None:
+            effective_responders = responders
+        else:
+            mgr_row = database.execute(
+                "SELECT agent_id FROM standing_grant WHERE id = ?", (manager_grant,)
+            ).fetchone()
+            effective_responders = (
+                (str(mgr_row[0]),)
+                if mgr_row is not None and str(mgr_row[0]) in members
+                else ()
+            )
         if previous == (revision, _json(members), _json(publishers)):
+            current_responders = list_project_peer_responders(
+                database, company_id=writer.company_id, project_id=project_id
+            )
+            if set(current_responders) != set(effective_responders):
+                _sync_project_peer_routes(
+                    database,
+                    writer.company_id,
+                    manager_grant,
+                    project_id,
+                    members,
+                    peer_responders=responders,
+                )
+                writer.verify()
             return revision
         if (previous[0] if previous else None) != expected_revision:
             raise DutyRefused("Shared project revision changed")
@@ -195,7 +287,12 @@ def assign_project(
             ),
         )
         _sync_project_peer_routes(
-            database, writer.company_id, manager_grant, project_id, members
+            database,
+            writer.company_id,
+            manager_grant,
+            project_id,
+            members,
+            peer_responders=responders,
         )
         writer.verify()
         return revision

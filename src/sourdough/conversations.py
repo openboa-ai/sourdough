@@ -10,10 +10,11 @@ from .agent_desk import require_desk
 from .company import _connect
 from .company_assets import project_membership, shared_asset_for
 from .conversation_delivery import enqueue_deliveries
-from .duty_run import DutyClaim, DutyRefused
+from .duty_run import DutyClaim, DutyRefused, WorkRunClaim
 from .writer_lease import WriterLease
 
 
+PER_RUN_MESSAGE_CAP = 8
 _FIELDS = "message_id,project_id,sender_id,run_id,body,asset_id"
 
 
@@ -54,7 +55,10 @@ class Post:
 
 
 def _membership(
-    database: Connection, claim: DutyClaim, purpose: str, project: str
+    database: Connection,
+    claim: DutyClaim | WorkRunClaim,
+    purpose: str,
+    project: str,
 ) -> tuple[str, tuple[str, ...]]:
     require_desk(database, claim, purpose)
     try:
@@ -67,26 +71,48 @@ def _membership(
 
 
 def append_message(
-    writer: WriterLease, claim: DutyClaim, purpose: str, post: Post
+    writer: WriterLease,
+    claim: DutyClaim | WorkRunClaim,
+    purpose: str,
+    post: Post,
+    *,
+    expected_membership_revision: str | None = None,
 ) -> Message:
+    if expected_membership_revision is not None and not _reference(
+        expected_membership_revision
+    ):
+        raise DutyRefused("Invalid project discussion reference")
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as database, database:
         database.execute("BEGIN IMMEDIATE")
         revision, members = _membership(database, claim, purpose, post.project_id)
-        if revision != post.project_revision:
+        if revision != post.project_revision or (
+            expected_membership_revision is not None
+            and revision != expected_membership_revision
+        ):
             raise DutyRefused("Project discussion membership changed")
         asset = post.asset_id or None
         if asset is not None:
-            shared_asset_for(database, claim.founder_id, asset)
+            linked = shared_asset_for(database, claim.founder_id, asset)
+            if linked.project_id != post.project_id:
+                raise DutyRefused("Shared asset is unavailable")
         prior = database.execute(
             f"""SELECT {_FIELDS},membership_revision FROM project_message
-                WHERE project_id=? AND sender_id=? AND request_id=?""",
-            (post.project_id, claim.founder_id, post.request_id),
+                WHERE company_id=? AND project_id=? AND sender_id=? AND request_id=?""",
+            (claim.company_id, post.project_id, claim.founder_id, post.request_id),
         ).fetchone()
         if prior is not None:
             if prior[-3:] != (post.body, asset, revision):
                 raise DutyRefused("Message request conflicts with the original post")
             return Message(*prior[:-1])
+        sent_count = int(
+            database.execute(
+                "SELECT COUNT(*) FROM project_message WHERE company_id=? AND run_id=?",
+                (claim.company_id, claim.run_id),
+            ).fetchone()[0]
+        )
+        if sent_count >= PER_RUN_MESSAGE_CAP:
+            raise DutyRefused("Per-run project message cap exceeded")
         message = Message(
             uuid4().hex,
             post.project_id,
@@ -121,30 +147,53 @@ def append_message(
 
 
 def read_messages(
-    writer: WriterLease, claim: DutyClaim, purpose: str, project_id: str, after: str
+    writer: WriterLease,
+    claim: DutyClaim | WorkRunClaim,
+    purpose: str,
+    project_id: str,
+    after: str,
+    *,
+    expected_membership_revision: str | None = None,
 ) -> tuple[tuple[Message, ...], str]:
-    if not _reference(project_id) or (after != "" and not _reference(after)):
+    if (
+        not _reference(project_id)
+        or (after != "" and not _reference(after))
+        or (
+            expected_membership_revision is not None
+            and not _reference(expected_membership_revision)
+        )
+    ):
         raise DutyRefused("Invalid project discussion reference")
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
-        _membership(database, claim, purpose, project_id)
+        revision, _ = _membership(database, claim, purpose, project_id)
+        if (
+            expected_membership_revision is not None
+            and revision != expected_membership_revision
+        ):
+            raise DutyRefused("Project discussion membership changed")
         page = database.execute(
             f"""WITH visible AS (
                     SELECT rowid AS position,{_FIELDS} FROM project_message
-                    WHERE project_id=? AND EXISTS (SELECT 1 FROM json_each(audience) WHERE value=?)
+                    WHERE company_id=? AND project_id=?
+                      AND EXISTS (SELECT 1 FROM json_each(audience) WHERE value=?)
                 )
                 SELECT {_FIELDS} FROM visible
                 WHERE ?='' OR position>(SELECT position FROM visible WHERE message_id=?)
                 ORDER BY position LIMIT 17""",
-            (project_id, claim.founder_id, after, after),
+            (claim.company_id, project_id, claim.founder_id, after, after),
         ).fetchall()
         messages = []
         for row in page[:16]:
             message = Message(*row)
             if message.asset_id is not None:
                 try:
-                    shared_asset_for(database, claim.founder_id, message.asset_id)
+                    linked = shared_asset_for(
+                        database, claim.founder_id, message.asset_id
+                    )
+                    if linked.project_id != project_id:
+                        message = replace(message, asset_id=None)
                 except DutyRefused:
                     message = replace(message, asset_id=None)
             messages.append(message)
