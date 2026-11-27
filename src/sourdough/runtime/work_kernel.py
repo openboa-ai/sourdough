@@ -464,6 +464,23 @@ def sync_duty_terminal(
     )
 
 
+def _project_peer_responsibility_matches(
+    responsibility_id: str,
+    scope_json: str,
+    *,
+    company_id: str,
+    project_id: str,
+) -> bool:
+    """Match project-managed peer responsibilities by exact project_id in readable_scope_json."""
+    if not str(responsibility_id).startswith(f"project-peer:{company_id}:"):
+        return False
+    try:
+        parsed = json.loads(str(scope_json))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("project_id") == project_id
+
+
 def upsert_project_peer_responsibility(
     connection: sqlite3.Connection,
     *,
@@ -475,7 +492,6 @@ def upsert_project_peer_responsibility(
 ) -> str:
     """Maintain a standing work.peer_response responsibility scoped to a shared project."""
     timestamp = time_ns() if now_ns is None else now_ns
-    responsibility_id = f"project-peer:{company_id}:{project_id}:{owner_agent_id}"
     scope_json = _canonical_json(
         {
             "project_id": project_id,
@@ -484,11 +500,27 @@ def upsert_project_peer_responsibility(
         }
     )
     status = "active" if allowed_requesters else "revoked"
-    existing = connection.execute(
-        "SELECT 1 FROM work_responsibilities WHERE responsibility_id = ?",
-        (responsibility_id,),
-    ).fetchone()
-    if existing is None:
+    existing_id: str | None = None
+    for cand_id, cand_scope in connection.execute(
+        """SELECT responsibility_id, readable_scope_json
+           FROM work_responsibilities
+           WHERE company_id = ? AND owner_agent_id = ?
+             AND duty_kind = 'work.peer_response'""",
+        (company_id, owner_agent_id),
+    ).fetchall():
+        if _project_peer_responsibility_matches(
+            str(cand_id),
+            str(cand_scope),
+            company_id=company_id,
+            project_id=project_id,
+        ):
+            existing_id = str(cand_id)
+            break
+    if existing_id is None:
+        key_digest = sha256(
+            _canonical_json([project_id, owner_agent_id]).encode("utf-8")
+        ).hexdigest()[:24]
+        responsibility_id = f"project-peer:{company_id}:{key_digest}"
         connection.execute(
             """INSERT INTO work_responsibilities (
                    responsibility_id, company_id, owner_agent_id, duty_kind, remit,
@@ -506,6 +538,7 @@ def upsert_project_peer_responsibility(
             ),
         )
     else:
+        responsibility_id = existing_id
         connection.execute(
             """UPDATE work_responsibilities
                SET readable_scope_json = ?, status = ?, updated_at_ns = ?
@@ -522,9 +555,8 @@ def list_project_peer_responders(
     project_id: str,
 ) -> tuple[str, ...]:
     """Return active work.peer_response owner_agent_ids configured for a project."""
-    prefix = f"project-peer:{company_id}:{project_id}:"
     rows = connection.execute(
-        """SELECT owner_agent_id, responsibility_id
+        """SELECT owner_agent_id, responsibility_id, readable_scope_json
            FROM work_responsibilities
            WHERE company_id = ? AND duty_kind = 'work.peer_response' AND status = 'active'
            ORDER BY owner_agent_id""",
@@ -532,9 +564,16 @@ def list_project_peer_responders(
     ).fetchall()
     return tuple(
         sorted(
-            str(owner_id)
-            for owner_id, resp_id in rows
-            if str(resp_id).startswith(prefix)
+            {
+                str(owner_id)
+                for owner_id, resp_id, scope_json in rows
+                if _project_peer_responsibility_matches(
+                    str(resp_id),
+                    str(scope_json),
+                    company_id=company_id,
+                    project_id=project_id,
+                )
+            }
         )
     )
 
@@ -546,16 +585,20 @@ def has_project_peer_policy(
     project_id: str,
 ) -> bool:
     """Return True if any project-peer responsibility policy rows exist for project_id."""
-    prefix = f"project-peer:{company_id}:{project_id}:"
-    return (
-        connection.execute(
-            """SELECT 1 FROM work_responsibilities
-               WHERE company_id = ? AND duty_kind = 'work.peer_response'
-                 AND substr(responsibility_id, 1, ?) = ?
-               LIMIT 1""",
-            (company_id, len(prefix), prefix),
-        ).fetchone()
-        is not None
+    rows = connection.execute(
+        """SELECT responsibility_id, readable_scope_json
+           FROM work_responsibilities
+           WHERE company_id = ? AND duty_kind = 'work.peer_response'""",
+        (company_id,),
+    ).fetchall()
+    return any(
+        _project_peer_responsibility_matches(
+            str(resp_id),
+            str(scope_json),
+            company_id=company_id,
+            project_id=project_id,
+        )
+        for resp_id, scope_json in rows
     )
 
 
@@ -582,15 +625,22 @@ def sync_project_peer_responsibilities(
             allowed_requesters=[m for m in member_list if m != responder_id],
             now_ns=timestamp,
         )
-    prefix = f"project-peer:{company_id}:{project_id}:"
     existing_rows = connection.execute(
-        """SELECT owner_agent_id, responsibility_id
+        """SELECT owner_agent_id, responsibility_id, readable_scope_json
            FROM work_responsibilities
            WHERE company_id = ? AND duty_kind = 'work.peer_response' AND status != 'revoked'""",
         (company_id,),
     ).fetchall()
-    for owner_id, resp_id in existing_rows:
-        if str(resp_id).startswith(prefix) and str(owner_id) not in active_set:
+    for owner_id, resp_id, scope_json in existing_rows:
+        if (
+            _project_peer_responsibility_matches(
+                str(resp_id),
+                str(scope_json),
+                company_id=company_id,
+                project_id=project_id,
+            )
+            and str(owner_id) not in active_set
+        ):
             upsert_project_peer_responsibility(
                 connection,
                 company_id=company_id,
@@ -2108,9 +2158,13 @@ def _insert_work_condition(
         raise WorkKernelRefused(
             "Condition must link a responsibility_id or work_item_id"
         )
+    is_result_dep_cond = isinstance(
+        source_identity, str
+    ) and source_identity.startswith("result_dep:")
     if responsibility_id is not None:
         row = connection.execute(
-            """SELECT owner_agent_id, status FROM work_responsibilities
+            """SELECT owner_agent_id, status, duty_kind, readable_scope_json
+               FROM work_responsibilities
                WHERE company_id = ? AND responsibility_id = ?""",
             (company_id, responsibility_id),
         ).fetchone()
@@ -2118,6 +2172,24 @@ def _insert_work_condition(
             raise WorkKernelRefused(
                 "Responsibility is inactive or owned by another Agent"
             )
+        if is_result_dep_cond and str(row[2]) in (
+            "work.discovery_review",
+            "work.dreaming",
+        ):
+            wake_budget, _, _ = _parse_scope_policy(str(row[3]))
+            armed_resp_deps = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM work_conditions
+                       WHERE company_id = ? AND owner_agent_id = ?
+                         AND responsibility_id = ? AND status = 'armed'
+                         AND source_identity LIKE 'result_dep:%'""",
+                    (company_id, owner_agent_id, responsibility_id),
+                ).fetchone()[0]
+            )
+            if armed_resp_deps >= wake_budget:
+                raise WorkKernelRefused(
+                    "Standing responsibility armed result continuation cap reached"
+                )
     if work_item_id is not None:
         item_owner = connection.execute(
             """SELECT owner_agent_id, duty_kind FROM work_items
@@ -2128,14 +2200,10 @@ def _insert_work_condition(
             raise WorkKernelRefused(
                 "Work item does not exist or belongs to another Agent"
             )
-        is_result_dep_cond = isinstance(
-            source_identity, str
-        ) and source_identity.startswith("result_dep:")
         if (
             responsibility_id is None
             and str(item_owner[1]) in ("work.discovery_review", "work.dreaming")
             and trigger_kind != "peer_response"
-            and not is_result_dep_cond
         ):
             existing_item_cond = connection.execute(
                 """SELECT 1 FROM work_conditions
@@ -2143,7 +2211,6 @@ def _insert_work_condition(
                      AND work_item_id = ? AND responsibility_id IS NULL
                      AND status IN ('armed', 'triggered')
                      AND trigger_kind != 'peer_response'
-                     AND (source_identity IS NULL OR source_identity NOT LIKE 'result_dep:%')
                    LIMIT 1""",
                 (company_id, owner_agent_id, work_item_id),
             ).fetchone()
@@ -3097,11 +3164,48 @@ def evaluate_conditions(
             and duty_kind in ("work.discovery_review", "work.dreaming")
             and not is_result_dep
         )
+        is_result_dep_discovery = is_result_dep and duty_kind in (
+            "work.discovery_review",
+            "work.dreaming",
+        )
         disc_noops = 0
         disc_cooldown_until = 0
         disc_window_started = now_ns
         disc_window_wakes = 0
         configured_cooldown_ns = 0
+        if is_result_dep_discovery:
+            if resp_id is not None:
+                wake_budget, wake_window_ns, configured_cooldown_ns = (
+                    _parse_scope_policy(resp_scope_json)
+                )
+                (
+                    disc_noops,
+                    disc_cooldown_until,
+                    disc_window_started,
+                    disc_window_wakes,
+                ) = _read_discovery_window(
+                    connection,
+                    company_id,
+                    resp_id,
+                    now_ns=now_ns,
+                    wake_window_ns=wake_window_ns,
+                )
+                if disc_window_wakes >= wake_budget:
+                    continue
+            else:
+                window_floor = max(0, now_ns - DEFAULT_DISCOVERY_WAKE_WINDOW_NS)
+                recent_unscoped = int(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM work_items
+                           WHERE company_id = ? AND owner_agent_id = ?
+                             AND duty_kind = ? AND source_kind = 'condition'
+                             AND json_extract(payload_json, '$.responsibility_id') IS NULL
+                             AND created_at_ns >= ?""",
+                        (company_id, owner_agent_id, duty_kind, window_floor),
+                    ).fetchone()[0]
+                )
+                if recent_unscoped >= DEFAULT_DISCOVERY_WAKE_BUDGET:
+                    continue
         if is_unscoped_discretionary:
             window_floor = max(0, now_ns - DEFAULT_DISCOVERY_WAKE_WINDOW_NS)
             recent_unscoped = int(
@@ -3291,7 +3395,7 @@ def evaluate_conditions(
                WHERE condition_id = ? AND condition_revision = ? AND status = 'armed'""",
             (new_status, new_fire_count, now_ns, cid, int(cond_rev)),
         )
-        if is_discretionary:
+        if is_discretionary or (is_result_dep_discovery and resp_id is not None):
             eff_cooldown = max(cooldown_ns, configured_cooldown_ns)
             if eff_cooldown > 0:
                 step_cooldown = min(

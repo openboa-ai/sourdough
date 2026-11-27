@@ -8047,6 +8047,428 @@ class TestM5Tier5Hardening(unittest.TestCase):
         self.assertNotIn("secret-acquisition-plan", str(row[2]))
         self.assertTrue(str(row[2]).startswith("redacted_private_error:"))
 
+    def test_pr191_r17_gen2_live_transfer_dispatches_only_sealed_case_ignoring_pending_cloned_work(
+        self,
+    ) -> None:
+        """PR #191 R17 P2: Gen-2 live transfer dispatch must target its newly created transfer item, ignoring older pending work."""
+        from sourdough.trial_runner import run_recursive_learning_cycle
+
+        # Seed an older pending ('due') discovery item in source_store BEFORE running the live cycle.
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                stale_pending, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="older-pending-gen2-distractor",
+                    payload={"distractor": True},
+                    now_ns=500,
+                )
+
+        seen_work_items: list[str] = []
+
+        class _TransferAwareAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                seen_work_items.append(request.instruction)
+                trigger = next(
+                    (
+                        r
+                        for r in request.context.open_receipts
+                        if isinstance(r, dict) and r.get("kind") == "discovery_trigger"
+                    ),
+                    {},
+                )
+                phase = str(trigger.get("phase") or "")
+                if phase == "witness_contrast":
+                    broker.invoke(
+                        "c1",
+                        "record_work_decision",
+                        {
+                            "action_kind": "witness_contrast",
+                            "rationale": "Gen1 contrast",
+                            "evidence": [],
+                        },
+                    )
+                elif phase in ("post_adoption_shift", "post_rollback_shift"):
+                    broker.invoke(
+                        "c1",
+                        "record_work_decision",
+                        {
+                            "action_kind": "witness_ok",
+                            "rationale": "Witness ok",
+                            "evidence": [],
+                        },
+                    )
+                else:
+                    # Gen-2 transfer arm: read improvement_procedure via progressive disclosure
+                    cx_proc: str | None = None
+                    for entry in request.context.active_methods:
+                        if entry.get("item_kind") != "improvement_procedure":
+                            continue
+                        mid = str(entry["method_id"])
+                        sres = broker.invoke(
+                            f"read-{request.run_id}-{mid}",
+                            "skill_read",
+                            {"method_id": mid},
+                        )
+                        broker.invoke(
+                            f"inv-{request.run_id}-{mid}",
+                            "skill_record_invocation",
+                            {"method_id": mid, "note": "Used"},
+                        )
+                        meta = (sres.get("skill") or {}).get("procedure_meta") or {}
+                        if meta.get("require_counterexample") is True:
+                            cx_proc = mid
+                    if cx_proc is not None:
+                        draft_name = f"ce-{request.run_id[:8]}"
+                        draft_res = broker.invoke(
+                            "c-draft",
+                            "desk_save_draft",
+                            {
+                                "name": draft_name,
+                                "content": "Verified boundary counterexample.",
+                            },
+                        )
+                        broker.invoke(
+                            "c1",
+                            "record_work_decision",
+                            {
+                                "action_kind": "counterexample_verified",
+                                "rationale": "Verified boundary counterexample.",
+                                "evidence": [
+                                    {
+                                        "kind": "private_draft",
+                                        "resource_id": draft_name,
+                                        "revision": str(draft_res["revision"]),
+                                        "observed_at_ns": 1,
+                                        "available_at_ns": 1,
+                                    }
+                                ],
+                            },
+                        )
+                    else:
+                        broker.invoke(
+                            "c1",
+                            "record_work_decision",
+                            {
+                                "action_kind": "apply_baseline_heuristic",
+                                "rationale": "Baseline only.",
+                                "evidence": [],
+                            },
+                        )
+                return ShiftResult(
+                    output_text="Done.",
+                    usage=TokenUsage(input_tokens=50, output_tokens=20),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_TransferAwareAdapter())
+        eval_store = self.root / "evals_r17_gen2" / "evaluator.sqlite"
+        eval_store.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with hold_company_writer(self.store, self.company_id) as w:
+            summary = run_recursive_learning_cycle(
+                w,
+                evaluator_store=eval_store,
+                company_id=self.company_id,
+                meta_agent_id=self.founder_id,
+                promotion_actor_id=self.founder_id,
+                promotion_grant_id=self.grant_id,
+                trial_root=self.root / "trials_r17_gen2",
+                min_families=3,
+                adapter_registry=areg,
+                profile_bindings={self.founder_id: self.profile},
+            )
+        self.assertEqual(summary.transfer_verdict, "SUPPORTED")
+        self.assertTrue(summary.shift_witnessed)
+        # Historical distractor item MUST remain untouched ('due') in the main store!
+        with closing(open_reader(self.store)) as ro_db, read_tx(ro_db):
+            distractor_state = ro_db.execute(
+                "SELECT state FROM work_items WHERE work_item_id = ?",
+                (stale_pending.work_item_id,),
+            ).fetchone()[0]
+        self.assertEqual(distractor_state, "due")
+
+    def test_pr191_r17_project_peer_policy_matches_exact_project_id_not_colon_prefix(
+        self,
+    ) -> None:
+        """PR #191 R17 P2: colon-prefixed project IDs ('risk' vs 'risk:review') must not cross-contaminate peer responders."""
+        from sourdough.company_assets import enroll_project_participant
+        from sourdough.runtime.work_kernel import (
+            list_project_peer_responders,
+            sync_project_peer_responsibilities,
+        )
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            alice_id, _ = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="alice-risk-r17",
+                profile_id=self.profile.profile_id(),
+            )
+            bob_id, _ = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="bob-risk-r17",
+                profile_id=self.profile.profile_id(),
+            )
+            assign_project(
+                w,
+                self.grant_id,
+                "risk",
+                (self.founder_id,),
+                publishers=(self.founder_id,),
+            )
+            assign_project(
+                w,
+                self.grant_id,
+                "risk:review",
+                (self.founder_id, alice_id),
+                publishers=(self.founder_id, alice_id),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                sync_project_peer_responsibilities(
+                    db,
+                    company_id=self.company_id,
+                    project_id="risk",
+                    members=(self.founder_id, bob_id),
+                    active_responders=(self.founder_id,),
+                    now_ns=1_000,
+                )
+                sync_project_peer_responsibilities(
+                    db,
+                    company_id=self.company_id,
+                    project_id="risk:review",
+                    members=(self.founder_id, alice_id),
+                    active_responders=(alice_id,),
+                    now_ns=1_000,
+                )
+                self.assertEqual(
+                    list_project_peer_responders(
+                        db, company_id=self.company_id, project_id="risk"
+                    ),
+                    (self.founder_id,),
+                )
+                self.assertEqual(
+                    list_project_peer_responders(
+                        db, company_id=self.company_id, project_id="risk:review"
+                    ),
+                    (alice_id,),
+                )
+
+            # Enrolling Bob into 'risk' MUST NOT pull Alice from 'risk:review' into 'risk' responders!
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                enroll_project_participant(
+                    db,
+                    self.company_id,
+                    self.grant_id,
+                    "risk",
+                    bob_id,
+                )
+            with closing(open_reader(self.store)) as ro_db, read_tx(ro_db):
+                risk_responders = list_project_peer_responders(
+                    ro_db, company_id=self.company_id, project_id="risk"
+                )
+                review_responders = list_project_peer_responders(
+                    ro_db, company_id=self.company_id, project_id="risk:review"
+                )
+            self.assertEqual(risk_responders, (self.founder_id,))
+            self.assertNotIn(alice_id, risk_responders)
+            self.assertEqual(review_responders, (alice_id,))
+
+    def test_pr191_r17_security_result_continuations_bound_to_owner_capped_and_budgeted(
+        self,
+    ) -> None:
+        """PR #191 R17 Security P2: arm_result_continuation binds to bounded owner, enforces caps, and charges discovery wake budgets."""
+        from sourdough.runtime.proactive_tools import (
+            build_core_proactive_tool_contribution,
+        )
+        from sourdough.runtime.work_kernel import (
+            DEFAULT_DISCOVERY_WAKE_BUDGET,
+            arm_result_continuation,
+        )
+        from sourdough.storage.kernel import append_audit_event
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                for idx in range(5):
+                    append_audit_event(
+                        db,
+                        company_id=self.company_id,
+                        domain="assets",
+                        entity_type="shared_publication",
+                        entity_id=f"r17-dep-asset-{idx}",
+                        event_type="asset.published",
+                        actor_id=self.founder_id,
+                        payload={"asset_id": f"r17-dep-asset-{idx}"},
+                        recorded_at_ns=500 + idx,
+                    )
+
+                # Part 1: Unscoped discovery shift -> arm_result_continuation with omitted owners
+                # auto-binds to claim.duty_id and permits at most ONE continuation per item!
+                unscoped_item, _, unscoped_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            unscoped_tool = build_core_proactive_tool_contribution(
+                writer=w, claim=unscoped_claim
+            ).handlers["arm_result_continuation"]
+            first_dep = unscoped_tool(
+                {"dependency_asset_id": "r17-dep-asset-0", "due_at_ns": 1_500}
+            )
+            self.assertEqual(first_dep["work_item_id"], unscoped_item.work_item_id)
+            self.assertIsNone(first_dep["responsibility_id"])
+            # 2nd call for a DIFFERENT authorized asset in the same shift MUST be refused!
+            with self.assertRaisesRegex(WorkKernelRefused, "at most one armed"):
+                unscoped_tool(
+                    {"dependency_asset_id": "r17-dep-asset-1", "due_at_ns": 1_500}
+                )
+
+            # Part 2: Responsibility-backed discovery shift -> auto-binds responsibility_id,
+            # caps armed result_dep continuations at wake_budget, and writes work_discovery_state rows!
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                complete_work_run(
+                    db,
+                    unscoped_claim.run_id,
+                    unscoped_claim.fencing_token,
+                    outcome={"done": True},
+                    now_ns=1_200,
+                )
+                disc_resp = register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Bounded result deps",
+                    readable_scope={
+                        "max_wakes_per_window": 2,
+                        "wake_window_ns": 100_000,
+                    },
+                    now_ns=1_250,
+                )
+                scoped_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="condition",
+                    source_id="r17-resp-origin",
+                    payload={"responsibility_id": disc_resp.responsibility_id},
+                    now_ns=1_300,
+                )
+                scoped_run = claim_work_run(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=scoped_item.work_item_id,
+                    lease_owner="test-r17",
+                    lease_ttl_ns=100_000,
+                    now_ns=1_350,
+                )
+                scoped_claim = WorkRunClaim(
+                    company_id=self.company_id,
+                    founder_id=self.founder_id,
+                    duty_id=scoped_item.work_item_id,
+                    run_id=scoped_run.run_id,
+                    fencing_token=scoped_run.fencing_token,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    purpose="discovery_review",
+                    _clock=1_400,
+                )
+            scoped_tool = build_core_proactive_tool_contribution(
+                writer=w, claim=scoped_claim
+            ).handlers["arm_result_continuation"]
+            dep_r1 = scoped_tool(
+                {"dependency_asset_id": "r17-dep-asset-1", "due_at_ns": 1_500}
+            )
+            dep_r2 = scoped_tool(
+                {"dependency_asset_id": "r17-dep-asset-2", "due_at_ns": 1_500}
+            )
+            self.assertEqual(dep_r1["responsibility_id"], disc_resp.responsibility_id)
+            self.assertEqual(dep_r2["responsibility_id"], disc_resp.responsibility_id)
+            self.assertIsNone(dep_r1["work_item_id"])
+            # 3rd armed result_dep exceeds max_wakes_per_window=2 -> MUST be refused!
+            with self.assertRaisesRegex(WorkKernelRefused, "cap reached"):
+                scoped_tool(
+                    {"dependency_asset_id": "r17-dep-asset-3", "due_at_ns": 1_500}
+                )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                admitted_resp = evaluate_conditions(db, self.company_id, now_ns=2_000)
+                # 1 unscoped + 2 responsibility-backed admitted (3 total)
+                self.assertEqual(len(admitted_resp), 3)
+                budget_row = db.execute(
+                    """SELECT window_wakes FROM work_discovery_state
+                       WHERE company_id = ? AND responsibility_id = ?""",
+                    (self.company_id, disc_resp.responsibility_id),
+                ).fetchone()
+                self.assertEqual(budget_row, (2,))
+                # Arming one more after budget=2 is spent MUST NOT admit!
+                arm_result_continuation(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    dependency_asset_id="r17-dep-asset-3",
+                    due_at_ns=2_100,
+                    responsibility_id=disc_resp.responsibility_id,
+                    now_ns=2_050,
+                )
+                self.assertEqual(
+                    evaluate_conditions(db, self.company_id, now_ns=2_200), ()
+                )
+
+                # Part 3: Unscoped/parentless result_dep continuations are ALSO capped at
+                # DEFAULT_DISCOVERY_WAKE_BUDGET in the rolling window!
+                for idx in range(DEFAULT_DISCOVERY_WAKE_BUDGET + 2):
+                    append_audit_event(
+                        db,
+                        company_id=self.company_id,
+                        domain="assets",
+                        entity_type="shared_publication",
+                        entity_id=f"r17-unscoped-dep-{idx}",
+                        event_type="asset.published",
+                        actor_id=self.founder_id,
+                        payload={"asset_id": f"r17-unscoped-dep-{idx}"},
+                        recorded_at_ns=2_300 + idx,
+                    )
+                    arm_result_continuation(
+                        db,
+                        company_id=self.company_id,
+                        owner_agent_id=self.founder_id,
+                        dependency_asset_id=f"r17-unscoped-dep-{idx}",
+                        due_at_ns=2_400,
+                        now_ns=2_350 + idx,
+                    )
+                admitted_unscoped_burst = evaluate_conditions(
+                    db, self.company_id, now_ns=2_500
+                )
+                # 1 unscoped was already admitted at t=2_000 -> at most DEFAULT_DISCOVERY_WAKE_BUDGET - 1 more!
+                self.assertEqual(
+                    len(admitted_unscoped_burst), DEFAULT_DISCOVERY_WAKE_BUDGET - 1
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

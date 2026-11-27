@@ -147,6 +147,35 @@ def build_core_proactive_tool_contribution(
         )
         cooldown_ns = _optional_int(obj.get("cooldown_ns"), "cooldown_ns", minimum=0)
         max_fires = _optional_int(obj.get("max_fires"), "max_fires", minimum=1)
+
+        def _infer_active_responsibility(db: Any) -> str | None:
+            wi_row = db.execute(
+                """SELECT payload_json FROM work_items
+                   WHERE company_id = ? AND work_item_id = ?""",
+                (claim.company_id, claim.duty_id),
+            ).fetchone()
+            if wi_row is None:
+                return None
+            try:
+                wi_payload = json.loads(str(wi_row[0]))
+            except json.JSONDecodeError:
+                wi_payload = {}
+            cand_resp = (
+                wi_payload.get("responsibility_id")
+                if isinstance(wi_payload, dict)
+                else None
+            )
+            if isinstance(cand_resp, str) and cand_resp.strip():
+                r_row = db.execute(
+                    """SELECT 1 FROM work_responsibilities
+                       WHERE company_id = ? AND responsibility_id = ?
+                         AND owner_agent_id = ? AND status = 'active'""",
+                    (claim.company_id, cand_resp.strip(), claim.founder_id),
+                ).fetchone()
+                if r_row is not None:
+                    return cand_resp.strip()
+            return None
+
         now = _now_ns()
         writer.verify_for(writer.store, claim.company_id)
         with (
@@ -162,31 +191,7 @@ def build_core_proactive_tool_contribution(
             if resp_id is None and (item_id is None or item_id == claim.duty_id):
                 # Prefer binding to the work item's active standing responsibility so
                 # discovery/dreaming timers cannot escape responsibility budgets/cooldowns.
-                wi_row = db.execute(
-                    """SELECT payload_json FROM work_items
-                       WHERE company_id = ? AND work_item_id = ?""",
-                    (claim.company_id, claim.duty_id),
-                ).fetchone()
-                inferred_resp: str | None = None
-                if wi_row is not None:
-                    try:
-                        wi_payload = json.loads(str(wi_row[0]))
-                    except json.JSONDecodeError:
-                        wi_payload = {}
-                    cand_resp = (
-                        wi_payload.get("responsibility_id")
-                        if isinstance(wi_payload, dict)
-                        else None
-                    )
-                    if isinstance(cand_resp, str) and cand_resp.strip():
-                        r_row = db.execute(
-                            """SELECT 1 FROM work_responsibilities
-                               WHERE company_id = ? AND responsibility_id = ?
-                                 AND owner_agent_id = ? AND status = 'active'""",
-                            (claim.company_id, cand_resp.strip(), claim.founder_id),
-                        ).fetchone()
-                        if r_row is not None:
-                            inferred_resp = cand_resp.strip()
+                inferred_resp = _infer_active_responsibility(db)
                 if inferred_resp is not None:
                     resp_id = inferred_resp
                     item_id = None
@@ -447,6 +452,37 @@ def build_core_proactive_tool_contribution(
                 raise WorkKernelRefused(
                     "arm_result_continuation may only link the current work item or an active standing responsibility"
                 )
+            if resp_id is None and (item_id is None or item_id == claim.duty_id):
+                wi_row = db.execute(
+                    """SELECT payload_json FROM work_items
+                       WHERE company_id = ? AND work_item_id = ?""",
+                    (claim.company_id, claim.duty_id),
+                ).fetchone()
+                inferred_resp: str | None = None
+                if wi_row is not None:
+                    try:
+                        wi_payload = json.loads(str(wi_row[0]))
+                    except json.JSONDecodeError:
+                        wi_payload = {}
+                    cand_resp = (
+                        wi_payload.get("responsibility_id")
+                        if isinstance(wi_payload, dict)
+                        else None
+                    )
+                    if isinstance(cand_resp, str) and cand_resp.strip():
+                        r_row = db.execute(
+                            """SELECT 1 FROM work_responsibilities
+                               WHERE company_id = ? AND responsibility_id = ?
+                                 AND owner_agent_id = ? AND status = 'active'""",
+                            (claim.company_id, cand_resp.strip(), claim.founder_id),
+                        ).fetchone()
+                        if r_row is not None:
+                            inferred_resp = cand_resp.strip()
+                if inferred_resp is not None:
+                    resp_id = inferred_resp
+                    item_id = None
+                else:
+                    item_id = claim.duty_id
             cond = arm_result_continuation(
                 db,
                 company_id=claim.company_id,

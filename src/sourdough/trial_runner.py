@@ -1990,7 +1990,10 @@ def run_recursive_learning_cycle(
                         step_error: str | None = None
                         try:
                             step_summary = runtime.step_with_writer(
-                                slot_w, max_dispatches=1, now_ns=slot_now_ns + 10
+                                slot_w,
+                                max_dispatches=1,
+                                now_ns=slot_now_ns + 10,
+                                target_work_item_id=item_obj.work_item_id,
                             )
                         except (
                             AgentRuntimeRefused,
