@@ -3064,7 +3064,7 @@ class TestF41MethodDistillationTier1(unittest.TestCase):
                         d.revision,
                         "proj-red",
                         rev,
-                        (a.agent_id,),
+                        (h.founder_id, a.agent_id),
                         0,
                         20,
                     ),

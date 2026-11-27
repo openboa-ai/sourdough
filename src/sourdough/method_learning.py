@@ -471,14 +471,38 @@ def _verify_source_refs(
                     raise MethodRefused(
                         f"Agent '{agent_id}' is not authorized to cite shared_publication '{asset_id}'"
                     )
-                if (
-                    audience_scope == "project"
-                    and audience_target_id is not None
-                    and str(pub_proj) != audience_target_id
-                ):
-                    raise MethodRefused(
-                        f"Cited shared_publication '{asset_id}' belongs to another project"
-                    )
+                if audience_scope == "project":
+                    if (
+                        audience_target_id is not None
+                        and str(pub_proj) != audience_target_id
+                    ):
+                        raise MethodRefused(
+                            f"Cited shared_publication '{asset_id}' belongs to another project"
+                        )
+                    active_proj_members = {
+                        m for m in members if employment_cutoff(db, m) is None
+                    }
+                    if not active_proj_members.issubset(audience):
+                        raise MethodRefused(
+                            f"Cited shared_publication '{asset_id}' is restricted to a subset "
+                            f"of project '{pub_proj}' members and cannot be shared across the project"
+                        )
+                elif audience_scope == "company":
+                    active_company_agents = {
+                        str(r[0])
+                        for r in db.execute(
+                            "SELECT id FROM agent WHERE company_id = ?", (company_id,)
+                        ).fetchall()
+                        if employment_cutoff(db, str(r[0])) is None
+                    }
+                    if not (
+                        active_company_agents.issubset(audience)
+                        and active_company_agents.issubset(members)
+                    ):
+                        raise MethodRefused(
+                            f"Cited shared_publication '{asset_id}' is not readable by all active "
+                            "company agents and cannot be distilled into a company-scoped method"
+                        )
                 if rev_parts:
                     expected_rev = sha256(str(content).encode("utf-8")).hexdigest()
                     if rev_parts[0] != expected_rev:

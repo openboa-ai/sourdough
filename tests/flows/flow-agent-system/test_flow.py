@@ -143,7 +143,7 @@ class ConnectedFlow(unittest.TestCase):
                         draft_revision=draft.revision,
                         project_id="vendor-compliance",
                         project_revision=rev,
-                        audience=(analyst.agent_id, legal.agent_id),
+                        audience=(h.founder_id, analyst.agent_id, legal.agent_id),
                         start=29,
                         end=61,
                     ),

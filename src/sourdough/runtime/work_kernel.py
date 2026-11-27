@@ -1694,19 +1694,15 @@ def _resolve_next_condition_revision(
     return 1
 
 
-def _arm_next_condition(
+def _normalize_next_condition_work_item_id(
     connection: sqlite3.Connection,
     *,
     company_id: str,
-    owner_agent_id: str,
     work_item_id: str,
     next_condition: Mapping[str, Any],
-    now_ns: int,
     always_link_work_item: bool = False,
-) -> WorkCondition:
-    next_revision = _resolve_next_condition_revision(
-        connection, company_id=company_id, next_condition=next_condition
-    )
+) -> str | None:
+    """Normalize condition work_item_id consistently for both arming and replay verification."""
     resp_arg = next_condition.get("responsibility_id")
     is_discretionary_resp = False
     if isinstance(resp_arg, str) and resp_arg.strip():
@@ -1721,13 +1717,36 @@ def _arm_next_condition(
         ):
             is_discretionary_resp = True
     if is_discretionary_resp:
-        item_arg = None
-    elif always_link_work_item:
-        item_arg = work_item_id
-    elif resp_arg is None and next_condition.get("work_item_id") is None:
-        item_arg = work_item_id
-    else:
-        item_arg = next_condition.get("work_item_id")
+        return None
+    if always_link_work_item:
+        return work_item_id
+    if resp_arg is None and next_condition.get("work_item_id") is None:
+        return work_item_id
+    raw_item = next_condition.get("work_item_id")
+    return None if raw_item is None else str(raw_item)
+
+
+def _arm_next_condition(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    owner_agent_id: str,
+    work_item_id: str,
+    next_condition: Mapping[str, Any],
+    now_ns: int,
+    always_link_work_item: bool = False,
+) -> WorkCondition:
+    next_revision = _resolve_next_condition_revision(
+        connection, company_id=company_id, next_condition=next_condition
+    )
+    resp_arg = next_condition.get("responsibility_id")
+    item_arg = _normalize_next_condition_work_item_id(
+        connection,
+        company_id=company_id,
+        work_item_id=work_item_id,
+        next_condition=next_condition,
+        always_link_work_item=always_link_work_item,
+    )
     return set_condition(
         connection,
         company_id=company_id,
@@ -3501,10 +3520,12 @@ def record_work_decision(
                     "Work decision conflicts with missing next_condition"
                 )
             exp_resp = validated_next.get("responsibility_id")
-            exp_item = (
-                work_item_id
-                if exp_resp is None and validated_next.get("work_item_id") is None
-                else validated_next.get("work_item_id")
+            exp_item = _normalize_next_condition_work_item_id(
+                connection,
+                company_id=company_id,
+                work_item_id=work_item_id,
+                next_condition=validated_next,
+                always_link_work_item=False,
             )
             req_source = validated_next.get("source_identity")
             exp_source = (

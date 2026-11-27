@@ -5075,6 +5075,362 @@ class TestM5Tier5Hardening(unittest.TestCase):
                     now_ns=1_600,
                 )
 
+    def test_pr191_r8_work_run_outcome_and_projection_redact_terminal_output_text(
+        self,
+    ) -> None:
+        """PR #191 R8 Security P2: model terminal prose quoting private Desk data must never leak to Board."""
+        from sourdough.ipc.projections import read_agent_detail_projection
+
+        canary = "PRIVATE_DESK_CANARY_QUOTE_918273"
+
+        class _CanaryQuotingAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                broker.invoke(
+                    "c1",
+                    "record_work_decision",
+                    {
+                        "action_kind": "hold",
+                        "rationale": "Checked status",
+                        "evidence": [],
+                        "action_id": f"act-{request.run_id}",
+                    },
+                )
+                return ShiftResult(
+                    output_text=f"Completed review referencing {canary} from Desk.",
+                    usage=TokenUsage(input_tokens=12, output_tokens=9),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=1,
+                    events=(),
+                )
+
+        reg = AgentAdapterRegistry()
+        reg.register(_CanaryQuotingAdapter())
+        duty_reg = build_production_duty_registry(
+            adapter_registry=reg, profile_bindings={self.founder_id: self.profile}
+        )
+        rt = CompanyRuntime(self.store, self.company_id, duty_reg, clock=lambda: 15_000)
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="r8-canary",
+                    now_ns=14_000,
+                )
+        step = rt.step(max_dispatches=1, now_ns=15_000)
+        self.assertEqual(len(step.executed_runs), 1)
+        run_id = step.executed_runs[0]
+
+        # 1. Durable work_runs.outcome_json does not store raw output_text
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            raw_outcome = str(
+                ro.execute(
+                    "SELECT outcome_json FROM work_runs WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+            )
+        self.assertNotIn(canary, raw_outcome)
+        parsed_outcome = json.loads(raw_outcome)
+        self.assertNotIn("output_text", parsed_outcome)
+        self.assertEqual(
+            parsed_outcome["output_digest"],
+            sha256(
+                f"Completed review referencing {canary} from Desk.".encode("utf-8")
+            ).hexdigest(),
+        )
+
+        # 2. Legacy/plugin work_runs row containing raw output_text is STILL redacted in Board projection
+        legacy_canary = "LEGACY_PLUGIN_RAW_PROSE_554433"
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, legacy_run, _ = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=16_000,
+                )
+                complete_work_run(
+                    db,
+                    legacy_run.run_id,
+                    legacy_run.fencing_token,
+                    outcome={"output_text": f"Leaked {legacy_canary}"},
+                    now_ns=16_500,
+                )
+
+        detail, _wm = read_agent_detail_projection(
+            self.store, self.company_id, self.founder_id
+        )
+        serialized = json.dumps(detail, sort_keys=True)
+        self.assertNotIn(canary, serialized)
+        self.assertNotIn(legacy_canary, serialized)
+        legacy_act = next(
+            r
+            for r in detail["tabs"]["work_activity"]
+            if r["run_id"] == legacy_run.run_id
+        )
+        self.assertIsNone(legacy_act["outcome"]["output_text"])
+        self.assertTrue(legacy_act["outcome"]["output_redacted"])
+        self.assertEqual(
+            legacy_act["outcome"]["output_digest"],
+            sha256(f"Leaked {legacy_canary}".encode("utf-8")).hexdigest(),
+        )
+
+    def test_pr191_r8_shared_method_distill_rejects_narrow_audience_publication(
+        self,
+    ) -> None:
+        """PR #191 R8 P2: selectively shared publication cannot be distilled into broader project/company method."""
+        with hold_company_writer(self.store, self.company_id) as w:
+            alice_id, alice_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="alice-r8",
+                profile_id=self.profile.profile_id(),
+            )
+            bob_id, _bob_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="bob-r8",
+                profile_id=self.profile.profile_id(),
+            )
+            proj_rev = assign_project(
+                w,
+                self.grant_id,
+                "proj-r8-aud",
+                (alice_id, bob_id),
+                publishers=(alice_id,),
+            )
+            co_proj_rev = assign_project(
+                w,
+                self.grant_id,
+                "proj-r8-all",
+                (self.founder_id, alice_id, bob_id),
+                publishers=(alice_id,),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, claim_a = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=alice_id,
+                    grant_id=alice_g,
+                    grant_scope="assessment",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            draft = save_draft(
+                w,
+                claim_a,
+                claim_a.purpose,
+                name="restricted-note",
+                content="Restricted memo content only for Alice.",
+                expected_revision=None,
+            )
+            alice_only_asset = publish_selection(
+                w,
+                claim_a,
+                claim_a.purpose,
+                Selection(
+                    "pub-r8-alice-only",
+                    "restricted-note",
+                    draft.revision,
+                    "proj-r8-aud",
+                    proj_rev,
+                    (alice_id,),  # Bob is a member of proj-r8-aud but NOT in audience!
+                    0,
+                    len(draft.content),
+                ),
+            )
+            proj_wide_asset = publish_selection(
+                w,
+                claim_a,
+                claim_a.purpose,
+                Selection(
+                    "pub-r8-proj-wide",
+                    "restricted-note",
+                    draft.revision,
+                    "proj-r8-aud",
+                    proj_rev,
+                    (alice_id, bob_id),  # Both project members, but NOT founder!
+                    0,
+                    len(draft.content),
+                ),
+            )
+            company_wide_asset = publish_selection(
+                w,
+                claim_a,
+                claim_a.purpose,
+                Selection(
+                    "pub-r8-co-wide",
+                    "restricted-note",
+                    draft.revision,
+                    "proj-r8-all",
+                    co_proj_rev,
+                    (self.founder_id, alice_id, bob_id),
+                    0,
+                    len(draft.content),
+                ),
+            )
+
+            # 1. Alice-only publication CANNOT be distilled or redacted into project or company scope
+            with self.assertRaisesRegex(MethodRefused, "restricted to a subset"):
+                distill_method_delta(
+                    w,
+                    claim_a,
+                    method_id="m-leak-proj",
+                    delta_kind="ADD",
+                    item_kind="work_method",
+                    audience_scope="project",
+                    audience_target_id="proj-r8-aud",
+                    trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                    body="Copied restricted memo content.",
+                    falsification_criteria="Fails if leaked.",
+                    source_refs=(f"shared_publication:{alice_only_asset.asset_id}",),
+                    now_ns=1_200,
+                )
+            with self.assertRaisesRegex(MethodRefused, "restricted to a subset"):
+                redact_for_shared_scope(
+                    w,
+                    claim_a,
+                    raw_body="Copied restricted memo content.",
+                    source_refs=(f"shared_publication:{alice_only_asset.asset_id}",),
+                    target_scope="project",
+                    now_ns=1_250,
+                )
+            with self.assertRaisesRegex(MethodRefused, "not readable by all active"):
+                distill_method_delta(
+                    w,
+                    claim_a,
+                    method_id="m-leak-co",
+                    delta_kind="ADD",
+                    item_kind="work_method",
+                    audience_scope="company",
+                    trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                    body="Copied restricted memo content.",
+                    falsification_criteria="Fails if leaked.",
+                    source_refs=(f"shared_publication:{proj_wide_asset.asset_id}",),
+                    now_ns=1_300,
+                )
+
+            # 2. Full project-wide publication succeeds for project scope
+            ok_proj = distill_method_delta(
+                w,
+                claim_a,
+                method_id="m-ok-proj",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="project",
+                audience_target_id="proj-r8-aud",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Authorized project-wide lesson.",
+                falsification_criteria="Fails if project rule breaks.",
+                source_refs=(f"shared_publication:{proj_wide_asset.asset_id}",),
+                now_ns=1_350,
+            )
+            self.assertTrue(ok_proj.redaction_passed)
+
+            # 3. Full company-wide publication succeeds for company scope
+            ok_co = distill_method_delta(
+                w,
+                claim_a,
+                method_id="m-ok-co",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="company",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Authorized company-wide lesson.",
+                falsification_criteria="Fails if company rule breaks.",
+                source_refs=(f"shared_publication:{company_wide_asset.asset_id}",),
+                now_ns=1_400,
+            )
+            self.assertTrue(ok_co.redaction_passed)
+
+    def test_pr191_r8_record_work_decision_replay_normalizes_discretionary_next_condition_item_id(
+        self,
+    ) -> None:
+        """PR #191 R8 P2: replaying record_work_decision with discovery resp + explicit work_item_id succeeds."""
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                disc_resp = register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Periodic discovery",
+                    readable_scope=["shared"],
+                    now_ns=1_000,
+                )
+                item, run, _claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_500,
+                )
+                nxt = {
+                    "responsibility_id": disc_resp.responsibility_id,
+                    "work_item_id": item.work_item_id,
+                    "trigger_kind": "timer",
+                    "due_at_ns": 50_000,
+                }
+                d1 = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Wait for next window",
+                    evidence=(),
+                    decision_at_ns=2_000,
+                    action_id="act-r8-replay",
+                    next_condition=nxt,
+                )
+                # Identical replay with explicit work_item_id + discretionary responsibility must succeed!
+                d2 = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Wait for next window",
+                    evidence=(),
+                    decision_at_ns=2_000,
+                    action_id="act-r8-replay",
+                    next_condition=nxt,
+                )
+                self.assertEqual(d1.decision_id, d2.decision_id)
+                self.assertEqual(d1.next_condition_id, d2.next_condition_id)
+                cond_item = db.execute(
+                    "SELECT work_item_id FROM work_conditions WHERE condition_id = ?",
+                    (d1.next_condition_id,),
+                ).fetchone()
+                self.assertEqual(cond_item, (None,))
+
 
 if __name__ == "__main__":
     unittest.main()

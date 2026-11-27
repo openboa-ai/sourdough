@@ -142,6 +142,22 @@ def _redact_active_method_for_board(method_dict: dict[str, Any]) -> dict[str, An
     return projected
 
 
+def _redact_run_outcome_for_board(raw_json: str | None) -> Any:
+    """Redact free-form model prose (output_text) from work_runs outcomes projected to Board."""
+    parsed = _json_loads_safe(raw_json, None)
+    if not isinstance(parsed, dict):
+        return parsed
+    if "output_text" not in parsed:
+        return parsed
+    projected = dict(parsed)
+    raw_out = projected.pop("output_text", None)
+    projected["output_text"] = None
+    projected["output_redacted"] = True
+    if raw_out is not None and "output_digest" not in projected:
+        projected["output_digest"] = sha256(str(raw_out).encode("utf-8")).hexdigest()
+    return projected
+
+
 def _redact_evidence_refs_for_board(raw_json: str) -> list[Any]:
     parsed = _json_loads_safe(raw_json, [])
     if not isinstance(parsed, list):
@@ -637,7 +653,7 @@ def read_agent_detail_projection(
                 "status": str(r[3]),
                 "fencing_token": int(r[4]),
                 "budget_ceiling_minor": int(r[5]),
-                "outcome": _json_loads_safe(r[6], None),
+                "outcome": _redact_run_outcome_for_board(r[6]),
                 "created_at_ns": int(r[7]),
                 "updated_at_ns": int(r[8]),
             }

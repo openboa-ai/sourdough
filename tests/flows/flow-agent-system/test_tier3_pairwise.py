@@ -1378,7 +1378,14 @@ class TestFullStackPairwise(unittest.TestCase):
                     ca,
                     ca.purpose,
                     Selection(
-                        "r-m", "note", d.revision, "p-m", rev, (a.agent_id,), 0, 25
+                        "r-m",
+                        "note",
+                        d.revision,
+                        "p-m",
+                        rev,
+                        (h.founder_id, a.agent_id),
+                        0,
+                        25,
                     ),
                 )
             ml = lazy_module("sourdough.method_learning")

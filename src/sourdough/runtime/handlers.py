@@ -805,12 +805,14 @@ def build_production_duty_registry(
                     "causal_method_trace": reconciled_trace,
                 },
             )
+        peer_out_bytes = run_res.shift_result.output_text.strip().encode("utf-8")
         return DutyOutcome(
             disposition="completed",
             result={
                 "request_id": peer.request_id,
                 "outcome": post_state,
-                "output_text": run_res.shift_result.output_text.strip(),
+                "output_digest": sha256(peer_out_bytes).hexdigest(),
+                "output_bytes": len(peer_out_bytes),
                 "cost_minor_units": run_res.settlement.cost_minor_units,
                 "journal_entry_id": run_res.settlement.journal_entry_id,
                 "active_snapshot_id": run_res.active_snapshot_id,
@@ -930,10 +932,12 @@ def build_production_duty_registry(
                 wait_reason="waiting_for_peer_response",
                 result={"waiting": True},
             )
+        collab_out_bytes = run_res.shift_result.output_text.strip().encode("utf-8")
         return DutyOutcome(
             disposition="completed",
             result={
-                "output_text": run_res.shift_result.output_text.strip(),
+                "output_digest": sha256(collab_out_bytes).hexdigest(),
+                "output_bytes": len(collab_out_bytes),
                 "provider": run_res.shift_result.provider,
                 "model": run_res.shift_result.model,
                 "cost_minor_units": run_res.settlement.cost_minor_units,
@@ -1156,6 +1160,7 @@ def build_production_duty_registry(
                 work_item_id=ctx.work_item.work_item_id,
                 run_id=ctx.run.run_id,
             )
+        disc_out_bytes = run_res.shift_result.output_text.strip().encode("utf-8")
         if dec is None:
             reconciled_trace = reconcile_shift_episode_outcome(
                 ctx,
@@ -1167,7 +1172,8 @@ def build_production_duty_registry(
                 disposition="blocked",
                 result={
                     "reason": "no_work_decision",
-                    "output_text": run_res.shift_result.output_text.strip(),
+                    "output_digest": sha256(disc_out_bytes).hexdigest(),
+                    "output_bytes": len(disc_out_bytes),
                     "cost_minor_units": run_res.settlement.cost_minor_units,
                     "journal_entry_id": run_res.settlement.journal_entry_id,
                     "active_snapshot_id": run_res.active_snapshot_id,
@@ -1180,7 +1186,8 @@ def build_production_duty_registry(
             "decision_id": dec_id,
             "action_kind": act_kind,
             "next_condition_id": next_cid,
-            "output_text": run_res.shift_result.output_text.strip(),
+            "output_digest": sha256(disc_out_bytes).hexdigest(),
+            "output_bytes": len(disc_out_bytes),
             "provider": run_res.shift_result.provider,
             "model": run_res.shift_result.model,
             "cost_minor_units": run_res.settlement.cost_minor_units,
