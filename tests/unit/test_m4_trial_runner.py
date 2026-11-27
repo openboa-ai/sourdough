@@ -10,6 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import time_ns
+from unittest.mock import patch
 
 from sourdough.agent_desk import desk_directory, ensure_private_desk
 from sourdough.agent_runtime.protocol import (
@@ -1752,6 +1753,179 @@ class M4TrialRunnerTests(unittest.TestCase):
                     drafted_methods=(),
                 )
                 self.assertTrue(obs_grounded["skill_grounded"])
+
+    def test_run_recursive_learning_cycle_slow_gen1_shift_refreshes_post_shift_lease_clock(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-m4-slow-gen1-") as tmp:
+            root = Path(tmp)
+            co_dir = root / "co"
+            co_dir.mkdir(mode=0o700)
+            store = co_dir / "company.sqlite"
+            leases = co_dir / "leases"
+            leases.mkdir(mode=0o700)
+            eval_store = root / "evals" / "evaluator.sqlite"
+            eval_store.parent.mkdir(mode=0o700)
+
+            clock_ns = [1_700_000_000_000_000_000]
+
+            def _fake_time_ns() -> int:
+                return clock_ns[0]
+
+            profile = AgentProfileBinding(
+                provider=PROVIDER_OPENAI,
+                model="gpt-6-luna",
+                revision="v1",
+                credential_handle_ref="envref:KEY",
+            )
+            rec = found(
+                store,
+                FoundingTerms(
+                    "slow-gen1-co",
+                    "charter-v1",
+                    "manage-company",
+                    profile.profile_id(),
+                ),
+            )
+
+            shift_calls: list[str] = []
+
+            class _SlowGen1RsiAdapter:
+                manifest = AdapterManifest(
+                    PROVIDER_OPENAI, "test-slow-gen1-v1", "https_json", True, True, True
+                )
+
+                def run_shift(self, prof, req, broker):
+                    del prof
+                    shift_calls.append(req.run_id)
+                    shift_idx = len(shift_calls)
+                    if shift_idx == 1:
+                        # Advance controllable wall clock +75s (>60s gen1_claim TTL,
+                        # within 120s CLI shift timeout) inside gen1_step.
+                        clock_ns[0] += 75_000_000_000
+                        broker.invoke(
+                            f"dec-{req.run_id}",
+                            "record_work_decision",
+                            {
+                                "action_kind": "witness_contrast",
+                                "rationale": "Observed deadline filter missed no-deadline items.",
+                                "evidence": [],
+                            },
+                        )
+                    else:
+                        # Advance clock across Gen-2 slots (>60s cumulative) and witness.
+                        clock_ns[0] += 10_000_000_000
+                        cx_proc: str | None = None
+                        for entry in req.context.active_methods:
+                            if entry.get("item_kind") != "improvement_procedure":
+                                continue
+                            mid = str(entry["method_id"])
+                            res = broker.invoke(
+                                f"read-{req.run_id}-{mid}",
+                                "skill_read",
+                                {"method_id": mid},
+                            )
+                            broker.invoke(
+                                f"inv-{req.run_id}-{mid}",
+                                "skill_record_invocation",
+                                {"method_id": mid, "note": "Used"},
+                            )
+                            meta = (res.get("skill") or {}).get("procedure_meta") or {}
+                            if meta.get("require_counterexample") is True:
+                                cx_proc = mid
+                        if cx_proc is not None and shift_idx <= 13:
+                            broker.invoke(
+                                f"draft-{req.run_id}",
+                                "skill_draft_candidate",
+                                {
+                                    "method_id": f"wm-slow-{req.run_id[:20]}",
+                                    "delta_kind": "ADD",
+                                    "item_kind": "work_method",
+                                    "trigger_spec": {
+                                        "duty_kind": "work.discovery_review",
+                                        "negative_triggers": [
+                                            "valid_no_deadline_obligation"
+                                        ],
+                                    },
+                                    "body": "Retain valid no-deadline boundary items.",
+                                    "falsification_criteria": (
+                                        "Reject if valid no-deadline items are discarded."
+                                    ),
+                                    "audience_scope": "company",
+                                    "source_refs": [f"work_run:{req.run_id}"],
+                                },
+                            )
+                            broker.invoke(
+                                f"dec-{req.run_id}",
+                                "record_work_decision",
+                                {
+                                    "action_kind": "counterexample_verified",
+                                    "rationale": f"Verified counterexample via {cx_proc}.",
+                                    "evidence": [],
+                                },
+                            )
+                        else:
+                            broker.invoke(
+                                f"dec-{req.run_id}",
+                                "record_work_decision",
+                                {
+                                    "action_kind": "witness_ok",
+                                    "rationale": "Completed shift.",
+                                    "evidence": [],
+                                },
+                            )
+                    return ShiftResult(
+                        provider=PROVIDER_OPENAI,
+                        model="gpt-6-luna",
+                        run_id=req.run_id,
+                        turn_id=req.turn_id,
+                        output_text="Completed slow-clock RSI shift.",
+                        usage=TokenUsage(input_tokens=30, output_tokens=10),
+                        tool_calls_executed=broker.call_count,
+                        events=(),
+                    )
+
+            adapters = AgentAdapterRegistry()
+            adapters.register(_SlowGen1RsiAdapter())
+            with (
+                patch("sourdough.trial_runner.time_ns", side_effect=_fake_time_ns),
+                patch(
+                    "sourdough.runtime.work_kernel.time_ns", side_effect=_fake_time_ns
+                ),
+            ):
+                with hold_company_writer(
+                    store, rec.company_id, lease_directory=leases
+                ) as w:
+                    with closing(open_writer(store, lease=w)) as db, write_tx(db):
+                        ensure_private_desk(
+                            db, rec.company_id, rec.founder_id, profile.profile_id()
+                        )
+                        register_responsibility(
+                            db,
+                            company_id=rec.company_id,
+                            owner_agent_id=rec.founder_id,
+                            duty_kind="work.discovery_review",
+                            remit="Monitor and improve work methods",
+                            readable_scope=["*"],
+                            now_ns=clock_ns[0],
+                        )
+                    cycle = run_recursive_learning_cycle(
+                        w,
+                        evaluator_store=eval_store,
+                        company_id=rec.company_id,
+                        meta_agent_id=rec.founder_id,
+                        promotion_actor_id=rec.founder_id,
+                        promotion_grant_id=rec.grant_id,
+                        trial_root=root / "rsi-slow-gen1",
+                        min_families=3,
+                        adapter_registry=adapters,
+                        profile_bindings={rec.founder_id: profile},
+                    )
+            self.assertEqual(len(shift_calls), 15)
+            self.assertEqual(cycle.transfer_verdict, "SUPPORTED")
+            self.assertTrue(cycle.shift_witnessed)
+            self.assertTrue(cycle.rollback_restored_incumbent)
+            self.assertGreater(clock_ns[0], 1_700_000_000_000_000_000 + 200_000_000_000)
 
 
 if __name__ == "__main__":

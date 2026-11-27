@@ -344,6 +344,7 @@ class CodexCliAdapter:
         secret_resolver: SecretHandleResolver | None = None,
         protocol_mode: Literal["auto", "codex_mcp", "shim"] = "auto",
         codex_home: Path | None = None,
+        reasoning_effort: str | None = "low",
     ) -> None:
         if not executable or not all(
             isinstance(part, str) and part for part in executable
@@ -353,6 +354,12 @@ class CodexCliAdapter:
             raise AgentRuntimeRefused(
                 f"Unsupported CodexCliAdapter protocol_mode: {protocol_mode}"
             )
+        if reasoning_effort is not None and (
+            not isinstance(reasoning_effort, str) or not reasoning_effort.strip()
+        ):
+            raise AgentRuntimeRefused(
+                "CodexCliAdapter reasoning_effort must be a non-empty string or None"
+            )
         self._executable = tuple(executable)
         self._use_macos_sandbox = use_macos_sandbox
         self._extra_read_paths = tuple(extra_read_paths)
@@ -360,6 +367,9 @@ class CodexCliAdapter:
         self._secret_resolver = secret_resolver or EnvSecretResolver()
         self._protocol_mode = protocol_mode
         self._codex_home = codex_home
+        self._reasoning_effort = (
+            reasoning_effort.strip() if reasoning_effort is not None else None
+        )
         self._manifest = AdapterManifest(
             provider=PROVIDER_CODEX_CLI,
             adapter_revision="codex-cli-uds-v2",
@@ -459,8 +469,11 @@ class CodexCliAdapter:
                 exe0 = self._executable[0]
                 is_explicit_path = "/" in exe0 or os.sep in exe0 or Path(exe0).is_file()
                 if Path(exe0).name == "codex":
+                    env_codex = os.environ.get("SOURDOUGH_CODEX_EXECUTABLE", "").strip()
                     if is_explicit_path:
                         codex_bin = exe0
+                    elif env_codex:
+                        codex_bin = env_codex
                     else:
                         found_bin = shutil.which("codex", path=env["PATH"])
                         codex_bin = found_bin or "/opt/homebrew/bin/codex"
@@ -492,6 +505,13 @@ class CodexCliAdapter:
                     "--cd",
                     str(cwd or sock_dir),
                     *confinement_arguments(),
+                ]
+                if self._reasoning_effort is not None:
+                    command += [
+                        "-c",
+                        f"model_reasoning_effort={json.dumps(self._reasoning_effort)}",
+                    ]
+                command += [
                     "-c",
                     f"mcp_servers.sourdough.command={json.dumps(sys.executable)}",
                     "-c",
@@ -594,6 +614,9 @@ class CodexCliAdapter:
                     round_usage = TokenUsage(
                         input_tokens=int(usage_obj.get("input_tokens") or 0),
                         output_tokens=int(usage_obj.get("output_tokens") or 0),
+                        cached_input_tokens=int(
+                            usage_obj.get("cached_input_tokens") or 0
+                        ),
                     )
                     total_usage = total_usage + round_usage
                     broker.record_usage(round_usage)
@@ -603,6 +626,7 @@ class CodexCliAdapter:
                             recorded_at_ns=time_ns(),
                             payload={
                                 "input_tokens": round_usage.input_tokens,
+                                "cached_input_tokens": round_usage.cached_input_tokens,
                                 "output_tokens": round_usage.output_tokens,
                             },
                         )

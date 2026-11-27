@@ -220,13 +220,16 @@ class ToolSpec:
 class TokenUsage:
     input_tokens: int
     output_tokens: int
+    cached_input_tokens: int = 0
 
     def __post_init__(self) -> None:
         if (
             type(self.input_tokens) is not int
             or type(self.output_tokens) is not int
+            or type(self.cached_input_tokens) is not int
             or self.input_tokens < 0
             or self.output_tokens < 0
+            or self.cached_input_tokens < 0
         ):
             raise AgentRuntimeRefused(
                 "Token usage counts must be non-negative integers"
@@ -236,6 +239,7 @@ class TokenUsage:
         return TokenUsage(
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
+            cached_input_tokens=self.cached_input_tokens + other.cached_input_tokens,
         )
 
 

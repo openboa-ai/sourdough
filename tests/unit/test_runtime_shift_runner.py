@@ -1451,6 +1451,125 @@ class RuntimeShiftRunnerTests(unittest.TestCase):
             )
             self.assertEqual(len(drafts), 1)
 
+    def test_shift_runner_codex_cli_timeout_and_cached_input_tokens(self) -> None:
+        from sourdough.agent_runtime import (
+            PROVIDER_CODEX_CLI,
+            AdapterManifest,
+            AgentAdapterRegistry,
+            ShiftResult,
+        )
+
+        captured_timeouts: list[tuple[str, float]] = []
+
+        class _TimeoutCaptureAdapter:
+            def __init__(self, provider: str) -> None:
+                self.manifest = AdapterManifest(
+                    provider,
+                    "test-v1",
+                    "local_cli_uds" if provider == PROVIDER_CODEX_CLI else "https_json",
+                    True,
+                    True,
+                    True,
+                )
+
+            def run_shift(self, profile, req, broker):
+                captured_timeouts.append((profile.provider, req.timeout_seconds))
+                return ShiftResult(
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=req.run_id,
+                    turn_id=req.turn_id,
+                    output_text="ok",
+                    usage=TokenUsage(
+                        input_tokens=300, output_tokens=20, cached_input_tokens=192
+                    ),
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leases = root / "leases"
+
+            codex_store = root / "codex.sqlite"
+            codex_profile = AgentProfileBinding(
+                provider=PROVIDER_CODEX_CLI, model="gpt-6-luna", revision="v1"
+            )
+            codex_found = found(
+                codex_store,
+                FoundingTerms(
+                    "codex-to", "charter-v1", "manage", codex_profile.profile_id()
+                ),
+            )
+            with closing(open_writer(codex_store)) as db, write_tx(db):
+                create_work_item(
+                    db,
+                    company_id=codex_found.company_id,
+                    owner_agent_id=codex_found.founder_id,
+                    duty_kind="ceo.respond_message",
+                    source_kind="manual",
+                    source_id="m-codex",
+                    payload={"message_id": "m-codex", "body": "Check timeout"},
+                    now_ns=100,
+                )
+            adapters = AgentAdapterRegistry()
+            adapters.register(_TimeoutCaptureAdapter(PROVIDER_CODEX_CLI))
+            adapters.register(_TimeoutCaptureAdapter(PROVIDER_OPENAI))
+            codex_rt = CompanyRuntime(
+                codex_store,
+                codex_found.company_id,
+                build_production_duty_registry(
+                    adapter_registry=adapters,
+                    profile_bindings={codex_found.founder_id: codex_profile},
+                ),
+                lease_directory=leases,
+            )
+            codex_rt.step(max_dispatches=1, now_ns=200)
+            self.assertEqual(captured_timeouts[-1], (PROVIDER_CODEX_CLI, 120.0))
+            with closing(open_reader(codex_store)) as db, read_tx(db):
+                dec_json = db.execute(
+                    "SELECT decisions_json FROM agent_episode"
+                ).fetchone()[0]
+                self.assertEqual(
+                    json.loads(dec_json)[0]["outcome_delta"]["cached_input_tokens"], 192
+                )
+
+            http_store = root / "http.sqlite"
+            http_profile = AgentProfileBinding(
+                provider=PROVIDER_OPENAI,
+                model="gpt-5-mini",
+                revision="v1",
+                credential_handle_ref="envref:SD_OPENAI_KEY",
+            )
+            http_found = found(
+                http_store,
+                FoundingTerms(
+                    "http-to", "charter-v1", "manage", http_profile.profile_id()
+                ),
+            )
+            with closing(open_writer(http_store)) as db, write_tx(db):
+                create_work_item(
+                    db,
+                    company_id=http_found.company_id,
+                    owner_agent_id=http_found.founder_id,
+                    duty_kind="ceo.respond_message",
+                    source_kind="manual",
+                    source_id="m-http",
+                    payload={"message_id": "m-http", "body": "Check http timeout"},
+                    now_ns=100,
+                )
+            http_rt = CompanyRuntime(
+                http_store,
+                http_found.company_id,
+                build_production_duty_registry(
+                    adapter_registry=adapters,
+                    profile_bindings={http_found.founder_id: http_profile},
+                ),
+                lease_directory=leases,
+            )
+            http_rt.step(max_dispatches=1, now_ns=200)
+            self.assertEqual(captured_timeouts[-1], (PROVIDER_OPENAI, 30.0))
+
 
 if __name__ == "__main__":
     unittest.main()

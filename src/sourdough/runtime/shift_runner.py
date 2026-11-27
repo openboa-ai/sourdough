@@ -29,6 +29,7 @@ from ..agent_runtime.cost_accounting import (
     settle_shift_cost_to_ledger,
 )
 from ..agent_runtime.protocol import (
+    PROVIDER_CODEX_CLI,
     AgentBudgetExceeded,
     AgentProfileBinding,
     OuterToolBroker,
@@ -189,7 +190,7 @@ class ShiftRunner:
         include_plugin_tools: bool = True,
         extra_recoverable_exceptions: tuple[type[BaseException], ...] = (),
         max_tool_calls: int = 16,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float | None = None,
         pre_resolved_active_methods: tuple[Sequence[Any], str | None] | None = None,
     ) -> ShiftRunResult:
         agent_id = ctx.work_item.owner_agent_id
@@ -481,6 +482,11 @@ class ShiftRunner:
             if ctx.run.budget_ceiling_minor > 0
             else self._default_budget_ceiling_minor
         )
+        eff_timeout_seconds = (
+            (120.0 if profile.provider == PROVIDER_CODEX_CLI else 30.0)
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         shift_req = ShiftRequest(
             company_id=ctx.company_id,
             agent_id=agent_id,
@@ -492,7 +498,7 @@ class ShiftRunner:
             tools=tool_specs,
             budget_ceiling_minor_units=budget_ceiling,
             max_tool_calls=max_tool_calls,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=eff_timeout_seconds,
             desk_path=desk,
             store_path=ctx.writer.store,
         )
@@ -719,6 +725,7 @@ class ShiftRunner:
                         else broker.call_count
                     ),
                     "input_tokens": incurred_usage.input_tokens,
+                    "cached_input_tokens": incurred_usage.cached_input_tokens,
                     "output_tokens": incurred_usage.output_tokens,
                     "cost_minor_units": cost_minor,
                     "work_decisions": decision_ids,

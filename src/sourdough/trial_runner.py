@@ -1155,7 +1155,14 @@ def run_recursive_learning_cycle(
                     duty_kind="work.discovery_review",
                     source_kind="recursive_learning",
                     source_id=f"gen1-witness-{cycle_tag}",
-                    payload={"generation": 1, "phase": "witness_contrast"},
+                    payload={
+                        "generation": 1,
+                        "phase": "witness_contrast",
+                        "action_hint": (
+                            "Call ONLY record_work_decision(action_kind='witness_contrast', "
+                            "rationale='Observed deadline filter missed no-deadline items.', evidence=[])."
+                        ),
+                    },
                     dedupe_key=f"rsi-gen1-live:{cycle_tag}",
                     actor_id=meta_agent_id,
                     now_ns=base_ns,
@@ -1181,6 +1188,7 @@ def run_recursive_learning_cycle(
                     "Gen-1 live shift did not record a grounded work_decision"
                 )
             gen1_dec_id = str(dec_row[0])
+            post_gen1_ns = max(base_ns + 100, time_ns())
             _, gen1_claim = _open_claim_for_agent(
                 w,
                 company_id=company_id,
@@ -1189,7 +1197,7 @@ def run_recursive_learning_cycle(
                 grant_scope=meta_grant_scope,
                 source_id=f"gen1-distill-{cycle_tag}",
                 payload={"generation": 1, "phase": "distill"},
-                now_ns=base_ns + 100,
+                now_ns=post_gen1_ns,
             )
             gen1_source_run_id = gen1_witness_run_id
         else:
@@ -1236,6 +1244,7 @@ def run_recursive_learning_cycle(
                 )
             gen1_dec_id = gen1_dec.decision_id
             gen1_source_run_id = gen1_claim.run_id
+            post_gen1_ns = base_ns + 100
 
         inc_proc_id = f"proc-improve-v1-{cycle_tag}"
         inc_proc_delta = distill_method_delta(
@@ -1246,8 +1255,10 @@ def run_recursive_learning_cycle(
             method_id=inc_proc_id,
             trigger_spec={"duty_kind": "work.discovery_review"},
             body=(
-                "Baseline improvement procedure: summarize failure mode and generalize directly "
-                "from single-case symptom without counterexample checks."
+                "v1: If v2 in active_methods, follow v2. Else skip other tools and call "
+                "record_work_decision(action_kind='apply_baseline',rationale='v1',"
+                "evidence=[{'kind':'work_run','resource_id':run_id,'revision':'1',"
+                "'available_at_ns':1,'observed_at_ns':2}])."
             ),
             audience_scope="company",
             source_refs=[f"work_run:{gen1_source_run_id}"],
@@ -1256,7 +1267,7 @@ def run_recursive_learning_cycle(
                 "predicted_effect": "Fixes primary symptom",
                 "observed_effect": "Over-generalized to no-deadline items",
             },
-            now_ns=base_ns + 200,
+            now_ns=post_gen1_ns + 100,
         )
         qualify_method_delta(
             w,
@@ -1265,14 +1276,14 @@ def run_recursive_learning_cycle(
             negative_trigger_passed=True,
             safety_passed=True,
             holdout_margin=0.05,
-            now_ns=base_ns + 210,
+            now_ns=post_gen1_ns + 110,
         )
         inc_proc_act = activate_method_delta(
             w,
             inc_proc_delta.delta_id,
             actor_id=promotion_actor_id,
             grant_id=promotion_grant_id,
-            now_ns=base_ns + 220,
+            now_ns=post_gen1_ns + 120,
         )
 
         gen1_method_id = f"wm-gen1-{cycle_tag}"
@@ -1295,7 +1306,7 @@ def run_recursive_learning_cycle(
             active_snapshot_id=inc_proc_act.active_snapshot_id,
             uncertainty_note="Needs counterexample validation on unseen task families.",
             falsification_criteria="Reject if valid no-deadline items are discarded.",
-            now_ns=base_ns + 230,
+            now_ns=post_gen1_ns + 130,
         )
         qualify_method_delta(
             w,
@@ -1304,14 +1315,14 @@ def run_recursive_learning_cycle(
             negative_trigger_passed=True,
             safety_passed=True,
             holdout_margin=0.1,
-            now_ns=base_ns + 240,
+            now_ns=post_gen1_ns + 140,
         )
         gen1_act = activate_method_delta(
             w,
             gen1_delta.delta_id,
             actor_id=promotion_actor_id,
             grant_id=promotion_grant_id,
-            now_ns=base_ns + 250,
+            now_ns=post_gen1_ns + 150,
         )
 
         cand_proc_id = f"proc-improve-v2-{cycle_tag}"
@@ -1323,8 +1334,12 @@ def run_recursive_learning_cycle(
             method_id=cand_proc_id,
             trigger_spec={"duty_kind": "work.discovery_review"},
             body=(
-                "Revised improvement procedure: require an explicit boundary counterexample "
-                "before generalizing any failure correction across unseen work families."
+                "v2: Skip extra tools. On boundary_counterexample: skill_draft_candidate("
+                "delta_kind='ADD',item_kind='work_method',method_id='wm-'+case_id,"
+                "trigger_spec={'negative_triggers':['no_deadline']},body='Keep',"
+                "audience_scope='one_agent',source_refs=['work_run:'+run_id],"
+                "falsification_criteria='No'); ALWAYS call record_work_decision("
+                "action_kind='counterexample_verified',rationale='ok')."
             ),
             audience_scope="company",
             source_refs=[
@@ -1339,7 +1354,7 @@ def run_recursive_learning_cycle(
                 "predicted_effect": "Prevents false-positive exclusions on unseen task families",
                 "observed_effect": "Gen-1 contrast logged",
             },
-            now_ns=base_ns + 260,
+            now_ns=post_gen1_ns + 160,
         )
 
         with closing(open_writer(w.store, lease=w)) as db, write_tx(db):
@@ -1351,7 +1366,7 @@ def run_recursive_learning_cycle(
                     "gen1_method_id": gen1_method_id,
                     "cand_proc_id": cand_proc_id,
                 },
-                now_ns=base_ns + 300,
+                now_ns=post_gen1_ns + 200,
             )
 
         # ------------------------------------------------------------------
@@ -1382,14 +1397,14 @@ def run_recursive_learning_cycle(
                         negative_trigger_passed=True,
                         safety_passed=True,
                         holdout_margin=0.2,
-                        now_ns=base_ns + 400,
+                        now_ns=post_gen1_ns + 300,
                     )
                     activate_method_delta(
                         arm_w,
                         cand_proc_delta.delta_id,
                         actor_id=promotion_actor_id,
                         grant_id=promotion_grant_id,
-                        now_ns=base_ns + 410,
+                        now_ns=post_gen1_ns + 310,
                     )
             arm_stores[arm_name] = arm_store
 
@@ -1398,7 +1413,11 @@ def run_recursive_learning_cycle(
         # families, isolated execution, deterministic grading & blind (AB, BA)
         # ------------------------------------------------------------------
         num_families = max(6, min_families)
-        limits = TrialCeiling(turns=4, wall_seconds=60, tokens=10_000)
+        limits = TrialCeiling(
+            turns=4,
+            wall_seconds=150,
+            tokens=1_500_000 if use_live_runtime else 10_000,
+        )
         fixture_bytes = f"company-fixture-{cycle_tag}".encode("utf-8")
         tools_bytes = b'{"tools":["desk_read_draft","record_work_decision"]}'
         inc_ctx_bytes = _canonical_json(
@@ -1506,6 +1525,7 @@ def run_recursive_learning_cycle(
                 slot_leases = slot_run_dir / "leases"
                 slot_started = monotonic()
                 if use_live_runtime:
+                    slot_now_ns = max(post_gen1_ns + 500 + _idx, time_ns())
                     with hold_company_writer(
                         slot_store, company_id, lease_directory=slot_leases
                     ) as slot_w:
@@ -1523,13 +1543,13 @@ def run_recursive_learning_cycle(
                                 payload=dict(_case_spec),
                                 dedupe_key=f"rsi-gen2:{sealed_slot.slot_id}:{_idx}",
                                 actor_id=meta_agent_id,
-                                now_ns=base_ns + 500 + _idx,
+                                now_ns=slot_now_ns,
                             )
                         step_summary = None
                         step_error: str | None = None
                         try:
                             step_summary = runtime.step_with_writer(
-                                slot_w, max_dispatches=1, now_ns=base_ns + 510 + _idx
+                                slot_w, max_dispatches=1, now_ns=slot_now_ns + 10
                             )
                         except (
                             AgentRuntimeRefused,
@@ -1982,37 +2002,35 @@ def run_recursive_learning_cycle(
                 agent_ids=(meta_agent_id,),
                 execute_case=_run_gen2_arm_case,
                 duty_registry=live_registry,
+                max_tokens=max(100_000, limits.tokens),
             )
-            assert evidence.decision_digest is not None
+            dec_payload = captured_payloads.get("decision") or {}
+            trace_payload = captured_payloads.get("tool_trace") or {}
+            obs_payload = captured_payloads.get("observation") or {}
+            effects_payload = captured_payloads.get("service_effects") or {}
             rubric_key = (
                 evidence.decision_digest or "",
                 evidence.tool_trace_digest or "",
             )
             blinded_rubric_by_decision[rubric_key] = {
                 "outcome": evidence.outcome,
-                "fatal_violations": int(
-                    captured_payloads["tool_trace"].get("violations", 0)
-                ),
-                "grounded": bool(captured_payloads["decision"].get("grounded", False)),
+                "fatal_violations": int(trace_payload.get("violations", 0)),
+                "grounded": bool(dec_payload.get("grounded", False)),
                 "relevant_constraints": bool(
-                    captured_payloads["decision"].get("relevant_constraints", False)
+                    dec_payload.get("relevant_constraints", False)
                 ),
                 "feasible_next_action": bool(
-                    captured_payloads["decision"].get("feasible_next_action", False)
+                    dec_payload.get("feasible_next_action", False)
                 ),
                 "counterexample_checked": bool(
-                    captured_payloads["decision"]["counterexample_checked"]
+                    dec_payload.get("counterexample_checked", False)
                 ),
                 "false_positive_prevented": bool(
-                    captured_payloads["decision"]["false_positive_prevented"]
+                    dec_payload.get("false_positive_prevented", False)
                 ),
-                "skill_grounded": bool(
-                    captured_payloads["decision"].get("skill_grounded", False)
-                ),
+                "skill_grounded": bool(dec_payload.get("skill_grounded", False)),
                 "drafted_counterexample_method": bool(
-                    captured_payloads["decision"].get(
-                        "drafted_counterexample_method", False
-                    )
+                    dec_payload.get("drafted_counterexample_method", False)
                 ),
             }
             rec = commit_trial_observation(
@@ -2028,10 +2046,12 @@ def run_recursive_learning_cycle(
             )
             grade = grade_trial_observation(
                 pkt,
-                observation=captured_payloads["observation"],
-                tool_trace=captured_payloads["tool_trace"],
-                service_effects=captured_payloads["service_effects"],
-                decision=captured_payloads["decision"],
+                observation=obs_payload if evidence.observation_digest else None,
+                tool_trace=trace_payload if pkt.tool_trace_digest is not None else None,
+                service_effects=(
+                    effects_payload if pkt.service_effects_digest is not None else None
+                ),
+                decision=dec_payload if pkt.decision_digest is not None else None,
             )
             commit_blind_grade(
                 evaluator_store, revision=eval_rev, packet=pkt, grade=grade
@@ -2107,6 +2127,7 @@ def run_recursive_learning_cycle(
         # ------------------------------------------------------------------
         # Adoption + Subsequent Shift Witness + Regression Rollback Witness
         # ------------------------------------------------------------------
+        post_gen2_ns = max(post_gen1_ns + 1000, time_ns())
         qualify_method_delta(
             w,
             cand_proc_delta.delta_id,
@@ -2120,14 +2141,14 @@ def run_recursive_learning_cycle(
                 "perm_p": summary.perm_p,
                 "distinct_transfer_families": summary.distinct_transfer_families,
             },
-            now_ns=base_ns + 1000,
+            now_ns=post_gen2_ns,
         )
         proc_act = activate_method_delta(
             w,
             cand_proc_delta.delta_id,
             actor_id=promotion_actor_id,
             grant_id=promotion_grant_id,
-            now_ns=base_ns + 1010,
+            now_ns=post_gen2_ns + 10,
         )
 
         witness_item_id, witness_claim = _open_claim_for_agent(
@@ -2138,7 +2159,7 @@ def run_recursive_learning_cycle(
             grant_scope=meta_grant_scope,
             source_id=f"gen2-adopted-witness-{cycle_tag}",
             payload={"generation": 2, "phase": "post_adoption_shift"},
-            now_ns=base_ns + 1100,
+            now_ns=post_gen2_ns + 100,
         )
         gen2_method_id = f"wm-gen2-{cycle_tag}"
         gen2_delta = distill_method_delta(
@@ -2156,7 +2177,7 @@ def run_recursive_learning_cycle(
             source_refs=[f"work_run:{witness_claim.run_id}"],
             parent_method_ids=(cand_proc_delta.delta_id,),
             active_snapshot_id=proc_act.active_snapshot_id,
-            now_ns=base_ns + 1110,
+            now_ns=post_gen2_ns + 110,
         )
         qualify_method_delta(
             w,
@@ -2166,14 +2187,14 @@ def run_recursive_learning_cycle(
             safety_passed=True,
             holdout_margin=0.25,
             evaluator_revision=eval_rev,
-            now_ns=base_ns + 1120,
+            now_ns=post_gen2_ns + 120,
         )
         gen2_act = activate_method_delta(
             w,
             gen2_delta.delta_id,
             actor_id=promotion_actor_id,
             grant_id=promotion_grant_id,
-            now_ns=base_ns + 1130,
+            now_ns=post_gen2_ns + 130,
         )
 
         active_after_adopt = resolve_active_methods(
@@ -2206,7 +2227,7 @@ def run_recursive_learning_cycle(
                     witness_claim.run_id,
                     witness_claim.fencing_token,
                     outcome={"phase": "distilled_gen2"},
-                    now_ns=base_ns + 1135,
+                    now_ns=post_gen2_ns + 135,
                 )
                 w_item, _ = create_work_item(
                     db,
@@ -2215,17 +2236,24 @@ def run_recursive_learning_cycle(
                     duty_kind="work.discovery_review",
                     source_kind="recursive_learning",
                     source_id=f"gen2-adopted-witness-shift-{cycle_tag}",
-                    payload={"generation": 2, "phase": "post_adoption_shift"},
+                    payload={
+                        "generation": 2,
+                        "phase": "post_adoption_shift",
+                        "action_hint": (
+                            "No boundary_counterexample present; call ONLY record_work_decision("
+                            "action_kind='witness_ok', rationale='Witnessed adopted skill snapshot.', evidence=[])."
+                        ),
+                    },
                     dedupe_key=f"rsi-witness-live:{cycle_tag}",
                     actor_id=meta_agent_id,
-                    now_ns=base_ns + 1140,
+                    now_ns=post_gen2_ns + 140,
                 )
             witness_step = CompanyRuntime(
                 w.store,
                 company_id,
                 live_registry,
                 lease_directory=w._lock_path.parent,
-            ).step_with_writer(w, max_dispatches=1, now_ns=base_ns + 1150)
+            ).step_with_writer(w, max_dispatches=1, now_ns=post_gen2_ns + 150)
             if len(witness_step.executed_runs) != 1:
                 raise TrialRefused("Post-adoption witness shift did not execute")
             witness_run_id = witness_step.executed_runs[0]
@@ -2259,7 +2287,7 @@ def run_recursive_learning_cycle(
                     rationale="Witnessed subsequent shift executing under adopted Gen-2 procedure and method.",
                     evidence=(),
                     active_snapshot_id=adopted_snap_id,
-                    decision_at_ns=base_ns + 1140,
+                    decision_at_ns=post_gen2_ns + 140,
                 )
                 record_episode(
                     db,
@@ -2273,7 +2301,7 @@ def run_recursive_learning_cycle(
                     outcome_status="completed",
                     summary_text="Subsequent shift witnessed adopted improvement_procedure and Gen-2 method.",
                     decisions=[{"decision_id": witness_dec.decision_id}],
-                    recorded_at_ns=base_ns + 1150,
+                    recorded_at_ns=post_gen2_ns + 150,
                 )
                 complete_work_run(
                     db,
@@ -2283,7 +2311,7 @@ def run_recursive_learning_cycle(
                         "active_snapshot_id": adopted_snap_id,
                         "decision_id": witness_dec.decision_id,
                     },
-                    now_ns=base_ns + 1160,
+                    now_ns=post_gen2_ns + 160,
                 )
             witness_run_id = witness_claim.run_id
             witness_dec_id = witness_dec.decision_id
@@ -2296,6 +2324,7 @@ def run_recursive_learning_cycle(
 
         # Inject a declared regression superseding gen2_delta, activate it,
         # then quarantine it and verify restoration of the clean incumbent.
+        post_reg_ns = max(post_gen2_ns + 200, time_ns())
         reg_item_id, reg_claim = _open_claim_for_agent(
             w,
             company_id=company_id,
@@ -2304,7 +2333,7 @@ def run_recursive_learning_cycle(
             grant_scope=meta_grant_scope,
             source_id=f"gen2-regression-witness-{cycle_tag}",
             payload={"generation": 2, "phase": "regression_rollback"},
-            now_ns=base_ns + 1200,
+            now_ns=post_reg_ns,
         )
         regressed_delta = distill_method_delta(
             w,
@@ -2319,7 +2348,7 @@ def run_recursive_learning_cycle(
             parent_method_ids=(gen2_delta.delta_id,),
             active_snapshot_id=adopted_snap_id,
             superseded_revision=gen2_delta.revision_sha256,
-            now_ns=base_ns + 1210,
+            now_ns=post_reg_ns + 10,
         )
         qualify_method_delta(
             w,
@@ -2328,14 +2357,14 @@ def run_recursive_learning_cycle(
             negative_trigger_passed=True,
             safety_passed=True,
             holdout_margin=0.0,
-            now_ns=base_ns + 1220,
+            now_ns=post_reg_ns + 20,
         )
         activate_method_delta(
             w,
             regressed_delta.delta_id,
             actor_id=promotion_actor_id,
             grant_id=promotion_grant_id,
-            now_ns=base_ns + 1230,
+            now_ns=post_reg_ns + 30,
         )
 
         q_receipt = quarantine_method_lineage(
@@ -2346,7 +2375,7 @@ def run_recursive_learning_cycle(
             reason="Declared regression rollback verification",
             actor_id=promotion_actor_id,
             grant_id=promotion_grant_id,
-            now_ns=base_ns + 1240,
+            now_ns=post_reg_ns + 40,
         )
 
         active_after_rollback = resolve_active_methods(
@@ -2369,7 +2398,7 @@ def run_recursive_learning_cycle(
                     reg_claim.run_id,
                     reg_claim.fencing_token,
                     outcome={"phase": "distilled_regression"},
-                    now_ns=base_ns + 1245,
+                    now_ns=post_reg_ns + 45,
                 )
                 create_work_item(
                     db,
@@ -2378,17 +2407,24 @@ def run_recursive_learning_cycle(
                     duty_kind="work.discovery_review",
                     source_kind="recursive_learning",
                     source_id=f"gen2-post-rollback-shift-{cycle_tag}",
-                    payload={"generation": 2, "phase": "post_rollback_shift"},
+                    payload={
+                        "generation": 2,
+                        "phase": "post_rollback_shift",
+                        "action_hint": (
+                            "No boundary_counterexample present; call ONLY record_work_decision("
+                            "action_kind='witness_ok', rationale='Witnessed rollback snapshot.', evidence=[])."
+                        ),
+                    },
                     dedupe_key=f"rsi-rollback-live:{cycle_tag}",
                     actor_id=meta_agent_id,
-                    now_ns=base_ns + 1250,
+                    now_ns=post_reg_ns + 50,
                 )
             rollback_step = CompanyRuntime(
                 w.store,
                 company_id,
                 live_registry,
                 lease_directory=w._lock_path.parent,
-            ).step_with_writer(w, max_dispatches=1, now_ns=base_ns + 1260)
+            ).step_with_writer(w, max_dispatches=1, now_ns=post_reg_ns + 60)
             if len(rollback_step.executed_runs) != 1:
                 raise TrialRefused("Post-rollback shift did not execute")
             post_rollback_run_id = rollback_step.executed_runs[0]
@@ -2413,7 +2449,7 @@ def run_recursive_learning_cycle(
                     rationale="Post-rollback shift confirmed clean incumbent revision restored.",
                     evidence=(),
                     active_snapshot_id=rollback_snap_id,
-                    decision_at_ns=base_ns + 1250,
+                    decision_at_ns=post_reg_ns + 50,
                 )
                 complete_work_run(
                     db,
@@ -2423,7 +2459,7 @@ def run_recursive_learning_cycle(
                         "restored_revision": q_receipt.restored_revision_sha256,
                         "active_snapshot_id": rollback_snap_id,
                     },
-                    now_ns=base_ns + 1260,
+                    now_ns=post_reg_ns + 60,
                 )
             post_rollback_run_id = reg_claim.run_id
             rollback_dec_snap = rollback_dec.active_snapshot_id

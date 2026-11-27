@@ -464,6 +464,79 @@ class CodexCliBridgeTests(unittest.TestCase):
             self.assertEqual(marker.read_text(encoding="utf-8"), "CUSTOM_CODEX_RAN")
             self.assertEqual(result.output_text, "Saved memo and handled refusal.")
 
+    def test_codex_cli_reasoning_effort_cached_tokens_and_env_override(self) -> None:
+        with self.assertRaisesRegex(AgentRuntimeRefused, "reasoning_effort"):
+            CodexCliAdapter(reasoning_effort="   ")
+
+        cached_script = """\
+import json, os, sys
+args = sys.argv[1:]
+sys.stdin.read()
+mode = open("effort.txt", encoding="utf-8").read().strip()
+if mode == "default":
+    assert 'model_reasoning_effort="low"' in args, args
+elif mode == "none":
+    assert not any("model_reasoning_effort=" in a for a in args), args
+print(json.dumps({"type": "item.completed", "item": {"id": "1", "type": "agent_message", "text": "ok"}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 200, "cached_input_tokens": 128, "output_tokens": 15}}))
+"""
+        with TemporaryDirectory(prefix="sd-codex-cfg-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            store.write_bytes(b"")
+            desk = desk_directory(store, "agent-1")
+            desk.mkdir(parents=True, exist_ok=True)
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+
+            env_codex = root / "env-codex"
+            env_codex.write_text(
+                f"#!{sys.executable}\n{cached_script}",
+                encoding="utf-8",
+            )
+            os.chmod(env_codex, 0o755)
+            profile = AgentProfileBinding(
+                provider=PROVIDER_CODEX_CLI, model="gpt-6-luna", revision="2026-11"
+            )
+            broker = OuterToolBroker(
+                company_id="co-1",
+                agent_id="agent-1",
+                run_id="run-1",
+                fencing_token=4,
+                handlers={},
+            )
+
+            old_env = os.environ.get("SOURDOUGH_CODEX_EXECUTABLE")
+            os.environ["SOURDOUGH_CODEX_EXECUTABLE"] = str(env_codex)
+            try:
+                (desk / "effort.txt").write_text("default", encoding="utf-8")
+                adapter = CodexCliAdapter(
+                    executable=("codex", "exec", "--json"),
+                    codex_home=codex_home,
+                )
+                res = adapter.run_shift(
+                    profile, self._make_request(desk, store), broker
+                )
+                self.assertEqual(res.usage, TokenUsage(200, 15, 128))
+                usage_events = [ev for ev in res.events if ev.kind == "usage"]
+                self.assertEqual(usage_events[0].payload["cached_input_tokens"], 128)
+
+                (desk / "effort.txt").write_text("none", encoding="utf-8")
+                adapter_none = CodexCliAdapter(
+                    executable=("codex", "exec", "--json"),
+                    codex_home=codex_home,
+                    reasoning_effort=None,
+                )
+                res_none = adapter_none.run_shift(
+                    profile, self._make_request(desk, store), broker
+                )
+                self.assertEqual(res_none.usage.cached_input_tokens, 128)
+            finally:
+                if old_env is None:
+                    os.environ.pop("SOURDOUGH_CODEX_EXECUTABLE", None)
+                else:
+                    os.environ["SOURDOUGH_CODEX_EXECUTABLE"] = old_env
+
 
 if __name__ == "__main__":
     unittest.main()
