@@ -379,10 +379,10 @@ class CodexCliBridgeTests(unittest.TestCase):
                     db,
                     company_id=founding.company_id,
                     owner_agent_id=founding.founder_id,
-                    duty_kind="ceo.respond_message",
+                    duty_kind="work.assessment_review",
                     source_kind="manual",
                     source_id="codex-gl-1",
-                    payload={"message_id": "m-gl-1", "body": "Hi"},
+                    payload={"note": "Check GL settlement"},
                     now_ns=100,
                 )
 

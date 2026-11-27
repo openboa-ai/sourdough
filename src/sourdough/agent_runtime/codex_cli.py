@@ -294,6 +294,7 @@ class CodexCliAdapter:
                 cwd = str(request.desk_path)
                 env["HOME"] = str(request.desk_path)
             else:
+                cwd = str(sock_dir)
                 env["HOME"] = str(sock_dir)
 
             # Never inject resolved credential_handle_ref secrets (e.g., SOURDOUGH_CLI_AUTH_TOKEN)

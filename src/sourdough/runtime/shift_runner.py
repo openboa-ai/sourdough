@@ -320,21 +320,24 @@ class ShiftRunner:
             limits=PRODUCTION_DESK_LIMITS,
         )
 
-        _, drafts = resolve_desk(
-            ctx.writer,
-            claim,
-            claim.purpose,
-            include_drafts=True,
-            limits=PRODUCTION_DESK_LIMITS,
-        )
-        desk_manifest = tuple(
-            {
-                "name": d.name,
-                "revision": d.revision,
-                "bytes": len(d.content.encode("utf-8")),
-            }
-            for d in drafts
-        )
+        if include_core_desk_tools:
+            _, drafts = resolve_desk(
+                ctx.writer,
+                claim,
+                claim.purpose,
+                include_drafts=True,
+                limits=PRODUCTION_DESK_LIMITS,
+            )
+            desk_manifest = tuple(
+                {
+                    "name": d.name,
+                    "revision": d.revision,
+                    "bytes": len(d.content.encode("utf-8")),
+                }
+                for d in drafts
+            )
+        else:
+            desk_manifest = ()
 
         with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
             recent_eps = list_recent_episodes(db, ctx.company_id, agent_id, limit=5)
@@ -409,6 +412,13 @@ class ShiftRunner:
                 ctx.work_item.duty_kind,
             )
         active_methods = _normalize_method_dicts(raw_active_methods)
+        if not include_core_desk_tools:
+            active_methods = tuple(
+                m for m in active_methods if m.get("audience_scope") != "one_agent"
+            )
+            active_snapshot_id = (
+                compute_active_snapshot_id(active_methods) if active_methods else None
+            )
         slug_map = assign_skill_slugs(
             [
                 *(m.method_id for m in all_agent_methods),
@@ -437,7 +447,11 @@ class ShiftRunner:
             active_snapshot_id=compute_active_snapshot_id(all_agent_methods),
         )
 
-        available_method_ids: list[str] = [m.method_id for m in all_agent_methods]
+        available_method_ids: list[str] = [
+            m.method_id
+            for m in all_agent_methods
+            if include_core_desk_tools or m.audience_scope != "one_agent"
+        ]
         for m in active_methods:
             mid = m.get("method_id")
             if isinstance(mid, str) and mid not in available_method_ids:
@@ -603,7 +617,7 @@ class ShiftRunner:
             budget_ceiling_minor_units=budget_ceiling,
             max_tool_calls=max_tool_calls,
             timeout_seconds=eff_timeout_seconds,
-            desk_path=desk,
+            desk_path=desk if include_core_desk_tools else None,
             store_path=ctx.writer.store,
         )
         stable_prefix_sha256 = compute_stable_prefix_sha256(shift_req)

@@ -1983,6 +1983,45 @@ def activate_method_delta(
             )
         eff_qual_id = str(q_row[0])
 
+        if delta.delta_kind != "DEPRECATE" and delta.audience_scope in (
+            "project",
+            "company",
+        ):
+            if delta.audience_scope == "project":
+                if not delta.audience_target_id:
+                    raise MethodRefused(
+                        "Project-scoped delta requires audience_target_id"
+                    )
+                proj_row = db.execute(
+                    "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
+                    (company_id, delta.audience_target_id),
+                ).fetchone()
+                try:
+                    raw_members = json.loads(str(proj_row[0])) if proj_row else []
+                except json.JSONDecodeError:
+                    raw_members = []
+                target_agents = [
+                    str(m)
+                    for m in raw_members
+                    if isinstance(m, str) and employment_cutoff(db, m) is None
+                ]
+            else:
+                target_agents = [
+                    str(r[0])
+                    for r in db.execute(
+                        "SELECT id FROM agent WHERE company_id = ?", (company_id,)
+                    ).fetchall()
+                    if employment_cutoff(db, str(r[0])) is None
+                ]
+            for target_agent in target_agents:
+                if not _agent_authorized_for_delta_sources(
+                    db, company_id, target_agent, delta
+                ):
+                    raise MethodRefused(
+                        f"Audience member '{target_agent}' is not authorized to read all cited "
+                        f"shared_publication sources for '{delta.method_id}'"
+                    )
+
         req_id = request_id or f"mact-{uuid4().hex[:16]}"
         seq_row = db.execute(
             "SELECT COALESCE(MAX(activation_seq), 0) FROM method_activation WHERE company_id = ?",
@@ -2536,6 +2575,116 @@ def quarantine_method_lineage(
     raise MethodRefused("Expected WriterLease or sqlite3.Connection")
 
 
+def _collect_transitive_shared_publication_ids(
+    db: sqlite3.Connection,
+    company_id: str,
+    delta: MethodDelta,
+) -> set[str] | None:
+    """Collect all shared_publication asset IDs cited directly or via ancestor method_deltas."""
+    asset_ids: set[str] = set()
+    visited: set[tuple[str, str]] = {(delta.method_id, delta.revision_sha256)}
+    queue: list[MethodDelta] = [delta]
+
+    def _enqueue_parent_ref(raw: str) -> None:
+        ref = raw.strip()
+        if not ref:
+            return
+        for sep in (":", "@"):
+            if sep in ref:
+                pm, pr = ref.rsplit(sep, 1)
+                if _SHA256_RE.fullmatch(pr):
+                    key = (pm, pr)
+                    if key in visited:
+                        return
+                    row = db.execute(
+                        f"""SELECT {_DELTA_COLUMNS}
+                            FROM method_delta
+                            WHERE company_id = ? AND method_id = ? AND revision_sha256 = ?""",
+                        (company_id, pm, pr),
+                    ).fetchone()
+                    if row is not None:
+                        visited.add(key)
+                        queue.append(_row_to_delta(row))
+                    return
+        # Revisionless parent reference: check all revisions of that method_id in this company.
+        for row in db.execute(
+            f"""SELECT {_DELTA_COLUMNS}
+                FROM method_delta
+                WHERE company_id = ? AND method_id = ?""",
+            (company_id, ref),
+        ).fetchall():
+            parent_delta = _row_to_delta(row)
+            key = (parent_delta.method_id, parent_delta.revision_sha256)
+            if key not in visited:
+                visited.add(key)
+                queue.append(parent_delta)
+
+    while queue:
+        cur = queue.pop(0)
+        for raw_ref in cur.source_refs:
+            if not isinstance(raw_ref, str) or ":" not in raw_ref:
+                continue
+            kind, ident = raw_ref.strip().split(":", 1)
+            if kind == "shared_publication":
+                asset_id = ident.split("@", 1)[0].strip()
+                if not asset_id:
+                    return None
+                asset_ids.add(asset_id)
+            elif kind == "method_delta":
+                _enqueue_parent_ref(ident)
+        for parent_ref in cur.parent_method_ids:
+            if isinstance(parent_ref, str):
+                _enqueue_parent_ref(parent_ref)
+    return asset_ids
+
+
+def _agent_authorized_for_delta_sources(
+    db: sqlite3.Connection,
+    company_id: str,
+    agent_id: str,
+    delta: MethodDelta,
+) -> bool:
+    """Revalidate recipient access to all directly or transitively cited shared publications."""
+    if delta.audience_scope not in ("project", "company"):
+        return True
+    asset_ids = _collect_transitive_shared_publication_ids(db, company_id, delta)
+    if asset_ids is None:
+        return False
+    for asset_id in asset_ids:
+        pub_row = db.execute(
+            """SELECT company_id, project_id, audience
+               FROM shared_publication
+               WHERE asset_id = ?""",
+            (asset_id,),
+        ).fetchone()
+        if pub_row is None:
+            return False
+        pub_co, pub_proj, aud_json = pub_row
+        if str(pub_co) != company_id:
+            return False
+        try:
+            audience = set(json.loads(str(aud_json)))
+        except json.JSONDecodeError:
+            audience = set()
+        proj_row = db.execute(
+            "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
+            (company_id, str(pub_proj)),
+        ).fetchone()
+        try:
+            members = set(json.loads(str(proj_row[0]))) if proj_row else set()
+        except json.JSONDecodeError:
+            members = set()
+        if agent_id not in audience or agent_id not in members:
+            return False
+        if (
+            delta.audience_scope == "project"
+            and delta.audience_target_id is not None
+            and str(pub_proj) != delta.audience_target_id
+        ):
+            return False
+    return True
+
+
 def _trigger_matches_duty(
     trigger_spec: Mapping[str, Any], duty_kind: str | None
 ) -> bool:
@@ -2611,6 +2760,9 @@ def _resolve_active_methods_on_db(
             if delta.audience_target_id != agent_id:
                 continue
         else:
+            continue
+
+        if not _agent_authorized_for_delta_sources(db, company_id, agent_id, delta):
             continue
 
         if q_nodes and _has_quarantined_ancestor(

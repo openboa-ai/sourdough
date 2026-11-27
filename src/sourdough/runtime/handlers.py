@@ -396,7 +396,7 @@ def build_production_duty_registry(
             base_tools=_CEO_READONLY_TOOLS,
             base_handlers=base_handlers,
             history_notes=history_notes,
-            include_core_desk_tools=True,
+            include_core_desk_tools=False,
             include_plugin_tools=True,
         )
         result = run_res.shift_result

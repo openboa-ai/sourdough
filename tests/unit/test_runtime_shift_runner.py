@@ -682,15 +682,17 @@ class RuntimeShiftRunnerTests(unittest.TestCase):
                 bind_board_principal(
                     writer, principal_id="board-1", role_name=BOARD_CONTROL_ROLE
                 )
-                post_ceo_message(
-                    writer,
-                    command_id="cmd-ceo-1",
-                    target_agent_id=founding.founder_id,
-                    charter_revision="charter-v1",
-                    body="Draft a board memo.",
-                    principal_hint="board-1",
-                )
-                sync_board_triggers(writer, founding.company_id)
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    create_work_item(
+                        db,
+                        company_id=founding.company_id,
+                        owner_agent_id=founding.founder_id,
+                        duty_kind="work.assessment_review",
+                        source_kind="manual",
+                        source_id="cmd-ceo-1",
+                        payload={"note": "Draft a board memo."},
+                        now_ns=5_000,
+                    )
 
             adapter_registry = build_default_adapter_registry(
                 secret_resolver=self.resolver,
@@ -1119,7 +1121,7 @@ class RuntimeShiftRunnerTests(unittest.TestCase):
                             "resp-cmd-unlock",
                             founding.company_id,
                             founding.founder_id,
-                            "ceo.respond_message",
+                            "work.assessment_review",
                             "Run local sandbox checks",
                             json.dumps({"grants": ["desk:exec"]}),
                         ),
@@ -1128,10 +1130,10 @@ class RuntimeShiftRunnerTests(unittest.TestCase):
                         db,
                         company_id=founding.company_id,
                         owner_agent_id=founding.founder_id,
-                        duty_kind="ceo.respond_message",
+                        duty_kind="work.assessment_review",
                         source_kind="manual",
                         source_id="cmd-unlock-1",
-                        payload={"message_id": "m-cmd-unlock", "body": "Run check"},
+                        payload={"note": "Run check"},
                         now_ns=200,
                     )
 
@@ -1309,10 +1311,10 @@ class RuntimeShiftRunnerTests(unittest.TestCase):
                         db,
                         company_id=founding.company_id,
                         owner_agent_id=founding.founder_id,
-                        duty_kind="ceo.respond_message",
-                        source_kind="board",
+                        duty_kind="work.assessment_review",
+                        source_kind="manual",
                         source_id="crash-msg-1",
-                        payload={"message_id": "m-crash", "body": "Publish brief"},
+                        payload={"note": "Publish brief"},
                         now_ns=1_000,
                     )
                     run1 = claim_work_run(
