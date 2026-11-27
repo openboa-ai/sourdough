@@ -146,9 +146,13 @@ def build_core_proactive_tool_contribution(
             write_tx(db),
         ):
             _verify_fencing_and_desk(db)
-            if resp_id is None and item_id is None:
-                # Prefer binding omitted owner fields to the work item's active standing
-                # responsibility so discovery/dreaming timers stay under responsibility budgets.
+            if resp_id is None and item_id is not None and item_id != claim.duty_id:
+                raise WorkKernelRefused(
+                    "set_condition may only link the current work item or an active standing responsibility"
+                )
+            if resp_id is None and (item_id is None or item_id == claim.duty_id):
+                # Prefer binding to the work item's active standing responsibility so
+                # discovery/dreaming timers cannot escape responsibility budgets/cooldowns.
                 wi_row = db.execute(
                     """SELECT payload_json FROM work_items
                        WHERE company_id = ? AND work_item_id = ?""",
@@ -176,6 +180,7 @@ def build_core_proactive_tool_contribution(
                             inferred_resp = cand_resp.strip()
                 if inferred_resp is not None:
                     resp_id = inferred_resp
+                    item_id = None
                 else:
                     item_id = claim.duty_id
             cond = set_condition(
@@ -421,6 +426,10 @@ def build_core_proactive_tool_contribution(
             write_tx(db),
         ):
             _verify_fencing_and_desk(db)
+            if resp_id is None and item_id is not None and item_id != claim.duty_id:
+                raise WorkKernelRefused(
+                    "arm_result_continuation may only link the current work item or an active standing responsibility"
+                )
             cond = arm_result_continuation(
                 db,
                 company_id=claim.company_id,

@@ -424,7 +424,11 @@ class ProactiveActivationTests(unittest.TestCase):
                     ).fetchone()[0]
                 )
                 self.assertEqual(coalesced_payload["observed_revision"], "r3")
-                self.assertEqual(len(coalesced_payload["coalesced_revisions"]), 1)
+                self.assertEqual(len(coalesced_payload["coalesced_revisions"]), 2)
+                self.assertEqual(
+                    coalesced_payload["coalesced_revisions"][-1]["observed_revision"],
+                    "r3",
+                )
 
                 # Settle item 1, then Fire 2 at t=20_000 admits item 2 and marks condition triggered
                 r1 = claim_work_run(

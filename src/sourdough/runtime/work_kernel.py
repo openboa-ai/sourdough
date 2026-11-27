@@ -1747,6 +1747,35 @@ def _arm_next_condition(
         next_condition=next_condition,
         always_link_work_item=always_link_work_item,
     )
+    if resp_arg is None and item_arg is not None:
+        wi_row = connection.execute(
+            """SELECT duty_kind, payload_json FROM work_items
+               WHERE company_id = ? AND work_item_id = ?""",
+            (company_id, item_arg),
+        ).fetchone()
+        if wi_row is not None and str(wi_row[0]) in (
+            "work.discovery_review",
+            "work.dreaming",
+        ):
+            try:
+                wi_payload = json.loads(str(wi_row[1]))
+            except json.JSONDecodeError:
+                wi_payload = {}
+            cand_resp = (
+                wi_payload.get("responsibility_id")
+                if isinstance(wi_payload, dict)
+                else None
+            )
+            if isinstance(cand_resp, str) and cand_resp.strip():
+                r_row = connection.execute(
+                    """SELECT 1 FROM work_responsibilities
+                       WHERE company_id = ? AND responsibility_id = ?
+                         AND owner_agent_id = ? AND status = 'active'""",
+                    (company_id, cand_resp.strip(), owner_agent_id),
+                ).fetchone()
+                if r_row is not None:
+                    resp_arg = cand_resp.strip()
+                    item_arg = None
     return set_condition(
         connection,
         company_id=company_id,
@@ -1997,9 +2026,18 @@ def _insert_work_condition(
     condition_id: str | None = None,
     now_ns: int | None = None,
     require_parent_link: bool = True,
+    allow_reserved_source: bool = False,
 ) -> WorkCondition:
     """Internal helper to validate and insert a work_conditions row."""
     _require_agent(connection, company_id, owner_agent_id)
+    if (
+        not allow_reserved_source
+        and isinstance(source_identity, str)
+        and source_identity.startswith("result_dep:")
+    ):
+        raise WorkKernelRefused(
+            "Reserved source_identity prefix 'result_dep:' may only be armed via arm_result_continuation"
+        )
     if type(condition_revision) is not int or condition_revision < 1:
         raise WorkKernelRefused("condition_revision must be a positive integer")
     if type(cooldown_ns) is not int or cooldown_ns < 0:
@@ -2069,7 +2107,7 @@ def _insert_work_condition(
                 """SELECT 1 FROM work_conditions
                    WHERE company_id = ? AND owner_agent_id = ?
                      AND work_item_id = ? AND responsibility_id IS NULL
-                     AND status = 'armed'
+                     AND status IN ('armed', 'triggered')
                      AND trigger_kind != 'peer_response'
                      AND (source_identity IS NULL OR source_identity NOT LIKE 'result_dep:%')
                    LIMIT 1""",
@@ -2187,6 +2225,15 @@ def arm_result_continuation(
     _require_nonempty(dependency_asset_id, "dependency_asset_id")
     if type(due_at_ns) is not int or due_at_ns < 0:
         raise WorkKernelRefused("due_at_ns must be a nonnegative integer")
+    if (
+        _is_authorized_for_shared_publication(
+            connection, company_id, owner_agent_id, dependency_asset_id
+        )
+        is False
+    ):
+        raise WorkKernelRefused(
+            "Agent is not authorized to watch dependency shared_publication"
+        )
     cid = condition_id or uuid4().hex
     return _insert_work_condition(
         connection,
@@ -2202,6 +2249,7 @@ def arm_result_continuation(
         condition_id=cid,
         now_ns=now_ns,
         require_parent_link=False,
+        allow_reserved_source=True,
     )
 
 
@@ -2440,6 +2488,71 @@ def drain_work_event_cursor(
         events_processed=len(batch_rows),
         has_more=has_more,
     )
+
+
+def _coalesce_open_condition_payload(
+    open_payload: dict[str, Any],
+    *,
+    condition_id: str,
+    condition_revision: int,
+    trigger_kind: str,
+    source_identity: str | None,
+    observed_revision: str | None,
+    responsibility_id: str | None = None,
+) -> dict[str, Any]:
+    """Preserve prior trigger(s) and append the incoming trigger when coalescing onto an open item."""
+    raw_coalesced = open_payload.get("coalesced_revisions")
+    coalesced: list[dict[str, Any]] = (
+        [entry for entry in raw_coalesced if isinstance(entry, dict)]
+        if isinstance(raw_coalesced, list)
+        else []
+    )
+    existing_cond_id = open_payload.get("condition_id")
+    existing_source = open_payload.get("source_identity")
+    existing_rev = open_payload.get("observed_revision")
+    if not coalesced and (
+        existing_cond_id is not None
+        or existing_source is not None
+        or existing_rev is not None
+    ):
+        coalesced.append(
+            {
+                "condition_id": existing_cond_id,
+                "condition_revision": open_payload.get("condition_revision"),
+                "trigger_kind": open_payload.get("trigger_kind"),
+                "source_identity": existing_source,
+                "observed_revision": existing_rev,
+            }
+        )
+    coalesced.append(
+        {
+            "condition_id": condition_id,
+            "condition_revision": int(condition_revision),
+            "trigger_kind": trigger_kind,
+            "source_identity": source_identity,
+            "observed_revision": observed_revision,
+        }
+    )
+    if len(coalesced) > 32:
+        deduped: list[dict[str, Any]] = []
+        seen_keys: set[tuple[Any, Any]] = set()
+        for entry in reversed(coalesced):
+            key = (entry.get("condition_id"), entry.get("source_identity"))
+            if key not in seen_keys:
+                seen_keys.add(key)
+                deduped.append(entry)
+        deduped.reverse()
+        coalesced = deduped[-32:]
+
+    open_payload["condition_id"] = condition_id
+    open_payload["condition_revision"] = int(condition_revision)
+    if responsibility_id is not None:
+        open_payload["responsibility_id"] = responsibility_id
+    open_payload["trigger_kind"] = trigger_kind
+    open_payload["source_identity"] = source_identity
+    open_payload["observed_revision"] = observed_revision
+    open_payload["coalesced_revisions"] = coalesced
+    return open_payload
 
 
 def _read_discovery_window(
@@ -2832,13 +2945,16 @@ def evaluate_conditions(
         elif trigger_kind == "peer_response" and source_identity:
             req_id = str(source_identity).removeprefix("peer_response:")
             peer_row = connection.execute(
-                """SELECT state, recipient_agent_id FROM work_peer_requests
+                """SELECT state, requester_agent_id, recipient_agent_id FROM work_peer_requests
                    WHERE company_id = ? AND request_id = ?""",
                 (company_id, req_id),
             ).fetchone()
             if peer_row is not None and str(peer_row[0]) != "open":
                 res_state = str(peer_row[0])
-                persisted_responder = str(peer_row[1])
+                persisted_requester = str(peer_row[1])
+                persisted_responder = str(peer_row[2])
+                if owner_agent_id != persisted_requester:
+                    continue  # only the originating requester may wake on peer_response
                 if res_state in ("answered", "declined") and (
                     owner_agent_id == persisted_responder
                     or triggering_actor_id == owner_agent_id
@@ -2856,15 +2972,30 @@ def evaluate_conditions(
         if not eligible:
             continue
 
-        # Deduplicate strictly by (company_id, source_identity, condition_revision),
-        # scoping shared_asset_revision and peer_response by condition_id so multiple
-        # watchers on the same revision never collide.
-        if trigger_kind in ("shared_asset_revision", "peer_response"):
+        # Deduplicate strictly by (company_id, source_identity, condition_revision).
+        # Scope shared_asset_revision by condition_id so multiple watchers never collide;
+        # scope peer_response and result_dep per (owner_agent_id, target) to prevent
+        # duplicate-condition wake amplification on already-resolved records.
+        if trigger_kind == "shared_asset_revision":
             dedupe_source = (
                 f"{cid}:{source_identity}@{matched_revision}"
                 if matched_revision is not None
                 else f"{cid}:{source_identity}"
             )
+        elif trigger_kind == "peer_response":
+            peer_target = str(source_identity or "").removeprefix("peer_response:")
+            dedupe_source = (
+                f"peer_response:{owner_agent_id}:{peer_target}@{matched_revision}"
+                if matched_revision is not None
+                else f"peer_response:{owner_agent_id}:{peer_target}"
+            )
+        elif (
+            trigger_kind == "timer"
+            and isinstance(source_identity, str)
+            and source_identity.startswith("result_dep:")
+            and matched_revision is not None
+        ):
+            dedupe_source = f"result_dep:{owner_agent_id}:{matched_revision}"
         else:
             dedupe_source = (
                 f"{source_identity}@{matched_revision}"
@@ -2958,7 +3089,6 @@ def evaluate_conditions(
                      AND duty_kind = ?
                      AND state IN ('due', 'scheduled', 'running')
                      AND json_extract(payload_json, '$.responsibility_id') IS NULL
-                     AND source_kind = 'condition'
                    ORDER BY created_at_ns ASC, work_item_id ASC
                    LIMIT 1""",
                 (company_id, owner_agent_id, duty_kind),
@@ -2972,23 +3102,14 @@ def evaluate_conditions(
                         open_payload = {}
                     if not isinstance(open_payload, dict):
                         open_payload = {}
-                    coalesced = open_payload.get("coalesced_revisions")
-                    if not isinstance(coalesced, list):
-                        coalesced = []
-                    coalesced.append(
-                        {
-                            "condition_id": cid,
-                            "condition_revision": int(cond_rev),
-                            "source_identity": source_identity,
-                            "observed_revision": matched_revision,
-                        }
+                    open_payload = _coalesce_open_condition_payload(
+                        open_payload,
+                        condition_id=cid,
+                        condition_revision=int(cond_rev),
+                        trigger_kind=trigger_kind,
+                        source_identity=source_identity,
+                        observed_revision=matched_revision,
                     )
-                    open_payload["condition_id"] = cid
-                    open_payload["condition_revision"] = int(cond_rev)
-                    open_payload["trigger_kind"] = trigger_kind
-                    open_payload["source_identity"] = source_identity
-                    open_payload["observed_revision"] = matched_revision
-                    open_payload["coalesced_revisions"] = coalesced[-32:]
                     connection.execute(
                         """UPDATE work_items
                            SET payload_json = ?, updated_at_ns = ?
@@ -3059,24 +3180,15 @@ def evaluate_conditions(
                         open_payload = {}
                     if not isinstance(open_payload, dict):
                         open_payload = {}
-                    coalesced = open_payload.get("coalesced_revisions")
-                    if not isinstance(coalesced, list):
-                        coalesced = []
-                    coalesced.append(
-                        {
-                            "condition_id": cid,
-                            "condition_revision": int(cond_rev),
-                            "source_identity": source_identity,
-                            "observed_revision": matched_revision,
-                        }
+                    open_payload = _coalesce_open_condition_payload(
+                        open_payload,
+                        condition_id=cid,
+                        condition_revision=int(cond_rev),
+                        trigger_kind=trigger_kind,
+                        source_identity=source_identity,
+                        observed_revision=matched_revision,
+                        responsibility_id=resp_id,
                     )
-                    open_payload["condition_id"] = cid
-                    open_payload["condition_revision"] = int(cond_rev)
-                    open_payload["responsibility_id"] = resp_id
-                    open_payload["trigger_kind"] = trigger_kind
-                    open_payload["source_identity"] = source_identity
-                    open_payload["observed_revision"] = matched_revision
-                    open_payload["coalesced_revisions"] = coalesced[-32:]
                     connection.execute(
                         """UPDATE work_items
                            SET payload_json = ?, updated_at_ns = ?

@@ -684,7 +684,10 @@ def run_isolated_trial_slot(
                     actor_id=actor_id,
                     now_ns=max(1, time_ns()),
                 )
-        step_summary = runtime.step(max_dispatches=min(slot.limits.turns, 1))
+        step_summary = runtime.step(
+            max_dispatches=min(slot.limits.turns, 1),
+            target_work_item_id=trial_item.work_item_id,
+        )
         exec_runs = tuple(step_summary.executed_runs)
         with closing(open_reader(run_store)) as ro_db, read_tx(ro_db):
             settled_count = int(
@@ -1382,7 +1385,7 @@ def run_recursive_learning_cycle(
         if use_live_runtime:
             assert live_registry is not None
             with closing(open_writer(w.store, lease=w)) as db, write_tx(db):
-                create_work_item(
+                gen1_item, _ = create_work_item(
                     db,
                     company_id=company_id,
                     owner_agent_id=meta_agent_id,
@@ -1406,7 +1409,12 @@ def run_recursive_learning_cycle(
                 company_id,
                 live_registry,
                 lease_directory=w._lock_path.parent,
-            ).step_with_writer(w, max_dispatches=1, now_ns=base_ns + 50)
+            ).step_with_writer(
+                w,
+                max_dispatches=1,
+                now_ns=base_ns + 50,
+                target_work_item_id=gen1_item.work_item_id,
+            )
             if len(gen1_step.executed_runs) != 1:
                 raise TrialRefused("Gen-1 live shift did not execute")
             gen1_witness_run_id = gen1_step.executed_runs[0]
@@ -2672,7 +2680,12 @@ def run_recursive_learning_cycle(
                 company_id,
                 live_registry,
                 lease_directory=w._lock_path.parent,
-            ).step_with_writer(w, max_dispatches=1, now_ns=post_gen2_ns + 150)
+            ).step_with_writer(
+                w,
+                max_dispatches=1,
+                now_ns=post_gen2_ns + 150,
+                target_work_item_id=w_item.work_item_id,
+            )
             if len(witness_step.executed_runs) != 1:
                 raise TrialRefused("Post-adoption witness shift did not execute")
             witness_run_id = witness_step.executed_runs[0]
@@ -2819,7 +2832,7 @@ def run_recursive_learning_cycle(
                     outcome={"phase": "distilled_regression"},
                     now_ns=post_reg_ns + 45,
                 )
-                create_work_item(
+                rollback_item, _ = create_work_item(
                     db,
                     company_id=company_id,
                     owner_agent_id=meta_agent_id,
@@ -2843,7 +2856,12 @@ def run_recursive_learning_cycle(
                 company_id,
                 live_registry,
                 lease_directory=w._lock_path.parent,
-            ).step_with_writer(w, max_dispatches=1, now_ns=post_reg_ns + 60)
+            ).step_with_writer(
+                w,
+                max_dispatches=1,
+                now_ns=post_reg_ns + 60,
+                target_work_item_id=rollback_item.work_item_id,
+            )
             if len(rollback_step.executed_runs) != 1:
                 raise TrialRefused("Post-rollback shift did not execute")
             post_rollback_run_id = rollback_step.executed_runs[0]

@@ -6799,6 +6799,607 @@ class TestM5Tier5Hardening(unittest.TestCase):
                 admitted_over = evaluate_conditions(db, self.company_id, now_ns=4_500)
                 self.assertEqual(admitted_over, ())
 
+    def test_pr191_r14_isolated_trial_dispatches_only_new_trial_item_ignoring_pending_cloned_work(
+        self,
+    ) -> None:
+        """PR #191 R14 P2: Isolated trial dispatch executes ONLY the new trial_item, ignoring older pending cloned work."""
+        from sourdough.runtime.registry import DutyDescriptor, DutyRegistry
+        from sourdough.trial_execution import TrialWorkerInput
+        from sourdough.trial_registry import (
+            TrialCeiling,
+            TrialInputs,
+            TrialSlot,
+            TrialSuite,
+            seal_trial_suite,
+        )
+        from sourdough.trial_runner import (
+            _compute_source_store_fixture,
+            run_isolated_trial_slot,
+        )
+
+        # Seed source_store with an older pending ('due') work.discovery_review item
+        # AND an armed due timer condition before cloning into the isolated trial.
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                old_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="older-pending-work",
+                    payload={"historical": True},
+                    now_ns=1_000,
+                )
+                old_cond = set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    work_item_id=old_item.work_item_id,
+                    trigger_kind="timer",
+                    due_at_ns=500,
+                    now_ns=1_000,
+                )
+
+        eval_store = self.root / "evals_r14" / "evaluator.sqlite"
+        eval_store.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fixture_bytes, profiles, _founder = _compute_source_store_fixture(
+            self.store, self.company_id
+        )
+        case_bytes = b'{"case":"r14-target-item"}'
+        ctx_bytes = b'{"arm":"base"}'
+        tools_bytes = b'{"tools":[]}'
+        limits = TrialCeiling(turns=1, wall_seconds=30, tokens=2_000)
+        sealed_inputs = TrialInputs(
+            company_fixture=sha256(fixture_bytes).hexdigest(),
+            case_inputs=sha256(case_bytes).hexdigest(),
+            worker_context=sha256(ctx_bytes).hexdigest(),
+            tools=sha256(tools_bytes).hexdigest(),
+            runtime_profile=profiles[self.founder_id],
+        )
+        suite = TrialSuite(
+            suite_id="r14-trial-target",
+            purpose="judgment",
+            rubric_digest=sha256(b"r").hexdigest(),
+            evaluator_digest=sha256(b"e").hexdigest(),
+            analysis_plan_digest=sha256(b"p").hexdigest(),
+            slots=(TrialSlot("s1", "c1", "f1", sealed_inputs, limits),),
+        )
+        rev = seal_trial_suite(eval_store, suite)
+
+        dispatched: list[tuple[str, str]] = []
+
+        def _record_handler(ctx) -> DutyOutcome:
+            dispatched.append((ctx.work_item.work_item_id, ctx.work_item.source_kind))
+            with (
+                closing(open_writer(ctx.writer.store, lease=ctx.writer)) as db,
+                write_tx(db),
+            ):
+                record_work_decision(
+                    db,
+                    company_id=ctx.company_id,
+                    work_item_id=ctx.work_item.work_item_id,
+                    run_id=ctx.run.run_id,
+                    fencing_token=ctx.run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Executed targeted trial item cleanly.",
+                    evidence=(),
+                    decision_at_ns=ctx.now_ns,
+                )
+            return DutyOutcome(disposition="settled", result={"ok": True})
+
+        reg = DutyRegistry()
+        reg.register(
+            DutyDescriptor(
+                duty_kind="work.discovery_review",
+                execute=_record_handler,
+            )
+        )
+        trial_root = self.root / "trials_r14"
+        ev = run_isolated_trial_slot(
+            eval_store,
+            revision=rev,
+            slot_id="s1",
+            run_id="r14-target-run",
+            trial_root=trial_root,
+            source_store=self.store,
+            company_id=self.company_id,
+            agent_ids=(self.founder_id,),
+            worker_input=TrialWorkerInput(case_bytes, ctx_bytes, tools_bytes, limits),
+            duty_registry=reg,
+        )
+        self.assertEqual(ev.outcome, "completed")
+        self.assertEqual(len(dispatched), 1)
+        self.assertNotEqual(dispatched[0][0], old_item.work_item_id)
+        self.assertEqual(dispatched[0][1], "offline_trial")
+
+        cloned_store = trial_root / "trial-r14-target-run" / "company.sqlite"
+        with closing(open_reader(cloned_store)) as ro_db, read_tx(ro_db):
+            old_state = ro_db.execute(
+                "SELECT state FROM work_items WHERE work_item_id = ?",
+                (old_item.work_item_id,),
+            ).fetchone()[0]
+            cond_status = ro_db.execute(
+                "SELECT status FROM work_conditions WHERE condition_id = ?",
+                (old_cond.condition_id,),
+            ).fetchone()[0]
+        self.assertEqual(old_state, "due")
+        self.assertEqual(cond_status, "armed")
+
+    def test_pr191_r14_coalescing_different_watched_assets_retains_original_trigger_and_hydrates_both(
+        self,
+    ) -> None:
+        """PR #191 R14 P2: Coalescing different watched publications retains original trigger and hydrates all sources."""
+        with hold_company_writer(self.store, self.company_id) as w:
+            peer_id, peer_grant = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="pub-peer-r14",
+                profile_id=self.profile.profile_id(),
+            )
+            proj_rev = assign_project(
+                w,
+                self.grant_id,
+                "proj-r14-coalesce",
+                (self.founder_id, peer_id),
+                publishers=(peer_id,),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, peer_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=peer_id,
+                    grant_id=peer_grant,
+                    grant_scope="assessment",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+            da = save_draft(
+                w,
+                peer_claim,
+                peer_claim.purpose,
+                name="alpha-r14",
+                content="Alpha watched publication content",
+                expected_revision=None,
+            )
+            pub_a = publish_selection(
+                w,
+                peer_claim,
+                peer_claim.purpose,
+                Selection(
+                    "pub-r14-alpha",
+                    "alpha-r14",
+                    da.revision,
+                    "proj-r14-coalesce",
+                    proj_rev,
+                    (self.founder_id, peer_id),
+                    0,
+                    len(da.content),
+                ),
+            )
+            db_draft = save_draft(
+                w,
+                peer_claim,
+                peer_claim.purpose,
+                name="beta-r14",
+                content="Beta watched publication content",
+                expected_revision=None,
+            )
+            pub_b = publish_selection(
+                w,
+                peer_claim,
+                peer_claim.purpose,
+                Selection(
+                    "pub-r14-beta",
+                    "beta-r14",
+                    db_draft.revision,
+                    "proj-r14-coalesce",
+                    proj_rev,
+                    (self.founder_id, peer_id),
+                    0,
+                    len(db_draft.content),
+                ),
+            )
+
+            # Part A: Responsibility-backed coalescing of two distinct watched publications
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                resp = register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Watch multiple project publications",
+                    readable_scope=["shared"],
+                    now_ns=2_000,
+                )
+                ca = set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=resp.responsibility_id,
+                    trigger_kind="shared_asset_revision",
+                    source_identity=pub_a.asset_id,
+                    max_fires=1,
+                    now_ns=2_100,
+                )
+                cb = set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=resp.responsibility_id,
+                    trigger_kind="shared_asset_revision",
+                    source_identity=pub_b.asset_id,
+                    max_fires=1,
+                    now_ns=2_200,
+                )
+                admitted = evaluate_conditions(db, self.company_id, now_ns=3_000)
+                self.assertEqual(len(admitted), 1)
+                row_ca = db.execute(
+                    "SELECT status, fire_count FROM work_conditions WHERE condition_id = ?",
+                    (ca.condition_id,),
+                ).fetchone()
+                row_cb = db.execute(
+                    "SELECT status, fire_count FROM work_conditions WHERE condition_id = ?",
+                    (cb.condition_id,),
+                ).fetchone()
+                self.assertEqual(row_ca, ("triggered", 1))
+                self.assertEqual(row_cb, ("triggered", 1))
+                payload = json.loads(
+                    db.execute(
+                        "SELECT payload_json FROM work_items WHERE work_item_id = ?",
+                        (admitted[0].work_item_id,),
+                    ).fetchone()[0]
+                )
+                coalesced_sids = [
+                    e["source_identity"] for e in payload.get("coalesced_revisions", [])
+                ]
+                self.assertIn(pub_a.asset_id, coalesced_sids)
+                self.assertIn(pub_b.asset_id, coalesced_sids)
+
+        # Verify _run_work_discovery_review hydrates BOTH watched publications!
+        seen_receipts: list[dict[str, Any]] = []
+        seen_notes: list[str] = []
+
+        class _CaptureHydratedAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                seen_receipts.extend(request.context.open_receipts)
+                seen_notes.extend(request.context.history_notes)
+                broker.invoke(
+                    "c1",
+                    "record_work_decision",
+                    {
+                        "action_kind": "hold",
+                        "rationale": "Reviewed both coalesced publications.",
+                        "evidence": [],
+                    },
+                )
+                return ShiftResult(
+                    output_text="Reviewed.",
+                    usage=TokenUsage(input_tokens=10, output_tokens=5),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=1,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_CaptureHydratedAdapter())
+        dreg = build_production_duty_registry(
+            adapter_registry=areg, profile_bindings={self.founder_id: self.profile}
+        )
+        rt = CompanyRuntime(self.store, self.company_id, dreg, clock=lambda: 4_000)
+        rt.step(
+            max_dispatches=1,
+            now_ns=4_000,
+            target_work_item_id=admitted[0].work_item_id,
+        )
+        hydrated_asset_ids = [
+            r["asset_id"]
+            for r in seen_receipts
+            if isinstance(r, dict) and r.get("kind") == "shared_asset"
+        ]
+        self.assertIn(pub_a.asset_id, hydrated_asset_ids)
+        self.assertIn(pub_b.asset_id, hydrated_asset_ids)
+        joined_notes = "\n".join(seen_notes)
+        self.assertIn("Alpha watched publication content", joined_notes)
+        self.assertIn("Beta watched publication content", joined_notes)
+
+        # Part B: Unscoped coalescing branch also preserves original trigger!
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                parent_a, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="unscoped-parent-a",
+                    now_ns=5_000,
+                )
+                parent_b, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="unscoped-parent-b",
+                    now_ns=5_001,
+                )
+                db.execute(
+                    "UPDATE work_items SET state = 'settled' WHERE work_item_id IN (?, ?)",
+                    (parent_a.work_item_id, parent_b.work_item_id),
+                )
+                set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    work_item_id=parent_a.work_item_id,
+                    trigger_kind="shared_asset_revision",
+                    source_identity=pub_a.asset_id,
+                    max_fires=1,
+                    now_ns=5_100,
+                )
+                set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    work_item_id=parent_b.work_item_id,
+                    trigger_kind="shared_asset_revision",
+                    source_identity=pub_b.asset_id,
+                    max_fires=1,
+                    now_ns=5_200,
+                )
+                admitted_unscoped = evaluate_conditions(
+                    db, self.company_id, now_ns=6_000
+                )
+                self.assertEqual(len(admitted_unscoped), 1)
+                unscoped_payload = json.loads(
+                    db.execute(
+                        "SELECT payload_json FROM work_items WHERE work_item_id = ?",
+                        (admitted_unscoped[0].work_item_id,),
+                    ).fetchone()[0]
+                )
+                unscoped_sids = [
+                    e["source_identity"]
+                    for e in unscoped_payload.get("coalesced_revisions", [])
+                ]
+                self.assertIn(pub_a.asset_id, unscoped_sids)
+                self.assertIn(pub_b.asset_id, unscoped_sids)
+
+    def test_pr191_r14_security_condition_budget_bypass_vectors_closed(self) -> None:
+        """PR #191 R14 Security: close result_dep spoofing, explicit work_item_id escape, and duplicate continuation amplification."""
+        from sourdough.runtime.proactive_tools import (
+            build_core_proactive_tool_contribution,
+        )
+        from sourdough.runtime.work_kernel import (
+            arm_result_continuation,
+            open_peer_request,
+            record_peer_request_read,
+            resolve_peer_request,
+        )
+        from sourdough.storage.kernel import append_audit_event
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            peer_id, peer_grant = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="sec-peer-r14",
+                profile_id=self.profile.profile_id(),
+            )
+            assign_project(
+                w,
+                self.grant_id,
+                "proj-sec-r14",
+                (self.founder_id, peer_id),
+                publishers=(self.founder_id, peer_id),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=peer_id,
+                    duty_kind="work.peer_response",
+                    remit="Answer peer requests",
+                    readable_scope={
+                        "project_id": "proj-sec-r14",
+                        "allowed_requesters": [self.founder_id],
+                    },
+                    now_ns=900,
+                )
+                disc_resp = register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Bounded security check",
+                    readable_scope={
+                        "max_wakes_per_window": 1,
+                        "wake_window_ns": 60_000,
+                    },
+                    now_ns=1_000,
+                )
+                other_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="other-settled-item",
+                    now_ns=1_050,
+                )
+                db.execute(
+                    "UPDATE work_items SET state = 'settled' WHERE work_item_id = ?",
+                    (other_item.work_item_id,),
+                )
+                scoped_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="condition",
+                    source_id="sec-cond-origin",
+                    payload={"responsibility_id": disc_resp.responsibility_id},
+                    now_ns=1_100,
+                )
+                scoped_run = claim_work_run(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=scoped_item.work_item_id,
+                    lease_owner="test-sec-r14",
+                    lease_ttl_ns=100_000,
+                    now_ns=1_200,
+                )
+                scoped_claim = WorkRunClaim(
+                    company_id=self.company_id,
+                    founder_id=self.founder_id,
+                    duty_id=scoped_item.work_item_id,
+                    run_id=scoped_run.run_id,
+                    fencing_token=scoped_run.fencing_token,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    purpose="discovery_review",
+                    _clock=1_300,
+                )
+
+            contrib = build_core_proactive_tool_contribution(
+                writer=w, claim=scoped_claim
+            )
+            set_cond_tool = contrib.handlers["set_condition"]
+
+            # 1. Spoofing reserved source_identity='result_dep:...' via set_condition MUST be refused.
+            with self.assertRaisesRegex(WorkKernelRefused, "result_dep:"):
+                set_cond_tool(
+                    {
+                        "trigger_kind": "timer",
+                        "due_at_ns": 0,
+                        "source_identity": "result_dep:spoof",
+                    }
+                )
+
+            # 2. Linking an unrelated historical work_item_id via set_condition MUST be refused.
+            with self.assertRaisesRegex(WorkKernelRefused, "current work item"):
+                set_cond_tool(
+                    {
+                        "trigger_kind": "timer",
+                        "due_at_ns": 0,
+                        "work_item_id": other_item.work_item_id,
+                    }
+                )
+
+            # 3. Explicitly passing work_item_id=claim.duty_id on a responsibility-backed item
+            # MUST still auto-bind to the active standing responsibility (cannot escape its budget!).
+            bound = set_cond_tool(
+                {
+                    "trigger_kind": "timer",
+                    "due_at_ns": 5_000,
+                    "work_item_id": scoped_item.work_item_id,
+                }
+            )
+            self.assertEqual(bound["responsibility_id"], disc_resp.responsibility_id)
+            self.assertIsNone(bound["work_item_id"])
+
+            # 4. Duplicate arm_result_continuation on the same dependency_asset_id admits at most 1 item,
+            # and duplicate peer_response conditions on the same resolved request admit at most 1 item.
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                append_audit_event(
+                    db,
+                    company_id=self.company_id,
+                    domain="assets",
+                    entity_type="shared_publication",
+                    entity_id="dep-dedupe-r14",
+                    event_type="asset.published",
+                    actor_id=peer_id,
+                    payload={"asset_id": "dep-dedupe-r14"},
+                    recorded_at_ns=1_400,
+                )
+                for _ in range(3):
+                    arm_result_continuation(
+                        db,
+                        company_id=self.company_id,
+                        owner_agent_id=self.founder_id,
+                        dependency_asset_id="dep-dedupe-r14",
+                        due_at_ns=1_500,
+                        now_ns=1_450,
+                    )
+                req, _ = open_peer_request(
+                    db,
+                    company_id=self.company_id,
+                    requester_work_item_id=scoped_item.work_item_id,
+                    requester_run_id=scoped_run.run_id,
+                    fencing_token=scoped_run.fencing_token,
+                    recipient_agent_id=peer_id,
+                    question="Check R14 dedupe",
+                    expected_decision="confirm",
+                    evidence_refs=[],
+                    deadline_ns=100_000,
+                    request_id="req-r14-dedupe",
+                    project_id="proj-sec-r14",
+                    now_ns=1_500,
+                )
+                resp_run = claim_work_run(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=req.response_work_item_id,
+                    lease_owner="peer-worker-r14",
+                    lease_ttl_ns=60_000,
+                    now_ns=1_550,
+                )
+                record_peer_request_read(
+                    db,
+                    company_id=self.company_id,
+                    request_id=req.request_id,
+                    actor_id=peer_id,
+                    response_run_id=resp_run.run_id,
+                    response_fencing_token=resp_run.fencing_token,
+                    now_ns=1_580,
+                )
+                resolve_peer_request(
+                    db,
+                    company_id=self.company_id,
+                    request_id=req.request_id,
+                    actor_id=peer_id,
+                    resolution_state="answered",
+                    response_payload={"answer": "Done"},
+                    response_run_id=resp_run.run_id,
+                    response_fencing_token=resp_run.fencing_token,
+                    now_ns=1_600,
+                )
+                for _ in range(3):
+                    set_condition(
+                        db,
+                        company_id=self.company_id,
+                        owner_agent_id=self.founder_id,
+                        responsibility_id=disc_resp.responsibility_id,
+                        trigger_kind="peer_response",
+                        source_identity=f"peer_response:{req.request_id}",
+                        now_ns=1_650,
+                    )
+                admitted_all = evaluate_conditions(db, self.company_id, now_ns=2_000)
+                dep_items = [
+                    it for it in admitted_all if "result_dep:" in it.payload_json
+                ]
+                peer_items = [
+                    it
+                    for it in admitted_all
+                    if f"peer_response:{req.request_id}" in it.payload_json
+                ]
+                self.assertEqual(len(dep_items), 1)
+                self.assertEqual(len(peer_items), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

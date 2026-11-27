@@ -150,6 +150,7 @@ class CompanyRuntime:
         triggering_actor_id: str | None = None,
         on_ready: Callable[[WriterLease], None] | None = None,
         truncate_wal_on_exit: bool = False,
+        target_work_item_id: str | None = None,
     ) -> RuntimeStepSummary:
         """Run one durable recovery, wake, condition-evaluation, and dispatch cycle."""
         with hold_company_writer(
@@ -167,6 +168,7 @@ class CompanyRuntime:
                 triggering_actor_id=triggering_actor_id,
                 on_ready=on_ready,
                 truncate_wal_on_exit=truncate_wal_on_exit,
+                target_work_item_id=target_work_item_id,
             )
 
     def _sweep_work_state(
@@ -221,10 +223,15 @@ class CompanyRuntime:
         tx_lock: threading.RLock | None = None,
         on_commit: Callable[[], None] | None = None,
         stop_event: threading.Event | None = None,
+        target_work_item_id: str | None = None,
     ) -> RuntimeStepSummary:
         """Execute one durable sweep/claim/dispatch cycle using an already-held WriterLease."""
         if max_dispatches < 0:
             raise RuntimeRefused("max_dispatches must be nonnegative")
+        if target_work_item_id is not None and (
+            not isinstance(target_work_item_id, str) or not target_work_item_id.strip()
+        ):
+            raise RuntimeRefused("target_work_item_id must be a non-empty string")
         read_clock: Callable[[], int] = (
             self._clock if now_ns is None else (lambda: now_ns)
         )
@@ -235,14 +242,25 @@ class CompanyRuntime:
             on_ready(writer)
 
         sweep_now = read_clock()
-        cursor_batch, fenced, woken, admitted_items = self._sweep_work_state(
-            writer,
-            now_ns=sweep_now,
-            tx_lock=tx_lock,
-            observed_assets=observed_assets,
-            event_key=event_key,
-            triggering_actor_id=triggering_actor_id,
-        )
+        if target_work_item_id is None:
+            cursor_batch, fenced, woken, admitted_items = self._sweep_work_state(
+                writer,
+                now_ns=sweep_now,
+                tx_lock=tx_lock,
+                observed_assets=observed_assets,
+                event_key=event_key,
+                triggering_actor_id=triggering_actor_id,
+            )
+        else:
+            with (
+                lock_ctx,
+                closing(open_writer(self._store, lease=writer)) as conn,
+                write_tx(conn),
+            ):
+                fenced = reclaim_expired_runs(conn, self._company_id, now_ns=sweep_now)
+            cursor_batch = WorkEventBatch(last_event_seq=0)
+            woken = ()
+            admitted_items = ()
         if on_commit is not None and (fenced or woken or admitted_items):
             on_commit()
 
@@ -254,7 +272,12 @@ class CompanyRuntime:
             writer.verify()
             claim_now = read_clock()
             with lock_ctx:
-                claimed = self._claim_next(writer, claim_now, blocked)
+                claimed = self._claim_next(
+                    writer,
+                    claim_now,
+                    blocked,
+                    target_work_item_id=target_work_item_id,
+                )
             if claimed is None:
                 break
             item, run, descriptor = claimed
@@ -419,16 +442,27 @@ class CompanyRuntime:
         writer: WriterLease,
         now_ns: int,
         blocked: list[str],
+        *,
+        target_work_item_id: str | None = None,
     ) -> tuple[WorkItem, Any, DutyDescriptor] | None:
         with closing(open_writer(self._store, lease=writer)) as conn, write_tx(conn):
+            target_filter = (
+                " AND work_item_id = ?" if target_work_item_id is not None else ""
+            )
+            params: tuple[Any, ...] = (
+                (self._company_id, now_ns, target_work_item_id)
+                if target_work_item_id is not None
+                else (self._company_id, now_ns)
+            )
             rows = conn.execute(
-                """SELECT work_item_id, company_id, owner_agent_id, duty_kind, state,
+                f"""SELECT work_item_id, company_id, owner_agent_id, duty_kind, state,
                           source_kind, source_id, parent_work_item_id, dedupe_key,
                           payload_json, created_at_ns, updated_at_ns,
                           attempt_count, next_retry_at_ns
                    FROM work_items
                    WHERE company_id = ? AND state = 'due'
                      AND (next_retry_at_ns IS NULL OR next_retry_at_ns <= ?)
+                     {target_filter}
                      AND owner_agent_id NOT IN (
                          SELECT agent_id FROM work_runs WHERE status = 'running'
                      )
@@ -451,7 +485,7 @@ class CompanyRuntime:
                        END ASC,
                        created_at_ns ASC,
                        work_item_id ASC""",
-                (self._company_id, now_ns),
+                params,
             ).fetchall()
             for row in rows:
                 item = WorkItem(*row)

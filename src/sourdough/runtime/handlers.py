@@ -1050,6 +1050,17 @@ def build_production_duty_registry(
                     f"Watched condition trigger ({payload.get('trigger_kind', 'manual')}): "
                     f"source={payload.get('source_identity')} rev={payload.get('observed_revision')}"
                 )
+                coalesced_entries = payload.get("coalesced_revisions")
+                if isinstance(coalesced_entries, list) and len(coalesced_entries) > 1:
+                    summary_parts = [
+                        f"{e.get('trigger_kind', 'condition')}:{e.get('source_identity')}@{e.get('observed_revision')}"
+                        for e in coalesced_entries
+                        if isinstance(e, dict)
+                    ]
+                    if summary_parts:
+                        notes.append(
+                            f"Coalesced triggers ({len(summary_parts)}): {', '.join(summary_parts)}"
+                        )
             resp_id = payload.get("responsibility_id")
             if isinstance(resp_id, str) and resp_id.strip():
                 resp_row = db.execute(
@@ -1068,8 +1079,26 @@ def build_production_duty_registry(
                         }
                     )
                     notes.append(f"Standing responsibility remit: {resp_row[0]}")
-            source_id = payload.get("source_identity")
-            if isinstance(source_id, str) and source_id.strip():
+            source_ids: list[str] = []
+            coalesced_entries = payload.get("coalesced_revisions")
+            if isinstance(coalesced_entries, list):
+                for entry in coalesced_entries:
+                    if isinstance(entry, dict):
+                        entry_sid = entry.get("source_identity")
+                        if (
+                            isinstance(entry_sid, str)
+                            and entry_sid.strip()
+                            and entry_sid not in source_ids
+                        ):
+                            source_ids.append(entry_sid)
+            top_source_id = payload.get("source_identity")
+            if (
+                isinstance(top_source_id, str)
+                and top_source_id.strip()
+                and top_source_id not in source_ids
+            ):
+                source_ids.append(top_source_id)
+            for source_id in source_ids:
                 try:
                     asset = shared_asset_for(db, agent_id, source_id)
                 except DutyRefused:
