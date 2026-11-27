@@ -385,7 +385,7 @@ class DomainPlugin(Protocol):
         agent_id: str,
         decision_at_ns: int,
         evidence: Any,
-    ) -> None: ...
+    ) -> bool | None: ...
 
 
 class BaseDomainPlugin:
@@ -456,8 +456,8 @@ class BaseDomainPlugin:
         agent_id: str,
         decision_at_ns: int,
         evidence: Any,
-    ) -> None:
-        return None
+    ) -> bool:
+        return False
 
 
 class DomainPluginRegistry:

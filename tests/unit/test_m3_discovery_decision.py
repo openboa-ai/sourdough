@@ -339,9 +339,12 @@ class DiscoveryDecisionTests(unittest.TestCase):
 
             def validate_decision_evidence(
                 self, _conn, _company_id, _agent_id, _decision_at_ns, evidence
-            ) -> None:
-                if evidence.kind == "custom_metric" and evidence.revision == "bad":
-                    raise WorkKernelRefused("Domain plugin rejected custom_metric")
+            ) -> bool:
+                if evidence.kind == "custom_metric":
+                    if evidence.revision == "bad":
+                        raise WorkKernelRefused("Domain plugin rejected custom_metric")
+                    return True
+                return False
 
         a, ga, sa = self._hire("dec-a")
         item_a, run_a, ca = self._open_claim(a, ga, sa)

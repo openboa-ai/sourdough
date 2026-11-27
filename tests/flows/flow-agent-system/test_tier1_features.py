@@ -2496,8 +2496,9 @@ class TestF32DiscoveryDecisionTier1(unittest.TestCase):
 
             def validate_decision_evidence(
                 self, _conn, _company_id, _agent_id, _decision_at_ns, evidence
-            ) -> None:
+            ) -> bool:
                 called.append(evidence.kind)
+                return evidence.kind == "custom_test_kind"
 
         with CoreCompanyHarness() as h:
             h.found_company()

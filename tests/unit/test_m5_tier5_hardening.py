@@ -4679,6 +4679,99 @@ class TestM5Tier5Hardening(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["outcome_status"], "blocked")
 
+    def test_pr191_r6_unrecognized_decision_evidence_kind_fails_closed(
+        self,
+    ) -> None:
+        """PR #191 R6 P2: record_work_decision rejects unrecognized evidence kinds without a validating plugin."""
+        from sourdough.runtime.domains import BaseDomainPlugin
+
+        class _NoOpInheritedPlugin(BaseDomainPlugin):
+            domain_name = "noop_ev"
+
+        class _NoneReturningPlugin(BaseDomainPlugin):
+            domain_name = "none_ev"
+
+            def validate_decision_evidence(self, _conn, _cid, _aid, _ts, _ev) -> None:
+                return None
+
+        class _ScopedMetricPlugin(BaseDomainPlugin):
+            domain_name = "scoped_metric"
+
+            def validate_decision_evidence(
+                self, _conn, _cid, _aid, _ts, evidence
+            ) -> bool:
+                if evidence.kind == "custom_metric":
+                    if evidence.revision != "verified-v1":
+                        raise WorkKernelRefused("Invalid custom_metric revision")
+                    return True
+                return False
+
+        fabricated = DecisionEvidence(
+            kind="invented_metric",
+            resource_id="nonexistent",
+            revision="fake",
+            observed_at_ns=1_500,
+            available_at_ns=1_000,
+        )
+        valid_custom = DecisionEvidence(
+            kind="custom_metric",
+            resource_id="metric-1",
+            revision="verified-v1",
+            observed_at_ns=1_500,
+            available_at_ns=1_000,
+        )
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, _claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+                for label, plugins in (
+                    ("core_only", ()),
+                    ("base_noop_plugin", (_NoOpInheritedPlugin(),)),
+                    ("none_returning_plugin", (_NoneReturningPlugin(),)),
+                    ("unrelated_scoped_plugin", (_ScopedMetricPlugin(),)),
+                ):
+                    with self.subTest(label=label):
+                        with self.assertRaisesRegex(
+                            WorkKernelRefused, "Unsupported or unvalidated"
+                        ):
+                            record_work_decision(
+                                db,
+                                company_id=self.company_id,
+                                work_item_id=item.work_item_id,
+                                run_id=run.run_id,
+                                fencing_token=run.fencing_token,
+                                agent_id=self.founder_id,
+                                action_kind="counterexample_verified",
+                                rationale="Attempted fabricated evidence",
+                                evidence=(fabricated,),
+                                decision_at_ns=2_000,
+                                domain_plugins=plugins,
+                            )
+                # Explicitly recognized & validated plugin evidence succeeds
+                dec = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="counterexample_verified",
+                    rationale="Authoritatively validated custom evidence",
+                    evidence=(valid_custom,),
+                    decision_at_ns=2_000,
+                    domain_plugins=(_ScopedMetricPlugin(),),
+                )
+                self.assertTrue(dec.decision_id)
+
 
 if __name__ == "__main__":
     unittest.main()

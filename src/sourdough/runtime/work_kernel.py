@@ -3145,6 +3145,18 @@ def _normalize_evidence(
     return tuple(normalized)
 
 
+CORE_EVIDENCE_KINDS: frozenset[str] = frozenset(
+    {
+        "private_draft",
+        "shared_publication",
+        "peer_request",
+        "work_run",
+        "work_item",
+        "tool_call_receipt",
+    }
+)
+
+
 def _validate_core_evidence_entry(
     connection: sqlite3.Connection,
     *,
@@ -3153,7 +3165,7 @@ def _validate_core_evidence_entry(
     decision_at_ns: int,
     ev: DecisionEvidence,
     current_run_id: str | None = None,
-) -> None:
+) -> bool:
     if ev.available_at_ns > ev.observed_at_ns or ev.observed_at_ns > decision_at_ns:
         raise WorkKernelRefused(
             "Decision evidence timestamps violate availability/observation order"
@@ -3335,6 +3347,9 @@ def _validate_core_evidence_entry(
             raise WorkKernelRefused(
                 "Cited tool_call_receipt timestamps precede receipt recording or follow decision"
             )
+    else:
+        return False
+    return True
 
 
 def record_work_decision(
@@ -3394,7 +3409,7 @@ def record_work_decision(
 
     normalized_evidence = _normalize_evidence(evidence)
     for ev in normalized_evidence:
-        _validate_core_evidence_entry(
+        validated = _validate_core_evidence_entry(
             connection,
             company_id=company_id,
             agent_id=agent_id,
@@ -3405,13 +3420,21 @@ def record_work_decision(
         for plugin in domain_plugins:
             validator = getattr(plugin, "validate_decision_evidence", None)
             if validator is not None:
-                validator(
-                    connection,
-                    company_id,
-                    agent_id,
-                    effective_decision_ns,
-                    ev,
-                )
+                if (
+                    validator(
+                        connection,
+                        company_id,
+                        agent_id,
+                        effective_decision_ns,
+                        ev,
+                    )
+                    is True
+                ):
+                    validated = True
+        if not validated:
+            raise WorkKernelRefused(
+                f"Unsupported or unvalidated DecisionEvidence kind: {ev.kind!r}"
+            )
 
     evidence_refs = [
         {
