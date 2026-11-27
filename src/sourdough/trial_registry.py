@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
 import re
 import sqlite3
 import stat
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+from itertools import product
 from pathlib import Path
 from time import sleep
+from typing import Any
 from uuid import uuid4
 
 from .storage.db import ManagedConnection, connect_sqlite
@@ -394,6 +398,12 @@ class RsiTransferSummary:
     candidate_authority_violations: int
     candidate_service_incorrect: int
     distinct_transfer_families: int = 0
+    lcb_alpha: float = 0.0
+    ucb_alpha: float = 0.0
+    mean_family_delta: float = 0.0
+    perm_p: float = 1.0
+    alpha: float = 0.05
+    min_worthwhile_margin: float = 0.0
 
 
 def _private_key(path: Path) -> tuple[int, int]:
@@ -1276,6 +1286,135 @@ def _decode_pairwise_row(
     return outcome, winner
 
 
+def read_sealed_slot(path: Path, *, revision: str, slot_id: str) -> TrialSlot:
+    """Read-only lookup of a sealed TrialSlot without mutating evaluator.sqlite."""
+    if not _digest(revision) or not _label(slot_id):
+        raise TrialRefused("Invalid sealed slot lookup parameters")
+    with closing(_open(path, read_only=True)) as database, _read_tx(database):
+        suite = _sealed_suite(database, revision)
+        raw_slot = next(
+            (slot for slot in suite["slots"] if slot["slot_id"] == slot_id), None
+        )
+        if raw_slot is None:
+            raise TrialRefused(f"Trial slot '{slot_id}' is not registered")
+        return TrialSlot(
+            slot_id=str(raw_slot["slot_id"]),
+            case_id=str(raw_slot["case_id"]),
+            family_id=str(raw_slot["family_id"]),
+            inputs=TrialInputs(**raw_slot["inputs"]),
+            limits=TrialCeiling(**raw_slot["limits"]),
+            arm=raw_slot.get("arm"),
+            counterpart_id=raw_slot.get("counterpart_id"),
+        )
+
+
+def read_sealed_suite_meta(path: Path) -> dict[str, Any]:
+    """Read-only inspection of the sealed suite metadata and aggregate counts."""
+    with closing(_open(path, read_only=True)) as database, _read_tx(database):
+        tables, has_other = _schema_objects(database)
+        if has_other or tables != _REQUIRED_TABLES:
+            raise TrialRefused("Store is not a sealed trial registry")
+        _verify_strict_tables(database)
+        stored = database.execute(
+            "SELECT revision, document FROM trial_suite WHERE singleton=1"
+        ).fetchone()
+        if stored is None or _revision(stored[1]) != stored[0]:
+            raise TrialRefused("Sealed trial registration is missing or corrupted")
+        try:
+            suite = json.loads(stored[1])
+        except json.JSONDecodeError as error:
+            raise TrialRefused("Corrupted sealed trial suite document") from error
+        if not isinstance(suite, dict) or suite.get("format") != _FORMAT:
+            raise TrialRefused("Unsupported trial registry format")
+        obs_count = int(
+            database.execute("SELECT COUNT(*) FROM trial_observation").fetchone()[0]
+        )
+        grade_count = int(
+            database.execute("SELECT COUNT(*) FROM trial_grade").fetchone()[0]
+        )
+        pair_count = int(
+            database.execute("SELECT COUNT(*) FROM trial_pairwise_grade").fetchone()[0]
+        )
+        inv_count = int(
+            database.execute("SELECT COUNT(*) FROM trial_invalidation").fetchone()[0]
+        )
+        return {
+            "revision": str(stored[0]),
+            "suite_id": str(suite["suite_id"]),
+            "purpose": str(suite["purpose"]),
+            "rubric_digest": str(suite["rubric_digest"]),
+            "evaluator_digest": str(suite["evaluator_digest"]),
+            "analysis_plan_digest": str(suite["analysis_plan_digest"]),
+            "planned_slots": len(suite["slots"]),
+            "observation_count": obs_count,
+            "grade_count": grade_count,
+            "pairwise_grade_count": pair_count,
+            "invalidation_count": inv_count,
+        }
+
+
+def _family_bootstrap_and_permutation(
+    *,
+    suite_id: str,
+    revision: str,
+    analysis_plan_digest: str,
+    family_means: list[float],
+    alpha: float,
+    bootstrap_resamples: int,
+) -> tuple[float, float, float, float]:
+    """Compute (mean_family_delta, lcb_alpha, ucb_alpha, perm_p) over family-clustered pair scores."""
+    f_count = len(family_means)
+    if f_count == 0:
+        return 0.0, 0.0, 0.0, 1.0
+    mean_delta = sum(family_means) / f_count
+    seed_material = (
+        f"{suite_id}:{revision}:{analysis_plan_digest}:{alpha}:{bootstrap_resamples}"
+    ).encode("utf-8")
+    seed_int = int.from_bytes(sha256(seed_material).digest(), "big")
+    rng = random.Random(seed_int)
+
+    boot_means: list[float] = []
+    for _ in range(bootstrap_resamples):
+        sample_sum = 0.0
+        for _ in range(f_count):
+            sample_sum += family_means[rng.randrange(f_count)]
+        boot_means.append(sample_sum / f_count)
+    boot_means.sort()
+    low_idx = max(
+        0, min(bootstrap_resamples - 1, math.floor(alpha * bootstrap_resamples))
+    )
+    high_idx = max(
+        0,
+        min(
+            bootstrap_resamples - 1, math.ceil((1.0 - alpha) * bootstrap_resamples) - 1
+        ),
+    )
+    lcb_alpha = boot_means[low_idx]
+    ucb_alpha = boot_means[high_idx]
+
+    obs_sum = sum(family_means)
+    if f_count <= 16:
+        total_assign = 1 << f_count
+        ge_count = 0
+        for signs in product((-1.0, 1.0), repeat=f_count):
+            signed_sum = sum(s * d for s, d in zip(signs, family_means, strict=True))
+            if signed_sum >= obs_sum - 1e-12:
+                ge_count += 1
+        perm_p = ge_count / total_assign
+    else:
+        mc_flips = 10_000
+        ge_count = 1
+        for _ in range(mc_flips):
+            signed_sum = sum(
+                (1.0 if rng.random() < 0.5 else -1.0) * d for d in family_means
+            )
+            if signed_sum >= obs_sum - 1e-12:
+                ge_count += 1
+        perm_p = ge_count / (mc_flips + 1)
+
+    return mean_delta, lcb_alpha, ucb_alpha, perm_p
+
+
 def summarize_rsi_transfer(
     path: Path,
     *,
@@ -1283,24 +1422,71 @@ def summarize_rsi_transfer(
     min_pairs: int = 2,
     min_net_wins: int = 1,
     min_families: int = 1,
+    alpha: float = 0.05,
+    min_worthwhile_margin: float = 0.0,
+    bootstrap_resamples: int = 2000,
+    analysis_plan: Mapping[str, Any] | None = None,
 ) -> RsiTransferSummary:
     """Reconcile paired rubric grades and position-swapped pairwise outcomes into
     an explicit SUPPORTED | UNSUPPORTED | INCONCLUSIVE verdict for recursive suites.
     """
+    eff_min_pairs = min_pairs
+    eff_min_net_wins = min_net_wins
+    eff_min_families = min_families
+    eff_alpha = alpha
+    eff_margin = min_worthwhile_margin
+    eff_resamples = bootstrap_resamples
+
+    plan_dict: dict[str, Any] | None = None
+    if analysis_plan is not None:
+        if not isinstance(analysis_plan, Mapping):
+            raise TrialRefused("Invalid RSI transfer summary analysis_plan")
+        plan_dict = dict(analysis_plan)
+        if "min_pairs" in plan_dict:
+            eff_min_pairs = plan_dict["min_pairs"]
+        if "min_net_wins" in plan_dict:
+            eff_min_net_wins = plan_dict["min_net_wins"]
+        if "min_families" in plan_dict:
+            eff_min_families = plan_dict["min_families"]
+        if "alpha" in plan_dict:
+            eff_alpha = plan_dict["alpha"]
+        if "min_worthwhile_margin" in plan_dict:
+            eff_margin = plan_dict["min_worthwhile_margin"]
+        if "bootstrap_resamples" in plan_dict:
+            eff_resamples = plan_dict["bootstrap_resamples"]
+
     if (
         not _digest(revision)
-        or type(min_pairs) is not int
-        or min_pairs < 1
-        or type(min_net_wins) is not int
-        or min_net_wins < 1
-        or type(min_families) is not int
-        or min_families < 1
+        or type(eff_min_pairs) is not int
+        or eff_min_pairs < 1
+        or type(eff_min_net_wins) is not int
+        or eff_min_net_wins < 1
+        or type(eff_min_families) is not int
+        or eff_min_families < 1
+        or isinstance(eff_alpha, bool)
+        or not isinstance(eff_alpha, (int, float))
+        or not math.isfinite(float(eff_alpha))
+        or not (0.0 < float(eff_alpha) < 0.5)
+        or isinstance(eff_margin, bool)
+        or not isinstance(eff_margin, (int, float))
+        or not math.isfinite(float(eff_margin))
+        or not (0.0 <= float(eff_margin) <= 1.0)
+        or type(eff_resamples) is not int
+        or not (100 <= eff_resamples <= 50_000)
     ):
         raise TrialRefused("Invalid RSI transfer summary parameters")
+    alpha_f = float(eff_alpha)
+    margin_f = float(eff_margin)
+
     with closing(_open(path, read_only=True)) as database, _read_tx(database):
         suite = _sealed_suite(database, revision)
         if suite["purpose"] != "recursive":
             raise TrialRefused("RSI transfer verdict requires a recursive trial suite")
+        if plan_dict is not None:
+            if _revision(_canonical_json(plan_dict)) != suite["analysis_plan_digest"]:
+                raise TrialRefused(
+                    "Analysis plan does not match sealed analysis_plan_digest"
+                )
         slots = suite["slots"]
         planned_pairs = len(slots) // 2
         distinct_families = len({slot["family_id"] for slot in slots})
@@ -1309,6 +1495,11 @@ def summarize_rsi_transfer(
         grades = _read_grades(database, suite, records)
         arm_by_result = {
             rec.result_id: slot["arm"]
+            for slot, rec in zip(slots, records, strict=True)
+            if rec.result_id is not None
+        }
+        family_by_result = {
+            rec.result_id: slot["family_id"]
             for slot, rec in zip(slots, records, strict=True)
             if rec.result_id is not None
         }
@@ -1337,24 +1528,50 @@ def summarize_rsi_transfer(
         ties = 0
         noise = 0
         complete_pairs = 0
+        scores_by_family: dict[str, list[float]] = {}
         for pair_id, (ab, ba) in valid_pairs.items():
             row = pw_rows.get(pair_id)
             if row is None:
                 continue
             outcome, winner = _decode_pairwise_row(row, ab, ba)
             complete_pairs += 1
+            fam_id = family_by_result.get(ab.first.result_id)
+            if fam_id is None:
+                raise TrialRefused("Pairwise result has no registered transfer family")
             if outcome == "tie_noise":
                 noise += 1
+                pair_score = 0.0
             elif outcome == "tie":
                 ties += 1
+                pair_score = 0.0
             elif outcome == "winner" and winner is not None:
                 winner_arm = arm_by_result.get(winner)
                 if winner_arm == "candidate":
                     cand_wins += 1
+                    pair_score = 1.0
                 elif winner_arm == "incumbent":
                     inc_wins += 1
+                    pair_score = -1.0
                 else:
                     raise TrialRefused("Pairwise winner has no registered trial arm")
+            else:
+                pair_score = 0.0
+            scores_by_family.setdefault(fam_id, []).append(pair_score)
+
+        family_means = [
+            sum(scores_by_family[fam]) / len(scores_by_family[fam])
+            for fam in sorted(scores_by_family)
+        ]
+        mean_family_delta, lcb_alpha, ucb_alpha, perm_p = (
+            _family_bootstrap_and_permutation(
+                suite_id=str(suite["suite_id"]),
+                revision=revision,
+                analysis_plan_digest=str(suite["analysis_plan_digest"]),
+                family_means=family_means,
+                alpha=alpha_f,
+                bootstrap_resamples=eff_resamples,
+            )
+        )
 
         cand_passes = 0
         inc_passes = 0
@@ -1393,6 +1610,14 @@ def summarize_rsi_transfer(
                 if grade.judgment_passed(packet.outcome):
                     inc_passes += 1
 
+        # Enforce exact permutation alpha when an explicit plan, custom alpha, or >=3 families apply.
+        enforce_perm = (
+            plan_dict is not None
+            or alpha_f != 0.05
+            or eff_min_families >= 3
+            or distinct_families >= 5
+        )
+
         # Evaluate clean candidate hard-invariant failures BEFORE invalidation masking!
         reasons: list[str] = []
         if cand_violations > 0 or cand_service_bad > 0:
@@ -1409,35 +1634,50 @@ def summarize_rsi_transfer(
         elif (
             incomplete_rubric
             or complete_pairs < planned_pairs
-            or complete_pairs < min_pairs
-            or distinct_families < min_families
+            or complete_pairs < eff_min_pairs
+            or distinct_families < eff_min_families
         ):
             verdict = "INCONCLUSIVE"
             if incomplete_rubric:
                 reasons.append("incomplete-rubric-coverage")
-            if complete_pairs < planned_pairs or complete_pairs < min_pairs:
+            if complete_pairs < planned_pairs or complete_pairs < eff_min_pairs:
                 reasons.append("incomplete-paired-coverage")
-            if distinct_families < min_families:
+            if distinct_families < eff_min_families:
                 reasons.append("insufficient-transfer-families")
-        elif cand_passes < inc_passes:
+        elif (
+            cand_passes < inc_passes
+            or mean_family_delta < 0.0
+            or ucb_alpha < margin_f
+            or inc_wins - cand_wins >= eff_min_net_wins
+        ):
             verdict = "UNSUPPORTED"
-            reasons.append("candidate-judgment-regression")
+            if cand_passes < inc_passes:
+                reasons.append("candidate-judgment-regression")
+            if inc_wins - cand_wins >= eff_min_net_wins or mean_family_delta < 0.0:
+                reasons.append("incumbent-outperformed-candidate")
+            if ucb_alpha < margin_f:
+                reasons.append("futility-below-worthwhile-margin")
         elif cand_passes == 0:
             verdict = "INCONCLUSIVE"
             reasons.append("zero-candidate-judgment-passes")
-        elif cand_wins - inc_wins >= min_net_wins:
-            verdict = "SUPPORTED"
-            reasons.append("consistent-blind-pairwise-gain")
-        elif inc_wins - cand_wins >= min_net_wins:
-            verdict = "UNSUPPORTED"
-            reasons.append("incumbent-outperformed-candidate")
-        else:
+        elif cand_wins - inc_wins < eff_min_net_wins:
             verdict = "INCONCLUSIVE"
             reasons.append(
                 "position-bias-noise"
                 if noise > 0
                 else "insufficient-net-pairwise-margin"
             )
+        elif lcb_alpha <= margin_f:
+            verdict = "INCONCLUSIVE"
+            reasons.append("bootstrap-lcb-below-margin")
+            if noise > 0:
+                reasons.append("position-bias-noise")
+        elif enforce_perm and perm_p > alpha_f:
+            verdict = "INCONCLUSIVE"
+            reasons.append("permutation-p-above-alpha")
+        else:
+            verdict = "SUPPORTED"
+            reasons.append("consistent-blind-pairwise-gain")
 
         return RsiTransferSummary(
             verdict=verdict,
@@ -1454,4 +1694,10 @@ def summarize_rsi_transfer(
             candidate_authority_violations=cand_violations,
             candidate_service_incorrect=cand_service_bad,
             distinct_transfer_families=distinct_families,
+            lcb_alpha=lcb_alpha,
+            ucb_alpha=ucb_alpha,
+            mean_family_delta=mean_family_delta,
+            perm_p=perm_p,
+            alpha=alpha_f,
+            min_worthwhile_margin=margin_f,
         )

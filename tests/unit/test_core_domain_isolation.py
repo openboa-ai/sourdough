@@ -22,6 +22,7 @@ from sourdough.runtime.handlers import (
     DUTY_CEO_RESPOND_MESSAGE,
     DUTY_WORK_ASSESSMENT_REVIEW,
     DUTY_WORK_DISCOVERY_REVIEW,
+    DUTY_WORK_DREAMING,
     DUTY_WORK_HANDOFF_FOLLOWUP,
     DUTY_WORK_PEER_RESPONSE,
     build_production_duty_registry,
@@ -113,6 +114,7 @@ _CORE_SINGLE_MODULES = (
     "harness.py",
     "hiring_run.py",
     "memory.py",
+    "method_learning.py",
     "onboarding.py",
     "retirement.py",
     "review_qualification_store.py",
@@ -122,6 +124,7 @@ _CORE_SINGLE_MODULES = (
     "supervisor.py",
     "trial_execution.py",
     "trial_registry.py",
+    "trial_runner.py",
     "work.py",
     "work_handoff.py",
     "work_peer_response.py",
@@ -212,6 +215,7 @@ class CoreDomainIsolationTests(unittest.TestCase):
                 DUTY_WORK_ASSESSMENT_REVIEW,
                 DUTY_WORK_HANDOFF_FOLLOWUP,
                 DUTY_WORK_DISCOVERY_REVIEW,
+                DUTY_WORK_DREAMING,
             },
         )
 

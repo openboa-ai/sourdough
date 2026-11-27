@@ -15,6 +15,7 @@ import sqlite3
 import stat
 from collections.abc import Sequence
 from contextlib import closing
+from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
 from time import time_ns
@@ -27,10 +28,20 @@ from ..board_control import (
     resolve_board_access,
 )
 from ..company import FoundingRefused, _identity
+from ..method_learning import (
+    collect_lineage_blast_radii,
+    compute_active_snapshot_id,
+    resolve_active_methods,
+)
 from ..runtime.domains import DomainPlugin, load_domain_plugins
-from ..storage.db import connect_sqlite, open_reader, read_tx
+from ..storage.db import open_reader, read_tx
 from ..storage.kernel import max_event_seq
 from ..storage.schema import installed_domains
+from ..trial_registry import (
+    TrialRefused,
+    read_sealed_suite_meta,
+    summarize_rsi_transfer,
+)
 
 PROJECTION_AGENTS_GRAPH = "agents-graph-v1"
 PROJECTION_AGENT_DETAIL = "agent-detail-v1"
@@ -112,20 +123,29 @@ def _json_loads_safe(raw: str | None, default: Any) -> Any:
 
 
 def _count_private_drafts(store: Path, agent_id: str) -> int:
-    """Count private Desk draft files without opening, reading, or naming any file."""
+    """Count unique private Desk draft stems without opening, reading, or naming any file."""
     try:
         root = store.resolve(strict=False).parent
         drafts_dir = _drafts_directory(store, agent_id)
         if not _check_no_symlinks(drafts_dir, root):
             return 0
-        count = 0
+        dir_st = os.lstat(drafts_dir)
+        if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
+            return 0
+        stems: set[str] = set()
         for entry in drafts_dir.iterdir():
-            if entry.name.startswith(".") or entry.suffix != ".json":
+            name = entry.name
+            if name.startswith("."):
                 continue
             st = os.lstat(entry)
-            if stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode):
-                count += 1
-        return count
+            if (
+                stat.S_ISLNK(st.st_mode)
+                or not stat.S_ISREG(st.st_mode)
+                or st.st_nlink != 1
+            ):
+                continue
+            stems.add(entry.stem if entry.suffix else name)
+        return len(stems)
     except Exception:
         return 0
 
@@ -620,12 +640,81 @@ def read_agent_detail_projection(
                 "due_at_ns": None if r[2] is None else int(r[2]),
                 "source_identity": None if r[3] is None else str(r[3]),
                 "status": str(r[4]),
+                "condition_revision": int(r[5]),
+                "responsibility_id": None if r[6] is None else str(r[6]),
+                "work_item_id": None if r[7] is None else str(r[7]),
+                "cooldown_ns": int(r[8]),
+                "max_fires": None if r[9] is None else int(r[9]),
+                "fire_count": int(r[10]),
             }
             for r in db.execute(
-                """SELECT condition_id, trigger_kind, due_at_ns, source_identity, status
+                """SELECT condition_id, trigger_kind, due_at_ns, source_identity, status,
+                          condition_revision, responsibility_id, work_item_id,
+                          cooldown_ns, max_fires, fire_count
                    FROM work_conditions
                    WHERE company_id = ? AND owner_agent_id = ?
-                   ORDER BY updated_at_ns DESC LIMIT 20""",
+                   ORDER BY updated_at_ns DESC, condition_id ASC LIMIT 20""",
+                (company_id, agent_id),
+            ).fetchall()
+        ]
+        armed_conditions = [c for c in conditions if c["status"] == "armed"]
+
+        active_methods_resolved = resolve_active_methods(
+            db, company_id, agent_id=agent_id
+        )
+        active_methods = [
+            m.to_dict() | {"delta_id": f"{m.method_id}:{m.revision_sha256}"}
+            for m in active_methods_resolved
+        ]
+        active_snapshot_id = compute_active_snapshot_id(active_methods_resolved)
+
+        work_decisions = [
+            {
+                "decision_id": str(r[0]),
+                "work_item_id": str(r[1]),
+                "run_id": str(r[2]),
+                "action_id": str(r[3]),
+                "action_kind": str(r[4]),
+                "evidence_refs": _json_loads_safe(str(r[5]), []),
+                "evidence_digest": str(r[6]),
+                "rationale": str(r[7]),
+                "next_condition_id": None if r[8] is None else str(r[8]),
+                "active_snapshot_id": None if r[9] is None else str(r[9]),
+                "decision_at_ns": int(r[10]),
+            }
+            for r in db.execute(
+                """SELECT decision_id, work_item_id, run_id, action_id, action_kind,
+                          evidence_refs_json, evidence_digest, rationale,
+                          next_condition_id, active_snapshot_id, decision_at_ns
+                   FROM work_decision
+                   WHERE company_id = ? AND agent_id = ?
+                   ORDER BY decision_at_ns DESC, decision_id ASC LIMIT 30""",
+                (company_id, agent_id),
+            ).fetchall()
+        ]
+
+        agent_episodes = [
+            {
+                "episode_id": str(r[0]),
+                "work_item_id": str(r[1]),
+                "run_id": str(r[2]),
+                "duty_kind": str(r[3]),
+                "outcome_status": str(r[4]),
+                "active_snapshot_id": None if r[5] is None else str(r[5]),
+                "summary_text": str(r[6])[:400],
+                "tool_calls_count": int(r[7]),
+                "input_tokens": int(r[8]),
+                "output_tokens": int(r[9]),
+                "cost_minor_units": int(r[10]),
+                "recorded_at_ns": int(r[11]),
+            }
+            for r in db.execute(
+                """SELECT episode_id, work_item_id, run_id, duty_kind, outcome_status,
+                          active_snapshot_id, summary_text, tool_calls_count,
+                          input_tokens, output_tokens, cost_minor_units, recorded_at_ns
+                   FROM agent_episode
+                   WHERE company_id = ? AND agent_id = ?
+                   ORDER BY recorded_at_ns DESC, episode_id ASC LIMIT 30""",
                 (company_id, agent_id),
             ).fetchall()
         ]
@@ -774,10 +863,16 @@ def read_agent_detail_projection(
                 "allocated_turns": info["allocated_turns"],
                 "prohibitions": prohibitions,
             },
+            "active_methods": active_methods,
+            "active_snapshot_id": active_snapshot_id,
+            "armed_conditions": armed_conditions,
             "tabs": {
                 "work_activity": work_activity,
                 "work_items": work_items,
                 "conditions": conditions,
+                "armed_conditions": armed_conditions,
+                "work_decisions": work_decisions,
+                "agent_episodes": agent_episodes,
                 "interactions_and_talks": interactions,
                 "published_reports": published_reports,
                 "peer_requests": peer_requests,
@@ -1367,6 +1462,140 @@ def read_system_evals_projection(
             ).fetchall()
         ]
 
+        method_deltas = [
+            {
+                "delta_id": f"{r[0]}:{r[1]}",
+                "method_id": str(r[0]),
+                "revision_sha256": str(r[1]),
+                "delta_kind": str(r[2]),
+                "item_kind": str(r[3]),
+                "audience_scope": str(r[4]),
+                "audience_target_id": None if r[5] is None else str(r[5]),
+                "author_agent_id": str(r[6]),
+                "parent_method_ids": _json_loads_safe(str(r[7]), []),
+                "active_snapshot_id": None if r[8] is None else str(r[8]),
+                "superseded_revision": None if r[9] is None else str(r[9]),
+                "redaction_passed": bool(r[10]),
+                "status": str(r[11]),
+                "created_at_ns": int(r[12]),
+            }
+            for r in db.execute(
+                """SELECT method_id, revision_sha256, delta_kind, item_kind,
+                          audience_scope, audience_target_id, author_agent_id,
+                          parent_method_ids_json, active_snapshot_id,
+                          superseded_revision, redaction_passed, status, created_at_ns
+                   FROM method_delta
+                   WHERE company_id = ?
+                   ORDER BY created_at_ns DESC, method_id ASC, revision_sha256 ASC
+                   LIMIT 50""",
+                (company_id,),
+            ).fetchall()
+        ]
+
+        method_qualifications = [
+            {
+                "qualification_id": str(r[0]),
+                "method_id": str(r[1]),
+                "revision_sha256": str(r[2]),
+                "delta_id": f"{r[1]}:{r[2]}",
+                "baseline_revision_sha256": None if r[3] is None else str(r[3]),
+                "stage1_passed": bool(r[4]),
+                "stage2_passed": bool(r[5]),
+                "stage3_passed": bool(r[6]),
+                "trial_count": int(r[7]),
+                "metrics": _json_loads_safe(str(r[8]), {}),
+                "evaluator_revision": str(r[9]),
+                "passed": bool(r[10]),
+                "recorded_at_ns": int(r[11]),
+            }
+            for r in db.execute(
+                """SELECT qualification_id, method_id, revision_sha256,
+                          baseline_revision_sha256, stage1_passed, stage2_passed,
+                          stage3_passed, trial_count, metrics_json, evaluator_revision,
+                          passed, recorded_at_ns
+                   FROM method_qualification
+                   WHERE company_id = ?
+                   ORDER BY recorded_at_ns DESC, qualification_id ASC
+                   LIMIT 50""",
+                (company_id,),
+            ).fetchall()
+        ]
+
+        delta_meta_by_id: dict[str, tuple[str, str]] = {}
+        method_activations: list[dict[str, Any]] = []
+        for r in db.execute(
+            """SELECT a.request_id, a.operation, a.method_id, a.revision_sha256,
+                      a.qualification_id, a.audience_scope, a.audience_target_id,
+                      a.activation_seq, a.principal_id, a.grant_id, a.quarantined,
+                      a.quarantine_reason, a.recorded_at_ns,
+                      d.delta_kind, d.status
+               FROM method_activation a
+               LEFT JOIN method_delta d
+                 ON d.company_id = a.company_id
+                AND d.method_id = a.method_id
+                AND d.revision_sha256 = a.revision_sha256
+               WHERE a.company_id = ?
+               ORDER BY a.activation_seq DESC
+               LIMIT 50""",
+            (company_id,),
+        ).fetchall():
+            delta_id = f"{r[2]}:{r[3]}"
+            delta_meta_by_id[delta_id] = (
+                "" if r[13] is None else str(r[13]),
+                "" if r[14] is None else str(r[14]),
+            )
+            method_activations.append(
+                {
+                    "request_id": str(r[0]),
+                    "operation": str(r[1]),
+                    "method_id": str(r[2]),
+                    "revision_sha256": str(r[3]),
+                    "delta_id": delta_id,
+                    "qualification_id": str(r[4]),
+                    "audience_scope": str(r[5]),
+                    "audience_target_id": None if r[6] is None else str(r[6]),
+                    "activation_seq": int(r[7]),
+                    "principal_id": str(r[8]),
+                    "grant_id": str(r[9]),
+                    "quarantined": bool(r[10]),
+                    "quarantine_reason": None if r[11] is None else str(r[11]),
+                    "recorded_at_ns": int(r[12]),
+                }
+            )
+
+        blast_radii = collect_lineage_blast_radii(
+            db,
+            company_id,
+            [
+                (m_act["method_id"], m_act["revision_sha256"])
+                for m_act in method_activations
+            ],
+        )
+        for m_act in method_activations:
+            desc = list(
+                blast_radii.get((m_act["method_id"], m_act["revision_sha256"]), ())
+            )
+            m_act["blast_radius_descendants"] = desc
+            blocked = {m_act["delta_id"], *desc}
+            fallback = next(
+                (
+                    other["revision_sha256"]
+                    for other in method_activations
+                    if other["method_id"] == m_act["method_id"]
+                    and other["audience_scope"] == m_act["audience_scope"]
+                    and other["audience_target_id"] == m_act["audience_target_id"]
+                    and not other["quarantined"]
+                    and other["operation"] != "quarantine"
+                    and other["delta_id"] not in blocked
+                    and delta_meta_by_id.get(other["delta_id"], ("", ""))[0]
+                    != "DEPRECATE"
+                    and delta_meta_by_id.get(other["delta_id"], ("", ""))[1]
+                    != "quarantined"
+                ),
+                None,
+            )
+            m_act["fallback_revision"] = fallback
+
     # Pre-compute transitive blast radius for each activated tool candidate
     children_map: dict[str, list[str]] = {}
     for act in activations:
@@ -1398,12 +1627,13 @@ def read_system_evals_projection(
         )
         act["fallback_candidate_id"] = fallback
 
-    # Optional physically separate Flow 13 offline evaluator database (strictly read-only)
+    # Optional physically separate offline evaluator database (strictly read-only)
     offline_evals: dict[str, Any] = {
         "connected": False,
         "isolated_notice": "Offline evaluator registry runs in a separate read-only SQLite database outside company.sqlite.",
         "suites": [],
     }
+    rsi_transfer_summaries: list[dict[str, Any]] = []
     if evaluator_store is not None:
         try:
             st = os.lstat(evaluator_store)
@@ -1411,56 +1641,40 @@ def read_system_evals_projection(
                 not stat.S_ISLNK(st.st_mode)
                 and stat.S_ISREG(st.st_mode)
                 and st.st_uid == os.geteuid()
+                and st.st_nlink == 1
             ):
-                from urllib.parse import quote
-
-                encoded_path = quote(str(evaluator_store.absolute()), safe="/")
-                with closing(
-                    connect_sqlite(
-                        f"file:{encoded_path}?mode=ro",
-                        uri=True,
-                        autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,
+                meta = read_sealed_suite_meta(evaluator_store)
+                offline_evals["connected"] = True
+                offline_evals["suites"] = [
+                    {
+                        "revision": meta["revision"],
+                        "suite_id": meta["suite_id"],
+                        "purpose": meta["purpose"],
+                        "sealed_at_ns": int(st.st_mtime_ns),
+                        "observation_count": meta["observation_count"],
+                        "grade_count": meta["grade_count"],
+                        "pairwise_grade_count": meta["pairwise_grade_count"],
+                    }
+                ]
+                if meta["purpose"] == "recursive":
+                    summary = summarize_rsi_transfer(
+                        evaluator_store,
+                        revision=meta["revision"],
+                        min_pairs=1,
+                        min_net_wins=1,
+                        min_families=1,
                     )
-                ) as edb:
-                    edb.execute("PRAGMA query_only = ON")
-                    edb.execute("PRAGMA trusted_schema = OFF")
-                    suite_rows = edb.execute(
-                        "SELECT revision, suite_json, sealed_at_ns FROM trial_suite ORDER BY sealed_at_ns DESC LIMIT 10"
-                    ).fetchall()
-                    suites = []
-                    for sr in suite_rows:
-                        rev = str(sr[0])
-                        obs_count = int(
-                            edb.execute(
-                                "SELECT COUNT(*) FROM trial_observation WHERE revision = ?",
-                                (rev,),
-                            ).fetchone()[0]
-                        )
-                        grade_count = int(
-                            edb.execute(
-                                "SELECT COUNT(*) FROM trial_grade WHERE revision = ?",
-                                (rev,),
-                            ).fetchone()[0]
-                        )
-                        pair_count = int(
-                            edb.execute(
-                                "SELECT COUNT(*) FROM trial_pairwise_grade WHERE revision = ?",
-                                (rev,),
-                            ).fetchone()[0]
-                        )
-                        suites.append(
-                            {
-                                "revision": rev,
-                                "sealed_at_ns": int(sr[2]),
-                                "observation_count": obs_count,
-                                "grade_count": grade_count,
-                                "pairwise_grade_count": pair_count,
-                            }
-                        )
-                    offline_evals["connected"] = True
-                    offline_evals["suites"] = suites
-        except (OSError, sqlite3.Error):
+                    rsi_transfer_summaries.append(
+                        {
+                            "suite_id": meta["suite_id"],
+                            "revision": meta["revision"],
+                            **asdict(summary),
+                        }
+                    )
+        except (TrialRefused, OSError, sqlite3.Error):
             offline_evals["connected"] = False
+            offline_evals["suites"] = []
+            rsi_transfer_summaries = []
 
     return (
         {
@@ -1470,6 +1684,10 @@ def read_system_evals_projection(
             "event_seq": event_seq,
             "qualifications": qualifications,
             "activations": activations,
+            "method_deltas": method_deltas,
+            "method_qualifications": method_qualifications,
+            "method_activations": method_activations,
+            "rsi_transfer_summaries": rsi_transfer_summaries,
             "offline_evaluator": offline_evals,
         },
         event_seq,

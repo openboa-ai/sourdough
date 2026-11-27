@@ -7,7 +7,7 @@ import os
 import stat
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +20,7 @@ from ..agent_desk import (
     logs_directory,
     resolve_desk,
 )
+from ..agent_runtime._http import compute_stable_prefix_sha256
 from ..agent_runtime.cost_accounting import (
     DEFAULT_MODEL_PRICING,
     TurnCostSettlement,
@@ -44,7 +45,15 @@ from ..harness import (
     offload_large_output,
 )
 from ..memory import AgentEpisode, list_recent_episodes, record_episode
+from ..method_learning import (
+    build_causal_method_trace,
+    compute_active_snapshot_id,
+    default_active_methods_provider,
+    resolve_active_methods,
+    sync_desk_harness_projections,
+)
 from ..storage.db import open_reader, open_writer, read_tx, write_tx
+from ..storage.kernel import append_audit_event
 from ..storage.schema import installed_domains
 from .desk_tools import build_core_desk_tool_contribution
 from .domains import (
@@ -53,6 +62,7 @@ from .domains import (
     ToolQueryContext,
     merge_tool_contributions,
 )
+from .method_tools import build_core_skill_tool_contribution
 from .registry import DutyContext, RuntimeRefused
 from .work_kernel import RunFenced, assert_run_fencing
 
@@ -63,8 +73,24 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 ActiveMethodsProvider = Callable[
     [Path, str, str, str],
-    tuple[tuple[dict[str, Any], ...], str | None],
+    tuple[Sequence[Any], str | None],
 ]
+
+
+def _normalize_method_dicts(items: Sequence[Any]) -> tuple[dict[str, Any], ...]:
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+        elif hasattr(item, "to_dict") and callable(item.to_dict):
+            normalized.append(dict(item.to_dict()))
+        elif is_dataclass(item) and not isinstance(item, type):
+            normalized.append(asdict(item))
+        elif isinstance(item, Mapping):
+            normalized.append(dict(item))
+        else:
+            normalized.append({"method_id": str(item)})
+    return tuple(normalized)
 
 
 @dataclass(frozen=True)
@@ -76,6 +102,9 @@ class ShiftRunResult:
     run_status: str = "completed"
     wait_until_ns: int | None = None
     wait_event_key: str | None = None
+    active_snapshot_id: str | None = None
+    causal_method_trace: dict[str, Any] | None = None
+    stable_prefix_sha256: str = ""
 
 
 def _ensure_private_dir(path: Path, stop_at: Path) -> None:
@@ -134,7 +163,11 @@ class ShiftRunner:
         self._read_agent_state = read_agent_state
         self._resolve_profile = resolve_profile
         self._contribute_tools = contribute_tools
-        self._active_methods_provider = active_methods_provider
+        self._active_methods_provider = (
+            active_methods_provider
+            if active_methods_provider is not None
+            else default_active_methods_provider
+        )
 
     def run(
         self,
@@ -149,10 +182,12 @@ class ShiftRunner:
         history_notes: Sequence[str] = (),
         open_receipts: Sequence[dict[str, Any]] = (),
         include_core_desk_tools: bool = True,
+        include_core_skill_tools: bool | None = None,
         include_plugin_tools: bool = True,
         extra_recoverable_exceptions: tuple[type[BaseException], ...] = (),
         max_tool_calls: int = 16,
         timeout_seconds: float = 30.0,
+        pre_resolved_active_methods: tuple[Sequence[Any], str | None] | None = None,
     ) -> ShiftRunResult:
         agent_id = ctx.work_item.owner_agent_id
         persisted_profile, grant_scope = self._read_agent_state(
@@ -211,15 +246,55 @@ class ShiftRunner:
             for ep in recent_eps
         )
 
-        if self._active_methods_provider is not None:
-            active_methods, active_snapshot_id = self._active_methods_provider(
+        all_agent_methods = resolve_active_methods(
+            ctx.writer.store,
+            ctx.company_id,
+            agent_id=agent_id,
+            duty_kind=None,
+        )
+        if pre_resolved_active_methods is not None:
+            raw_active_methods, active_snapshot_id = pre_resolved_active_methods
+        else:
+            raw_active_methods, active_snapshot_id = self._active_methods_provider(
                 ctx.writer.store,
                 ctx.company_id,
                 agent_id,
                 ctx.work_item.duty_kind,
             )
-        else:
-            active_methods, active_snapshot_id = (), None
+        active_methods = _normalize_method_dicts(raw_active_methods)
+        if active_snapshot_id is None and active_methods:
+            active_snapshot_id = compute_active_snapshot_id(active_methods)
+
+        sync_desk_harness_projections(
+            ctx.writer.store,
+            ctx.company_id,
+            agent_id,
+            active_methods=all_agent_methods,
+            active_snapshot_id=compute_active_snapshot_id(all_agent_methods),
+        )
+
+        available_method_ids: list[str] = [m.method_id for m in all_agent_methods]
+        for m in active_methods:
+            mid = m.get("method_id")
+            if isinstance(mid, str) and mid not in available_method_ids:
+                available_method_ids.append(mid)
+        retrieved_method_ids: list[str] = [
+            str(m["method_id"])
+            for m in active_methods
+            if isinstance(m.get("method_id"), str)
+        ]
+        invoked_method_ids: list[str] = []
+
+        def _record_retrieved(mid: str) -> None:
+            if mid not in retrieved_method_ids:
+                retrieved_method_ids.append(mid)
+            if mid not in available_method_ids:
+                available_method_ids.append(mid)
+
+        def _record_invoked(mid: str, _note: str | None) -> None:
+            _record_retrieved(mid)
+            if mid not in invoked_method_ids:
+                invoked_method_ids.append(mid)
 
         context_pack = hydrate_shift_context(
             company_id=ctx.company_id,
@@ -236,6 +311,11 @@ class ShiftRunner:
             recent_episodes=recent_episodes,
         )
 
+        eff_skill_tools = (
+            include_core_desk_tools
+            if include_core_skill_tools is None
+            else include_core_skill_tools
+        )
         contributions: list[ToolContribution] = []
         if include_core_desk_tools:
             contributions.append(
@@ -246,6 +326,17 @@ class ShiftRunner:
                     sandbox_backend=profile.sandbox_backend,
                     tx_lock=ctx.tx_lock,
                     desk_limits=PRODUCTION_DESK_LIMITS,
+                )
+            )
+        if eff_skill_tools:
+            contributions.append(
+                build_core_skill_tool_contribution(
+                    writer=ctx.writer,
+                    claim=claim,
+                    active_snapshot_id=active_snapshot_id,
+                    retrieved_recorder=_record_retrieved,
+                    invoked_recorder=_record_invoked,
+                    tx_lock=ctx.tx_lock,
                 )
             )
         if include_plugin_tools:
@@ -266,6 +357,7 @@ class ShiftRunner:
         tool_specs, merged_handlers, contributed_recoverable = merge_tool_contributions(
             base_tools, base_handlers, contributions
         )
+        tool_specs = tuple(sorted(tool_specs, key=lambda spec: spec.name))
         merged_recoverable = tuple(
             dict.fromkeys((*contributed_recoverable, *extra_recoverable_exceptions))
         )
@@ -320,8 +412,34 @@ class ShiftRunner:
                     ),
                 )
 
+        budget_ceiling = (
+            ctx.run.budget_ceiling_minor
+            if ctx.run.budget_ceiling_minor > 0
+            else self._default_budget_ceiling_minor
+        )
+        shift_req = ShiftRequest(
+            company_id=ctx.company_id,
+            agent_id=agent_id,
+            run_id=ctx.run.run_id,
+            turn_id=turn_id,
+            fencing_token=ctx.run.fencing_token,
+            instruction=instruction,
+            context=context_pack,
+            tools=tool_specs,
+            budget_ceiling_minor_units=budget_ceiling,
+            max_tool_calls=max_tool_calls,
+            timeout_seconds=timeout_seconds,
+            desk_path=desk,
+            store_path=ctx.writer.store,
+        )
+        stable_prefix_sha256 = compute_stable_prefix_sha256(shift_req)
+
         def _record_trace(trace_payload: dict[str, Any]) -> None:
-            _append_trace_line(ctx.writer.store, session.trace_path, trace_payload)
+            enriched = {
+                **trace_payload,
+                "stable_prefix_sha256": stable_prefix_sha256,
+            }
+            _append_trace_line(ctx.writer.store, session.trace_path, enriched)
 
         def _offload(
             seq: int, tool_name: str, payload: dict[str, Any]
@@ -350,25 +468,22 @@ class ShiftRunner:
             clock=lambda: max(1, int(ctx.now_ns)),
         )
 
-        budget_ceiling = (
-            ctx.run.budget_ceiling_minor
-            if ctx.run.budget_ceiling_minor > 0
-            else self._default_budget_ceiling_minor
-        )
-        shift_req = ShiftRequest(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            turn_id=turn_id,
-            fencing_token=ctx.run.fencing_token,
-            instruction=instruction,
-            context=context_pack,
-            tools=tool_specs,
-            budget_ceiling_minor_units=budget_ceiling,
-            max_tool_calls=max_tool_calls,
-            timeout_seconds=timeout_seconds,
-            desk_path=desk,
-            store_path=ctx.writer.store,
+        _append_trace_line(
+            ctx.writer.store,
+            session.trace_path,
+            {
+                "seq": 0,
+                "kind": "shift_prefix",
+                "recorded_at_ns": max(1, int(ctx.now_ns)),
+                "company_id": ctx.company_id,
+                "agent_id": agent_id,
+                "run_id": ctx.run.run_id,
+                "turn_id": turn_id,
+                "fencing_token": ctx.run.fencing_token,
+                "active_snapshot_id": active_snapshot_id,
+                "stable_prefix_sha256": stable_prefix_sha256,
+                "tool_names": [spec.name for spec in shift_req.tools],
+            },
         )
 
         shift_result: ShiftResult | None = None
@@ -376,6 +491,7 @@ class ShiftRunner:
         settlement: TurnCostSettlement | None = None
         settlement_error: BaseException | None = None
         episode: AgentEpisode | None = None
+        causal_trace_dict: dict[str, Any] | None = None
         final_run_status = "completed"
         final_wait_until_ns: int | None = None
         final_wait_event_key: str | None = None
@@ -393,6 +509,14 @@ class ShiftRunner:
         finally:
             try:
                 cleanup_run_scratch(ctx.writer.store, agent_id, ctx.run.run_id)
+            except Exception:
+                pass
+            try:
+                sync_desk_harness_projections(
+                    ctx.writer.store,
+                    ctx.company_id,
+                    agent_id,
+                )
             except Exception:
                 pass
 
@@ -460,12 +584,58 @@ class ShiftRunner:
                     else "Shift failed"
                 )
 
+            if shift_result is not None and shift_result.output_text:
+                out_text = shift_result.output_text
+                for mid in retrieved_method_ids:
+                    if mid in out_text and mid not in invoked_method_ids:
+                        invoked_method_ids.append(mid)
+
+            decision_ids: list[str] = []
+            try:
+                with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
+                    decision_ids = [
+                        str(r[0])
+                        for r in db.execute(
+                            "SELECT decision_id FROM work_decision WHERE company_id = ? AND run_id = ? ORDER BY decision_at_ns, decision_id",
+                            (ctx.company_id, ctx.run.run_id),
+                        ).fetchall()
+                    ]
+            except Exception:
+                decision_ids = []
+
+            causal_trace = build_causal_method_trace(
+                company_id=ctx.company_id,
+                agent_id=agent_id,
+                run_id=ctx.run.run_id,
+                duty_kind=ctx.work_item.duty_kind,
+                active_snapshot_id=active_snapshot_id,
+                available_methods=available_method_ids,
+                retrieved_methods=retrieved_method_ids,
+                invoked_methods=invoked_method_ids,
+                outcome_delta={
+                    "status": ep_status,
+                    "tool_calls_executed": (
+                        shift_result.tool_calls_executed
+                        if shift_result is not None
+                        else broker.call_count
+                    ),
+                    "input_tokens": incurred_usage.input_tokens,
+                    "output_tokens": incurred_usage.output_tokens,
+                    "cost_minor_units": cost_minor,
+                    "work_decisions": decision_ids,
+                    "stable_prefix_sha256": stable_prefix_sha256,
+                },
+                stable_prefix_sha256=stable_prefix_sha256,
+            )
+            causal_trace_dict = causal_trace.to_dict()
+
             receipt_refs = tuple(
                 str(ev.payload["call_id"])
                 for ev in broker.events
                 if ev.kind == "tool_result" and ev.payload.get("call_id")
             )
             try:
+                ep_ts = max(1, int(ctx.now_ns))
                 with (
                     ctx.write_lock_ctx(),
                     closing(open_writer(ctx.writer.store, lease=ctx.writer)) as db,
@@ -482,13 +652,31 @@ class ShiftRunner:
                         outcome_status=ep_status,
                         summary_text=ep_summary,
                         active_snapshot_id=active_snapshot_id,
+                        decisions=[causal_trace_dict],
                         receipts=receipt_refs,
                         tool_calls_count=broker.call_count,
                         input_tokens=incurred_usage.input_tokens,
                         output_tokens=incurred_usage.output_tokens,
                         cost_minor_units=cost_minor,
-                        recorded_at_ns=max(1, int(ctx.now_ns)),
+                        recorded_at_ns=ep_ts,
                     )
+                    if (
+                        available_method_ids
+                        or retrieved_method_ids
+                        or invoked_method_ids
+                    ):
+                        append_audit_event(
+                            db,
+                            company_id=ctx.company_id,
+                            domain="learning",
+                            entity_type="agent_episode",
+                            entity_id=ctx.run.run_id,
+                            event_type="learning.causal_method_trace",
+                            actor_id=agent_id,
+                            run_id=ctx.run.run_id,
+                            payload=causal_trace_dict,
+                            recorded_at_ns=ep_ts,
+                        )
                 if episode is not None:
                     upsert_episode_entry(ctx.writer.store, episode)
             except Exception:
@@ -511,4 +699,7 @@ class ShiftRunner:
             run_status=final_run_status,
             wait_until_ns=final_wait_until_ns,
             wait_event_key=final_wait_event_key,
+            active_snapshot_id=active_snapshot_id,
+            causal_method_trace=causal_trace_dict,
+            stable_prefix_sha256=stable_prefix_sha256,
         )

@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from sqlite3 import Connection
 from uuid import uuid4
 
@@ -211,6 +211,129 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+_HOST_MANAGED_ROOTS = frozenset({"AGENTS.md", "skills"})
+
+
+def assert_writable_desk_relative_path(relative_path: str) -> PurePosixPath:
+    """Reject writes targeting host-managed Desk harness projections (AGENTS.md, skills/)."""
+    if (
+        not isinstance(relative_path, str)
+        or not relative_path
+        or "\\" in relative_path
+        or "\x00" in relative_path
+        or relative_path.startswith("/")
+    ):
+        raise DutyRefused("Invalid Desk relative path")
+    posix = PurePosixPath(relative_path)
+    if not posix.parts or any(part in ("", ".", "..") for part in posix.parts):
+        raise DutyRefused("Invalid Desk relative path")
+    if posix.parts[0] in _HOST_MANAGED_ROOTS:
+        raise DutyRefused(
+            "Host-managed Desk harness files (AGENTS.md, skills/) are read-only"
+        )
+    return posix
+
+
+def _remove_path_no_symlinks(path: Path, stop_at: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if not _check_no_symlinks(path, stop_at):
+        return
+    st = os.lstat(path)
+    if stat.S_ISDIR(st.st_mode):
+        for root_str, dirs, files in os.walk(path, topdown=False, followlinks=False):
+            root_path = Path(root_str)
+            for name in (*files, *dirs):
+                child = root_path / name
+                cst = os.lstat(child)
+                if stat.S_ISLNK(cst.st_mode):
+                    raise DutyRefused(
+                        "Symlinks are forbidden inside private Desk storage"
+                    )
+        shutil.rmtree(path, ignore_errors=False)
+    else:
+        path.unlink()
+
+
+def write_desk_harness_files(
+    store: Path,
+    agent_id: str,
+    *,
+    agents_md: str,
+    skills: Mapping[str, Mapping[str, bytes]],
+) -> Path:
+    """Atomically materialize read-only AGENTS.md and skills/<name>/SKILL.md inside an Agent Desk."""
+    if not isinstance(agents_md, str):
+        raise DutyRefused("AGENTS.md content must be a string")
+    root = store.resolve(strict=False).parent
+    desk = desk_directory(store, agent_id)
+    _ensure_private_dir(desk, root)
+    _ensure_private_dir(desk / ".desk", root)
+    _write_file_atomic(desk, "AGENTS.md", agents_md.encode("utf-8"))
+
+    skills_root = desk / "skills"
+    _ensure_private_dir(skills_root, root)
+    expected_skills = set(skills.keys())
+    for entry in sorted(skills_root.iterdir(), key=lambda p: p.name):
+        est = os.lstat(entry)
+        if stat.S_ISLNK(est.st_mode):
+            raise DutyRefused("Symlinks are forbidden inside private Desk storage")
+        if entry.name not in expected_skills:
+            _remove_path_no_symlinks(entry, root)
+
+    for skill_name, rel_files in sorted(skills.items()):
+        if (
+            not isinstance(skill_name, str)
+            or not _AGENT_ID.fullmatch(skill_name)
+            or ".." in skill_name
+            or skill_name.startswith(".")
+        ):
+            raise DutyRefused(f"Invalid skill directory name: {skill_name!r}")
+        skill_dir = skills_root / skill_name
+        _ensure_private_dir(skill_dir, root)
+
+        expected_rel_paths: set[str] = set()
+        for raw_rel, content_bytes in sorted(rel_files.items()):
+            posix = PurePosixPath(raw_rel)
+            if (
+                posix.is_absolute()
+                or not posix.parts
+                or any(p in ("", ".", "..") or p.startswith(".") for p in posix.parts)
+            ):
+                raise DutyRefused(f"Invalid projected skill file path: {raw_rel!r}")
+            expected_rel_paths.add(posix.as_posix())
+            target_parent = skill_dir.joinpath(*posix.parts[:-1])
+            _ensure_private_dir(target_parent, root)
+            _write_file_atomic(target_parent, posix.parts[-1], bytes(content_bytes))
+
+        for root_str, dirs, files in os.walk(
+            skill_dir, topdown=False, followlinks=False
+        ):
+            cur_path = Path(root_str)
+            for fname in files:
+                fpath = cur_path / fname
+                fst = os.lstat(fpath)
+                if stat.S_ISLNK(fst.st_mode):
+                    raise DutyRefused(
+                        "Symlinks are forbidden inside private Desk storage"
+                    )
+                rel_posix = fpath.relative_to(skill_dir).as_posix()
+                if rel_posix not in expected_rel_paths:
+                    fpath.unlink()
+            for dname in dirs:
+                dpath = cur_path / dname
+                dst = os.lstat(dpath)
+                if stat.S_ISLNK(dst.st_mode):
+                    raise DutyRefused(
+                        "Symlinks are forbidden inside private Desk storage"
+                    )
+                if not any(dpath.iterdir()):
+                    dpath.rmdir()
+    _fsync_dir(skills_root)
+    _fsync_dir(desk)
+    return desk
+
+
 def _read_draft_file(
     path: Path, *, limits: DeskLimits = LEGACY_DESK_LIMITS
 ) -> Draft | None:
@@ -381,6 +504,7 @@ def save_draft(
         or not 0 < len(content.encode("utf-8")) <= limits.max_content_bytes
     ):
         raise DutyRefused("Invalid private draft name or content")
+    assert_writable_desk_relative_path(name)
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
@@ -448,6 +572,7 @@ def delete_draft(
     """Remove an authorized private draft from disk and return the updated Desk digest."""
     if not isinstance(name, str) or not _NAME.fullmatch(name):
         raise DutyRefused("Invalid private draft name")
+    assert_writable_desk_relative_path(name)
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
@@ -484,6 +609,7 @@ def clone_desk_snapshot(
     *,
     expected_revisions: Mapping[str, str] | None = None,
     limits: DeskLimits = PRODUCTION_DESK_LIMITS,
+    include_harness_projections: bool = True,
 ) -> dict[str, str]:
     """Clone only authorized active Agents' .desk/drafts/ into an isolated target store."""
     unique_agents = tuple(dict.fromkeys(agent_ids))
@@ -576,5 +702,14 @@ def clone_desk_snapshot(
             dst_digest = compute_agent_desk_digest(target_store, aid)
             if dst_digest != src_digest:
                 raise DutyRefused(f"Cloned Desk digest mismatch for Agent '{aid}'")
+            if include_harness_projections:
+                from .method_learning import sync_desk_harness_projections
+
+                sync_desk_harness_projections(
+                    source_store,
+                    company_id,
+                    aid,
+                    target_store=target_store,
+                )
             cloned[aid] = dst_digest
     return cloned

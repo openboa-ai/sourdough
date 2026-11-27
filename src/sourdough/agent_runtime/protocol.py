@@ -6,8 +6,8 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, field, is_dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import time_ns
@@ -266,6 +266,111 @@ class ContextPack:
     recent_episodes: tuple[dict[str, Any], ...] = ()
 
 
+def skill_slug(method_id: str) -> str:
+    """Return a safe normalized directory slug for an active method/skill ID."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", method_id.strip()).strip(".-")
+    return slug or "skill"
+
+
+_skill_slug = skill_slug
+
+
+def summarize_when_to_use(raw: Mapping[str, Any]) -> str:
+    """Format a bounded single-line trigger summary for Skill Index projections."""
+    explicit = raw.get("when_to_use")
+    if isinstance(explicit, str) and explicit.strip():
+        return " ".join(explicit.strip().split())[:160]
+    trig = raw.get("trigger_spec")
+    if isinstance(trig, Mapping) and trig:
+        parts: list[str] = []
+        for k in sorted(str(key) for key in trig.keys()):
+            v = trig[k]
+            if isinstance(v, (str, int, float, bool)):
+                parts.append(f"{k}={v}")
+            elif isinstance(v, (list, tuple)):
+                parts.append(f"{k}={','.join(str(x) for x in v[:4])}")
+            else:
+                parts.append(
+                    f"{k}={json.dumps(v, sort_keys=True, separators=(',', ':'))}"
+                )
+        summary = "; ".join(parts)
+        if summary:
+            return summary[:160]
+    for fallback_key in ("title", "description"):
+        val = raw.get(fallback_key)
+        if isinstance(val, str) and val.strip():
+            return " ".join(val.strip().split())[:160]
+    return ""
+
+
+_summarize_when_to_use = summarize_when_to_use
+
+
+def project_skill_index_entry(item: Any) -> dict[str, Any]:
+    """Project an ActiveMethod or mapping into a lean Skill Index entry without body_text."""
+    if isinstance(item, dict):
+        raw: Mapping[str, Any] = item
+    elif hasattr(item, "to_index_dict") and callable(item.to_index_dict):
+        raw = dict(item.to_index_dict())
+    elif hasattr(item, "to_dict") and callable(item.to_dict):
+        raw = dict(item.to_dict())
+    elif is_dataclass(item) and not isinstance(item, type):
+        raw = asdict(item)
+    elif isinstance(item, Mapping):
+        raw = dict(item)
+    else:
+        raise AgentRuntimeRefused("Unsupported active_methods entry type")
+
+    method_id = str(raw.get("method_id") or "").strip()
+    if not method_id:
+        raise AgentRuntimeRefused(
+            "active_methods entry must include nonempty method_id"
+        )
+    raw_skill_name = raw.get("skill_name")
+    skill_name = (
+        str(raw_skill_name).strip()
+        if isinstance(raw_skill_name, str) and raw_skill_name.strip()
+        else _skill_slug(method_id)
+    )
+    raw_item_kind = raw.get("item_kind") or raw.get("target_kind") or "work_method"
+    item_kind = str(raw_item_kind).strip() or "work_method"
+    raw_skill_path = raw.get("skill_path")
+    skill_path = (
+        str(raw_skill_path).strip()
+        if isinstance(raw_skill_path, str) and raw_skill_path.strip()
+        else f"skills/{skill_name}/SKILL.md"
+    )
+    revision_sha256 = str(raw.get("revision_sha256") or "").strip()
+    audience_scope = str(raw.get("audience_scope") or "").strip()
+    when_to_use = _summarize_when_to_use(raw)
+    return {
+        "method_id": method_id,
+        "skill_name": skill_name,
+        "item_kind": item_kind,
+        "when_to_use": when_to_use,
+        "skill_path": skill_path,
+        "revision_sha256": revision_sha256,
+        "audience_scope": audience_scope,
+    }
+
+
+def project_skill_index(
+    active_methods: tuple[Any, ...] | list[Any],
+) -> list[dict[str, Any]]:
+    """Return a deterministically sorted lean Skill Index list for ContextPack v2."""
+    entries = [project_skill_index_entry(item) for item in active_methods]
+    entries.sort(
+        key=lambda e: (e["method_id"], e["revision_sha256"], e["audience_scope"])
+    )
+    return entries
+
+
+def _normalize_active_methods(
+    active_methods: tuple[Any, ...] | list[Any],
+) -> list[dict[str, Any]]:
+    return project_skill_index(active_methods)
+
+
 def hydrate_shift_context(
     *,
     company_id: str,
@@ -277,7 +382,7 @@ def hydrate_shift_context(
     open_receipts: tuple[dict[str, Any], ...] = (),
     history_notes: tuple[str, ...] = (),
     desk_manifest: tuple[dict[str, Any], ...] = (),
-    active_methods: tuple[dict[str, Any], ...] = (),
+    active_methods: tuple[Any, ...] = (),
     active_snapshot_id: str | None = None,
     recent_episodes: tuple[dict[str, Any], ...] = (),
     max_context_bytes: int = 16_384,
@@ -285,6 +390,7 @@ def hydrate_shift_context(
     """Build a bounded ContextPack without EVER evicting open_receipts, grants, or active methods."""
     kept_history = list(history_notes)
     kept_episodes = list(recent_episodes)
+    normalized_methods = _normalize_active_methods(active_methods)
     compacted = False
     while True:
         body = {
@@ -297,7 +403,7 @@ def hydrate_shift_context(
             "open_receipts": list(open_receipts),
             "history_notes": kept_history,
             "desk_manifest": list(desk_manifest),
-            "active_methods": list(active_methods),
+            "active_methods": normalized_methods,
             "active_snapshot_id": active_snapshot_id,
             "recent_episodes": kept_episodes,
         }
@@ -327,7 +433,7 @@ def hydrate_shift_context(
         digest=digest,
         compacted=compacted,
         desk_manifest=tuple(desk_manifest),
-        active_methods=tuple(active_methods),
+        active_methods=tuple(normalized_methods),
         active_snapshot_id=active_snapshot_id,
         recent_episodes=tuple(kept_episodes),
     )
@@ -348,6 +454,10 @@ class ShiftRequest:
     timeout_seconds: float = 30.0
     desk_path: Path | None = None
     store_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        sorted_tools = tuple(sorted(self.tools, key=lambda spec: spec.name))
+        object.__setattr__(self, "tools", sorted_tools)
 
 
 @dataclass(frozen=True)
@@ -412,6 +522,7 @@ def _is_recoverable_tool_exception(
     from ..episode_index import EpisodeIndexRefused
     from ..general_ledger import JournalRefused
     from ..memory import MemoryRefused
+    from ..method_learning import MethodRefused
     from ..runtime.domains import DomainActionRefused
     from ..runtime.work_kernel import WorkKernelRefused
 
@@ -425,6 +536,7 @@ def _is_recoverable_tool_exception(
             JournalRefused,
             MemoryRefused,
             EpisodeIndexRefused,
+            MethodRefused,
         ),
     )
 

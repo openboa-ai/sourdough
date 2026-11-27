@@ -84,6 +84,7 @@ if TYPE_CHECKING:
         DUTY_CEO_RESPOND_MESSAGE,
         DUTY_WORK_ASSESSMENT_REVIEW,
         DUTY_WORK_DISCOVERY_REVIEW,
+        DUTY_WORK_DREAMING,
         DUTY_WORK_HANDOFF_FOLLOWUP,
         DUTY_WORK_PEER_RESPONSE,
         ProfileBindingLookup,
@@ -92,6 +93,7 @@ if TYPE_CHECKING:
         build_store_profile_lookup,
         sync_board_triggers,
     )
+    from .method_tools import build_core_skill_tool_contribution
     from .resident import ResidentCompanyService, ResidentHealth
 
 _LAZY_HANDLERS = frozenset(
@@ -100,6 +102,7 @@ _LAZY_HANDLERS = frozenset(
         "DUTY_CEO_RESPOND_MESSAGE",
         "DUTY_WORK_ASSESSMENT_REVIEW",
         "DUTY_WORK_DISCOVERY_REVIEW",
+        "DUTY_WORK_DREAMING",
         "DUTY_WORK_HANDOFF_FOLLOWUP",
         "DUTY_WORK_PEER_RESPONSE",
         "ProfileBindingLookup",
@@ -110,6 +113,7 @@ _LAZY_HANDLERS = frozenset(
     }
 )
 _LAZY_RESIDENT = frozenset({"ResidentCompanyService", "ResidentHealth"})
+_LAZY_METHOD_TOOLS = frozenset({"build_core_skill_tool_contribution"})
 
 
 def __getattr__(name: str) -> Any:
@@ -121,6 +125,10 @@ def __getattr__(name: str) -> Any:
         from . import resident
 
         return getattr(resident, name)
+    if name in _LAZY_METHOD_TOOLS:
+        from . import method_tools
+
+        return getattr(method_tools, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -134,6 +142,7 @@ __all__ = [
     "DUTY_CEO_RESPOND_MESSAGE",
     "DUTY_WORK_ASSESSMENT_REVIEW",
     "DUTY_WORK_DISCOVERY_REVIEW",
+    "DUTY_WORK_DREAMING",
     "DUTY_WORK_HANDOFF_FOLLOWUP",
     "DUTY_WORK_PEER_RESPONSE",
     "DecisionActionContext",
@@ -179,6 +188,7 @@ __all__ = [
     "WorkTimelineContribution",
     "arm_result_continuation",
     "assert_run_fencing",
+    "build_core_skill_tool_contribution",
     "build_default_registry",
     "build_proactive_tool_handlers",
     "build_production_duty_registry",

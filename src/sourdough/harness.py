@@ -312,6 +312,8 @@ def build_desk_sandbox_profile(
 
     store_wal = Path(f"{resolved_store}-wal")
     store_shm = Path(f"{resolved_store}-shm")
+    agents_md_path = resolved_desk / "AGENTS.md"
+    skills_dir_path = resolved_desk / "skills"
     return "\n".join(
         [
             "(version 1)",
@@ -329,6 +331,9 @@ def build_desk_sandbox_profile(
             "(allow file-read* file-write*",
             rw_block + ")",
             *extra_file_lines,
+            "(deny file-write*",
+            f"    (literal {_sbpl_quote(agents_md_path)})",
+            f"    (subpath {_sbpl_quote(skills_dir_path)}))",
             "(deny file-read* file-write*",
             f"    (literal {_sbpl_quote(resolved_store)})",
             f"    (literal {_sbpl_quote(store_wal)})",

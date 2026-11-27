@@ -6,12 +6,14 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from hashlib import sha256
 from typing import Any
 
 from .protocol import (
     AgentRuntimeRefused,
     AgentTransportInterrupted,
     ShiftRequest,
+    project_skill_index,
 )
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -43,13 +45,14 @@ def resolve_endpoint_base(
 def render_context_system_blocks(request: ShiftRequest) -> tuple[str, str]:
     """Split ContextPack v2 into a prompt-cache-stable prefix and per-run dynamic suffix."""
     ctx = request.context
+    skill_index = project_skill_index(ctx.active_methods) if ctx.active_methods else []
     stable_envelope = {
         "company_id": ctx.company_id,
         "agent_id": ctx.agent_id,
         "grant_scope": ctx.grant_scope,
         "mandate_summary": ctx.mandate_summary,
         "active_snapshot_id": ctx.active_snapshot_id,
-        "active_methods": list(ctx.active_methods),
+        "active_methods": skill_index,
     }
     dynamic_envelope = {
         "run_id": ctx.run_id,
@@ -67,11 +70,31 @@ def render_context_system_blocks(request: ShiftRequest) -> tuple[str, str]:
         "You are operating inside a Sourdough fenced Agent shift. "
         "Respect your grant_scope and open_receipts, never spoof server identity arguments "
         "(agent_id, company_id, run_id, fencing_token, tier, actor_id, created_by_agent_id), "
+        "use skill_read (or skills/<skill-name>/SKILL.md) to load full Skill instructions on demand, "
         "and invoke only declared tools.\n"
         f"SHIFT_STABLE_CONTEXT={stable_json}"
     )
     dynamic_suffix = f"SHIFT_DYNAMIC_CONTEXT={dynamic_json}"
     return stable_prefix, dynamic_suffix
+
+
+def compute_stable_prefix_sha256(request: ShiftRequest) -> str:
+    """Compute canonical SHA-256 of the prompt-cache-stable system prefix and sorted tool specs."""
+    stable_prefix, _ = render_context_system_blocks(request)
+    sorted_tools = [
+        {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters,
+        }
+        for spec in sorted(request.tools, key=lambda s: s.name)
+    ]
+    payload = {
+        "stable_prefix": stable_prefix,
+        "tools": sorted_tools,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()
 
 
 def render_context_system_prompt(request: ShiftRequest) -> str:

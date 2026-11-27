@@ -29,6 +29,7 @@ from sourdough.runtime import (
     DUTY_CEO_RESPOND_MESSAGE,
     DUTY_WORK_ASSESSMENT_REVIEW,
     DUTY_WORK_DISCOVERY_REVIEW,
+    DUTY_WORK_DREAMING,
     DUTY_WORK_HANDOFF_FOLLOWUP,
     DUTY_WORK_PEER_RESPONSE,
     CompanyRuntime,
@@ -247,6 +248,7 @@ class M2CollabRuntimeTests(unittest.TestCase):
                     DUTY_WORK_ASSESSMENT_REVIEW,
                     DUTY_WORK_HANDOFF_FOLLOWUP,
                     DUTY_WORK_DISCOVERY_REVIEW,
+                    DUTY_WORK_DREAMING,
                 },
             )
 
