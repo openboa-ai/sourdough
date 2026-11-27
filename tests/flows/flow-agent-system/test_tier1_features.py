@@ -2221,6 +2221,7 @@ class TestF32DiscoveryDecisionTier1(unittest.TestCase):
                         "p-d", "ev-d", d.revision, "proj-d", rev, (a.agent_id,), 0, 22
                     ),
                 )
+            pub_ns = time_ns()
             with h.writer() as w:
                 with closing(open_writer(h.store, lease=w)) as db, write_tx(db):
                     complete_work_run(
@@ -2228,7 +2229,7 @@ class TestF32DiscoveryDecisionTier1(unittest.TestCase):
                         ca.run_id,
                         ca.fencing_token,
                         outcome={"prep": True},
-                        now_ns=1_500,
+                        now_ns=pub_ns,
                     )
                     create_work_item(
                         db,
@@ -2237,7 +2238,7 @@ class TestF32DiscoveryDecisionTier1(unittest.TestCase):
                         duty_kind="work.discovery_review",
                         source_kind="e2e",
                         source_id="rev-1",
-                        now_ns=2_000,
+                        now_ns=pub_ns + 100,
                     )
             srv.openai_queue.put(
                 openai_tool_call_response(
@@ -2247,14 +2248,14 @@ class TestF32DiscoveryDecisionTier1(unittest.TestCase):
                     {
                         "action_kind": "investigate",
                         "rationale": "Discrepancy observed in shared asset.",
-                        "decision_at_ns": 3_000,
+                        "decision_at_ns": pub_ns + 1_000,
                         "evidence": [
                             {
                                 "kind": "shared_publication",
                                 "resource_id": asset.asset_id,
                                 "revision": sha256_hex(asset.content),
-                                "observed_at_ns": 2_500,
-                                "available_at_ns": 1_500,
+                                "observed_at_ns": pub_ns + 500,
+                                "available_at_ns": pub_ns,
                             }
                         ],
                     },
@@ -2268,7 +2269,7 @@ class TestF32DiscoveryDecisionTier1(unittest.TestCase):
                 profile_bindings={h.founder_id: profile, a.agent_id: profile},
                 domain_plugins=(),
             )
-            step = h.make_runtime(reg).step(max_dispatches=2, now_ns=3_000)
+            step = h.make_runtime(reg).step(max_dispatches=2, now_ns=pub_ns + 1_000)
             self.assertEqual(len(step.executed_runs), 1)
             self.assertEqual(
                 count_rows(h.store, "work_decision", "company_id = ?", (h.company_id,)),

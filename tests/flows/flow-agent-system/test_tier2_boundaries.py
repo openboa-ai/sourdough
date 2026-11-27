@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import unittest
 from contextlib import closing
+from time import time_ns
 from zipfile import ZipFile
 
 from _helpers import (
@@ -2727,13 +2728,14 @@ class TestF32DiscoveryDecisionTier2(unittest.TestCase):
             DecisionEvidence = lazy_attr(
                 "sourdough.runtime.work_kernel", "DecisionEvidence"
             )
+            pub_ns = time_ns()
             ev1 = (
                 DecisionEvidence(
                     "shared_publication",
                     asset1.asset_id,
                     sha256_hex(asset1.content),
-                    observed_at_ns=1_500,
-                    available_at_ns=1_000,
+                    observed_at_ns=pub_ns + 500,
+                    available_at_ns=pub_ns,
                 ),
             )
             ev2 = (
@@ -2741,8 +2743,8 @@ class TestF32DiscoveryDecisionTier2(unittest.TestCase):
                     "shared_publication",
                     asset2.asset_id,
                     sha256_hex(asset2.content),
-                    observed_at_ns=1_500,
-                    available_at_ns=1_000,
+                    observed_at_ns=pub_ns + 500,
+                    available_at_ns=pub_ns,
                 ),
             )
             with h.writer() as w:
@@ -2757,7 +2759,7 @@ class TestF32DiscoveryDecisionTier2(unittest.TestCase):
                         action_kind="hold",
                         rationale="Same",
                         evidence=ev1,
-                        decision_at_ns=2_000,
+                        decision_at_ns=pub_ns + 1_000,
                         action_id="act-1",
                     )
                     d2 = record_work_decision(
@@ -2770,7 +2772,7 @@ class TestF32DiscoveryDecisionTier2(unittest.TestCase):
                         action_kind="hold",
                         rationale="Same",
                         evidence=ev1,
-                        decision_at_ns=2_000,
+                        decision_at_ns=pub_ns + 1_000,
                         action_id="act-1",
                     )
                     self.assertEqual(d1.decision_id, d2.decision_id)
@@ -2785,7 +2787,7 @@ class TestF32DiscoveryDecisionTier2(unittest.TestCase):
                             action_kind="hold",
                             rationale="Changed",
                             evidence=ev2,
-                            decision_at_ns=2_000,
+                            decision_at_ns=pub_ns + 1_000,
                             action_id="act-1",
                         )
 

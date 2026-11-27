@@ -502,9 +502,12 @@ def main() -> int:
                         print(announcement, flush=True)
                     if args.once:
                         if not stop_requested:
+                            single_tick_timeout = max(960.0, args.tick_interval + 960.0)
                             service.wait_for(
-                                lambda h: h.ticks_completed >= 1,
-                                timeout_seconds=max(10.0, args.tick_interval + 10.0),
+                                lambda h: stop_requested
+                                or h.ticks_completed >= 1
+                                or not h.running,
+                                timeout_seconds=single_tick_timeout,
                             )
                     else:
                         while not stop_requested:

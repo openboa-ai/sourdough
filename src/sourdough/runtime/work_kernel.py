@@ -3176,6 +3176,93 @@ CORE_EVIDENCE_KINDS: frozenset[str] = frozenset(
 )
 
 
+def work_run_evidence_revision(
+    run_id: str,
+    *,
+    company_id: str,
+    work_item_id: str,
+    agent_id: str,
+    duty_kind: str,
+    fencing_token: int,
+    created_at_ns: int,
+) -> str:
+    """Compute canonical immutable revision digest for a work_run evidence citation."""
+    return sha256(
+        _canonical_json(
+            {
+                "kind": "work_run",
+                "company_id": company_id,
+                "run_id": run_id,
+                "work_item_id": work_item_id,
+                "agent_id": agent_id,
+                "duty_kind": duty_kind,
+                "fencing_token": int(fencing_token),
+                "created_at_ns": int(created_at_ns),
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def work_item_evidence_revision(
+    work_item_id: str,
+    *,
+    company_id: str,
+    owner_agent_id: str,
+    duty_kind: str,
+    source_kind: str,
+    source_id: str,
+    payload_json: str,
+    created_at_ns: int,
+) -> str:
+    """Compute canonical immutable revision digest for a work_item evidence citation."""
+    return sha256(
+        _canonical_json(
+            {
+                "kind": "work_item",
+                "company_id": company_id,
+                "work_item_id": work_item_id,
+                "owner_agent_id": owner_agent_id,
+                "duty_kind": duty_kind,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "payload_json": payload_json,
+                "created_at_ns": int(created_at_ns),
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def peer_request_evidence_revision(
+    request_id: str,
+    *,
+    company_id: str,
+    requester_agent_id: str,
+    recipient_agent_id: str,
+    state: str,
+    question: str,
+    expected_decision: str,
+    response_json: str | None,
+    created_at_ns: int,
+) -> str:
+    """Compute canonical revision digest for a peer_request evidence citation."""
+    return sha256(
+        _canonical_json(
+            {
+                "kind": "peer_request",
+                "company_id": company_id,
+                "request_id": request_id,
+                "requester_agent_id": requester_agent_id,
+                "recipient_agent_id": recipient_agent_id,
+                "state": state,
+                "question": question,
+                "expected_decision": expected_decision,
+                "response_json": response_json,
+                "created_at_ns": int(created_at_ns),
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _validate_core_evidence_entry(
     connection: sqlite3.Connection,
     *,
@@ -3273,9 +3360,28 @@ def _validate_core_evidence_entry(
             raise WorkKernelRefused(
                 "Cited shared_publication revision does not match committed content"
             )
+        pub_audit = connection.execute(
+            """SELECT MIN(recorded_at_ns)
+               FROM audit_event
+               WHERE company_id = ?
+                 AND event_type IN ('company.asset_published', 'asset.published')
+                 AND (entity_id = ? OR json_extract(payload_json, '$.asset_id') = ?)""",
+            (company_id, ev.resource_id, ev.resource_id),
+        ).fetchone()
+        if pub_audit is not None and pub_audit[0] is not None:
+            pub_recorded_at_ns = int(pub_audit[0])
+            if (
+                ev.available_at_ns < pub_recorded_at_ns
+                or pub_recorded_at_ns > decision_at_ns
+            ):
+                raise WorkKernelRefused(
+                    "Cited shared_publication timestamps precede publication commit or follow decision"
+                )
     elif ev.kind == "peer_request":
         req_row = connection.execute(
-            """SELECT company_id, requester_agent_id, recipient_agent_id
+            """SELECT company_id, requester_agent_id, recipient_agent_id,
+                      state, question, expected_decision, response_json,
+                      created_at_ns, resolved_at_ns
                FROM work_peer_requests WHERE request_id = ?""",
             (ev.resource_id,),
         ).fetchone()
@@ -3286,24 +3392,86 @@ def _validate_core_evidence_entry(
             str(req_row[2]),
         ):
             raise WorkKernelRefused("Agent is not authorized to cite peer_request")
+        expected_peer_rev = peer_request_evidence_revision(
+            ev.resource_id,
+            company_id=str(req_row[0]),
+            requester_agent_id=str(req_row[1]),
+            recipient_agent_id=str(req_row[2]),
+            state=str(req_row[3]),
+            question=str(req_row[4]),
+            expected_decision=str(req_row[5]),
+            response_json=None if req_row[6] is None else str(req_row[6]),
+            created_at_ns=int(req_row[7]),
+        )
+        if ev.revision != expected_peer_rev:
+            raise WorkKernelRefused(
+                "Cited peer_request revision does not match canonical request state"
+            )
+        min_avail = max(
+            int(req_row[7]),
+            int(req_row[8]) if req_row[8] is not None else 0,
+        )
+        if ev.available_at_ns < min_avail or min_avail > decision_at_ns:
+            raise WorkKernelRefused(
+                "Cited peer_request timestamps precede request creation/resolution or follow decision"
+            )
     elif ev.kind == "work_run":
         run_row = connection.execute(
-            "SELECT company_id, agent_id FROM work_runs WHERE run_id = ?",
+            """SELECT company_id, work_item_id, agent_id, duty_kind,
+                      fencing_token, created_at_ns
+               FROM work_runs WHERE run_id = ?""",
             (ev.resource_id,),
         ).fetchone()
         if run_row is None:
             raise WorkKernelRefused("Cited work_run does not exist")
-        if str(run_row[0]) != company_id or str(run_row[1]) != agent_id:
+        if str(run_row[0]) != company_id or str(run_row[2]) != agent_id:
             raise WorkKernelRefused("Agent is not authorized to cite work_run")
+        expected_run_rev = work_run_evidence_revision(
+            ev.resource_id,
+            company_id=str(run_row[0]),
+            work_item_id=str(run_row[1]),
+            agent_id=str(run_row[2]),
+            duty_kind=str(run_row[3]),
+            fencing_token=int(run_row[4]),
+            created_at_ns=int(run_row[5]),
+        )
+        if ev.revision != expected_run_rev:
+            raise WorkKernelRefused(
+                "Cited work_run revision does not match canonical run identity"
+            )
+        if ev.available_at_ns < int(run_row[5]) or int(run_row[5]) > decision_at_ns:
+            raise WorkKernelRefused(
+                "Cited work_run timestamps precede run creation or follow decision"
+            )
     elif ev.kind == "work_item":
         item_row = connection.execute(
-            "SELECT company_id, owner_agent_id FROM work_items WHERE work_item_id = ?",
+            """SELECT company_id, owner_agent_id, duty_kind, source_kind,
+                      source_id, payload_json, created_at_ns
+               FROM work_items WHERE work_item_id = ?""",
             (ev.resource_id,),
         ).fetchone()
         if item_row is None:
             raise WorkKernelRefused("Cited work_item does not exist")
         if str(item_row[0]) != company_id or str(item_row[1]) != agent_id:
             raise WorkKernelRefused("Agent is not authorized to cite work_item")
+        expected_item_rev = work_item_evidence_revision(
+            ev.resource_id,
+            company_id=str(item_row[0]),
+            owner_agent_id=str(item_row[1]),
+            duty_kind=str(item_row[2]),
+            source_kind=str(item_row[3]),
+            source_id=str(item_row[4]),
+            payload_json=str(item_row[5]),
+            created_at_ns=int(item_row[6]),
+        )
+        if ev.revision != expected_item_rev:
+            raise WorkKernelRefused(
+                "Cited work_item revision does not match canonical item state"
+            )
+        if ev.available_at_ns < int(item_row[6]) or int(item_row[6]) > decision_at_ns:
+            raise WorkKernelRefused(
+                "Cited work_item timestamps precede item creation or follow decision"
+            )
     elif ev.kind == "tool_call_receipt":
         target_run_id: str | None = None
         target_call_id = ev.resource_id

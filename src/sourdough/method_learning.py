@@ -2169,8 +2169,17 @@ def quarantine_method_lineage(
         ]
         if revision_sha256 is None:
             for extra_rev in db.execute(
-                "SELECT revision_sha256 FROM method_delta WHERE company_id = ? AND method_id = ?",
-                (company_id, clean_method_id),
+                """SELECT revision_sha256 FROM method_delta
+                   WHERE company_id = ? AND method_id = ?
+                     AND audience_scope = ?
+                     AND (audience_target_id IS ? OR audience_target_id = ?)""",
+                (
+                    company_id,
+                    clean_method_id,
+                    target_delta.audience_scope,
+                    target_delta.audience_target_id,
+                    target_delta.audience_target_id,
+                ),
             ).fetchall():
                 start_nodes.append((clean_method_id, str(extra_rev[0])))
 

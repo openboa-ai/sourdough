@@ -1167,6 +1167,14 @@ class M4TrialRunnerTests(unittest.TestCase):
                         if meta.get("require_counterexample") is True:
                             cx_proc = mid
                     if cx_proc is not None:
+                        draft_res = broker.invoke(
+                            f"draft-{req.run_id}",
+                            "desk_save_draft",
+                            {
+                                "name": f"cx-check-{req.run_id[:8]}",
+                                "content": f"Verified boundary counterexample via {cx_proc}.",
+                            },
+                        )
                         broker.invoke(
                             f"dec-{req.run_id}",
                             "record_work_decision",
@@ -1178,9 +1186,9 @@ class M4TrialRunnerTests(unittest.TestCase):
                                 ),
                                 "evidence": [
                                     {
-                                        "kind": "work_run",
-                                        "resource_id": req.run_id,
-                                        "revision": "v1",
+                                        "kind": "private_draft",
+                                        "resource_id": draft_res["name"],
+                                        "revision": draft_res["revision"],
                                         "available_at_ns": 1,
                                         "observed_at_ns": 1,
                                     }

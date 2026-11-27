@@ -5431,6 +5431,627 @@ class TestM5Tier5Hardening(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(cond_item, (None,))
 
+    def test_pr191_r9_core_evidence_authenticates_work_run_work_item_and_peer_request_revisions(
+        self,
+    ) -> None:
+        """PR #191 R9 Security P2: work_run, work_item, and peer_request evidence must verify canonical revision & time."""
+        from sourdough.runtime.work_kernel import (
+            peer_request_evidence_revision,
+            work_item_evidence_revision,
+            work_run_evidence_revision,
+        )
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            peer_id, _peer_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="peer-r9",
+                profile_id=self.profile.profile_id(),
+            )
+            assign_project(
+                w,
+                self.grant_id,
+                "proj-r9",
+                (self.founder_id, peer_id),
+                publishers=(self.founder_id, peer_id),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=peer_id,
+                    duty_kind="work.peer_response",
+                    remit="Answer R9 requests",
+                    readable_scope={
+                        "project_id": "proj-r9",
+                        "allowed_requesters": [self.founder_id],
+                    },
+                    now_ns=1_000,
+                )
+                item, run, _claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=2_000,
+                )
+                other_item, other_run, _ = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=peer_id,
+                    grant_id=_peer_g,
+                    grant_scope="assessment",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=2_100,
+                )
+                # Create a valid peer_request from peer -> founder so founder can cite it
+                register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.peer_response",
+                    remit="Founder peer responder",
+                    readable_scope={
+                        "project_id": "proj-r9",
+                        "allowed_requesters": [peer_id],
+                    },
+                    now_ns=1_000,
+                )
+                req, _ = open_peer_request(
+                    db,
+                    company_id=self.company_id,
+                    requester_work_item_id=other_item.work_item_id,
+                    requester_run_id=other_run.run_id,
+                    fencing_token=other_run.fencing_token,
+                    recipient_agent_id=self.founder_id,
+                    question="Confirm R9 revision auth",
+                    expected_decision="approve",
+                    evidence_refs=[],
+                    deadline_ns=900_000,
+                    request_id="req-r9-auth",
+                    project_id="proj-r9",
+                    now_ns=2_200,
+                )
+
+                run_row = db.execute(
+                    """SELECT company_id, work_item_id, agent_id, duty_kind, fencing_token, created_at_ns
+                       FROM work_runs WHERE run_id = ?""",
+                    (run.run_id,),
+                ).fetchone()
+                valid_run_rev = work_run_evidence_revision(
+                    run.run_id,
+                    company_id=str(run_row[0]),
+                    work_item_id=str(run_row[1]),
+                    agent_id=str(run_row[2]),
+                    duty_kind=str(run_row[3]),
+                    fencing_token=int(run_row[4]),
+                    created_at_ns=int(run_row[5]),
+                )
+                item_row = db.execute(
+                    """SELECT company_id, owner_agent_id, duty_kind, source_kind, source_id, payload_json, created_at_ns
+                       FROM work_items WHERE work_item_id = ?""",
+                    (item.work_item_id,),
+                ).fetchone()
+                valid_item_rev = work_item_evidence_revision(
+                    item.work_item_id,
+                    company_id=str(item_row[0]),
+                    owner_agent_id=str(item_row[1]),
+                    duty_kind=str(item_row[2]),
+                    source_kind=str(item_row[3]),
+                    source_id=str(item_row[4]),
+                    payload_json=str(item_row[5]),
+                    created_at_ns=int(item_row[6]),
+                )
+                req_row = db.execute(
+                    """SELECT company_id, requester_agent_id, recipient_agent_id,
+                              state, question, expected_decision, response_json, created_at_ns
+                       FROM work_peer_requests WHERE request_id = ?""",
+                    (req.request_id,),
+                ).fetchone()
+                valid_req_rev = peer_request_evidence_revision(
+                    req.request_id,
+                    company_id=str(req_row[0]),
+                    requester_agent_id=str(req_row[1]),
+                    recipient_agent_id=str(req_row[2]),
+                    state=str(req_row[3]),
+                    question=str(req_row[4]),
+                    expected_decision=str(req_row[5]),
+                    response_json=None if req_row[6] is None else str(req_row[6]),
+                    created_at_ns=int(req_row[7]),
+                )
+
+                # 1. Attacker-chosen revisions MUST fail closed for all three kinds
+                for kind, rid in (
+                    ("work_run", run.run_id),
+                    ("work_item", item.work_item_id),
+                    ("peer_request", req.request_id),
+                ):
+                    with self.subTest(bad_rev_kind=kind):
+                        with self.assertRaisesRegex(WorkKernelRefused, "revision"):
+                            record_work_decision(
+                                db,
+                                company_id=self.company_id,
+                                work_item_id=item.work_item_id,
+                                run_id=run.run_id,
+                                fencing_token=run.fencing_token,
+                                agent_id=self.founder_id,
+                                action_kind="counterexample_verified",
+                                rationale="Forged revision",
+                                evidence=(
+                                    DecisionEvidence(
+                                        kind=kind,
+                                        resource_id=rid,
+                                        revision="attacker-chosen-not-a-revision",
+                                        observed_at_ns=3_000,
+                                        available_at_ns=2_500,
+                                    ),
+                                ),
+                                decision_at_ns=3_500,
+                            )
+
+                # 2. Pre-creation available_at_ns MUST fail closed even with valid revision
+                with self.assertRaisesRegex(WorkKernelRefused, "precede"):
+                    record_work_decision(
+                        db,
+                        company_id=self.company_id,
+                        work_item_id=item.work_item_id,
+                        run_id=run.run_id,
+                        fencing_token=run.fencing_token,
+                        agent_id=self.founder_id,
+                        action_kind="counterexample_verified",
+                        rationale="Backdated timestamp",
+                        evidence=(
+                            DecisionEvidence(
+                                kind="work_run",
+                                resource_id=run.run_id,
+                                revision=valid_run_rev,
+                                observed_at_ns=1_000,
+                                available_at_ns=500,
+                            ),
+                        ),
+                        decision_at_ns=3_500,
+                    )
+
+                # 3. Canonical authenticated revisions + valid timestamps succeed for all three!
+                dec = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="counterexample_verified",
+                    rationale="Authenticated core citations",
+                    evidence=(
+                        DecisionEvidence(
+                            kind="work_run",
+                            resource_id=run.run_id,
+                            revision=valid_run_rev,
+                            observed_at_ns=2_500,
+                            available_at_ns=2_000,
+                        ),
+                        DecisionEvidence(
+                            kind="work_item",
+                            resource_id=item.work_item_id,
+                            revision=valid_item_rev,
+                            observed_at_ns=2_500,
+                            available_at_ns=2_000,
+                        ),
+                        DecisionEvidence(
+                            kind="peer_request",
+                            resource_id=req.request_id,
+                            revision=valid_req_rev,
+                            observed_at_ns=2_500,
+                            available_at_ns=2_200,
+                        ),
+                    ),
+                    decision_at_ns=3_500,
+                )
+                self.assertTrue(dec.decision_id)
+
+    def test_pr191_r9_board_detail_projection_redacts_work_decision_rationale(
+        self,
+    ) -> None:
+        """PR #191 R9 Security P2: Board agent-detail projection must redact work_decision rationales."""
+        from sourdough.ipc.projections import read_agent_detail_projection
+
+        canary_rationale = "PRIVATE_DRAFT_CANARY_RATIONALE_9347"
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, _claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+                record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale=canary_rationale,
+                    evidence=(),
+                    decision_at_ns=1_500,
+                )
+        detail, _wm = read_agent_detail_projection(
+            self.store, self.company_id, self.founder_id
+        )
+        serialized = json.dumps(detail, sort_keys=True)
+        self.assertNotIn(canary_rationale, serialized)
+        dec_proj = detail["tabs"]["work_decisions"][0]
+        self.assertIsNone(dec_proj["rationale"])
+        self.assertTrue(dec_proj["rationale_redacted"])
+        self.assertEqual(
+            dec_proj["rationale_digest"],
+            sha256(canary_rationale.encode("utf-8")).hexdigest(),
+        )
+
+    def test_pr191_r9_revisionless_quarantine_seeds_scoped_to_authorized_audience(
+        self,
+    ) -> None:
+        """PR #191 R9 P2: revisionless quarantine must not sweep another Agent's unrelated method_id."""
+        from sourdough.method_learning import resolve_active_methods
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            alice_id, alice_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="alice-r9q",
+                profile_id=self.profile.profile_id(),
+            )
+            bob_id, bob_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="bob-r9q",
+                profile_id=self.profile.profile_id(),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, run_a, claim_a = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=alice_id,
+                    grant_id=alice_g,
+                    grant_scope="assessment",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+                _, run_b, claim_b = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=bob_id,
+                    grant_id=bob_g,
+                    grant_scope="assessment",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            # Bob activates earlier, Alice activates later under the SAME method_id
+            bob_delta = distill_method_delta(
+                w,
+                claim_b,
+                method_id="colliding-slug-r9",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="one_agent",
+                audience_target_id=bob_id,
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Bob active method must survive Alice quarantine.",
+                falsification_criteria="Fails if Bob loses active method.",
+                source_refs=(f"work_run:{run_b.run_id}",),
+                now_ns=1_100,
+            )
+            qualify_method_delta(
+                w,
+                bob_delta.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_150,
+            )
+            activate_method_delta(
+                w,
+                bob_delta.delta_id,
+                actor_id=bob_id,
+                grant_id=bob_g,
+                now_ns=1_200,
+            )
+            alice_delta = distill_method_delta(
+                w,
+                claim_a,
+                method_id="colliding-slug-r9",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="one_agent",
+                audience_target_id=alice_id,
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Alice active method to be quarantined.",
+                falsification_criteria="Fails if Alice method stays active.",
+                source_refs=(f"work_run:{run_a.run_id}",),
+                now_ns=1_300,
+            )
+            qualify_method_delta(
+                w,
+                alice_delta.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_350,
+            )
+            activate_method_delta(
+                w,
+                alice_delta.delta_id,
+                actor_id=alice_id,
+                grant_id=alice_g,
+                now_ns=1_400,
+            )
+
+            # Alice invokes revisionless quarantine using only Alice's grant
+            receipt = quarantine_method_lineage(
+                w,
+                self.company_id,
+                method_id="colliding-slug-r9",
+                revision_sha256=None,
+                reason="Alice revokes her own method",
+                actor_id=alice_id,
+                grant_id=alice_g,
+                now_ns=1_500,
+            )
+            self.assertEqual(
+                receipt.quarantined_revisions,
+                (("colliding-slug-r9", alice_delta.revision_sha256),),
+            )
+            with closing(open_reader(self.store)) as ro, read_tx(ro):
+                alice_active = resolve_active_methods(
+                    ro, self.company_id, agent_id=alice_id
+                )
+                bob_active = resolve_active_methods(
+                    ro, self.company_id, agent_id=bob_id
+                )
+            self.assertEqual(alice_active, ())
+            self.assertEqual(len(bob_active), 1)
+            self.assertEqual(bob_active[0].revision_sha256, bob_delta.revision_sha256)
+
+    def test_pr191_r9_shared_publication_evidence_rejects_post_decision_commit(
+        self,
+    ) -> None:
+        """PR #191 R9 P2: shared_publication committed after decision_at_ns must fail closed."""
+        with hold_company_writer(self.store, self.company_id) as w:
+            proj_rev = assign_project(
+                w,
+                self.grant_id,
+                "proj-r9-pub",
+                (self.founder_id,),
+                publishers=(self.founder_id,),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            draft = save_draft(
+                w,
+                claim,
+                claim.purpose,
+                name="pub-time-check",
+                content="Point-in-time published guidance.",
+                expected_revision=None,
+            )
+            asset = publish_selection(
+                w,
+                claim,
+                claim.purpose,
+                Selection(
+                    "pub-r9-time",
+                    "pub-time-check",
+                    draft.revision,
+                    "proj-r9-pub",
+                    proj_rev,
+                    (self.founder_id,),
+                    0,
+                    len(draft.content),
+                ),
+            )
+            pub_digest = sha256(asset.content.encode("utf-8")).hexdigest()
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                pub_ts = int(
+                    db.execute(
+                        """SELECT MIN(recorded_at_ns) FROM audit_event
+                           WHERE company_id = ? AND entity_id = ?
+                             AND event_type = 'company.asset_published'""",
+                        (self.company_id, asset.asset_id),
+                    ).fetchone()[0]
+                )
+                # Backdated timestamps preceding publication commit MUST fail closed
+                with self.assertRaisesRegex(WorkKernelRefused, "precede publication"):
+                    record_work_decision(
+                        db,
+                        company_id=self.company_id,
+                        work_item_id=item.work_item_id,
+                        run_id=run.run_id,
+                        fencing_token=run.fencing_token,
+                        agent_id=self.founder_id,
+                        action_kind="hold",
+                        rationale="Backdated future publication",
+                        evidence=(
+                            DecisionEvidence(
+                                kind="shared_publication",
+                                resource_id=asset.asset_id,
+                                revision=pub_digest,
+                                observed_at_ns=pub_ts - 10,
+                                available_at_ns=pub_ts - 20,
+                            ),
+                        ),
+                        decision_at_ns=pub_ts - 5,
+                    )
+                # Post-publication timestamps succeed
+                dec = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Point-in-time verified publication",
+                    evidence=(
+                        DecisionEvidence(
+                            kind="shared_publication",
+                            resource_id=asset.asset_id,
+                            revision=pub_digest,
+                            observed_at_ns=pub_ts + 10,
+                            available_at_ns=pub_ts,
+                        ),
+                    ),
+                    decision_at_ns=pub_ts + 20,
+                )
+                self.assertTrue(dec.decision_id)
+
+    def test_pr191_r9_offload_large_output_is_run_qualified_and_never_clobbers_prior_run(
+        self,
+    ) -> None:
+        """PR #191 R9 P2: resumed shift offloading at same seq/tool must not overwrite prior run log."""
+        from sourdough.harness import offload_large_output
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, run1, claim1 = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+                complete_work_run(
+                    db,
+                    run1.run_id,
+                    run1.fencing_token,
+                    outcome={"done": True},
+                    now_ns=1_500,
+                )
+                _, run2, claim2 = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=2_000,
+                )
+            s1 = create_agent_session(w, claim1, claim1.purpose)
+            s2 = create_agent_session(w, claim2, claim2.purpose)
+            p1 = {"payload": "FIRST_RUN_LARGE_DATA_" + ("A" * 5000)}
+            p2 = {"payload": "SECOND_RUN_LARGE_DATA_" + ("B" * 5000)}
+            r1 = offload_large_output(
+                self.store, s1, "large_result", p1, seq=1, max_inline_bytes=128
+            )
+            r2 = offload_large_output(
+                self.store, s2, "large_result", p2, seq=1, max_inline_bytes=128
+            )
+            self.assertNotEqual(r1["log_path"], r2["log_path"])
+            self.assertIn(run1.run_id, r1["log_path"])
+            self.assertIn(run2.run_id, r2["log_path"])
+            # Prior run's offloaded file remains intact and matches original SHA-256
+            raw1 = (s1.desk_path / r1["log_path"]).read_bytes()
+            raw2 = (s2.desk_path / r2["log_path"]).read_bytes()
+            self.assertEqual(sha256(raw1).hexdigest(), r1["sha256"])
+            self.assertEqual(sha256(raw2).hexdigest(), r2["sha256"])
+            self.assertIn(b"FIRST_RUN_LARGE_DATA_", raw1)
+            self.assertIn(b"SECOND_RUN_LARGE_DATA_", raw2)
+
+    def test_pr191_r9_cli_run_company_once_waits_past_11s_for_valid_shift(
+        self,
+    ) -> None:
+        """PR #191 R9 P2: run-company --once must allow permitted shift duration (>120s) without premature timeout."""
+        from unittest.mock import patch
+
+        from sourdough import cli
+        from sourdough.runtime.resident import ResidentHealth
+
+        recorded_timeouts: list[float] = []
+        recorded_preds: list[Any] = []
+
+        class _FakeService:
+            def __init__(self, *args, **kwargs) -> None:
+                self.info = type(
+                    "_Info",
+                    (),
+                    {
+                        "__dataclass_fields__": {"socket_path": None},
+                        "socket_path": "/tmp/fake.sock",
+                    },
+                )()
+                self.socket_path = Path("/tmp/fake.sock")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def wait_for(self, predicate, *, timeout_seconds: float = 10.0):
+                recorded_timeouts.append(timeout_seconds)
+                recorded_preds.append(predicate)
+                return ResidentHealth(
+                    running=True,
+                    ticks_completed=1,
+                    runs_executed=1,
+                    triggers_enqueued=0,
+                    last_tick_at_ns=1_000,
+                    last_error=None,
+                )
+
+        with (
+            patch.object(cli, "ResidentCompanyService", _FakeService),
+            patch.object(cli, "asdict", lambda _obj: {"socket_path": "/tmp/fake.sock"}),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "sourdough",
+                    "run-company",
+                    str(self.store),
+                    "--company-id",
+                    self.company_id,
+                    "--once",
+                ],
+            ),
+        ):
+            rc = cli.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(recorded_timeouts), 1)
+        self.assertGreaterEqual(recorded_timeouts[0], 960.0)
+        pred = recorded_preds[0]
+        self.assertFalse(pred(ResidentHealth(True, 0, 0, 0, None, None)))
+        self.assertTrue(pred(ResidentHealth(True, 1, 1, 0, 1_000, None)))
+        self.assertTrue(pred(ResidentHealth(False, 0, 0, 0, None, "stopped")))
+
 
 if __name__ == "__main__":
     unittest.main()

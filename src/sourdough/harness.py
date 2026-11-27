@@ -173,8 +173,10 @@ def offload_large_output(
     root = store.resolve(strict=False).parent
     logs_dir = session.desk_path / ".desk" / "logs"
     _ensure_private_directory(logs_dir, root)
+    safe_run = re.sub(r"[^A-Za-z0-9_.-]", "_", session.run_id)[:64] or "run"
     safe_tool = re.sub(r"[^a-z0-9_]", "_", tool_name)
-    filename = f"{seq:04d}-{safe_tool}.json"
+    digest_prefix = sha256(encoded).hexdigest()[:12]
+    filename = f"{safe_run}-{seq:04d}-{safe_tool}-{digest_prefix}.json"
     tmp_path = logs_dir / f".tmp-{uuid4().hex}-{filename}"
     fd = os.open(
         tmp_path,

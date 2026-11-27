@@ -221,7 +221,7 @@ class ConnectedFlow(unittest.TestCase):
             _, _, cl = h.open_work_run_claim(
                 legal.agent_id, legal.grant_id, legal.grant_scope
             )
-            now = 4_000_000
+            now = (time_ns() // 1_000_000_000) + 10
             with h.writer() as w:
                 l_inb, _ = read_inbox(w, cl, cl.purpose, "")
                 acknowledge_delivery(w, cl, cl.purpose, l_inb[0].delivery_id)
@@ -259,6 +259,7 @@ class ConnectedFlow(unittest.TestCase):
             DecisionEvidence = lazy_attr(
                 "sourdough.runtime.work_kernel", "DecisionEvidence"
             )
+            dec_ns = (now + 11) * 1_000_000_000
             with h.writer() as w:
                 with closing(open_writer(h.store, lease=w)) as db, write_tx(db):
                     dec = record_work_decision(
@@ -275,15 +276,15 @@ class ConnectedFlow(unittest.TestCase):
                                 kind="shared_publication",
                                 resource_id=asset.asset_id,
                                 revision=sha256_hex(asset.content),
-                                observed_at_ns=4_500,
-                                available_at_ns=1_000,
+                                observed_at_ns=dec_ns - 500,
+                                available_at_ns=dec_ns - 1_000,
                             ),
                         ),
-                        decision_at_ns=5_000,
+                        decision_at_ns=dec_ns,
                         next_condition={
                             "responsibility_id": legal_resp,
                             "trigger_kind": "timer",
-                            "due_at_ns": 50_000,
+                            "due_at_ns": dec_ns + 50_000,
                         },
                     )
                     complete_work_run(
@@ -291,7 +292,7 @@ class ConnectedFlow(unittest.TestCase):
                         resumed_legal.run_id,
                         resumed_legal.fencing_token,
                         outcome={"decision_id": dec.decision_id},
-                        now_ns=5_000,
+                        now_ns=dec_ns,
                     )
 
             # 7. Checkpoint v2 + FTS5-free LogicalWatermark verification
@@ -544,8 +545,8 @@ raise SystemExit(main())
                                 "kind": "shared_publication",
                                 "resource_id": asset.asset_id,
                                 "revision": sha256_hex(asset.content),
-                                "observed_at_ns": now_crash,
-                                "available_at_ns": 2_000,
+                                "observed_at_ns": now_crash + 100,
+                                "available_at_ns": now_crash,
                             }
                         ],
                     },
