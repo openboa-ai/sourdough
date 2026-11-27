@@ -85,7 +85,9 @@ _PRIVATE_DESK_READ_TOOLS = frozenset(
         "desk_read_draft",
         "desk_read_offloaded_log",
         "desk_run_command",
-        "search_episodes",
+        "memory_search_episodes",
+        "memory_read_episode",
+        "skill_list_active",
         "skill_read",
     }
 )
@@ -94,7 +96,7 @@ _PEER_INPUT_TOOLS = frozenset(
         "read_messages",
         "read_inbox",
         "discover_handoffs",
-        "desk_read_shared_asset",
+        "read_shared_asset",
     }
 )
 _PEER_OUTBOUND_SINKS = frozenset(
@@ -103,6 +105,7 @@ _PEER_OUTBOUND_SINKS = frozenset(
         "request_peer_response",
         "respond_peer_request",
         "offer_handoff",
+        "decline_handoff",
     }
 )
 _PRIVATE_DESK_RECEIPT_TOOLS = frozenset(
@@ -119,9 +122,11 @@ _PRIVATE_RECEIPT_ERROR_TOOLS = frozenset(
     {
         *_PRIVATE_DESK_RECEIPT_TOOLS,
         "desk_publish_selection",
-        "search_episodes",
+        "memory_search_episodes",
+        "memory_read_episode",
         "skill_read",
         "skill_list_active",
+        "skill_draft_candidate",
         "skill_record_invocation",
     }
 )
@@ -615,6 +620,11 @@ class ShiftRunner:
                     raise DutyRefused(
                         "Cannot read private Desk data in the same shift after reading "
                         "peer-authored messages, handoffs, or shared assets"
+                    )
+                if name in _PEER_INPUT_TOOLS and flow_state["read_private_desk"]:
+                    raise DutyRefused(
+                        "Cannot read peer-authored messages, handoffs, or shared assets "
+                        "in the same shift after reading private Desk data"
                     )
                 if use_lock:
                     with ctx.write_lock_ctx():

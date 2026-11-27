@@ -1152,16 +1152,26 @@ def build_production_duty_registry(
             domain_plugins=domain_plugins,
             active_snapshot_id=resolved_snapshot_id,
         )
-        has_peer_discovery_input = any(
-            isinstance(r, dict)
-            and (
-                r.get("kind") == "peer_outcome"
-                or (
-                    r.get("kind") == "shared_asset"
-                    and r.get("author_id") not in (None, agent_id)
+        has_peer_discovery_input = (
+            payload.get("trigger_kind") == "peer_response"
+            or (
+                isinstance(payload.get("coalesced_revisions"), list)
+                and any(
+                    isinstance(e, dict) and e.get("trigger_kind") == "peer_response"
+                    for e in payload["coalesced_revisions"]
                 )
             )
-            for r in receipts
+            or any(
+                isinstance(r, dict)
+                and (
+                    r.get("kind") == "peer_outcome"
+                    or (
+                        r.get("kind") == "shared_asset"
+                        and r.get("author_id") != agent_id
+                    )
+                )
+                for r in receipts
+            )
         )
         collab = build_core_collab_tool_contribution(
             writer=ctx.writer,
@@ -1196,7 +1206,7 @@ def build_production_duty_registry(
             base_handlers=merged_handlers,
             history_notes=tuple(notes),
             open_receipts=tuple(receipts),
-            include_core_desk_tools=True,
+            include_core_desk_tools=not has_peer_discovery_input,
             include_plugin_tools=True,
             extra_recoverable_exceptions=merged_recoverable,
             pre_resolved_active_methods=(resolved_methods, resolved_snapshot_id),
