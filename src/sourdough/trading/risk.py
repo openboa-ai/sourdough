@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
@@ -141,9 +142,11 @@ def verify_trading_restriction_clear(
             )
 
     # Enforce <= 15s quote freshness precondition when clearing execution:* / trading_risk_pause.
+    remaining_envs = envs
     if engine_directory is not None:
         from .engine import VERSION
         from .execution import VenueRefused
+        from .market_worker import MarketRefused
         from .nautilus_paper import NautilusPaperVenue
 
         sandbox_db = (
@@ -157,28 +160,31 @@ def verify_trading_restriction_clear(
                     qrow = vconn.execute(
                         "SELECT event_ns, exchange_trade_ns FROM sandbox_quote LIMIT 1"
                     ).fetchone()
-                if qrow is None:
+                if qrow is None or type(qrow[0]) is not int or type(qrow[1]) is not int:
                     raise BoardControlRefused(
                         "Cannot resume trading execution without fresh quote (<= 15s)"
                     )
-                observed = min(int(qrow[0]), int(qrow[1]))
+                observed = min(qrow[0], qrow[1])
                 if observed > now_ns or now_ns - observed > QUOTE_FRESHNESS_MAX_NS:
                     raise BoardControlRefused(
                         "Cannot resume trading execution without fresh quote (<= 15s)"
                     )
-                return
-            except VenueRefused as error:
+                remaining_envs = tuple(e for e in envs if e != ENV_PAPER)
+                if not remaining_envs:
+                    return
+            except (VenueRefused, MarketRefused, sqlite3.Error) as error:
                 raise BoardControlRefused(
                     f"Cannot resume trading execution: {error}"
                 ) from error
 
+    rem_placeholders = ", ".join("?" for _ in remaining_envs)
     active_bindings = int(
         db.execute(
             f"""SELECT COUNT(*) FROM execution_environment_binding
                 WHERE company_id = ?
-                  AND environment IN ({env_placeholders})
+                  AND environment IN ({rem_placeholders})
                   AND status = 'active'""",
-            (company_id, *envs),
+            (company_id, *remaining_envs),
         ).fetchone()[0]
     )
     if active_bindings == 0:
@@ -186,13 +192,13 @@ def verify_trading_restriction_clear(
 
     latest_order_quote = db.execute(
         f"""SELECT MAX(quote_observed_at_ns) FROM trading_book_order
-            WHERE company_id = ? AND environment IN ({env_placeholders})""",
-        (company_id, *envs),
+            WHERE company_id = ? AND environment IN ({rem_placeholders})""",
+        (company_id, *remaining_envs),
     ).fetchone()[0]
     latest_val_ns = db.execute(
         f"""SELECT MAX(recorded_at_ns) FROM trading_book_valuation
-            WHERE company_id = ? AND environment IN ({env_placeholders})""",
-        (company_id, *envs),
+            WHERE company_id = ? AND environment IN ({rem_placeholders})""",
+        (company_id, *remaining_envs),
     ).fetchone()[0]
 
     candidates = [int(v) for v in (latest_order_quote, latest_val_ns) if v is not None]

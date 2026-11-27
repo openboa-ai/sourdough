@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sourdough.board_control import (
+    ALLOWED_AVATAR_VARIANTS,
     BOARD_CONTROL_ROLE,
     PAUSE_COMPANY,
     RESTRICTION_COMMAND,
@@ -413,3 +414,30 @@ class IpcConsolidationTests(unittest.TestCase):
                 assert detail is not None
                 self.assertFalse(detail["sandbox_authorized"])
                 self.assertIsNone(detail["agent_sandbox"])
+                self.assertIn(
+                    nodes["agent-qa"]["avatar_variant"], ALLOWED_AVATAR_VARIANTS
+                )
+                self.assertIn(
+                    detail["profile"]["avatar_variant"], ALLOWED_AVATAR_VARIANTS
+                )
+
+            # Whitespace-only avatar_variant also sanitizes to a valid Yogurt variant.
+            with hold_company_writer(store, cid, lease_directory=leases) as writer:
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    db.execute(
+                        "UPDATE agent_profile SET avatar_variant = '   ' WHERE agent_id = 'agent-qa'"
+                    )
+            with CompanyDaemon(
+                store, cid, socket_dir=sock_dir, lease_directory=leases
+            ) as daemon2:
+                client2 = ControlPlaneClient(daemon2.socket_path)
+                _, _, graph2 = client2.projection("agents-graph", principal="board-1")
+                assert graph2 is not None
+                nodes2 = {n["agent_id"]: n for n in graph2["nodes"]}
+                self.assertIn(
+                    nodes2["agent-qa"]["avatar_variant"], ALLOWED_AVATAR_VARIANTS
+                )
+                _, _, org = client2.projection("org", principal="board-1")
+                assert org is not None
+                for item in org["roster"]:
+                    self.assertIn(item["avatar_variant"], ALLOWED_AVATAR_VARIANTS)

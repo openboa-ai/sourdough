@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from ..board_control import (
     CANCEL_WORK,
@@ -87,6 +87,7 @@ from .protocol import (
     default_socket_path,
     extract_peer_credentials,
     read_http_request,
+    valid_path_segment as _valid_path_segment,
     validate_socket_path_length,
     validate_timeout_seconds,
     verify_private_socket_dir,
@@ -130,22 +131,6 @@ def _etag_matches(header_value: str | None, etag: str) -> bool:
         if candidate == etag or candidate == f"W/{etag}":
             return True
     return False
-
-
-def _valid_path_segment(raw: str) -> str | None:
-    if "/" in raw or not raw:
-        return None
-    decoded = unquote(raw)
-    if (
-        "/" in decoded
-        or "\\" in decoded
-        or "\x00" in decoded
-        or decoded in (".", "..")
-        or not decoded.strip()
-        or len(decoded) > 128
-    ):
-        return None
-    return decoded
 
 
 def _probe_socket_is_active(target: Path) -> bool:

@@ -76,7 +76,7 @@ VALID_APPLICATION_STATUSES = frozenset(
 )
 VALID_DELIVERY_STATUSES = frozenset({"pending", "delivered", "acknowledged"})
 
-_ALLOWED_AVATAR_VARIANTS = frozenset(
+ALLOWED_AVATAR_VARIANTS = frozenset(
     {
         "wide-oval-top",
         "wide-oval-bottom",
@@ -118,6 +118,7 @@ _ALLOWED_AVATAR_VARIANTS = frozenset(
         "round-heart-left",
     }
 )
+_ALLOWED_AVATAR_VARIANTS = ALLOWED_AVATAR_VARIANTS
 
 
 class BoardControlRefused(Exception):

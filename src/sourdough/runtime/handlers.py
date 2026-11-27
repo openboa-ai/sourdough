@@ -23,6 +23,7 @@ from ..agent_runtime.cost_accounting import settle_shift_cost_to_ledger
 if TYPE_CHECKING:
     from ..agent_runtime.registry import AgentAdapterRegistry
 from ..board_control import (
+    ALLOWED_AVATAR_VARIANTS,
     BoardControlRefused,
     mark_ceo_message_delivered,
     record_ceo_reply,
@@ -440,7 +441,16 @@ def build_production_duty_registry(
                         else "Agent"
                     )
                 )
-                avatar_variant = str(row[2]) if row is not None else "wide-oval-top"
+                raw_variant = (
+                    str(row[2]).strip()
+                    if row is not None and row[2] is not None
+                    else ""
+                )
+                avatar_variant = (
+                    raw_variant
+                    if raw_variant in ALLOWED_AVATAR_VARIANTS
+                    else "wide-oval-top"
+                )
                 upsert_agent_profile(
                     ctx.writer,
                     agent_id=target_agent,

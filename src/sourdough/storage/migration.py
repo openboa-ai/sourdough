@@ -1069,7 +1069,9 @@ def _migrate_trading_tables_impl(
                       market_price_minor_units, quote_observed_at_ns, quote_source,
                       fee_bps, slippage_bps, status, filled_quantity,
                       fill_price_minor_units, fee_minor_units, created_at_ns, updated_at_ns
-               FROM agent_sandbox_order"""
+               FROM agent_sandbox_order
+               WHERE true
+               ON CONFLICT DO NOTHING"""
         )
     if _has_table(connection, "agent_sandbox_fill"):
         connection.execute(
@@ -1083,7 +1085,9 @@ def _migrate_trading_tables_impl(
                       agent_id, NULL, instrument_id, side, quantity,
                       price_minor_units, fee_minor_units, realized_pnl_minor_units,
                       filled_at_ns
-               FROM agent_sandbox_fill"""
+               FROM agent_sandbox_fill
+               WHERE true
+               ON CONFLICT (fill_id) DO NOTHING"""
         )
     if _has_table(connection, "agent_sandbox_position"):
         connection.execute(
@@ -1095,7 +1099,9 @@ def _migrate_trading_tables_impl(
                SELECT binding_id, 'agent_sandbox', company_id, instrument_id,
                       quantity, avg_entry_minor_units, 0,
                       realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
-               FROM agent_sandbox_position"""
+               FROM agent_sandbox_position
+               WHERE true
+               ON CONFLICT (binding_id, instrument_id) DO NOTHING"""
         )
 
     # 4.1d: Migrate Gen 1 paper_order / paper_fill / paper_fill_fee / paper_cancellation
@@ -1480,7 +1486,8 @@ def _migrate_trading_tables_impl(
                        realized_pnl_minor_units, unrealized_pnl_minor_units,
                        total_fees_minor_units, source, binding_revision, policy,
                        evidence_json, revision, recorded_at_ns
-                   ) VALUES (?, ?, 'paper', ?, ?, ?, ?, ?, 0, 0, 0, 'paper_valuation', ?, ?, ?, ?, ?)""",
+                   ) VALUES (?, ?, 'paper', ?, ?, ?, ?, ?, 0, 0, 0, 'paper_valuation', ?, ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
                 (
                     capture_id,
                     bid,
@@ -1538,7 +1545,7 @@ def _migrate_trading_tables_impl(
             old_cols = _table_columns(connection, old_tbl)
             col_list = ", ".join(f'"{c}"' for c in old_cols)
             connection.execute(
-                f"INSERT INTO {new_tbl} ({col_list}) SELECT {col_list} FROM {old_tbl} ORDER BY {order_by}"
+                f"INSERT INTO {new_tbl} ({col_list}) SELECT {col_list} FROM {old_tbl} ORDER BY {order_by} ON CONFLICT DO NOTHING"
             )
 
     # trading_fee_delivery (must verify against paper_fill_accounting_source & trading_book_fill)

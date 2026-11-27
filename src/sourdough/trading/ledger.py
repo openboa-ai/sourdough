@@ -44,6 +44,12 @@ def _assert_active_agent(db: Connection, company_id: str, agent_id: str) -> None
         raise ExecutionTierRefused("Agent does not belong to this company")
     if employment_cutoff(db, agent_id) is not None:
         raise ExecutionTierRefused("Retired agent cannot operate an execution sandbox")
+    grants = db.execute(
+        "SELECT scope FROM standing_grant WHERE agent_id = ?",
+        (agent_id,),
+    ).fetchall()
+    if grants and all(str(r[0]).strip().lower() == "revoked" for r in grants):
+        raise ExecutionTierRefused("Revoked agent cannot operate an execution sandbox")
 
 
 def _compute_unified_book_metrics_in_tx(
@@ -368,15 +374,17 @@ def submit_agent_sandbox_order(
         gross_exposure = metrics_before["gross_exposure_minor_units"]
 
         pos_row = db.execute(
-            """SELECT quantity, avg_entry_minor_units, realized_pnl_minor_units, total_fees_minor_units
+            """SELECT quantity, avg_entry_minor_units, mark_price_minor_units,
+                      realized_pnl_minor_units, total_fees_minor_units
                FROM trading_book_position
                WHERE binding_id = ? AND environment = 'agent_sandbox' AND instrument_id = ?""",
             (binding.binding_id, instrument_id),
         ).fetchone()
         cur_qty = int(pos_row[0]) if pos_row else 0
         cur_avg = int(pos_row[1]) if pos_row else 0
-        cur_realized = int(pos_row[2]) if pos_row else 0
-        cur_fees = int(pos_row[3]) if pos_row else 0
+        cur_mark = int(pos_row[2]) if pos_row and int(pos_row[2]) > 0 else cur_avg
+        cur_realized = int(pos_row[3]) if pos_row else 0
+        cur_fees = int(pos_row[4]) if pos_row else 0
 
         now = time_ns()
         order_id = f"sbxo-{uuid4().hex[:16]}"
@@ -387,7 +395,7 @@ def submit_agent_sandbox_order(
             fee = (notional * binding.fee_bps + 5_000) // 10_000
             delta = quantity if side == "buy" else -quantity
             new_qty = cur_qty + delta
-            other_exposure = gross_exposure - abs(cur_qty) * cur_avg
+            other_exposure = gross_exposure - abs(cur_qty) * cur_mark
 
             realized_delta = 0
             if (
@@ -410,7 +418,7 @@ def submit_agent_sandbox_order(
                 else:
                     new_avg = slipped_price
 
-            projected_exposure = other_exposure + abs(new_qty) * new_avg
+            projected_exposure = other_exposure + abs(new_qty) * slipped_price
             if projected_exposure > binding.exposure_limit_minor_units:
                 raise ExecutionTierRefused(
                     "Sandbox order exceeds agent sandbox exposure limit"
@@ -636,6 +644,7 @@ def cancel_agent_sandbox_order(
             raise ExecutionTierRefused("Company identity mismatch")
         if not is_domain_installed(db, "trading"):
             raise ExecutionTierRefused("Agent sandbox order not found")
+        _assert_active_agent(db, writer.company_id, agent_id)
         row = db.execute(
             """SELECT binding_id, actor_id, status
                FROM trading_book_order
@@ -883,15 +892,17 @@ def submit_company_paper_book_order(
         gross_exposure = metrics_before["gross_exposure_minor_units"]
 
         pos_row = db.execute(
-            """SELECT quantity, avg_entry_minor_units, realized_pnl_minor_units, total_fees_minor_units
+            """SELECT quantity, avg_entry_minor_units, mark_price_minor_units,
+                      realized_pnl_minor_units, total_fees_minor_units
                FROM trading_book_position
                WHERE binding_id = ? AND environment = 'paper' AND instrument_id = ?""",
             (binding.binding_id, instrument_id),
         ).fetchone()
         cur_qty = int(pos_row[0]) if pos_row else 0
         cur_avg = int(pos_row[1]) if pos_row else 0
-        cur_realized = int(pos_row[2]) if pos_row else 0
-        cur_fees = int(pos_row[3]) if pos_row else 0
+        cur_mark = int(pos_row[2]) if pos_row and int(pos_row[2]) > 0 else cur_avg
+        cur_realized = int(pos_row[3]) if pos_row else 0
+        cur_fees = int(pos_row[4]) if pos_row else 0
 
         now = time_ns() if now_ns is None else now_ns
         order_id = f"cpbo-{uuid4().hex[:16]}"
@@ -902,7 +913,7 @@ def submit_company_paper_book_order(
             fee = (notional * binding.fee_bps + 5_000) // 10_000
             delta = quantity if side == "buy" else -quantity
             new_qty = cur_qty + delta
-            other_exposure = gross_exposure - abs(cur_qty) * cur_avg
+            other_exposure = gross_exposure - abs(cur_qty) * cur_mark
 
             realized_delta = 0
             if (
@@ -925,7 +936,7 @@ def submit_company_paper_book_order(
                 else:
                     new_avg = slipped_price
 
-            projected_exposure = other_exposure + abs(new_qty) * new_avg
+            projected_exposure = other_exposure + abs(new_qty) * slipped_price
             if projected_exposure > binding.exposure_limit_minor_units:
                 raise ExecutionTierRefused(
                     "Company paper book order exceeds exposure limit"

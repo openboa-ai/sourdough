@@ -31,6 +31,10 @@ from .strategy_comparison import (
 STRATEGY_COMMAND = "strategy-command-v1"
 ACTIVATE_STRATEGY_RELEASE = "activate_strategy_release"
 ROLLBACK_STRATEGY_DEPLOYMENT = "rollback_strategy_deployment"
+ACTIVATE_PRECONDITION_KEYS = frozenset(
+    {"binding_revision", "expected_active_deployment_id"}
+)
+ROLLBACK_PRECONDITION_KEYS = frozenset({"expected_active_deployment_id"})
 
 PROMOTE_PRECONDITION_KEYS = frozenset(
     {
@@ -67,6 +71,10 @@ def execute_strategy_command(
 
     try:
         if command_type == ACTIVATE_STRATEGY_RELEASE:
+            if not set(preconditions.keys()).issubset(ACTIVATE_PRECONDITION_KEYS):
+                raise BoardControlRefused(
+                    "Command preconditions contain unsupported or missing fields"
+                )
             release_id = _require_text(
                 payload.get("release_id"), "release_id", max_len=128
             )
@@ -75,6 +83,10 @@ def execute_strategy_command(
             )
             comparison_id = payload.get("comparison_id")
             expected_active = preconditions.get("expected_active_deployment_id")
+            if expected_active is not None:
+                expected_active = _require_text(
+                    expected_active, "expected_active_deployment_id", max_len=128
+                )
             deployment = activate_strategy_release(
                 writer,
                 command_id=safe_cmd,
@@ -83,6 +95,8 @@ def execute_strategy_command(
                 authorize_deploy=_deploy_auth,
                 comparison_id=comparison_id,
                 expected_active_deployment_id=expected_active,
+                contract_version=STRATEGY_COMMAND,
+                peer_pid=peer_pid,
             )
         elif command_type == ROLLBACK_STRATEGY_DEPLOYMENT:
             target_release = _require_text(
@@ -99,6 +113,8 @@ def execute_strategy_command(
                 target_release_id=target_release,
                 expected_active_deployment_id=expected_active,
                 authorize_deploy=_deploy_auth,
+                contract_version=STRATEGY_COMMAND,
+                peer_pid=peer_pid,
             )
         else:
             raise BoardControlRefused("Unsupported strategy command")
@@ -112,7 +128,12 @@ def execute_strategy_command(
             or "cannot self-activate" in low
         ):
             raise BoardControlForbidden(msg) from error
-        if "already in use" in low or "conflict" in low:
+        if (
+            "already in use" in low
+            or "conflict" in low
+            or "does not match expected precondition" in low
+            or "does not match expected rollback target" in low
+        ):
             raise BoardControlConflict(msg) from error
         raise BoardControlRefused(msg) from error
 

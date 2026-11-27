@@ -37,6 +37,7 @@ import {
   type DataColumn,
   type DataRow,
 } from "@openboa/yogurt";
+import { normalizeAvatarVariant } from "../api/avatar";
 import { fetchProjection, formatMinorCurrency, formatRelativeNs } from "../api/client";
 import type { AgentEdgeItem, AgentNodeItem, AgentsGraphProjection } from "../api/types";
 import { useApp } from "../state/store";
@@ -1212,7 +1213,7 @@ export function AgentsActivityView() {
               name: node.display_name,
               role: node.role_label,
               state: node.avatar_state,
-              art: node.avatar_variant,
+              art: normalizeAvatarVariant(node.avatar_variant),
               preview: node.grant_scope,
             }}
             onSelect={() => openAgent(node.agent_id)}
@@ -1413,7 +1414,7 @@ export function AgentsActivityView() {
             <div className="sd-graph-card-head">
               <div className="sd-graph-card-identity">
                 <AgentAvatar
-                  agent={node.avatar_variant}
+                  agent={normalizeAvatarVariant(node.avatar_variant)}
                   state={node.avatar_state}
                   animated={animateAvatars}
                   size={34}

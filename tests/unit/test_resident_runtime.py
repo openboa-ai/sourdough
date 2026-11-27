@@ -799,6 +799,83 @@ class ResidentRuntimeTests(unittest.TestCase):
                 ).fetchone()[0]
                 self.assertEqual(sandbox_count, 0)
 
+    def test_update_agent_budget_normalizes_legacy_avatar_variant(self) -> None:
+        from sourdough.board_control import (
+            ALLOWED_AVATAR_VARIANTS,
+            record_decision_question,
+            submit_decision_answer,
+        )
+        from sourdough.runtime import sync_board_triggers
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms("budget-avatar-co", "charter-1", "manage", "profile-1"),
+            )
+            registry = self._build_registry(founding.founder_id, "q1")
+            runtime = CompanyRuntime(
+                store, founding.company_id, registry, lease_directory=leases
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as writer:
+                bind_board_principal(
+                    writer, principal_id="board-1", role_name=BOARD_CONTROL_ROLE
+                )
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    db.execute(
+                        """INSERT INTO agent_profile (
+                               agent_id, company_id, display_name, role_label,
+                               avatar_variant, monthly_budget_minor, updated_at_ns
+                           ) VALUES (?, ?, 'Founder', 'CEO', 'cobalt', 50000, 10)""",
+                        (founding.founder_id, founding.company_id),
+                    )
+                q_hash = record_decision_question(
+                    writer,
+                    question_id="q-budget-legacy-avatar",
+                    kind="governance",
+                    title="Update budget",
+                    summary="Increase monthly budget",
+                    options=("approve", "decline"),
+                    impact={
+                        "action": "update_agent_budget",
+                        "agent_id": founding.founder_id,
+                        "monthly_budget_minor": 120_000,
+                    },
+                    created_by_agent_id=founding.founder_id,
+                    now_ns=20,
+                )
+                submit_decision_answer(
+                    writer,
+                    command_id="cmd-budget-legacy",
+                    question_id="q-budget-legacy-avatar",
+                    expected_revision=1,
+                    expected_payload_hash=q_hash,
+                    choice="approve",
+                    reason="Approved",
+                    principal_hint="board-1",
+                    now_ns=30,
+                )
+                sync_board_triggers(writer, founding.company_id, now_ns=40)
+
+            summary = runtime.step(max_dispatches=5, now_ns=50)
+            self.assertEqual(len(summary.executed_runs), 1)
+            with closing(open_reader(store)) as db, read_tx(db):
+                st = db.execute(
+                    "SELECT application_status FROM decision_question WHERE question_id = 'q-budget-legacy-avatar'"
+                ).fetchone()
+                self.assertEqual(st, ("applied",))
+                prof = db.execute(
+                    "SELECT avatar_variant, monthly_budget_minor FROM agent_profile WHERE agent_id = ?",
+                    (founding.founder_id,),
+                ).fetchone()
+                self.assertIsNotNone(prof)
+                self.assertIn(prof[0], ALLOWED_AVATAR_VARIANTS)
+                self.assertEqual(prof[1], 120_000)
+
 
 if __name__ == "__main__":
     unittest.main()

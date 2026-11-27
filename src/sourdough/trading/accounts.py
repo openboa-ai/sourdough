@@ -1016,7 +1016,7 @@ def promote_execution_environment(
 
         qual_row = db.execute(
             """SELECT adapter_revision, environment, instrument_rules_digest,
-                      core_digest, verdict, cases_passed, cases_failed
+                      core_digest, verdict, cases_passed, cases_failed, cases_unrun
                FROM venue_qualification_receipt
                WHERE company_id = ? AND receipt_id = ?""",
             (writer.company_id, qual_id),
@@ -1030,9 +1030,14 @@ def promote_execution_environment(
             or str(qual_row[4]) != "PASS"
             or int(qual_row[5]) <= 0
             or int(qual_row[6]) != 0
+            or int(qual_row[7]) != 0
         ):
             raise BoardControlRefused(
-                "Live promotion requires a PASS external_test qualification receipt with zero failures"
+                "Live promotion requires a PASS external_test qualification receipt with zero failures or unrun cases"
+            )
+        if str(qual_row[0]) != target.connector_revision:
+            raise BoardControlRefused(
+                "Qualification receipt adapter_revision does not match target live binding"
             )
         if str(qual_row[2]) != target.instrument_rules_digest:
             raise BoardControlRefused(

@@ -819,6 +819,18 @@ export function SystemAuditView({
   const [auditQuery, setAuditQuery] = useState("");
   const [selectedDomain, setSelectedDomain] = useState<string>("all");
 
+  const tradingActive = meta?.active_domains.includes("trading") ?? false;
+  const visibleAuditDomains = useMemo(
+    () => AUDIT_DOMAINS.filter((d) => d !== "trading" || tradingActive),
+    [tradingActive]
+  );
+
+  useEffect(() => {
+    if (!tradingActive && selectedDomain === "trading") {
+      setSelectedDomain("all");
+    }
+  }, [tradingActive, selectedDomain]);
+
   useEffect(() => {
     if (!effectiveDaemon || embedded) return;
     return registerEscapeBack("/audit", "system-daemon-entry");
@@ -1213,7 +1225,7 @@ export function SystemAuditView({
         >
           <Stack gap={12}>
             <Inline gap={6} wrap>
-              {AUDIT_DOMAINS.map((domain) => (
+              {visibleAuditDomains.map((domain) => (
                 <Button
                   key={domain}
                   size="compact"

@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 
 from sourdough.board_control import (
     BOARD_CONTROL_ROLE,
+    BoardControlRefused,
     apply_company_restriction,
     bind_board_principal,
     clear_company_restriction,
@@ -16,12 +17,14 @@ from sourdough.board_control import (
 from sourdough.company import FoundingTerms, found
 from sourdough.trading.accounts import (
     open_company_paper_book,
+    promote_execution_environment,
     record_venue_qualification_receipt,
     register_live_candidate_binding,
 )
 from sourdough.trading.domain import (
     ENV_EXTERNAL_TEST,
     ExecutionTierRefused,
+    build_promotion_payload_hash,
     compute_trading_core_digest,
 )
 from sourdough.trading.ledger import submit_company_paper_book_order
@@ -356,6 +359,138 @@ class TestMultiBookPaperAndLiveMigration(unittest.TestCase):
                 # Source book_eth retired as requested.
                 self.assertEqual(books2[book_eth.binding_id]["role"], "retired")
                 self.assertEqual(books2[book_eth.binding_id]["status"], "retired")
+
+    def test_qualification_rejects_unrun_cases_and_adapter_revision_mismatch(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-mig-qual-strict-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            founding = found(
+                store,
+                FoundingTerms("sourdough-qual", "charter-v1", "paper", "profile-v1"),
+            )
+            company_id = founding.company_id
+            ceo_id = founding.founder_id
+
+            with hold_company_writer(
+                store, company_id, lease_directory=leases
+            ) as writer:
+                bind_board_principal(
+                    writer, principal_id="board-chair", role_name=BOARD_CONTROL_ROLE
+                )
+                paper_book = open_company_paper_book(
+                    writer,
+                    account_id="paper-q-1",
+                    book_name="Soak Paper",
+                    starting_minor_units=20_000_000,
+                    exposure_limit_minor_units=10_000_000,
+                )
+                submit_company_paper_book_order(
+                    writer,
+                    binding_id=paper_book.binding_id,
+                    actor_id=ceo_id,
+                    action_id="soak-q-1",
+                    instrument_id="BTC-USDT",
+                    side="buy",
+                    quantity=1,
+                    limit_minor_units=1_010_000,
+                    market_price_minor_units=1_000_000,
+                )
+                live_cand = register_live_candidate_binding(
+                    writer,
+                    binding_id="live-q-cand",
+                    account_id="binance-q",
+                    destination_id="binance-spot-prod",
+                    connector_revision="binance-spot-v2",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    currency="USD",
+                    starting_minor_units=20_000_000,
+                    exposure_limit_minor_units=10_000_000,
+                    credential_handle_ref="keychain:openboa/binance/q",
+                )
+                core_digest = compute_trading_core_digest()
+                record_venue_qualification_receipt(
+                    writer,
+                    receipt_id="qual-unrun",
+                    adapter_revision="binance-spot-v2",
+                    environment=ENV_EXTERNAL_TEST,
+                    destination_id="binance-spot-testnet",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    core_digest=core_digest,
+                    verdict="PASS",
+                    cases_passed=5,
+                    cases_failed=0,
+                    cases_unrun=3,
+                    evidence_sha256="a" * 64,
+                )
+                record_venue_qualification_receipt(
+                    writer,
+                    receipt_id="qual-wrong-adapter",
+                    adapter_revision="binance-spot-v1",
+                    environment=ENV_EXTERNAL_TEST,
+                    destination_id="binance-spot-testnet",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    core_digest=core_digest,
+                    verdict="PASS",
+                    cases_passed=5,
+                    cases_failed=0,
+                    cases_unrun=0,
+                    evidence_sha256="b" * 64,
+                )
+
+                with self.assertRaisesRegex(BoardControlRefused, "unrun"):
+                    promote_execution_environment(
+                        writer,
+                        command_id="prom-unrun",
+                        charter_revision="charter-v1",
+                        target_binding_id=live_cand.binding_id,
+                        qualification_receipt_id="qual-unrun",
+                        expected_payload_hash=build_promotion_payload_hash(
+                            company_id=company_id,
+                            charter_revision="charter-v1",
+                            target_binding=live_cand,
+                            qualification_receipt_id="qual-unrun",
+                        ),
+                        reason="Must fail on unrun cases",
+                        principal_hint="board-chair",
+                    )
+
+                with self.assertRaisesRegex(BoardControlRefused, "adapter_revision"):
+                    promote_execution_environment(
+                        writer,
+                        command_id="prom-wrong-adapter",
+                        charter_revision="charter-v1",
+                        target_binding_id=live_cand.binding_id,
+                        qualification_receipt_id="qual-wrong-adapter",
+                        expected_payload_hash=build_promotion_payload_hash(
+                            company_id=company_id,
+                            charter_revision="charter-v1",
+                            target_binding=live_cand,
+                            qualification_receipt_id="qual-wrong-adapter",
+                        ),
+                        reason="Must fail on adapter mismatch",
+                        principal_hint="board-chair",
+                    )
+
+                with self.assertRaisesRegex(ExecutionTierRefused, "adapter_revision"):
+                    propose_paper_to_live_migration(
+                        writer,
+                        question_id="q-wrong-adapter",
+                        source_paper_binding_id=paper_book.binding_id,
+                        target_live_binding_id=live_cand.binding_id,
+                        qualification_receipt_id="qual-wrong-adapter",
+                        created_by_agent_id=ceo_id,
+                    )
+
+                with self.assertRaisesRegex(ExecutionTierRefused, "adapter_revision"):
+                    execute_paper_to_live_migration(
+                        writer,
+                        source_paper_binding_id=paper_book.binding_id,
+                        target_live_binding_id=live_cand.binding_id,
+                        qualification_receipt_id="qual-wrong-adapter",
+                    )
 
 
 if __name__ == "__main__":

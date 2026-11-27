@@ -326,6 +326,45 @@ class CoreDomainIsolationTests(unittest.TestCase):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_core_only_pause_company_never_leaks_trading_domain_into_work_timeline(
+        self,
+    ):
+        from sourdough.board_control import (
+            BOARD_CONTROL_ROLE,
+            apply_company_restriction,
+            bind_board_principal,
+        )
+        from sourdough.trading import TradingDomainPlugin
+
+        with TemporaryDirectory(prefix="sd-core-pause-tl-") as tmp:
+            root = Path(tmp)
+            store = root / "company.sqlite"
+            leases = root / "leases"
+            receipt = found(
+                store, FoundingTerms("core-co", "charter-v1", "manage", "profile-v1")
+            )
+            with hold_company_writer(
+                store, receipt.company_id, lease_directory=leases
+            ) as writer:
+                bind_board_principal(
+                    writer, principal_id="board-1", role_name=BOARD_CONTROL_ROLE
+                )
+                apply_company_restriction(
+                    writer,
+                    command_id="core-pause-1",
+                    restriction_id="rest-core-1",
+                    charter_revision="charter-v1",
+                    expected_restriction_revision=0,
+                    cause_category="board_pause",
+                    scope_ref="company:all",
+                    reason="Core operational pause",
+                    principal_hint="board-1",
+                )
+            projection, _seq = read_local_board_timeline_with_seq(
+                store, receipt.company_id, domain_plugins=(TradingDomainPlugin(),)
+            )
+            self.assertEqual(projection["domains"], {})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,6 @@ from collections.abc import Mapping
 from contextlib import closing
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
 
 from ..agent_desk import desk_directory
 from ..agent_runtime.cost_accounting import settle_shift_cost_to_ledger
@@ -19,7 +18,7 @@ from ..agent_runtime.protocol import (
     ToolSpec,
     hydrate_shift_context,
 )
-from ..ipc.protocol import IpcRefused
+from ..ipc.protocol import IpcRefused, valid_path_segment as _valid_path_segment
 from ..runtime.domains import (
     BaseDomainPlugin,
     CommandDescriptor,
@@ -48,6 +47,7 @@ from .commands import (
     EXECUTION_TIER_COMMAND,
     PROMOTE_EXECUTION_ENVIRONMENT,
     PROMOTE_PRECONDITION_KEYS,
+    ROLLBACK_PRECONDITION_KEYS,
     ROLLBACK_STRATEGY_DEPLOYMENT,
     STRATEGY_COMMAND,
     execute_execution_tier_command,
@@ -171,6 +171,8 @@ def _rows(connection: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
 def _trading_risk_control(
     connection: sqlite3.Connection, company_id: str, has_trading: bool
 ) -> dict[str, Any] | None:
+    if not has_trading:
+        return None
     last_receipt = connection.execute(
         """SELECT command_id, command_type, COALESCE(finalized_at_ns, created_at_ns)
            FROM command_receipt
@@ -181,8 +183,6 @@ def _trading_risk_control(
            LIMIT 1""",
         (company_id,),
     ).fetchone()
-    if not has_trading and last_receipt is None:
-        return None
 
     has_binding = (
         has_trading
@@ -397,7 +397,12 @@ def _handle_migrate_paper_to_live(ctx: DecisionActionContext) -> str:
 
 
 class TradingDomainPlugin(BaseDomainPlugin):
-    """M2 bridge plugging Trading duties, tools, decisions, timeline, commands, and CLI into Core OS."""
+    """M2 bridge plugging Trading duties, tools, decisions, timeline, commands, and CLI into Core OS.
+
+    ``restore_guard()`` intentionally fails closed (returns ``None``) unless an
+    explicit external-venue ``RestoreDomainGuard`` is supplied at composition time,
+    preventing un-reconciled checkpoint restores on Trading-enabled stores.
+    """
 
     domain_name: str = "trading"
 
@@ -661,10 +666,12 @@ class TradingDomainPlugin(BaseDomainPlugin):
         self, connection: sqlite3.Connection, company_id: str
     ) -> WorkTimelineContribution | None:
         has_trading = is_domain_installed(connection, "trading")
+        if not has_trading:
+            return None
         risk_control = _trading_risk_control(connection, company_id, has_trading)
         paper = _paper_timeline_projection(connection, has_trading)
         decisions = _trading_decisions(connection, has_trading)
-        if not has_trading and risk_control is None and paper is None and not decisions:
+        if risk_control is None and paper is None and not decisions:
             return None
         return WorkTimelineContribution(
             decisions_by_duty_id=decisions,
@@ -707,6 +714,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 command_type=ROLLBACK_STRATEGY_DEPLOYMENT,
                 contract_version=STRATEGY_COMMAND,
                 execute=_exec_strategy,
+                precondition_keys=ROLLBACK_PRECONDITION_KEYS,
                 requires_domain="trading",
             ),
             CommandDescriptor(
@@ -726,21 +734,6 @@ class TradingDomainPlugin(BaseDomainPlugin):
         )
 
     def contribute_projections(self) -> tuple[ProjectionDescriptor, ...]:
-        def _valid_path_segment(raw: str) -> str | None:
-            if "/" in raw or not raw:
-                return None
-            decoded = unquote(raw)
-            if (
-                "/" in decoded
-                or "\\" in decoded
-                or "\x00" in decoded
-                or decoded in (".", "..")
-                or not decoded.strip()
-                or len(decoded) > 128
-            ):
-                return None
-            return decoded
-
         def _valid_query_segment(raw: str) -> str | None:
             seg = raw.strip()
             if (
@@ -750,6 +743,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 or "\x00" in seg
                 or seg in (".", "..")
                 or len(seg) > 128
+                or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in seg)
             ):
                 return None
             return seg

@@ -41,6 +41,7 @@ from sourdough.trading.risk import (
     TRADING_RISK_CAUSE_CATEGORY,
     TradingRestrictionGuard,
     is_environment_suspended,
+    verify_trading_restriction_clear,
 )
 from sourdough.writer_lease import hold_company_writer
 
@@ -294,4 +295,117 @@ class UnifiedTradingRiskControlTests(unittest.TestCase):
                     reason="Missing guard",
                     principal_hint="board-1",
                     restriction_guards=(),
+                )
+
+    def test_verify_trading_restriction_clear_handles_null_missing_table_and_live_scope(
+        self,
+    ) -> None:
+        import sqlite3
+        from sourdough.storage.db import open_writer, write_tx
+        from sourdough.trading.engine import VERSION
+
+        engine_dir = self.root / "engine"
+        sandbox_db = engine_dir / f"nautilus-{VERSION}" / "sandbox.sqlite"
+        sandbox_db.parent.mkdir(parents=True, exist_ok=True)
+        now = 1_730_000_000_000_000_000
+
+        # 1. Missing sandbox_quote table -> BoardControlRefused (not sqlite3.OperationalError)
+        conn = sqlite3.connect(sandbox_db)
+        conn.execute("CREATE TABLE other (x INTEGER)")
+        conn.commit()
+        conn.close()
+        sandbox_db.chmod(0o600)
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            with self.assertRaisesRegex(BoardControlRefused, "Cannot resume"):
+                verify_trading_restriction_clear(
+                    db,
+                    company_id=self.company_id,
+                    scope_ref=SCOPE_EXECUTION_PAPER,
+                    cause_category=TRADING_RISK_CAUSE_CATEGORY,
+                    now_ns=now,
+                    engine_directory=engine_dir,
+                )
+
+        # 2. World-readable sandbox.sqlite -> MarketRefused mapped to BoardControlRefused
+        sandbox_db.chmod(0o644)
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            with self.assertRaisesRegex(BoardControlRefused, "Cannot resume"):
+                verify_trading_restriction_clear(
+                    db,
+                    company_id=self.company_id,
+                    scope_ref=SCOPE_EXECUTION_PAPER,
+                    cause_category=TRADING_RISK_CAUSE_CATEGORY,
+                    now_ns=now,
+                    engine_directory=engine_dir,
+                )
+        sandbox_db.chmod(0o600)
+
+        # 3. NULL event_ns in sandbox_quote -> BoardControlRefused (not TypeError)
+        conn = sqlite3.connect(sandbox_db)
+        conn.execute(
+            "CREATE TABLE sandbox_quote (event_ns INTEGER, exchange_trade_ns INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO sandbox_quote (event_ns, exchange_trade_ns) VALUES (NULL, ?)",
+            (now,),
+        )
+        conn.commit()
+        conn.close()
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            with self.assertRaisesRegex(BoardControlRefused, "fresh quote"):
+                verify_trading_restriction_clear(
+                    db,
+                    company_id=self.company_id,
+                    scope_ref=SCOPE_EXECUTION_PAPER,
+                    cause_category=TRADING_RISK_CAUSE_CATEGORY,
+                    now_ns=now,
+                    engine_directory=engine_dir,
+                )
+
+        # 3. Fresh paper sandbox.sqlite must NOT bypass execution:live or execution:all live quote check!
+        conn = sqlite3.connect(sandbox_db)
+        conn.execute("DELETE FROM sandbox_quote")
+        conn.execute(
+            "INSERT INTO sandbox_quote (event_ns, exchange_trade_ns) VALUES (?, ?)",
+            (now, now),
+        )
+        conn.commit()
+        conn.close()
+        with hold_company_writer(
+            self.store, self.company_id, lease_directory=self.leases
+        ) as writer:
+            with closing(open_writer(self.store, lease=writer)) as db, write_tx(db):
+                db.execute(
+                    "UPDATE trading_book_valuation SET recorded_at_ns = 1 WHERE binding_id = ?",
+                    (self.live_binding_id,),
+                )
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            # execution:paper succeeds with fresh sandbox.sqlite
+            verify_trading_restriction_clear(
+                db,
+                company_id=self.company_id,
+                scope_ref=SCOPE_EXECUTION_PAPER,
+                cause_category=TRADING_RISK_CAUSE_CATEGORY,
+                now_ns=now,
+                engine_directory=engine_dir,
+            )
+            # execution:live MUST refuse stale live book even with fresh sandbox.sqlite
+            with self.assertRaisesRegex(BoardControlRefused, "fresh quote"):
+                verify_trading_restriction_clear(
+                    db,
+                    company_id=self.company_id,
+                    scope_ref=SCOPE_EXECUTION_LIVE,
+                    cause_category=TRADING_RISK_CAUSE_CATEGORY,
+                    now_ns=now,
+                    engine_directory=engine_dir,
+                )
+            # execution:all MUST also check live book freshness when live binding is active
+            with self.assertRaisesRegex(BoardControlRefused, "fresh quote"):
+                verify_trading_restriction_clear(
+                    db,
+                    company_id=self.company_id,
+                    scope_ref=SCOPE_EXECUTION_ALL,
+                    cause_category=TRADING_RISK_CAUSE_CATEGORY,
+                    now_ns=now,
+                    engine_directory=engine_dir,
                 )

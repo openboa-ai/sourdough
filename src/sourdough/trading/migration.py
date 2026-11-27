@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from ..board_control import record_decision_question
 from ..company import _identity
+from ..duty_run import employment_cutoff
 from ..storage.db import open_reader, open_writer, read_tx, write_tx
 from ..storage.kernel import append_audit_event
 from ..storage.schema import is_domain_installed
@@ -114,8 +115,8 @@ def propose_paper_to_live_migration(
                 f"Target live binding in status '{target.status}' cannot be nominated"
             )
         qual_row = db.execute(
-            """SELECT environment, instrument_rules_digest, core_digest,
-                      verdict, cases_passed, cases_failed, cases_unrun
+            """SELECT adapter_revision, environment, instrument_rules_digest,
+                      core_digest, verdict, cases_passed, cases_failed, cases_unrun
                FROM venue_qualification_receipt
                WHERE company_id = ? AND receipt_id = ?""",
             (writer.company_id, qualification_receipt_id),
@@ -125,20 +126,24 @@ def propose_paper_to_live_migration(
                 "Venue qualification receipt was not found for migration nomination"
             )
         if (
-            str(qual_row[0]) != ENV_EXTERNAL_TEST
-            or str(qual_row[3]) != "PASS"
-            or int(qual_row[4]) <= 0
-            or int(qual_row[5]) != 0
+            str(qual_row[1]) != ENV_EXTERNAL_TEST
+            or str(qual_row[4]) != "PASS"
+            or int(qual_row[5]) <= 0
             or int(qual_row[6]) != 0
+            or int(qual_row[7]) != 0
         ):
             raise ExecutionTierRefused(
                 "Migration nomination requires a PASS external_test qualification receipt with zero failed/unrun cases"
             )
-        if str(qual_row[1]) != target.instrument_rules_digest:
+        if str(qual_row[0]) != target.connector_revision:
+            raise ExecutionTierRefused(
+                "Qualification receipt adapter_revision does not match target live binding"
+            )
+        if str(qual_row[2]) != target.instrument_rules_digest:
             raise ExecutionTierRefused(
                 "Qualification receipt instrument_rules_digest does not match target live binding"
             )
-        if str(qual_row[2]) != core_digest:
+        if str(qual_row[3]) != core_digest:
             raise ExecutionTierRefused(
                 "Qualification receipt core_digest does not match current trading core"
             )
@@ -392,8 +397,8 @@ def execute_paper_to_live_migration(
 
         # Gate 5: Matching PASS external_test venue qualification receipt & current core digest.
         qual_row = db.execute(
-            """SELECT environment, instrument_rules_digest, core_digest,
-                      verdict, cases_passed, cases_failed, cases_unrun
+            """SELECT adapter_revision, environment, instrument_rules_digest,
+                      core_digest, verdict, cases_passed, cases_failed, cases_unrun
                FROM venue_qualification_receipt
                WHERE company_id = ? AND receipt_id = ?""",
             (writer.company_id, qualification_receipt_id),
@@ -403,20 +408,24 @@ def execute_paper_to_live_migration(
                 "External testnet venue qualification receipt is missing"
             )
         if (
-            str(qual_row[0]) != ENV_EXTERNAL_TEST
-            or str(qual_row[3]) != "PASS"
-            or int(qual_row[4]) <= 0
-            or int(qual_row[5]) != 0
+            str(qual_row[1]) != ENV_EXTERNAL_TEST
+            or str(qual_row[4]) != "PASS"
+            or int(qual_row[5]) <= 0
             or int(qual_row[6]) != 0
+            or int(qual_row[7]) != 0
         ):
             raise ExecutionTierRefused(
                 "Migration requires a PASS external_test qualification receipt with zero failures or unrun cases"
             )
-        if str(qual_row[1]) != target.instrument_rules_digest:
+        if str(qual_row[0]) != target.connector_revision:
+            raise ExecutionTierRefused(
+                "Qualification receipt adapter_revision does not match target live binding"
+            )
+        if str(qual_row[2]) != target.instrument_rules_digest:
             raise ExecutionTierRefused(
                 "Qualification receipt instrument_rules_digest does not match target live binding"
             )
-        if str(qual_row[2]) != core_digest:
+        if str(qual_row[3]) != core_digest:
             raise ExecutionTierRefused(
                 "Qualification receipt core_digest does not match current trading core"
             )
@@ -501,7 +510,7 @@ def execute_paper_to_live_migration(
             "unresolved_external_actions": unresolved_ext_actions,
             "source_book_fills": source_book["fill_count"],
             "source_book_soak_ready": True,
-            "qualification_cases_passed": int(qual_row[4]),
+            "qualification_cases_passed": int(qual_row[5]),
             "core_digest_verified": True,
             "positions_copied": 0,
         }
@@ -642,7 +651,8 @@ def read_execution_tiers_snapshot(db: Connection, company_id: str) -> dict[str, 
                 (
                     q
                     for q in qual_receipts
-                    if q["verdict"] == "PASS"
+                    if q["environment"] == ENV_EXTERNAL_TEST
+                    and q["verdict"] == "PASS"
                     and q["cases_failed"] == 0
                     and q["cases_unrun"] == 0
                     and q["adapter_revision"] == b.connector_revision
@@ -672,6 +682,16 @@ def read_execution_tiers_snapshot(db: Connection, company_id: str) -> dict[str, 
     agent_sandboxes = []
     for b in bindings:
         if b.tier == TIER_AGENT_SANDBOX and b.status == "active" and b.owner_agent_id:
+            if employment_cutoff(db, b.owner_agent_id) is not None:
+                continue
+            grant_rows = db.execute(
+                "SELECT scope FROM standing_grant WHERE agent_id = ?",
+                (b.owner_agent_id,),
+            ).fetchall()
+            if grant_rows and all(
+                str(r[0]).strip().lower() == "revoked" for r in grant_rows
+            ):
+                continue
             portfolio = read_agent_sandbox_portfolio_from_db(
                 db, company_id, b.owner_agent_id
             )

@@ -31,6 +31,7 @@ import {
   type Fact,
   type RuntimeState,
 } from "@openboa/yogurt";
+import { normalizeAvatarVariant } from "../api/avatar";
 import {
   ApiError,
   fetchProjection,
@@ -817,7 +818,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
       <PageHeader
         leading={
           <AgentAvatar
-            agent={profile.avatar_variant}
+            agent={normalizeAvatarVariant(profile.avatar_variant)}
             state={profile.avatar_state}
             size={44}
             label={profile.display_name}

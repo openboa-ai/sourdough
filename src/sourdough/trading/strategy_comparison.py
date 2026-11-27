@@ -1777,6 +1777,8 @@ def activate_strategy_release(
     authorize_deploy: AuthorizeDeployment | None,
     comparison_id: str | None = None,
     expected_active_deployment_id: str | None = None,
+    contract_version: str = STRATEGY_DEPLOY_CONTRACT,
+    peer_pid: int | None = None,
 ) -> StrategyDeployment:
     """Activate a sealed StrategyRelease with a fresh revocable program identity."""
     writer.verify()
@@ -1785,6 +1787,7 @@ def activate_strategy_release(
     _require_token(binding_revision, "binding_revision")
     if comparison_id is not None:
         _require_safe_id(comparison_id, "comparison_id")
+    effective_pid = os.getpid() if peer_pid is None else peer_pid
 
     payload_sha = _sha256_json(
         {
@@ -1794,6 +1797,7 @@ def activate_strategy_release(
         }
     )
     preconditions = {
+        "binding_revision": binding_revision,
         "expected_active_deployment_id": expected_active_deployment_id,
     }
 
@@ -1844,9 +1848,9 @@ def activate_strategy_release(
                     company_id=writer.company_id,
                     command_id=command_id,
                     actor_id=deployer,
-                    peer_pid=os.getpid(),
+                    peer_pid=effective_pid,
                     command_type=ACTIVATE_STRATEGY_CMD,
-                    contract_version=STRATEGY_DEPLOY_CONTRACT,
+                    contract_version=contract_version,
                     payload_sha256=payload_sha,
                     preconditions=preconditions,
                     state="applied",
@@ -1937,9 +1941,9 @@ def activate_strategy_release(
                 company_id=writer.company_id,
                 command_id=command_id,
                 actor_id=deployer,
-                peer_pid=os.getpid(),
+                peer_pid=effective_pid,
                 command_type=ACTIVATE_STRATEGY_CMD,
-                contract_version=STRATEGY_DEPLOY_CONTRACT,
+                contract_version=contract_version,
                 payload_sha256=payload_sha,
                 preconditions=preconditions,
                 state="applied",
@@ -2006,12 +2010,15 @@ def rollback_strategy_deployment(
     target_release_id: str,
     expected_active_deployment_id: str,
     authorize_deploy: AuthorizeDeployment | None,
+    contract_version: str = STRATEGY_DEPLOY_CONTRACT,
+    peer_pid: int | None = None,
 ) -> StrategyDeployment:
     """Fence and roll back an active deployment to a previously deployed release."""
     writer.verify()
     _require_token(command_id, "command_id")
     _require_safe_id(target_release_id, "target_release_id")
     _require_token(expected_active_deployment_id, "expected_active_deployment_id")
+    effective_pid = os.getpid() if peer_pid is None else peer_pid
     payload_sha = _sha256_json(
         {
             "target_release_id": target_release_id,
@@ -2068,9 +2075,9 @@ def rollback_strategy_deployment(
                     company_id=writer.company_id,
                     command_id=command_id,
                     actor_id=deployer,
-                    peer_pid=os.getpid(),
+                    peer_pid=effective_pid,
                     command_type=ROLLBACK_STRATEGY_CMD,
-                    contract_version=STRATEGY_DEPLOY_CONTRACT,
+                    contract_version=contract_version,
                     payload_sha256=payload_sha,
                     preconditions=preconditions,
                     state="applied",
@@ -2144,9 +2151,9 @@ def rollback_strategy_deployment(
                 company_id=writer.company_id,
                 command_id=command_id,
                 actor_id=deployer,
-                peer_pid=os.getpid(),
+                peer_pid=effective_pid,
                 command_type=ROLLBACK_STRATEGY_CMD,
-                contract_version=STRATEGY_DEPLOY_CONTRACT,
+                contract_version=contract_version,
                 payload_sha256=payload_sha,
                 preconditions=preconditions,
                 state="applied",

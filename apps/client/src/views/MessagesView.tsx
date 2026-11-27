@@ -27,6 +27,7 @@ import {
   Transcript,
   type Tone,
 } from "@openboa/yogurt";
+import { normalizeAvatarVariant } from "../api/avatar";
 import {
   fetchProjection,
   formatMinorCurrency,
@@ -654,7 +655,7 @@ export function MessagesView() {
                   name: data.ceo_thread.ceo_display_name,
                   role: "Direct 1:1",
                   state: sendingCeo ? "working" : "ready",
-                  art: data.ceo_thread.ceo_avatar_variant,
+                  art: normalizeAvatarVariant(data.ceo_thread.ceo_avatar_variant),
                   preview: `${formatMessageCount(ceoMsgs.length)} · ${
                     hasBoardControl ? "Writable" : "Read-only"
                   }`,
@@ -741,7 +742,7 @@ export function MessagesView() {
               <Inline justify="between" align="center" wrap>
                 <Inline gap={12} align="center">
                   <AgentAvatar
-                    agent={data.ceo_thread.ceo_avatar_variant}
+                    agent={normalizeAvatarVariant(data.ceo_thread.ceo_avatar_variant)}
                     state={sendingCeo ? "working" : "ready"}
                     size={36}
                     label={data.ceo_thread.ceo_display_name}
@@ -956,7 +957,7 @@ export function MessagesView() {
                             speaker={`${msg.sender_name} · ${msg.sender_role}`}
                             avatar={
                               <AgentAvatar
-                                agent={msg.avatar_variant}
+                                agent={normalizeAvatarVariant(msg.avatar_variant)}
                                 state="ready"
                                 animated={false}
                                 size={26}

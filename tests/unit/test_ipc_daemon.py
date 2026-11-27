@@ -119,6 +119,17 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
                 ControlPlaneClient(link).meta()
 
     def test_meta_projections_etag_events_commands_and_kernel_peer_pid(self):
+        from sourdough.storage.db import open_writer, write_tx
+        from sourdough.storage.schema import enable_domain_v1
+
+        with hold_company_writer(
+            self.store, self.company, lease_directory=self.leases
+        ) as writer:
+            with closing(open_writer(self.store, lease=writer)) as db, write_tx(db):
+                enable_domain_v1(
+                    db, "trading", company_id=self.company, actor_id="setup"
+                )
+
         with self._daemon(authorize=self._authorize) as daemon:
             client = ControlPlaneClient(daemon.socket_path)
             status, etag_v1, timeline_v1 = client.work_timeline(
@@ -614,3 +625,221 @@ class CompanyDaemonControlPlaneTests(unittest.TestCase):
                 t.join(timeout=5.0)
                 self.assertFalse(t.is_alive(), "continuous reader hung")
         self.assertEqual(reader_errors, [])
+
+    def test_strategy_commands_ipc_roundtrip_conflict_and_path_segment_ctl_rejection(
+        self,
+    ):
+        from sourdough.storage.db import open_reader, open_writer, read_tx, write_tx
+        from sourdough.storage.schema import enable_domain_v1
+        from sourdough.trading.accounts import open_company_paper_book
+        from sourdough.trading.commands import (
+            ACTIVATE_STRATEGY_RELEASE,
+            ROLLBACK_STRATEGY_DEPLOYMENT,
+            STRATEGY_COMMAND,
+        )
+        from sourdough.trading.strategy_comparison import (
+            build_pit_file_entries,
+            register_pit_catalog_manifest,
+            register_strategy_release,
+        )
+
+        catalog_dir = self.root / "catalog"
+        catalog_dir.mkdir(exist_ok=True)
+        (catalog_dir / "btc_bars.parquet").write_bytes(b"immutable-pit-bars-v1")
+        entries = build_pit_file_entries(
+            catalog_dir,
+            (("btc_bars.parquet", 1_000, 2_000, 2_000),),
+        )
+
+        with hold_company_writer(
+            self.store, self.company, lease_directory=self.leases
+        ) as writer:
+            with closing(open_writer(self.store, lease=writer)) as db, write_tx(db):
+                enable_domain_v1(db, "trading", company_id=self.company, actor_id="b1")
+                db.execute(
+                    "INSERT INTO agent (id, company_id, execution_profile) VALUES (?, ?, ?)",
+                    ("author-1", self.company, "profile"),
+                )
+                db.execute(
+                    "INSERT INTO standing_grant (id, agent_id, scope) VALUES (?, ?, ?)",
+                    ("grant-author-1", "author-1", "trading"),
+                )
+            paper = open_company_paper_book(
+                writer,
+                account_id="paper-strat-ipc",
+                book_name="Strategy IPC Paper",
+                starting_minor_units=50_000_000,
+                exposure_limit_minor_units=25_000_000,
+            )
+            pit = register_pit_catalog_manifest(
+                writer,
+                manifest_id="pit-ipc-1",
+                dataset_name="btc-spot",
+                files=entries,
+            )
+            rel_inc = register_strategy_release(
+                writer,
+                release_id="rel-ipc-inc",
+                owner_agent_id="author-1",
+                strategy_source_sha256="1" * 64,
+                parameters={"k": 1},
+                instrument_rules_sha256="2" * 64,
+                risk_config_sha256="3" * 64,
+                fill_policy_sha256="4" * 64,
+                pit_manifest_id=pit.manifest_id,
+                pit_manifest_sha256=pit.manifest_sha256,
+            )
+            rel_chal = register_strategy_release(
+                writer,
+                release_id="rel-ipc-chal",
+                owner_agent_id="author-1",
+                parent_release_id=rel_inc.release_id,
+                strategy_source_sha256="5" * 64,
+                parameters={"k": 2},
+                instrument_rules_sha256="2" * 64,
+                risk_config_sha256="3" * 64,
+                fill_policy_sha256="4" * 64,
+                pit_manifest_id=pit.manifest_id,
+                pit_manifest_sha256=pit.manifest_sha256,
+            )
+            with closing(open_writer(self.store, lease=writer)) as db, write_tx(db):
+                db.execute(
+                    """INSERT INTO trading_challenger_trial (
+                           comparison_id, company_id, incumbent_release_id, challenger_release_id,
+                           baseline_statement_revision, analysis_plan_json, analysis_plan_sha256,
+                           incumbent_arm_json, challenger_arm_json, status, verdict, verdict_json,
+                           invalidation_reason, registered_at_ns, evaluated_at_ns
+                       ) VALUES (
+                           'cmp-ipc-1', ?, ?, ?, 'stmt-rev-1', '{}', 'plan-sha', '{}', '{}',
+                           'completed', 'PROMOTE', '{}', NULL, 100, 200
+                       )""",
+                    (self.company, rel_inc.release_id, rel_chal.release_id),
+                )
+
+        with self._daemon(authorize=self._authorize) as daemon:
+            client = ControlPlaneClient(daemon.socket_path)
+
+            # 1. Path segments with encoded newline or space return 400 (not 404).
+            for bad_path in (
+                "agents/agt%0a1",
+                "agents/agt%201",
+                "orders/ord%0a1",
+                "orders/ord%201",
+            ):
+                with self.assertRaisesRegex(IpcRefused, "HTTP 400"):
+                    client.projection(bad_path)
+
+            # 2. Stale expected_active_deployment_id returns 409 Conflict.
+            code_stale, body_stale = client.submit_command(
+                company_id=self.company,
+                command_id="ipc-act-stale-1",
+                command_type=ACTIVATE_STRATEGY_RELEASE,
+                contract_version=STRATEGY_COMMAND,
+                preconditions={
+                    "binding_revision": paper.binding_revision,
+                    "expected_active_deployment_id": "wrong-dep",
+                },
+                payload={"release_id": rel_inc.release_id, "comparison_id": None},
+            )
+            self.assertEqual(code_stale, 409, body_stale)
+
+            # 3. Bad binding_revision continues returning 400 Bad Request.
+            code_bad_rev, body_bad_rev = client.submit_command(
+                company_id=self.company,
+                command_id="ipc-act-bad-rev",
+                command_type=ACTIVATE_STRATEGY_RELEASE,
+                contract_version=STRATEGY_COMMAND,
+                preconditions={
+                    "binding_revision": "stale-binding-rev",
+                    "expected_active_deployment_id": None,
+                },
+                payload={"release_id": rel_inc.release_id, "comparison_id": None},
+            )
+            self.assertEqual(code_bad_rev, 400, body_bad_rev)
+
+            # 4. Valid activation & rollback persist canonical contract_version, peer_pid, preconditions.
+            code_act1, act1 = client.submit_command(
+                company_id=self.company,
+                command_id="ipc-act-ok-1",
+                command_type=ACTIVATE_STRATEGY_RELEASE,
+                contract_version=STRATEGY_COMMAND,
+                preconditions={
+                    "binding_revision": paper.binding_revision,
+                    "expected_active_deployment_id": None,
+                },
+                payload={"release_id": rel_inc.release_id, "comparison_id": None},
+            )
+            self.assertEqual(code_act1, 200, act1)
+            dep1_id = act1["result"]["deployment_id"]
+
+            code_act2, act2 = client.submit_command(
+                company_id=self.company,
+                command_id="ipc-act-ok-2",
+                command_type=ACTIVATE_STRATEGY_RELEASE,
+                contract_version=STRATEGY_COMMAND,
+                preconditions={
+                    "binding_revision": paper.binding_revision,
+                    "expected_active_deployment_id": dep1_id,
+                },
+                payload={
+                    "release_id": rel_chal.release_id,
+                    "comparison_id": "cmp-ipc-1",
+                },
+            )
+            self.assertEqual(code_act2, 200, act2)
+            dep2_id = act2["result"]["deployment_id"]
+
+            # Stale rollback returns 409 Conflict.
+            code_rb_stale, rb_stale = client.submit_command(
+                company_id=self.company,
+                command_id="ipc-rb-stale-1",
+                command_type=ROLLBACK_STRATEGY_DEPLOYMENT,
+                contract_version=STRATEGY_COMMAND,
+                preconditions={"expected_active_deployment_id": dep1_id},
+                payload={"target_release_id": rel_inc.release_id},
+            )
+            self.assertEqual(code_rb_stale, 409, rb_stale)
+
+            code_rb, rb = client.submit_command(
+                company_id=self.company,
+                command_id="ipc-rb-ok-1",
+                command_type=ROLLBACK_STRATEGY_DEPLOYMENT,
+                contract_version=STRATEGY_COMMAND,
+                preconditions={"expected_active_deployment_id": dep2_id},
+                payload={"target_release_id": rel_inc.release_id},
+            )
+            self.assertEqual(code_rb, 200, rb)
+
+        with closing(open_reader(self.store)) as db, read_tx(db):
+            rec = db.execute(
+                """SELECT contract_version, peer_pid, preconditions_json, state
+                   FROM command_receipt
+                   WHERE company_id = ? AND command_id = 'ipc-act-ok-1'""",
+                (self.company,),
+            ).fetchone()
+            self.assertIsNotNone(rec)
+            self.assertEqual(rec[0], STRATEGY_COMMAND)
+            self.assertEqual(rec[1], os.getpid())
+            self.assertEqual(
+                json.loads(rec[2]),
+                {
+                    "binding_revision": paper.binding_revision,
+                    "expected_active_deployment_id": None,
+                },
+            )
+            self.assertEqual(rec[3], "applied")
+
+            rb_rec = db.execute(
+                """SELECT contract_version, peer_pid, preconditions_json, state
+                   FROM command_receipt
+                   WHERE company_id = ? AND command_id = 'ipc-rb-ok-1'""",
+                (self.company,),
+            ).fetchone()
+            self.assertIsNotNone(rb_rec)
+            self.assertEqual(rb_rec[0], STRATEGY_COMMAND)
+            self.assertEqual(rb_rec[1], os.getpid())
+            self.assertEqual(
+                json.loads(rb_rec[2]),
+                {"expected_active_deployment_id": dep2_id},
+            )
+            self.assertEqual(rb_rec[3], "applied")

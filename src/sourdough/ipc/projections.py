@@ -21,7 +21,11 @@ from time import time_ns
 from typing import Any
 
 from ..agent_desk import _check_no_symlinks, _drafts_directory
-from ..board_control import AuthorizeBoard, resolve_board_access
+from ..board_control import (
+    ALLOWED_AVATAR_VARIANTS,
+    AuthorizeBoard,
+    resolve_board_access,
+)
 from ..company import FoundingRefused, _identity
 from ..runtime.domains import DomainPlugin, load_domain_plugins
 from ..storage.db import connect_sqlite, open_reader, read_tx
@@ -162,6 +166,12 @@ def _agent_directory(
         default_name = (
             "Founder · CEO" if is_founder else agent_id.replace("-", " ").title()
         )
+        raw_avatar = str(row[6]).strip() if row[6] is not None else ""
+        avatar_variant = (
+            raw_avatar
+            if raw_avatar in ALLOWED_AVATAR_VARIANTS
+            else _DEFAULT_AVATAR_VARIANTS[idx % len(_DEFAULT_AVATAR_VARIANTS)]
+        )
         directory[agent_id] = {
             "agent_id": agent_id,
             "is_ceo": is_founder,
@@ -170,11 +180,7 @@ def _agent_directory(
             "grant_scope": scope,
             "display_name": str(row[4]) if row[4] else default_name,
             "role_label": str(row[5]) if row[5] else default_role,
-            "avatar_variant": (
-                str(row[6])
-                if row[6]
-                else _DEFAULT_AVATAR_VARIANTS[idx % len(_DEFAULT_AVATAR_VARIANTS)]
-            ),
+            "avatar_variant": avatar_variant,
             "monthly_budget_minor": int(row[7]) if row[7] is not None else 0,
             "archived": row[8] is not None,
             "archive_reason": None if row[9] is None else str(row[9]),

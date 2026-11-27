@@ -17,6 +17,7 @@ from sourdough.trading.accounts import (
 from sourdough.trading.domain import (
     ENV_EXTERNAL_TEST,
     ENV_LIVE,
+    ENV_PAPER,
     build_promotion_payload_hash,
     compute_trading_core_digest,
 )
@@ -113,6 +114,35 @@ class TierUiProjectionTests(unittest.TestCase):
                 self.assertIsNone(
                     stale_proj["governance"]["live_candidates"][0][
                         "matching_qualification_receipt_id"
+                    ]
+                )
+
+                # Paper-environment receipt must NOT qualify a live candidate.
+                record_venue_qualification_receipt(
+                    writer,
+                    receipt_id="qual-paper-env",
+                    adapter_revision="binance-spot-v1",
+                    environment=ENV_PAPER,
+                    destination_id="binance-spot-testnet",
+                    instrument_rules_digest="btc-usdt-spot-v1",
+                    core_digest=compute_trading_core_digest(),
+                    verdict="PASS",
+                    cases_passed=6,
+                    cases_failed=0,
+                    cases_unrun=0,
+                    evidence_sha256="c" * 64,
+                )
+                paper_env_proj, _ = read_trading_desk_projection(
+                    store, company_id, environment=ENV_LIVE
+                )
+                self.assertIsNone(
+                    paper_env_proj["governance"]["live_candidates"][0][
+                        "matching_qualification_receipt_id"
+                    ]
+                )
+                self.assertIsNone(
+                    paper_env_proj["governance"]["live_candidates"][0][
+                        "promotion_payload_hash"
                     ]
                 )
 

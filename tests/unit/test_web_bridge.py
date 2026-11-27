@@ -294,3 +294,300 @@ class ClientWebBridgeSecurityTests(unittest.TestCase):
             payload = json.loads(body.decode("utf-8"))
             self.assertTrue(payload["quarantined_stale"])
             self.assertIsNone(payload["pending"])
+
+    def test_duplicate_content_length_truncated_body_non_ascii_header_head_options_and_broken_pipe(
+        self,
+    ):
+        import io
+        import socket
+        from contextlib import redirect_stderr
+        from sourdough.board_control import PAUSE_COMPANY, RESTRICTION_COMMAND
+
+        with (
+            CompanyDaemon(
+                self.store,
+                self.company_id,
+                socket_dir=self.sock_dir,
+                lease_directory=self.leases,
+            ) as daemon,
+            ClientWebBridge(
+                daemon.socket_path,
+                static_dir=self.static_dir,
+                pending_dir=self.pending_dir,
+                principal="owner-1",
+            ) as bridge,
+        ):
+            port = bridge.info.port
+            tok = bridge.info.session_token
+            cmd_payload = json.dumps(
+                {
+                    "company_id": self.company_id,
+                    "command_id": "smuggle-1",
+                    "command_type": PAUSE_COMPANY,
+                    "contract_version": RESTRICTION_COMMAND,
+                    "preconditions": {
+                        "charter_revision": "charter-1",
+                        "restriction_id": "rest-smuggle",
+                        "expected_restriction_revision": 0,
+                    },
+                    "payload": {"reason": "test"},
+                }
+            ).encode("utf-8")
+
+            # 1. Duplicate Content-Length header rejected with 400.
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                req = (
+                    f"POST /api/v1/commands HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    f"Authorization: Bearer {tok}\r\n"
+                    f"Idempotency-Key: smuggle-1\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(cmd_payload)}\r\n"
+                    f"Content-Length: 999\r\n\r\n"
+                ).encode("ascii") + cmd_payload
+                sock.sendall(req)
+                resp = sock.recv(4096)
+            self.assertTrue(resp.startswith(b"HTTP/1.1 400 "), resp)
+
+            # 2. Premature EOF (body shorter than Content-Length) rejected with 400.
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                req = (
+                    f"POST /api/v1/commands HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    f"Authorization: Bearer {tok}\r\n"
+                    f"Idempotency-Key: smuggle-2\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(cmd_payload) + 50}\r\n\r\n"
+                ).encode("ascii") + cmd_payload
+                sock.sendall(req)
+                sock.shutdown(socket.SHUT_WR)
+                resp = sock.recv(4096)
+            self.assertTrue(resp.startswith(b"HTTP/1.1 400 "), resp)
+
+            # 3. Non-ASCII forwarded header rejected with 400 (not 503).
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                req = (
+                    f"POST /api/v1/commands HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    f"Authorization: Bearer {tok}\r\n"
+                    f"Idempotency-Key: key-\u00e9\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(cmd_payload)}\r\n\r\n"
+                ).encode("latin-1") + cmd_payload
+                sock.sendall(req)
+                resp = sock.recv(4096)
+            self.assertTrue(resp.startswith(b"HTTP/1.1 400 "), resp)
+
+            # 4. HEAD and OPTIONS return 405 JSON with CSP/nosniff headers (not 501 HTML).
+            for method, path in (("HEAD", "/"), ("OPTIONS", "/api/v1/meta")):
+                st, hdrs, body = self._raw_http(
+                    port,
+                    method,
+                    path,
+                    headers={"Authorization": f"Bearer {tok}"},
+                )
+                self.assertEqual(st, 405)
+                self.assertEqual(hdrs.get("x-content-type-options"), "nosniff")
+                self.assertIn("content-security-policy", hdrs)
+                if method == "OPTIONS":
+                    self.assertIn("Method not allowed", body.decode("utf-8"))
+
+            # 5. Client abort mid-long-poll does not dump BrokenPipeError traceback to stderr.
+            import struct
+            import time
+
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                    sock.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    sock.sendall(
+                        (
+                            f"GET /api/v1/events?after_seq=999&wait_ms=250 HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:{port}\r\n"
+                            f"Authorization: Bearer {tok}\r\n\r\n"
+                        ).encode("ascii")
+                    )
+                    time.sleep(0.05)
+                time.sleep(0.35)
+            self.assertNotIn("BrokenPipeError", err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+
+    def test_non_ascii_digit_content_length_returns_400_without_traceback(self):
+        import io
+        import socket
+        import time
+        from contextlib import redirect_stderr
+
+        with (
+            CompanyDaemon(
+                self.store,
+                self.company_id,
+                socket_dir=self.sock_dir,
+                lease_directory=self.leases,
+            ) as daemon,
+            ClientWebBridge(
+                daemon.socket_path,
+                static_dir=self.static_dir,
+                pending_dir=self.pending_dir,
+                principal="owner-1",
+            ) as bridge,
+        ):
+            port = bridge.info.port
+            tok = bridge.info.session_token
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                for cl_char in ("\xb2", "\xb3", "\xb9"):
+                    with socket.create_connection(
+                        ("127.0.0.1", port), timeout=5
+                    ) as sock:
+                        req = (
+                            f"POST /api/v1/commands HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:{port}\r\n"
+                            f"Authorization: Bearer {tok}\r\n"
+                            f"Idempotency-Key: non-ascii-cl-{ord(cl_char)}\r\n"
+                            f"Content-Type: application/json\r\n"
+                            f"Content-Length: {cl_char}\r\n\r\n"
+                        ).encode("latin-1")
+                        sock.sendall(req)
+                        chunks: list[bytes] = []
+                        while True:
+                            piece = sock.recv(4096)
+                            if not piece:
+                                break
+                            chunks.append(piece)
+                        resp = b"".join(chunks)
+                    self.assertTrue(resp.startswith(b"HTTP/1.1 400 "), resp)
+                    self.assertIn(b"Invalid Content-Length", resp)
+                time.sleep(0.05)
+            self.assertNotIn("ValueError", err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+
+    def test_concurrent_burst_meta_and_long_poll_commands_do_not_drop_connections(
+        self,
+    ):
+        import threading
+
+        with (
+            CompanyDaemon(
+                self.store,
+                self.company_id,
+                socket_dir=self.sock_dir,
+                lease_directory=self.leases,
+            ) as daemon,
+            ClientWebBridge(
+                daemon.socket_path,
+                static_dir=self.static_dir,
+                pending_dir=self.pending_dir,
+                principal="owner-1",
+            ) as bridge,
+        ):
+            port = bridge.info.port
+            tok = bridge.info.session_token
+
+            # 1. 24-thread barrier-synchronized GET /api/v1/meta burst (> default backlog=5).
+            meta_count = 24
+            meta_barrier = threading.Barrier(meta_count)
+            meta_results: list[tuple[int, str | None, BaseException | None]] = [
+                (0, None, None)
+            ] * meta_count
+
+            def _hit_meta(idx: int) -> None:
+                try:
+                    meta_barrier.wait(timeout=5.0)
+                    st, _, body = self._raw_http(
+                        port,
+                        "GET",
+                        "/api/v1/meta",
+                        headers={"Authorization": f"Bearer {tok}"},
+                    )
+                    cid = json.loads(body.decode("utf-8")).get("company_id")
+                    meta_results[idx] = (st, cid, None)
+                except BaseException as exc:
+                    meta_results[idx] = (0, None, exc)
+
+            threads = [
+                threading.Thread(target=_hit_meta, args=(i,)) for i in range(meta_count)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15.0)
+                self.assertFalse(t.is_alive())
+
+            meta_errors = [err for _, _, err in meta_results if err is not None]
+            self.assertEqual(meta_errors, [])
+            self.assertEqual(
+                [(st, cid) for st, cid, _ in meta_results],
+                [(200, self.company_id)] * meta_count,
+            )
+
+            # 2. 24-thread barrier-synchronized mixed long-poll (/events) + command (/commands) burst.
+            mixed_count = 24
+            mixed_barrier = threading.Barrier(mixed_count)
+            mixed_results: list[tuple[str, int, BaseException | None]] = [
+                ("", 0, None)
+            ] * mixed_count
+
+            def _hit_mixed(idx: int) -> None:
+                kind = "events" if idx < 12 else "commands"
+                try:
+                    mixed_barrier.wait(timeout=5.0)
+                    if kind == "events":
+                        st, _, _ = self._raw_http(
+                            port,
+                            "GET",
+                            "/api/v1/events?after_seq=999999&wait_ms=100",
+                            headers={"Authorization": f"Bearer {tok}"},
+                        )
+                    else:
+                        cid = f"burst-cmd-{idx}"
+                        cmd_body = json.dumps(
+                            {
+                                "company_id": self.company_id,
+                                "command_id": cid,
+                                "command_type": SEND_CEO_MESSAGE,
+                                "contract_version": CEO_CHAT_COMMAND,
+                                "preconditions": {
+                                    "ceo_agent_id": self.founder_id,
+                                    "charter_revision": "charter-1",
+                                },
+                                "payload": {
+                                    "target_agent_id": self.founder_id,
+                                    "body": f"burst-{idx}",
+                                },
+                            }
+                        ).encode("utf-8")
+                        st, _, _ = self._raw_http(
+                            port,
+                            "POST",
+                            "/api/v1/commands",
+                            headers={
+                                "Authorization": f"Bearer {tok}",
+                                "Content-Type": "application/json",
+                                "Idempotency-Key": cid,
+                            },
+                            body=cmd_body,
+                        )
+                    mixed_results[idx] = (kind, st, None)
+                except BaseException as exc:
+                    mixed_results[idx] = (kind, 0, exc)
+
+            mixed_threads = [
+                threading.Thread(target=_hit_mixed, args=(i,))
+                for i in range(mixed_count)
+            ]
+            for t in mixed_threads:
+                t.start()
+            for t in mixed_threads:
+                t.join(timeout=15.0)
+                self.assertFalse(t.is_alive())
+
+            mixed_errors = [err for _, _, err in mixed_results if err is not None]
+            self.assertEqual(mixed_errors, [])
+            for kind, st, _ in mixed_results:
+                if kind == "events":
+                    self.assertIn(st, (200, 503))
+                else:
+                    self.assertEqual(st, 200)

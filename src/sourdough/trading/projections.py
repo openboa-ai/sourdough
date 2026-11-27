@@ -124,18 +124,15 @@ def read_trading_desk_projection(
         selected_book: dict[str, Any] | None = None
         if book_id:
             selected_book = next((b for b in books if b["binding_id"] == book_id), None)
-        if selected_book is None:
-            if environment == ENV_LIVE:
-                selected_book = next(
-                    (b for b in books if b["status"] == "active"), None
-                )
-            else:
-                selected_book = (
-                    next((b for b in books if b["role"] == "nominated"), None)
-                    or next((b for b in books if b["role"] == "shadow"), None)
-                    or next((b for b in books if b["status"] == "active"), None)
-                    or (books[0] if books else None)
-                )
+        elif environment == ENV_LIVE:
+            selected_book = next((b for b in books if b["status"] == "active"), None)
+        else:
+            selected_book = (
+                next((b for b in books if b["role"] == "nominated"), None)
+                or next((b for b in books if b["role"] == "shadow"), None)
+                or next((b for b in books if b["status"] == "active"), None)
+                or (books[0] if books else None)
+            )
 
         currency = selected_book["currency"] if selected_book else "USD"
         close_has_issues = len(open_close_issues) > 0

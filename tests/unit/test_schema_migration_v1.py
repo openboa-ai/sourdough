@@ -1201,3 +1201,90 @@ class CanonicalV1SchemaMigrationTests(unittest.TestCase):
                     self.assertEqual(domains, {"core", "paper"})
                 finally:
                     check.close()
+
+    def test_migrate_tolerates_partial_dual_write_conflicts_in_sandbox_valuation_and_windows(
+        self,
+    ):
+        with TemporaryDirectory() as tmp:
+            store = Path(tmp) / "dual-write.sqlite"
+            _seed_precanonical_store(store, "co-dual-1")
+            conn = sqlite3.connect(store)
+            try:
+                conn.execute(
+                    """CREATE TABLE trading_book_order (
+                           order_id TEXT PRIMARY KEY NOT NULL,
+                           binding_id TEXT NOT NULL,
+                           environment TEXT NOT NULL,
+                           company_id TEXT NOT NULL,
+                           actor_id TEXT NOT NULL,
+                           action_id TEXT NOT NULL,
+                           external_order_id TEXT,
+                           run_id TEXT,
+                           decision_id TEXT,
+                           mandate_revision TEXT,
+                           cancelled_at_ns INTEGER,
+                           cancel_reason TEXT,
+                           instrument_id TEXT NOT NULL,
+                           side TEXT NOT NULL,
+                           quantity INTEGER NOT NULL,
+                           limit_minor_units INTEGER NOT NULL,
+                           market_price_minor_units INTEGER NOT NULL,
+                           quote_observed_at_ns INTEGER NOT NULL,
+                           quote_source TEXT NOT NULL,
+                           fee_bps INTEGER NOT NULL,
+                           slippage_bps INTEGER NOT NULL,
+                           status TEXT NOT NULL,
+                           filled_quantity INTEGER NOT NULL,
+                           fill_price_minor_units INTEGER,
+                           fee_minor_units INTEGER NOT NULL,
+                           created_at_ns INTEGER NOT NULL,
+                           updated_at_ns INTEGER NOT NULL
+                       ) STRICT"""
+                )
+                conn.execute(
+                    """INSERT INTO trading_book_order VALUES (
+                           'ord-sbx-1', 'bind-sbx-1', 'agent_sandbox', 'co-dual-1', 'quant-1',
+                           'act-sbx-1', NULL, NULL, NULL, NULL, NULL, NULL,
+                           'ETH-USDT', 'buy', 2, 3000, 2990, 411, 'live_read_only',
+                           4, 2, 'filled', 2, 2990, 5, 411, 412
+                       )"""
+                )
+                conn.execute(
+                    """INSERT INTO trading_book_valuation VALUES (
+                           'cap-gen1', 'bind-paper-2', 'paper', 'co-dual-1', 'mark_to_market',
+                           999960, 999960, 0, 0, 0, 0, 'paper_valuation', 415
+                       )"""
+                )
+                conn.execute(
+                    """CREATE TABLE trading_operating_window (
+                           window_id TEXT PRIMARY KEY NOT NULL,
+                           contract TEXT NOT NULL,
+                           committed_ns INTEGER,
+                           revision TEXT UNIQUE
+                       ) STRICT"""
+                )
+                conn.execute(
+                    "INSERT INTO trading_operating_window VALUES ('win-1', '24h', 2000, 'win-rev-1')"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            domains = migrate_v1_store_to_canonical(store)
+            self.assertEqual(domains, frozenset({"core", "trading"}))
+            with closing(open_reader(store)) as reader, read_tx(reader):
+                self.assertEqual(
+                    verify_v1_schema(reader), frozenset({"core", "trading"})
+                )
+                self.assertEqual(
+                    reader.execute(
+                        "SELECT COUNT(*) FROM trading_operating_window"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    reader.execute(
+                        "SELECT COUNT(*) FROM trading_book_order WHERE order_id = 'ord-sbx-1'"
+                    ).fetchone()[0],
+                    1,
+                )

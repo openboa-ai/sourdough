@@ -286,6 +286,51 @@ class ConnectedFlow(unittest.TestCase):
                 )
                 self.assertEqual(st_gate, 422)
 
+                # Core-only pause_company must never leak "domains": {"trading": ...} into work-timeline.
+                st_pause, pause_body = _bridge_json(
+                    f"{base}/api/v1/commands",
+                    tok,
+                    method="POST",
+                    idempotency_key="flow-core-pause-1",
+                    payload={
+                        "company_id": company_id,
+                        "command_id": "flow-core-pause-1",
+                        "command_type": "pause_company",
+                        "contract_version": RESTRICTION_COMMAND,
+                        "preconditions": {
+                            "charter_revision": "charter-v1",
+                            "restriction_id": "rest-core-flow",
+                            "expected_restriction_revision": 0,
+                        },
+                        "payload": {"reason": "Core-only pause check"},
+                    },
+                )
+                self.assertEqual(st_pause, 200, pause_body)
+                st_tl, tl_body = _bridge_json(
+                    f"{base}/api/v1/projections/work-timeline", tok
+                )
+                self.assertEqual(st_tl, 200)
+                self.assertNotIn("trading", tl_body.get("domains", {}))
+                st_res, _ = _bridge_json(
+                    f"{base}/api/v1/commands",
+                    tok,
+                    method="POST",
+                    idempotency_key="flow-core-resume-1",
+                    payload={
+                        "company_id": company_id,
+                        "command_id": "flow-core-resume-1",
+                        "command_type": "resume_company",
+                        "contract_version": RESTRICTION_COMMAND,
+                        "preconditions": {
+                            "charter_revision": "charter-v1",
+                            "restriction_id": "rest-core-flow",
+                            "expected_restriction_revision": 1,
+                        },
+                        "payload": {"reason": "Core-only resume check"},
+                    },
+                )
+                self.assertEqual(st_res, 200)
+
             # Phase 1: Opt-in Trading domain, Tier 1 agent_sandbox, and Tier 2 multi-book company_paper.
             with hold_company_writer(
                 store, company_id, lease_directory=leases
@@ -761,6 +806,24 @@ class ConnectedFlow(unittest.TestCase):
                 self.assertEqual(st_pt, 200)
                 self.assertEqual(paper_trace["projection"], "order-trace-v1")
                 self.assertEqual(paper_trace["order"]["environment"], "paper")
+
+                # Sanitized avatar_variant for legacy 'cobalt' profile & fail-closed unknown book_id.
+                from sourdough.board_control import ALLOWED_AVATAR_VARIANTS
+
+                st_ag, ag_body = _bridge_json(
+                    f"{base}/api/v1/projections/agents-graph", tok
+                )
+                self.assertEqual(st_ag, 200)
+                for node in ag_body["nodes"]:
+                    self.assertIn(node["avatar_variant"], ALLOWED_AVATAR_VARIANTS)
+
+                st_missing, missing_desk = _bridge_json(
+                    f"{base}/api/v1/projections/trading-desk?environment=paper&book_id=missing-book",
+                    tok,
+                )
+                self.assertEqual(st_missing, 200)
+                self.assertIsNone(missing_desk["selected_book"])
+                self.assertIsNone(missing_desk["selected_book_id"])
 
 
 if __name__ == "__main__":

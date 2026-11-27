@@ -29,6 +29,7 @@ import {
   type DataRow,
   type Fact,
 } from "@openboa/yogurt";
+import { normalizeAvatarVariant } from "../api/avatar";
 import {
   fetchProjection,
   formatMinorCurrency,
@@ -279,19 +280,20 @@ export function FinanceView() {
 
   const showRetainedStatements =
     data.trading_enabled || data.retained_statements.length > 0;
-  const showTradingFinance =
-    showRetainedStatements || data.funding_settlements.length > 0;
+  const showFundingSettlements =
+    data.trading_enabled || data.funding_settlements.length > 0;
+  const financeDetail =
+    showRetainedStatements && showFundingSettlements
+      ? "Double-entry general ledger, period accounting closes, retained statements, and funding settlements"
+      : showRetainedStatements
+        ? "Double-entry general ledger, period accounting closes, and retained statements"
+        : showFundingSettlements
+          ? "Double-entry general ledger, period accounting closes, and funding settlements"
+          : "Double-entry general ledger and period accounting closes";
 
   return (
     <Stack gap={16}>
-      <PageHeader
-        title="Finance"
-        detail={
-          showTradingFinance
-            ? "Double-entry general ledger, period accounting closes, retained statements, and funding settlements"
-            : "Double-entry general ledger and period accounting closes"
-        }
-      />
+      <PageHeader title="Finance" detail={financeDetail} />
 
       {data.open_close_issues.length > 0 ? (
         <Notice title="Accounting close contains open issues" tone="warning" urgent>
@@ -898,7 +900,7 @@ export function OrgReportsView() {
                                     name: agent.display_name,
                                     role: `${agent.role_label} · ${derivedLiveStatus}`,
                                     state: derivedAvatarState,
-                                    art: agent.avatar_variant,
+                                    art: normalizeAvatarVariant(agent.avatar_variant),
                                     preview: `${agent.grant_scope || "No grant"} · ${agent.private_draft_count} private drafts`,
                                   }}
                                   onSelect={() =>
@@ -1287,8 +1289,9 @@ export function RestrictionsView() {
             id: `pause-company-${data.charter_revision}`,
             revision: `${data.charter_revision}:${data.active_causes.length}`,
             title: "Apply Cause-Scoped Company Pause",
-            consequence:
-              "Adds a distinct operational restriction cause without disturbing existing stops or open positions.",
+            consequence: (meta.active_domains.includes("trading")
+              ? "Adds a distinct operational restriction cause without disturbing existing stops or open positions."
+              : "Adds a distinct operational restriction cause without disturbing existing stops."),
             confirmLabel: "Apply Operational Stop",
             destructive: true,
             available: canWrite || isPausePending,
