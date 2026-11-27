@@ -605,8 +605,6 @@ def run_isolated_trial_slot(
         with closing(open_reader(run_store)) as ro_db, read_tx(ro_db):
             if _identity(ro_db) != company_id:
                 raise TrialRefused("Backed-up trial store identity mismatch")
-        if agent_ids:
-            clone_desk_snapshot(source_store, company_id, agent_ids, run_store)
         target_cid = company_id
         actor_id = agent_ids[0] if agent_ids else ""
         if not actor_id:
@@ -618,6 +616,8 @@ def run_isolated_trial_slot(
                 if row is None:
                     raise TrialRefused("Trial company has no founder_id")
                 actor_id = str(row[0])
+        clone_agents = tuple(agent_ids) if agent_ids else (actor_id,)
+        clone_desk_snapshot(source_store, company_id, clone_agents, run_store)
     else:
         receipt = found(
             run_store,
@@ -672,7 +672,7 @@ def run_isolated_trial_slot(
                 closing(open_writer(run_store, lease=trial_w)) as db,
                 write_tx(db),
             ):
-                create_work_item(
+                trial_item, _ = create_work_item(
                     db,
                     company_id=target_cid,
                     owner_agent_id=actor_id,
@@ -685,25 +685,36 @@ def run_isolated_trial_slot(
                     now_ns=max(1, time_ns()),
                 )
         step_summary = runtime.step(max_dispatches=min(slot.limits.turns, 1))
+        exec_runs = tuple(step_summary.executed_runs)
         with closing(open_reader(run_store)) as ro_db, read_tx(ro_db):
             settled_count = int(
                 ro_db.execute(
-                    "SELECT COUNT(*) FROM work_items WHERE company_id = ? AND state = 'settled'",
-                    (target_cid,),
+                    """SELECT COUNT(*) FROM work_items
+                       WHERE company_id = ? AND work_item_id = ? AND state = 'settled'""",
+                    (target_cid, trial_item.work_item_id),
                 ).fetchone()[0]
             )
-            dec_count = int(
-                ro_db.execute(
-                    "SELECT COUNT(*) FROM work_decision WHERE company_id = ?",
-                    (target_cid,),
-                ).fetchone()[0]
-            )
-            fatal_calls = int(
-                ro_db.execute(
-                    "SELECT COUNT(*) FROM tool_call_receipt WHERE company_id = ? AND status = 'fatal'",
-                    (target_cid,),
-                ).fetchone()[0]
-            )
+            if exec_runs:
+                run_placeholders = ",".join("?" for _ in exec_runs)
+                dec_count = int(
+                    ro_db.execute(
+                        f"""SELECT COUNT(*) FROM work_decision
+                            WHERE company_id = ? AND work_item_id = ?
+                              AND run_id IN ({run_placeholders})""",
+                        (target_cid, trial_item.work_item_id, *exec_runs),
+                    ).fetchone()[0]
+                )
+                fatal_calls = int(
+                    ro_db.execute(
+                        f"""SELECT COUNT(*) FROM tool_call_receipt
+                            WHERE company_id = ? AND run_id IN ({run_placeholders})
+                              AND status = 'fatal'""",
+                        (target_cid, *exec_runs),
+                    ).fetchone()[0]
+                )
+            else:
+                dec_count = 0
+                fatal_calls = 0
         result = {
             "outcome": "completed"
             if settled_count >= 1 and dec_count >= 1

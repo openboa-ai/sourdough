@@ -387,7 +387,7 @@ class TestS1F1PrivateDeskReopenTier1(unittest.TestCase):
             ep_idx = lazy_module("sourdough.episode_index")
             memory_mod = lazy_module("sourdough.memory")
             hits = ep_idx.search_episodes(
-                h.store, h.company_id, agent.agent_id, "vendor SLA"
+                h.store, h.company_id, agent.agent_id, "output_digest"
             )
             self.assertGreaterEqual(len(hits), 1)
             with closing(open_reader(h.store)) as db, read_tx(db):
@@ -668,7 +668,7 @@ class TestS1F2CheckpointCloningTier1(unittest.TestCase):
             self.assertTrue(fts_path.is_file())
             self.assertEqual(read_watermark(h.store, h.company_id), wm_before)
             hits = ep_idx.search_episodes(
-                h.store, h.company_id, agent.agent_id, "compliance ledger"
+                h.store, h.company_id, agent.agent_id, "output_digest"
             )
             self.assertGreaterEqual(len(hits), 1)
 

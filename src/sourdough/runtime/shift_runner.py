@@ -9,6 +9,7 @@ import stat
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import asdict, dataclass, is_dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -768,10 +769,35 @@ class ShiftRunner:
                         None if run_state_row[2] is None else str(run_state_row[2])
                     )
                 ep_status = final_run_status
-                ep_summary = shift_result.output_text.strip() or (
-                    f"Waiting on {final_wait_event_key or ctx.work_item.duty_kind}"
-                    if final_run_status == "waiting"
-                    else f"Completed {ctx.work_item.duty_kind}"
+                raw_out = shift_result.output_text.strip()
+                out_bytes = raw_out.encode("utf-8")
+                out_digest = sha256(out_bytes).hexdigest()
+                if final_run_status == "waiting":
+                    ep_summary = (
+                        f"status={final_run_status} duty={ctx.work_item.duty_kind} "
+                        f"wait_key={final_wait_event_key or 'none'} "
+                        f"tools={broker.call_count} output_bytes={len(out_bytes)} "
+                        f"output_digest={out_digest}"
+                    )
+                else:
+                    ep_summary = (
+                        f"status={final_run_status} duty={ctx.work_item.duty_kind} "
+                        f"tools={broker.call_count} output_bytes={len(out_bytes)} "
+                        f"output_digest={out_digest}"
+                    )
+                _append_trace_line(
+                    ctx.writer.store,
+                    session.trace_path,
+                    {
+                        "seq": broker.call_count + 1,
+                        "kind": "shift_terminal",
+                        "recorded_at_ns": max(1, int(ctx.now_ns)),
+                        "run_id": ctx.run.run_id,
+                        "status": final_run_status,
+                        "output_bytes": len(out_bytes),
+                        "output_digest": out_digest,
+                        "output_text": raw_out,
+                    },
                 )
             elif isinstance(shift_error, AgentBudgetExceeded) or (
                 isinstance(settlement_error, AgentBudgetExceeded)

@@ -741,9 +741,11 @@ class RuntimeShiftRunnerTests(unittest.TestCase):
                 ).fetchall()
                 self.assertEqual(len(ep_rows), 1)
                 self.assertEqual(ep_rows[0][1], "completed")
+                self.assertIn("output_digest=", str(ep_rows[0][2]))
+                self.assertNotIn("Draft saved", str(ep_rows[0][2]))
 
             hits = search_episodes(
-                store, founding.company_id, founding.founder_id, "Draft saved"
+                store, founding.company_id, founding.founder_id, "output_digest"
             )
             self.assertEqual(len(hits), 1)
             self.assertEqual(hits[0]["run_id"], ceo_run_id)

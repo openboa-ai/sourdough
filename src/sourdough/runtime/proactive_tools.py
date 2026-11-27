@@ -279,8 +279,7 @@ def build_core_proactive_tool_contribution(
         decision_at_ns = _optional_int(
             obj.get("decision_at_ns"), "decision_at_ns", minimum=1
         )
-        if decision_at_ns is None:
-            decision_at_ns = max(1, _now_ns())
+        fallback_now_ns = max(1, _now_ns())
         raw_evidence = obj.get("evidence", [])
         if not isinstance(raw_evidence, list):
             raise DutyRefused("evidence must be an array")
@@ -344,6 +343,7 @@ def build_core_proactive_tool_contribution(
                 rationale=rationale,
                 evidence=tuple(parsed_evidence),
                 decision_at_ns=decision_at_ns,
+                now_ns=fallback_now_ns,
                 action_id=action_id,
                 next_condition=next_cond,
                 active_snapshot_id=active_snapshot_id,

@@ -6286,6 +6286,325 @@ class TestM5Tier5Hardening(unittest.TestCase):
                 self.assertNotIn(canary, res.output_text)
                 self.assertEqual(json.loads(res.output_text), {})
 
+    def test_pr191_r12_terminal_prose_never_persisted_in_company_sqlite_episode_or_trading_outcome(
+        self,
+    ) -> None:
+        """PR #191 R12 Security P2: terminal prose quoting Desk canary must stay out of company.sqlite."""
+        from sourdough.trading.plugin import (
+            DUTY_QUANT_AGENT_SANDBOX,
+            TradingDomainPlugin,
+        )
+
+        canary = "PRIVATE_DESK_CANARY_PROSE_776655"
+
+        class _EchoDeskAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                broker.invoke(
+                    "c-save",
+                    "desk_save_draft",
+                    {"name": "secret-memo", "content": canary},
+                )
+                read_res = broker.invoke(
+                    "c-read",
+                    "desk_read_draft",
+                    {"name": "secret-memo"},
+                )
+                return ShiftResult(
+                    output_text=f"Echoed from Desk: {read_res['content']}",
+                    usage=TokenUsage(input_tokens=15, output_tokens=12),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=2,
+                    events=(),
+                )
+
+        reg = AgentAdapterRegistry()
+        reg.register(_EchoDeskAdapter())
+        trading_plugin = TradingDomainPlugin()
+        duty_reg = build_production_duty_registry(
+            adapter_registry=reg,
+            profile_bindings={self.founder_id: self.profile},
+            domain_plugins=(trading_plugin,),
+        )
+        rt = CompanyRuntime(
+            self.store,
+            self.company_id,
+            duty_reg,
+            clock=lambda: 20_000,
+        )
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind=DUTY_QUANT_AGENT_SANDBOX,
+                    source_kind="manual",
+                    source_id="r12-trading-canary",
+                    now_ns=19_000,
+                )
+
+        step = rt.step(max_dispatches=1, now_ns=20_000)
+        self.assertEqual(len(step.executed_runs), 1)
+        run_id = step.executed_runs[0]
+        expected_out = f"Echoed from Desk: {canary}".encode("utf-8")
+        expected_digest = sha256(expected_out).hexdigest()
+
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            run_outcome = str(
+                ro.execute(
+                    "SELECT outcome_json FROM work_runs WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+            )
+            ep_summary = str(
+                ro.execute(
+                    "SELECT summary_text FROM agent_episode WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+            )
+        self.assertNotIn(canary, run_outcome)
+        self.assertNotIn(canary, ep_summary)
+        self.assertNotIn(canary.encode("utf-8"), self.store.read_bytes())
+
+        parsed_outcome = json.loads(run_outcome)
+        self.assertNotIn("output_text", parsed_outcome)
+        self.assertEqual(parsed_outcome["output_digest"], expected_digest)
+        self.assertEqual(parsed_outcome["output_bytes"], len(expected_out))
+        self.assertIn(f"output_digest={expected_digest}", ep_summary)
+        self.assertIn(f"output_bytes={len(expected_out)}", ep_summary)
+
+    def test_pr191_r12_timestamp_free_decision_retry_reuses_committed_timestamp(
+        self,
+    ) -> None:
+        """PR #191 R12 P2: omitting decision_at_ns on identical action_id retries returns committed decision."""
+        from sourdough.runtime.proactive_tools import (
+            build_core_proactive_tool_contribution,
+        )
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+                # 1. Direct record_work_decision with omitted decision_at_ns & advancing clock
+                d1 = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Wait for next cycle",
+                    evidence=(),
+                    decision_at_ns=None,
+                    now_ns=2_000,
+                    action_id="act-r12-no-ts",
+                )
+                d2 = record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    run_id=run.run_id,
+                    fencing_token=run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Wait for next cycle",
+                    evidence=(),
+                    decision_at_ns=None,
+                    now_ns=9_999,
+                    action_id="act-r12-no-ts",
+                )
+                self.assertEqual(d1.decision_id, d2.decision_id)
+                self.assertEqual(d2.decision_at_ns, 2_000)
+
+                # Explicit different decision_at_ns still raises WorkKernelRefused!
+                with self.assertRaisesRegex(WorkKernelRefused, "conflicts"):
+                    record_work_decision(
+                        db,
+                        company_id=self.company_id,
+                        work_item_id=item.work_item_id,
+                        run_id=run.run_id,
+                        fencing_token=run.fencing_token,
+                        agent_id=self.founder_id,
+                        action_kind="hold",
+                        rationale="Wait for next cycle",
+                        evidence=(),
+                        decision_at_ns=9_999,
+                        action_id="act-r12-no-ts",
+                    )
+
+            # 2. Proactive tool wrapper with advancing clock & omitted decision_at_ns
+            from dataclasses import replace as dc_replace
+
+            now_box = [3_000]
+            clocked_claim = dc_replace(claim, _clock=lambda: now_box[0])
+            contrib = build_core_proactive_tool_contribution(
+                writer=w,
+                claim=clocked_claim,
+            )
+            handler = contrib.handlers["record_work_decision"]
+            r1 = handler(
+                {
+                    "action_kind": "hold",
+                    "rationale": "Tool retry check",
+                    "action_id": "act-r12-tool-retry",
+                    "evidence": [],
+                }
+            )
+            now_box[0] = 8_000
+            r2 = handler(
+                {
+                    "action_kind": "hold",
+                    "rationale": "Tool retry check",
+                    "action_id": "act-r12-tool-retry",
+                    "evidence": [],
+                }
+            )
+            self.assertEqual(r1["decision_id"], r2["decision_id"])
+            self.assertEqual(r2["decision_at_ns"], 3_000)
+
+    def test_pr191_r12_isolated_trial_clones_default_founder_desk_and_scopes_grading_to_new_run(
+        self,
+    ) -> None:
+        """PR #191 R12 P2: default agent_ids=() clones founder Desk, and grading ignores historical rows."""
+        from sourdough.runtime.registry import DutyDescriptor, DutyRegistry
+        from sourdough.trial_execution import TrialWorkerInput
+        from sourdough.trial_registry import (
+            TrialCeiling,
+            TrialInputs,
+            TrialSlot,
+            TrialSuite,
+            seal_trial_suite,
+        )
+        from sourdough.trial_runner import (
+            _compute_source_store_fixture,
+            run_isolated_trial_slot,
+        )
+
+        # Seed source_store with: (a) a founder private Desk draft AND (b) pre-existing settled work + decision
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                hist_item, hist_run, hist_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            save_draft(
+                w,
+                hist_claim,
+                hist_claim.purpose,
+                name="research",
+                content="FOUNDER_DESK_RESEARCH_NOTES_42",
+                expected_revision=None,
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=hist_item.work_item_id,
+                    run_id=hist_run.run_id,
+                    fencing_token=hist_run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="hold",
+                    rationale="Historical decision before trial",
+                    evidence=(),
+                    decision_at_ns=1_500,
+                )
+                complete_work_run(
+                    db,
+                    hist_run.run_id,
+                    hist_run.fencing_token,
+                    outcome={"historical": True},
+                    now_ns=1_600,
+                )
+
+        eval_store = self.root / "eval_r12" / "evaluator.sqlite"
+        eval_store.parent.mkdir(parents=True, exist_ok=True)
+        fixture_bytes, profiles, _founder = _compute_source_store_fixture(
+            self.store, self.company_id
+        )
+        case_bytes = b'{"case":"r12-scope"}'
+        ctx_bytes = b'{"arm":"base"}'
+        tools_bytes = b'{"tools":[]}'
+        limits = TrialCeiling(turns=2, wall_seconds=30, tokens=2_000)
+        sealed_inputs = TrialInputs(
+            company_fixture=sha256(fixture_bytes).hexdigest(),
+            case_inputs=sha256(case_bytes).hexdigest(),
+            worker_context=sha256(ctx_bytes).hexdigest(),
+            tools=sha256(tools_bytes).hexdigest(),
+            runtime_profile=profiles[self.founder_id],
+        )
+        suite = TrialSuite(
+            suite_id="r12-trial-isolation",
+            purpose="judgment",
+            rubric_digest=sha256(b"r").hexdigest(),
+            evaluator_digest=sha256(b"e").hexdigest(),
+            analysis_plan_digest=sha256(b"p").hexdigest(),
+            slots=(TrialSlot("s1", "c1", "f1", sealed_inputs, limits),),
+        )
+        rev = seal_trial_suite(eval_store, suite)
+
+        observed_drafts: list[str] = []
+
+        def _blocking_handler(ctx) -> DutyOutcome:
+            # Verify founder's private Desk draft WAS cloned even when agent_ids=()
+            founder_draft_file = (
+                desk_directory(ctx.writer.store, self.founder_id)
+                / ".desk"
+                / "drafts"
+                / "research.json"
+            )
+            if founder_draft_file.is_file():
+                observed_drafts.append(founder_draft_file.read_text(encoding="utf-8"))
+            # Deliberately return blocked WITHOUT recording any work_decision
+            return DutyOutcome(disposition="blocked", result={"reason": "no_decision"})
+
+        reg = DutyRegistry()
+        reg.register(
+            DutyDescriptor(
+                duty_kind="work.discovery_review",
+                execute=_blocking_handler,
+            )
+        )
+        ev = run_isolated_trial_slot(
+            eval_store,
+            revision=rev,
+            slot_id="s1",
+            run_id="r12-blocked-run",
+            trial_root=self.root / "trials_r12",
+            source_store=self.store,
+            company_id=self.company_id,
+            agent_ids=(),  # omitted -> must still clone founder's Desk!
+            worker_input=TrialWorkerInput(case_bytes, ctx_bytes, tools_bytes, limits),
+            duty_registry=reg,
+        )
+        self.assertEqual(len(observed_drafts), 1)
+        self.assertIn("FOUNDER_DESK_RESEARCH_NOTES_42", observed_drafts[0])
+        # Historical settled item & decision MUST NOT make the blocked trial pass!
+        self.assertEqual(ev.outcome, "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

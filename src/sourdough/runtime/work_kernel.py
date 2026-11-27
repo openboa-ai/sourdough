@@ -3551,6 +3551,7 @@ def record_work_decision(
     rationale: str,
     evidence: Sequence[DecisionEvidence | Mapping[str, Any]] = (),
     decision_at_ns: int | None = None,
+    now_ns: int | None = None,
     action_id: str | None = None,
     next_condition: Mapping[str, Any] | None = None,
     active_snapshot_id: str | None = None,
@@ -3566,7 +3567,12 @@ def record_work_decision(
     if action_id is not None:
         _require_nonempty(action_id, "action_id")
     effective_action_id = action_id or f"dec-{uuid4().hex}"
-    effective_decision_ns = time_ns() if decision_at_ns is None else decision_at_ns
+    if decision_at_ns is not None:
+        effective_decision_ns = decision_at_ns
+    elif now_ns is not None:
+        effective_decision_ns = now_ns
+    else:
+        effective_decision_ns = time_ns()
     if type(effective_decision_ns) is not int or effective_decision_ns <= 0:
         raise WorkKernelRefused("decision_at_ns must be a positive integer")
 
@@ -3668,7 +3674,10 @@ def record_work_decision(
             or prior.action_kind != action_kind
             or prior.evidence_digest != evidence_digest
             or prior.rationale != rationale
-            or prior.decision_at_ns != effective_decision_ns
+            or (
+                decision_at_ns is not None
+                and prior.decision_at_ns != effective_decision_ns
+            )
             or prior.active_snapshot_id != active_snapshot_id
             or (prior.next_condition_id is None) != (validated_next is None)
         ):

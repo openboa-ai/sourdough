@@ -8,6 +8,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Mapping
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -526,6 +527,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
             )
             result = run_res.shift_result
             settlement = run_res.settlement
+            sbx_out_bytes = result.output_text.strip().encode("utf-8")
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -533,7 +535,8 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "provider": result.provider,
                     "model": result.model,
                     "tool_calls_executed": result.tool_calls_executed,
-                    "output_text": result.output_text,
+                    "output_digest": sha256(sbx_out_bytes).hexdigest(),
+                    "output_bytes": len(sbx_out_bytes),
                     "cost_minor_units": settlement.cost_minor_units,
                     "journal_entry_id": settlement.journal_entry_id,
                 },
@@ -590,6 +593,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
             )
             result = run_res.shift_result
             settlement = run_res.settlement
+            sbx_out_bytes = result.output_text.strip().encode("utf-8")
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -597,7 +601,8 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "provider": result.provider,
                     "model": result.model,
                     "tool_calls_executed": result.tool_calls_executed,
-                    "output_text": result.output_text,
+                    "output_digest": sha256(sbx_out_bytes).hexdigest(),
+                    "output_bytes": len(sbx_out_bytes),
                     "cost_minor_units": settlement.cost_minor_units,
                     "journal_entry_id": settlement.journal_entry_id,
                 },
