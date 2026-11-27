@@ -2144,19 +2144,50 @@ def quarantine_method_lineage(
         quarantined_revisions = tuple(sorted(visited))
         quarantined_methods = tuple(sorted({m for m, _ in quarantined_revisions}))
 
-        # Capture scopes of currently active methods being quarantined before status change.
+        # Capture scopes of currently effective methods (active revisions OR currently
+        # effective adopted DEPRECATE activations) being quarantined before status change.
         affected_scopes: list[tuple[str, str, str | None]] = []
+        seen_affected_scopes: set[tuple[str, str, str | None]] = set()
         for q_mid, q_rev in quarantined_revisions:
             row = db.execute(
-                """SELECT audience_scope, audience_target_id, status
+                """SELECT audience_scope, audience_target_id, status, delta_kind
                    FROM method_delta
                    WHERE company_id = ? AND method_id = ? AND revision_sha256 = ?""",
                 (company_id, q_mid, q_rev),
             ).fetchone()
-            if row is not None and str(row[2]) == "active":
-                affected_scopes.append(
-                    (q_mid, str(row[0]), None if row[1] is None else str(row[1]))
-                )
+            if row is not None:
+                r_scope = str(row[0])
+                r_target = None if row[1] is None else str(row[1])
+                r_status = str(row[2])
+                r_dkind = str(row[3])
+                is_effective = r_status == "active"
+                if (
+                    not is_effective
+                    and r_dkind == "DEPRECATE"
+                    and r_status == "retired"
+                ):
+                    latest_act = db.execute(
+                        """SELECT method_id, revision_sha256
+                           FROM method_activation
+                           WHERE company_id = ?
+                             AND method_id = ?
+                             AND audience_scope = ?
+                             AND (audience_target_id IS ? OR audience_target_id = ?)
+                             AND quarantined = 0
+                           ORDER BY activation_seq DESC
+                           LIMIT 1""",
+                        (company_id, q_mid, r_scope, r_target, r_target),
+                    ).fetchone()
+                    if latest_act is not None and (
+                        str(latest_act[0]),
+                        str(latest_act[1]),
+                    ) == (q_mid, q_rev):
+                        is_effective = True
+                if is_effective:
+                    scope_key = (q_mid, r_scope, r_target)
+                    if scope_key not in seen_affected_scopes:
+                        seen_affected_scopes.add(scope_key)
+                        affected_scopes.append(scope_key)
             db.execute(
                 """UPDATE method_delta
                    SET status = 'quarantined'

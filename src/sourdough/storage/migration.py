@@ -204,9 +204,28 @@ def _rebuild_single_table(
     connection.execute(create_table_sql)
     for idx_sql in create_index_sqls:
         connection.execute(idx_sql)
-    connection.execute(
-        f"INSERT INTO {table_name} ({col_list}) SELECT {col_list} FROM {staging}"
-    )
+    if table_name == "work_handoff" and "state" not in columns:
+        connection.execute(
+            f"""INSERT INTO {table_name} ({col_list}, "state", "state_version")
+                SELECT {col_list},
+                       CASE
+                           WHEN successor_work_item_id IS NOT NULL
+                             OR accepted_run_id IS NOT NULL
+                           THEN 'accepted'
+                           ELSE 'offered'
+                       END,
+                       CASE
+                           WHEN successor_work_item_id IS NOT NULL
+                             OR accepted_run_id IS NOT NULL
+                           THEN 2
+                           ELSE 1
+                       END
+                FROM {staging}"""
+        )
+    else:
+        connection.execute(
+            f"INSERT INTO {table_name} ({col_list}) SELECT {col_list} FROM {staging}"
+        )
     connection.execute(f"DROP TABLE {staging}")
 
 

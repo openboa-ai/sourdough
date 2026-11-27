@@ -3151,6 +3151,413 @@ class TestM5Tier5Hardening(unittest.TestCase):
             proj2_with_plan["rsi_transfer_summaries"][0]["verdict"], "INCONCLUSIVE"
         )
 
+    def test_pr191_r2_judge_preserves_17kb_evidence_and_rejects_oversized_packet(
+        self,
+    ) -> None:
+        """PR #191 R2 P2: judge must keep >16KB evidence intact and refuse oversized packets."""
+        from sourdough.trial_registry import (
+            TrialCeiling,
+            TrialInputs,
+            TrialRefused,
+            TrialSlot,
+            TrialSuite,
+            TrialTerminalEvidence,
+            commit_trial_observation,
+            reserve_trial_launch,
+            seal_trial_suite,
+        )
+        from sourdough.trial_runner import run_blind_pairwise_judge
+
+        def _cjson(obj: object) -> str:
+            return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+        eval_store = self.root / "eval_17kb.sqlite"
+        slots = (
+            TrialSlot(
+                "s1-inc",
+                "c1",
+                "f1",
+                TrialInputs(
+                    sha256(b"f").hexdigest(),
+                    sha256(b"c1").hexdigest(),
+                    sha256(b"inc").hexdigest(),
+                    sha256(b"t").hexdigest(),
+                    "offline-v1",
+                ),
+                TrialCeiling(2, 10, 1000),
+                "incumbent",
+                "s1-cand",
+            ),
+            TrialSlot(
+                "s1-cand",
+                "c1",
+                "f1",
+                TrialInputs(
+                    sha256(b"f").hexdigest(),
+                    sha256(b"c1").hexdigest(),
+                    sha256(b"cand").hexdigest(),
+                    sha256(b"t").hexdigest(),
+                    "offline-v1",
+                ),
+                TrialCeiling(2, 10, 1000),
+                "candidate",
+                "s1-inc",
+            ),
+        )
+        suite = TrialSuite(
+            suite_id="judge-17kb-suite",
+            purpose="recursive",
+            rubric_digest=sha256(b"rubric-17kb").hexdigest(),
+            evaluator_digest=sha256(b"eval").hexdigest(),
+            analysis_plan_digest=sha256(b"plan").hexdigest(),
+            slots=slots,
+        )
+        rev = seal_trial_suite(eval_store, suite)
+        ev_map: dict[str, dict[str, object]] = {}
+        for idx, slot in enumerate(slots, start=1):
+            rid = f"r17-{idx}"
+            reserve_trial_launch(
+                eval_store,
+                revision=rev,
+                slot_id=slot.slot_id,
+                run_id=rid,
+                inputs=slot.inputs,
+                limits=slot.limits,
+            )
+            dec_doc = {
+                "action_kind": "counterexample_verified",
+                "details": "X" * 17_500,
+            }
+            trace_doc = {"calls": [], "violations": 0}
+            eff_doc = {"service_correct": True}
+            rec = commit_trial_observation(
+                eval_store,
+                revision=rev,
+                slot_id=slot.slot_id,
+                run_id=rid,
+                evidence=TrialTerminalEvidence(
+                    "completed",
+                    sha256(f"o-{idx}".encode()).hexdigest(),
+                    sha256(_cjson(dec_doc).encode()).hexdigest(),
+                    sha256(_cjson(trace_doc).encode()).hexdigest(),
+                    sha256(_cjson(eff_doc).encode()).hexdigest(),
+                ),
+            )
+            assert rec.result_id is not None
+            ev_map[rec.result_id] = {
+                "decision": dec_doc,
+                "tool_trace": trace_doc,
+                "service_effects": eff_doc,
+            }
+
+        seen_compacted: list[bool] = []
+        seen_note_lengths: list[int] = []
+
+        class _CheckJudgeAdapter:
+            def run_shift(self, profile_arg, req, broker):
+                del profile_arg, broker
+                seen_compacted.append(req.context.compacted)
+                seen_note_lengths.append(len(req.context.history_notes))
+                parsed = json.loads(req.context.history_notes[0])
+                assert parsed["rubric"] == "rubric-17kb"
+                assert len(parsed["first"]["evidence"]["decision"]["details"]) == 17_500
+                return ShiftResult(
+                    provider=PROVIDER_OPENAI,
+                    model="gpt-6-luna",
+                    run_id=req.run_id,
+                    turn_id=req.turn_id,
+                    output_text=json.dumps({"rationale": "Equal", "preferred": "tie"}),
+                    usage=TokenUsage(input_tokens=10, output_tokens=5),
+                    tool_calls_executed=0,
+                    events=(),
+                )
+
+        run_blind_pairwise_judge(
+            eval_store,
+            revision=rev,
+            judge_adapter=_CheckJudgeAdapter(),
+            judge_profile=self.profile,
+            rubric_document="rubric-17kb",
+            evidence_by_result_id=ev_map,
+        )
+        self.assertEqual(seen_compacted, [False, False])
+        self.assertEqual(seen_note_lengths, [1, 1])
+
+        # Oversized packet (>128 KiB) must be refused instead of silently evicted
+        eval_huge = self.root / "eval_huge.sqlite"
+        rev_h = seal_trial_suite(eval_huge, suite)
+        huge_map: dict[str, dict[str, object]] = {}
+        for idx, slot in enumerate(slots, start=1):
+            rid = f"rh-{idx}"
+            reserve_trial_launch(
+                eval_huge,
+                revision=rev_h,
+                slot_id=slot.slot_id,
+                run_id=rid,
+                inputs=slot.inputs,
+                limits=slot.limits,
+            )
+            dec_doc = {"details": "Y" * 100_000}
+            trace_doc = {"calls": [], "violations": 0}
+            eff_doc = {"service_correct": True}
+            rec = commit_trial_observation(
+                eval_huge,
+                revision=rev_h,
+                slot_id=slot.slot_id,
+                run_id=rid,
+                evidence=TrialTerminalEvidence(
+                    "completed",
+                    sha256(f"oh-{idx}".encode()).hexdigest(),
+                    sha256(_cjson(dec_doc).encode()).hexdigest(),
+                    sha256(_cjson(trace_doc).encode()).hexdigest(),
+                    sha256(_cjson(eff_doc).encode()).hexdigest(),
+                ),
+            )
+            assert rec.result_id is not None
+            huge_map[rec.result_id] = {
+                "decision": dec_doc,
+                "tool_trace": trace_doc,
+                "service_effects": eff_doc,
+            }
+        with self.assertRaisesRegex(TrialRefused, "maximum safe context budget"):
+            run_blind_pairwise_judge(
+                eval_huge,
+                revision=rev_h,
+                judge_adapter=_CheckJudgeAdapter(),
+                judge_profile=self.profile,
+                rubric_document="rubric-17kb",
+                evidence_by_result_id=huge_map,
+            )
+
+    def test_pr191_r2_migration_preserves_accepted_handoff_state(self) -> None:
+        """PR #191 R2 P2: migrating legacy work_handoff rows preserves accepted state."""
+        from sourdough.storage.migration import rebuild_core_v1_tables
+        from sourdough.work_handoff import accepted_handoff
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            recip_id, recip_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="mig-recip",
+                profile_id=self.profile.profile_id(),
+            )
+            proj_rev = assign_project(
+                w,
+                self.grant_id,
+                "mig-proj",
+                (self.founder_id, recip_id),
+                publishers=(self.founder_id,),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                orig_item, orig_run, cs = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+                succ_item, succ_run, cr = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=recip_id,
+                    grant_id=recip_g,
+                    grant_scope="assessment",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=2_000,
+                )
+            draft = save_draft(
+                w,
+                cs,
+                cs.purpose,
+                name="mig-doc",
+                content="Handoff migration content",
+                expected_revision=None,
+            )
+            asset = publish_selection(
+                w,
+                cs,
+                cs.purpose,
+                Selection(
+                    "mig-pub",
+                    "mig-doc",
+                    draft.revision,
+                    "mig-proj",
+                    proj_rev,
+                    (self.founder_id, recip_id),
+                    0,
+                    25,
+                ),
+            )
+            # Simulate pre-state-machine work_handoff table (no state / state_version columns)
+            with closing(sqlite3.connect(self.store, isolation_level=None)) as raw:
+                raw.execute("PRAGMA foreign_keys = OFF")
+                raw.execute("BEGIN IMMEDIATE")
+                raw.execute("DROP TABLE work_handoff")
+                raw.execute(
+                    """CREATE TABLE work_handoff (
+                        offer_id TEXT PRIMARY KEY NOT NULL,
+                        company_id TEXT NOT NULL REFERENCES company(id),
+                        request_id TEXT NOT NULL,
+                        sender_id TEXT NOT NULL REFERENCES agent(id),
+                        sender_run_id TEXT NOT NULL REFERENCES work_runs(run_id),
+                        original_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id),
+                        recipient_id TEXT NOT NULL REFERENCES agent(id),
+                        asset_id TEXT NOT NULL REFERENCES shared_publication(asset_id),
+                        expires_at INTEGER NOT NULL,
+                        expected_result TEXT NOT NULL,
+                        successor_work_item_id TEXT REFERENCES work_items(work_item_id),
+                        accepted_run_id TEXT REFERENCES work_runs(run_id),
+                        UNIQUE (sender_id, request_id)
+                    ) STRICT"""
+                )
+                raw.execute(
+                    """INSERT INTO work_handoff VALUES
+                       ('off-acc', ?, 'req-acc', ?, ?, ?, ?, ?, 1000, 'deliver', ?, ?),
+                       ('off-pen', ?, 'req-pen', ?, ?, ?, ?, ?, 1000, 'pending', NULL, NULL)""",
+                    (
+                        self.company_id,
+                        self.founder_id,
+                        orig_run.run_id,
+                        orig_item.work_item_id,
+                        recip_id,
+                        asset.asset_id,
+                        succ_item.work_item_id,
+                        succ_run.run_id,
+                        self.company_id,
+                        self.founder_id,
+                        orig_run.run_id,
+                        orig_item.work_item_id,
+                        recip_id,
+                        asset.asset_id,
+                    ),
+                )
+                rebuild_core_v1_tables(raw)
+                raw.execute("COMMIT")
+            with closing(open_reader(self.store)) as ro, read_tx(ro):
+                rows = dict(
+                    ro.execute(
+                        "SELECT offer_id, state || ':' || state_version FROM work_handoff"
+                    ).fetchall()
+                )
+                self.assertEqual(rows["off-acc"], "accepted:2")
+                self.assertEqual(rows["off-pen"], "offered:1")
+                acc = accepted_handoff(ro, cr, asset.asset_id)
+                self.assertIsNotNone(acc)
+                assert acc is not None
+                self.assertEqual(acc["offer_id"], "off-acc")
+
+    def test_pr191_r2_quarantining_adopted_deprecation_restores_clean_incumbent(
+        self,
+    ) -> None:
+        """PR #191 R2 P2: quarantining an adopted DEPRECATE restores the clean prior incumbent."""
+        from sourdough.method_learning import resolve_active_methods
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+            inc = distill_method_delta(
+                w,
+                claim,
+                delta_kind="ADD",
+                target_kind="work_method",
+                method_id="m-deprecate-rollback",
+                trigger_spec={
+                    "duty_kind": "work.assessment_review",
+                    "negative_triggers": ["skip on closed items"],
+                },
+                body="Always verify evidence timestamps.",
+                audience_scope="one_agent",
+                audience_target_id=self.founder_id,
+                source_refs=[f"work_run:{claim.run_id}"],
+                falsification_criteria="Fail if timestamps are unordered",
+                now_ns=2_000,
+            )
+            qualify_method_delta(
+                w,
+                inc.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                now_ns=2_500,
+            )
+            activate_method_delta(
+                w,
+                inc.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=3_000,
+            )
+            dep = distill_method_delta(
+                w,
+                claim,
+                delta_kind="DEPRECATE",
+                target_kind="work_method",
+                method_id="m-deprecate-rollback",
+                trigger_spec={
+                    "duty_kind": "work.assessment_review",
+                    "negative_triggers": ["keep when audits require it"],
+                },
+                body="Deprecate timestamp check.",
+                audience_scope="one_agent",
+                audience_target_id=self.founder_id,
+                source_refs=[f"work_run:{claim.run_id}"],
+                superseded_revision=inc.revision_sha256,
+                parent_method_ids=(inc.method_id,),
+                falsification_criteria="Revert if audit misses spike",
+                now_ns=3_500,
+            )
+            qualify_method_delta(
+                w,
+                dep.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                now_ns=4_000,
+            )
+            activate_method_delta(
+                w,
+                dep.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=4_500,
+            )
+            self.assertEqual(
+                resolve_active_methods(w, self.company_id, agent_id=self.founder_id),
+                (),
+            )
+            q_receipt = quarantine_method_lineage(
+                w,
+                self.company_id,
+                method_id="m-deprecate-rollback",
+                revision_sha256=dep.revision_sha256,
+                reason="Defective deprecation caused audit regressions",
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=5_000,
+            )
+            self.assertEqual(q_receipt.restored_method_id, inc.method_id)
+            self.assertEqual(q_receipt.restored_revision_sha256, inc.revision_sha256)
+            restored = resolve_active_methods(
+                w, self.company_id, agent_id=self.founder_id
+            )
+            self.assertEqual(len(restored), 1)
+            self.assertEqual(restored[0].method_id, inc.method_id)
+            self.assertEqual(restored[0].revision_sha256, inc.revision_sha256)
+
 
 if __name__ == "__main__":
     unittest.main()

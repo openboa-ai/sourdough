@@ -986,6 +986,9 @@ def _verify_and_redact_blinded_evidence(
     return redacted
 
 
+_MAX_BLIND_JUDGE_CONTEXT_BYTES = 131_072
+
+
 def _judge_via_adapter(
     adapter: AgentRuntimeAdapter,
     profile: AgentProfileBinding,
@@ -996,6 +999,34 @@ def _judge_via_adapter(
     second_evidence: Mapping[str, Any],
 ) -> PairwiseJudgment:
     run_id = f"judge-{packet.pair_id[:16]}-{packet.ordering}"
+    judge_note = _canonical_json(
+        {
+            "pair_id": packet.pair_id,
+            "ordering": packet.ordering,
+            "rubric_digest": packet.rubric_digest,
+            "rubric": rubric_content,
+            "evaluator_digest": packet.evaluator_digest,
+            "first": {
+                "result_id": packet.first.result_id,
+                "outcome": packet.first.outcome,
+                "decision_digest": packet.first.decision_digest,
+                "tool_trace_digest": packet.first.tool_trace_digest,
+                "service_effects_digest": packet.first.service_effects_digest,
+                "evidence": dict(first_evidence),
+            },
+            "second": {
+                "result_id": packet.second.result_id,
+                "outcome": packet.second.outcome,
+                "decision_digest": packet.second.decision_digest,
+                "tool_trace_digest": packet.second.tool_trace_digest,
+                "service_effects_digest": packet.second.service_effects_digest,
+                "evidence": dict(second_evidence),
+            },
+        }
+    )
+    required_bytes = len(judge_note.encode("utf-8")) + 4096
+    if required_bytes > _MAX_BLIND_JUDGE_CONTEXT_BYTES:
+        raise TrialRefused("Blinded judge evidence exceeds maximum safe context budget")
     ctx = hydrate_shift_context(
         company_id="offline-evaluator",
         agent_id="blind-judge",
@@ -1006,34 +1037,13 @@ def _judge_via_adapter(
             "Score blinded trial results strictly on rubric grounding, "
             "constraint satisfaction, and service effects."
         ),
-        history_notes=(
-            _canonical_json(
-                {
-                    "pair_id": packet.pair_id,
-                    "ordering": packet.ordering,
-                    "rubric_digest": packet.rubric_digest,
-                    "rubric": rubric_content,
-                    "evaluator_digest": packet.evaluator_digest,
-                    "first": {
-                        "result_id": packet.first.result_id,
-                        "outcome": packet.first.outcome,
-                        "decision_digest": packet.first.decision_digest,
-                        "tool_trace_digest": packet.first.tool_trace_digest,
-                        "service_effects_digest": packet.first.service_effects_digest,
-                        "evidence": dict(first_evidence),
-                    },
-                    "second": {
-                        "result_id": packet.second.result_id,
-                        "outcome": packet.second.outcome,
-                        "decision_digest": packet.second.decision_digest,
-                        "tool_trace_digest": packet.second.tool_trace_digest,
-                        "service_effects_digest": packet.second.service_effects_digest,
-                        "evidence": dict(second_evidence),
-                    },
-                }
-            ),
-        ),
+        history_notes=(judge_note,),
+        max_context_bytes=max(16_384, required_bytes),
     )
+    if ctx.compacted or not ctx.history_notes:
+        raise TrialRefused(
+            "Blinded judge evidence was compacted or evicted before judging"
+        )
     req = ShiftRequest(
         company_id="offline-evaluator",
         agent_id="blind-judge",
