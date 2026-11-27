@@ -22,10 +22,12 @@ from .registry import (
 )
 from .work_kernel import (
     RunFenced,
+    WorkEventBatch,
     WorkItem,
     cancel_closed_peer_response_item,
     claim_work_run,
     complete_work_run,
+    drain_work_event_cursor,
     evaluate_conditions,
     fail_work_run,
     has_active_grant,
@@ -45,6 +47,7 @@ class RuntimeStepSummary:
     admitted_items: tuple[str, ...]
     executed_runs: tuple[str, ...]
     blocked_items: tuple[str, ...]
+    has_more_events: bool = False
 
 
 class CompanyRuntime:
@@ -161,6 +164,44 @@ class CompanyRuntime:
                 truncate_wal_on_exit=truncate_wal_on_exit,
             )
 
+    def _sweep_work_state(
+        self,
+        writer: WriterLease,
+        *,
+        now_ns: int,
+        tx_lock: threading.RLock | None = None,
+        observed_assets: dict[str, str] | None = None,
+        event_key: str | None = None,
+        triggering_actor_id: str | None = None,
+    ) -> tuple[WorkEventBatch, tuple[str, ...], tuple[str, ...], tuple[WorkItem, ...]]:
+        lock_ctx = tx_lock if tx_lock is not None else nullcontext()
+        with (
+            lock_ctx,
+            closing(open_writer(self._store, lease=writer)) as conn,
+            write_tx(conn),
+        ):
+            cursor_batch = drain_work_event_cursor(
+                conn, self._company_id, now_ns=now_ns
+            )
+            fenced = reclaim_expired_runs(conn, self._company_id, now_ns=now_ns)
+            woken = wake_waiting_runs(
+                conn,
+                self._company_id,
+                now_ns=now_ns,
+                event_key=event_key,
+                triggering_actor_id=triggering_actor_id,
+                event_actors=cursor_batch.peer_events,
+            )
+            admitted_items = evaluate_conditions(
+                conn,
+                self._company_id,
+                now_ns=now_ns,
+                observed_assets=observed_assets,
+                triggering_actor_id=triggering_actor_id,
+                _cursor_batch=cursor_batch,
+            )
+        return cursor_batch, fenced, woken, admitted_items
+
     def step_with_writer(
         self,
         writer: WriterLease,
@@ -189,26 +230,14 @@ class CompanyRuntime:
             on_ready(writer)
 
         sweep_now = read_clock()
-        with (
-            lock_ctx,
-            closing(open_writer(self._store, lease=writer)) as conn,
-            write_tx(conn),
-        ):
-            fenced = reclaim_expired_runs(conn, self._company_id, now_ns=sweep_now)
-            woken = wake_waiting_runs(
-                conn,
-                self._company_id,
-                now_ns=sweep_now,
-                event_key=event_key,
-                triggering_actor_id=triggering_actor_id,
-            )
-            admitted_items = evaluate_conditions(
-                conn,
-                self._company_id,
-                now_ns=sweep_now,
-                observed_assets=observed_assets,
-                triggering_actor_id=triggering_actor_id,
-            )
+        cursor_batch, fenced, woken, admitted_items = self._sweep_work_state(
+            writer,
+            now_ns=sweep_now,
+            tx_lock=tx_lock,
+            observed_assets=observed_assets,
+            event_key=event_key,
+            triggering_actor_id=triggering_actor_id,
+        )
         if on_commit is not None and (fenced or woken or admitted_items):
             on_commit()
 
@@ -323,6 +352,7 @@ class CompanyRuntime:
             admitted_items=tuple(item.work_item_id for item in admitted_items),
             executed_runs=tuple(executed),
             blocked_items=tuple(blocked),
+            has_more_events=cursor_batch.has_more,
         )
 
     def run_bound_handler(
@@ -345,13 +375,7 @@ class CompanyRuntime:
             lease_directory=self._lease_directory,
             expected_store_key=self._expected_store_key,
         ) as writer:
-            with (
-                closing(open_writer(self._store, lease=writer)) as conn,
-                write_tx(conn),
-            ):
-                reclaim_expired_runs(conn, self._company_id, now_ns=timestamp)
-                wake_waiting_runs(conn, self._company_id, now_ns=timestamp)
-                evaluate_conditions(conn, self._company_id, now_ns=timestamp)
+            self._sweep_work_state(writer, now_ns=timestamp)
             result = execute(writer)
             with closing(open_writer(self._store, lease=writer)) as conn:
                 wal_checkpoint(conn, "TRUNCATE" if truncate_wal_on_exit else "PASSIVE")

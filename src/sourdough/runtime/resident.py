@@ -125,11 +125,40 @@ class ResidentCompanyService:
         """Wake the autonomous scheduler immediately."""
         self._wake_event.set()
 
+    def _run_company_tick(
+        self,
+        *,
+        max_dispatches: int,
+        stop_event: threading.Event | None = None,
+    ) -> tuple[int, RuntimeStepSummary]:
+        writer = self._daemon.writer_lease
+        lock = self._daemon.write_lock
+        created = 0
+        if self._enable_board_trigger_intake:
+            with lock:
+                created = sync_board_triggers(
+                    writer, self._company_id, now_ns=self._clock()
+                )
+            if created > 0:
+                self._daemon.notify_commit(invoke_hook=False)
+        summary = self._runtime.step_with_writer(
+            writer,
+            max_dispatches=max_dispatches,
+            tx_lock=lock,
+            on_commit=lambda: self._daemon.notify_commit(invoke_hook=False),
+            stop_event=stop_event,
+        )
+        return created, summary
+
     def start(self) -> DaemonInfo:
         if self._started:
             return self._daemon.info
         info = self._daemon.start()
         try:
+            created, sweep_summary = self._run_company_tick(max_dispatches=0)
+            with self._state_cond:
+                self._triggers_enqueued += created
+                self._last_summary = sweep_summary
             self._stop_event.clear()
             self._wake_event.set()
             with self._state_cond:
@@ -195,22 +224,8 @@ class ResidentCompanyService:
                 self._state_cond.wait(timeout=min(remaining, 0.25))
 
     def _run_one_tick(self) -> RuntimeStepSummary:
-        writer = self._daemon.writer_lease
-        lock = self._daemon.write_lock
-        created = 0
-        if self._enable_board_trigger_intake:
-            with lock:
-                created = sync_board_triggers(
-                    writer, self._company_id, now_ns=self._clock()
-                )
-            if created > 0:
-                self._daemon.notify_commit(invoke_hook=False)
-
-        summary = self._runtime.step_with_writer(
-            writer,
+        created, summary = self._run_company_tick(
             max_dispatches=self._max_dispatches_per_tick,
-            tx_lock=lock,
-            on_commit=lambda: self._daemon.notify_commit(invoke_hook=False),
             stop_event=self._stop_event,
         )
         tick_ts = self._clock()
@@ -236,7 +251,9 @@ class ResidentCompanyService:
                     self._state_cond.notify_all()
                 self._wake_event.wait(timeout=self._tick_interval_seconds)
                 continue
-            if summary.executed_runs and not self._stop_event.is_set():
+            if (
+                summary.executed_runs or summary.has_more_events
+            ) and not self._stop_event.is_set():
                 # Drain queued follow-up items promptly before sleeping.
                 continue
             self._wake_event.wait(timeout=self._tick_interval_seconds)

@@ -3,6 +3,7 @@
 import json
 import os
 import select
+import stat
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -66,6 +67,29 @@ def _read_ready(
     return True
 
 
+def _verify_store_path(
+    store: Path,
+    expected_store_key: tuple[int, int] | None = None,
+    *,
+    msg_unavailable: str = "Original company store is unavailable",
+    msg_changed: str = "Original worker store changed before launch",
+) -> tuple[int, int]:
+    try:
+        identity = store.lstat()
+    except OSError as error:
+        raise SupervisionRefused(msg_unavailable) from error
+    if not stat.S_ISREG(identity.st_mode):
+        raise SupervisionRefused(msg_unavailable)
+    if identity.st_nlink != 1:
+        raise SupervisionRefused(
+            "Hard-link aliases are not a supported company store path"
+        )
+    key = identity.st_dev, identity.st_ino
+    if expected_store_key is not None and key != expected_store_key:
+        raise SupervisionRefused(msg_changed)
+    return key
+
+
 def supervise_worker(
     command: Sequence[str],
     store: Path,
@@ -85,18 +109,21 @@ def supervise_worker(
         or not 1 <= max_seconds <= 1800
     ):
         raise SupervisionRefused("Invalid worker supervision bounds")
-    if not store.is_file() or store.is_symlink():
-        raise SupervisionRefused("Original company store is unavailable")
-    identity = store.stat(follow_symlinks=False)
-    key = identity.st_dev, identity.st_ino
-    if expected_store_key is not None and key != expected_store_key:
-        raise SupervisionRefused("Original worker store changed before launch")
+    key = _verify_store_path(store, expected_store_key)
     deadline = monotonic() + max_seconds
     attempts = []
     for sequence in range(max_restarts + 1):
         if sequence:
             sleep(max(0, min(2 ** (sequence - 1), deadline - monotonic())))
-        if monotonic() >= deadline:
+            if monotonic() >= deadline:
+                break
+            _verify_store_path(
+                store,
+                key,
+                msg_unavailable="Original company store is unavailable",
+                msg_changed="Original worker store changed before restart",
+            )
+        elif monotonic() >= deadline:
             break
         read_end, write_end = os.pipe()
         try:

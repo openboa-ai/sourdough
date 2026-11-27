@@ -40,6 +40,7 @@ from sourdough.runtime import (
     DomainCliRefused,
     ResidentCompanyService,
     build_production_duty_registry,
+    build_store_profile_lookup,
     load_domain_plugins,
     merge_work_policies,
 )
@@ -70,6 +71,19 @@ def _agent_receipt(fields):
     return receipt
 
 
+def _validate_ready_fd(ready_fd: int | None) -> None:
+    if ready_fd is None:
+        return
+    if ready_fd < 3:
+        raise IpcRefused("ready-fd must be an inherited descriptor >= 3")
+    try:
+        fd_info = os.fstat(ready_fd)
+    except OSError as error:
+        raise IpcRefused("ready-fd is not an open file descriptor") from error
+    if not (stat.S_ISFIFO(fd_info.st_mode) or stat.S_ISREG(fd_info.st_mode)):
+        raise IpcRefused("ready-fd must refer to a pipe or regular file")
+
+
 def _emit_event(event: dict) -> None:
     print(json.dumps(event), file=sys.stderr, flush=True)
 
@@ -95,6 +109,52 @@ def _start_supervisor(args, *, emit=_emit_event):
         "--budget-from",
         str(count_company_runs(args.store, args.company_id)),
     ]
+    return supervise_worker(
+        command,
+        args.store,
+        args.company_id,
+        max_restarts=args.max_restarts,
+        startup_seconds=args.startup_seconds,
+        max_seconds=args.max_seconds,
+        emit=emit,
+    )
+
+
+def _start_company_supervisor(args, *, emit=_emit_event):
+    if args.command != "supervise-company":
+        raise DutyRefused(f"Unsupported supervision command: {args.command}")
+    command = [
+        sys.executable,
+        "-I",
+        "-m",
+        "sourdough.cli",
+        "run-company",
+        str(args.store),
+        "--company-id",
+        args.company_id,
+        "--tick-interval",
+        str(args.tick_interval),
+    ]
+    if args.profiles_json is not None:
+        command.extend(["--profiles-json", str(args.profiles_json)])
+    if args.socket_dir is not None:
+        command.extend(["--socket-dir", str(args.socket_dir)])
+    if args.socket is not None:
+        command.extend(["--socket", str(args.socket)])
+    if args.lease_dir is not None:
+        command.extend(["--lease-dir", str(args.lease_dir)])
+    if args.engine_dir is not None:
+        command.extend(["--engine-dir", str(args.engine_dir)])
+    if args.evaluator_store is not None:
+        command.extend(["--evaluator-store", str(args.evaluator_store)])
+    if args.web_port is not None:
+        command.extend(["--web-port", str(args.web_port)])
+    if args.static_dir is not None:
+        command.extend(["--static-dir", str(args.static_dir)])
+    if args.principal is not None:
+        command.extend(["--principal", args.principal])
+    if args.once:
+        command.append("--once")
     return supervise_worker(
         command,
         args.store,
@@ -183,6 +243,28 @@ def main() -> int:
     run_company_cmd.add_argument("--static-dir", type=Path)
     run_company_cmd.add_argument("--principal")
     run_company_cmd.add_argument("--ready-fd", type=int)
+    run_company_cmd.add_argument("--once", action="store_true")
+
+    supervise_company_cmd = commands.add_parser(
+        "supervise-company",
+        help="Supervise the resident Sourdough company worker with bounded restarts",
+    )
+    supervise_company_cmd.add_argument("store", type=Path)
+    supervise_company_cmd.add_argument("--company-id", required=True)
+    supervise_company_cmd.add_argument("--profiles-json", type=Path)
+    supervise_company_cmd.add_argument("--socket-dir", type=Path)
+    supervise_company_cmd.add_argument("--socket", type=Path)
+    supervise_company_cmd.add_argument("--lease-dir", type=Path)
+    supervise_company_cmd.add_argument("--engine-dir", type=Path)
+    supervise_company_cmd.add_argument("--evaluator-store", type=Path)
+    supervise_company_cmd.add_argument("--tick-interval", type=float, default=1.0)
+    supervise_company_cmd.add_argument("--web-port", type=int)
+    supervise_company_cmd.add_argument("--static-dir", type=Path)
+    supervise_company_cmd.add_argument("--principal")
+    supervise_company_cmd.add_argument("--once", action="store_true")
+    supervise_company_cmd.add_argument("--max-restarts", type=int, default=1)
+    supervise_company_cmd.add_argument("--startup-seconds", type=int, default=35)
+    supervise_company_cmd.add_argument("--max-seconds", type=int, default=360)
 
     web_cmd = commands.add_parser(
         "client-web",
@@ -309,19 +391,7 @@ def main() -> int:
             )
             return 0
         elif args.command == "serve-company-daemon":
-            if args.ready_fd is not None:
-                if args.ready_fd < 3:
-                    raise IpcRefused("ready-fd must be an inherited descriptor >= 3")
-                try:
-                    fd_info = os.fstat(args.ready_fd)
-                except OSError as error:
-                    raise IpcRefused(
-                        "ready-fd is not an open file descriptor"
-                    ) from error
-                if not (
-                    stat.S_ISFIFO(fd_info.st_mode) or stat.S_ISREG(fd_info.st_mode)
-                ):
-                    raise IpcRefused("ready-fd must refer to a pipe or regular file")
+            _validate_ready_fd(args.ready_fd)
 
             stop_requested = False
 
@@ -359,38 +429,32 @@ def main() -> int:
                 signal.signal(signal.SIGHUP, previous_sighup)
             return 0
         elif args.command == "run-company":
-            if args.ready_fd is not None:
-                if args.ready_fd < 3:
-                    raise IpcRefused("ready-fd must be an inherited descriptor >= 3")
-                try:
-                    fd_info = os.fstat(args.ready_fd)
-                except OSError as error:
-                    raise IpcRefused(
-                        "ready-fd is not an open file descriptor"
-                    ) from error
-                if not (
-                    stat.S_ISFIFO(fd_info.st_mode) or stat.S_ISREG(fd_info.st_mode)
-                ):
-                    raise IpcRefused("ready-fd must refer to a pipe or regular file")
+            _validate_ready_fd(args.ready_fd)
 
             profile_bindings: dict[str, AgentProfileBinding] = {}
             if args.profiles_json is not None:
-                raw_profiles = json.loads(
-                    args.profiles_json.read_text(encoding="utf-8")
-                )
-                if not isinstance(raw_profiles, dict):
-                    raise RuntimeRefused("profiles-json must be a JSON object")
-                for agent_id, spec in raw_profiles.items():
-                    if not isinstance(spec, dict):
-                        raise RuntimeRefused(
-                            f"Invalid profile binding for agent '{agent_id}'"
-                        )
-                    profile_bindings[str(agent_id)] = AgentProfileBinding(**spec)
+                try:
+                    raw_profiles = json.loads(
+                        args.profiles_json.read_text(encoding="utf-8")
+                    )
+                    if not isinstance(raw_profiles, dict):
+                        raise RuntimeRefused("profiles-json must be a JSON object")
+                    for agent_id, spec in raw_profiles.items():
+                        if not isinstance(spec, dict):
+                            raise RuntimeRefused(
+                                f"Invalid profile binding for agent '{agent_id}'"
+                            )
+                        profile_bindings[str(agent_id)] = AgentProfileBinding(**spec)
+                except (ValueError, TypeError) as err:
+                    raise RuntimeRefused(f"Invalid profiles-json: {err}") from err
 
             adapter_registry = build_default_adapter_registry()
+            profile_lookup = build_store_profile_lookup(
+                args.store, args.company_id, overrides=profile_bindings
+            )
             duty_registry = build_production_duty_registry(
                 adapter_registry=adapter_registry,
-                profile_bindings=profile_bindings,
+                profile_bindings=profile_lookup,
                 domain_plugins=plugins,
             )
 
@@ -433,13 +497,18 @@ def main() -> int:
                         payload["web_url"] = bridge.info.url
                     announcement = json.dumps(payload, sort_keys=True)
                     if args.ready_fd is not None:
-                        with os.fdopen(args.ready_fd, "w", encoding="utf-8") as ready:
-                            ready.write(announcement + "\n")
-                            ready.flush()
+                        announce_ready(args.ready_fd, service.daemon.writer_lease)
                     else:
                         print(announcement, flush=True)
-                    while not stop_requested:
-                        sleep(0.25)
+                    if args.once:
+                        if not stop_requested:
+                            service.wait_for(
+                                lambda h: h.ticks_completed >= 1,
+                                timeout_seconds=max(10.0, args.tick_interval + 10.0),
+                            )
+                    else:
+                        while not stop_requested:
+                            sleep(0.25)
             finally:
                 signal.signal(signal.SIGINT, previous_sigint)
                 signal.signal(signal.SIGTERM, previous_sigterm)
@@ -553,6 +622,10 @@ def main() -> int:
             return 0
         elif args.command == "supervise-assessment":
             result = _start_supervisor(args)
+            print(json.dumps(asdict(result)))
+            return 0 if result.completed else 1
+        elif args.command == "supervise-company":
+            result = _start_company_supervisor(args)
             print(json.dumps(asdict(result)))
             return 0 if result.completed else 1
         elif args.command == "stage-staffing":

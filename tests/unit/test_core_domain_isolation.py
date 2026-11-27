@@ -21,6 +21,7 @@ from sourdough.runtime.handlers import (
     DUTY_BOARD_APPLY_DECISION,
     DUTY_CEO_RESPOND_MESSAGE,
     DUTY_WORK_ASSESSMENT_REVIEW,
+    DUTY_WORK_DISCOVERY_REVIEW,
     DUTY_WORK_HANDOFF_FOLLOWUP,
     DUTY_WORK_PEER_RESPONSE,
     build_production_duty_registry,
@@ -210,6 +211,7 @@ class CoreDomainIsolationTests(unittest.TestCase):
                 DUTY_WORK_PEER_RESPONSE,
                 DUTY_WORK_ASSESSMENT_REVIEW,
                 DUTY_WORK_HANDOFF_FOLLOWUP,
+                DUTY_WORK_DISCOVERY_REVIEW,
             },
         )
 

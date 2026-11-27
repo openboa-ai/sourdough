@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from time import time_ns
 from typing import TYPE_CHECKING, Any
@@ -26,10 +28,11 @@ from ..board_control import (
     upsert_agent_profile,
 )
 from ..company_assets import project_membership, shared_asset_for
-from ..duty_run import DutyRefused, work_run_claim_from_context
+from ..duty_run import DutyRefused, WorkRunClaim, work_run_claim_from_context
 from ..storage.db import open_reader, open_writer, read_tx, write_tx
 from ..writer_lease import WriterLease
 from .collab_tools import build_core_collab_tool_contribution
+from .proactive_tools import build_core_proactive_tool_contribution
 from .domains import (
     DecisionActionContext,
     DecisionActionRegistry,
@@ -52,6 +55,7 @@ from .shift_runner import ActiveMethodsProvider, ShiftRunner
 from .work_kernel import (
     _PEER_REQUEST_COLUMNS,
     PeerRequest,
+    assert_run_fencing,
     create_work_item,
     mark_peer_request_resumed,
     read_peer_request_outcome,
@@ -64,6 +68,7 @@ DUTY_BOARD_APPLY_DECISION = "board.apply_decision"
 DUTY_WORK_PEER_RESPONSE = "work.peer_response"
 DUTY_WORK_ASSESSMENT_REVIEW = "work.assessment_review"
 DUTY_WORK_HANDOFF_FOLLOWUP = "work.handoff_followup"
+DUTY_WORK_DISCOVERY_REVIEW = "work.discovery_review"
 
 _CEO_READONLY_TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
@@ -85,6 +90,61 @@ def _resolve_profile(
             f"No AgentProfileBinding configured for agent '{agent_id}'"
         )
     return binding
+
+
+def build_store_profile_lookup(
+    store: Path,
+    company_id: str,
+    *,
+    overrides: Mapping[str, AgentProfileBinding] | None = None,
+) -> Callable[[str], AgentProfileBinding]:
+    """Resolve AgentProfileBinding dynamically from overrides or persisted agent_runtime_binding."""
+    override_map = dict(overrides or {})
+
+    def _lookup(agent_id: str) -> AgentProfileBinding:
+        if agent_id in override_map:
+            return override_map[agent_id]
+        with closing(open_reader(store)) as db, read_tx(db):
+            row = db.execute(
+                """SELECT provider, model, revision, sandbox_backend,
+                          credential_handle_ref, profile_id
+                   FROM agent_runtime_binding
+                   WHERE company_id = ? AND agent_id = ?""",
+                (company_id, agent_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeRefused(
+                f"No AgentProfileBinding configured for agent '{agent_id}'"
+            )
+        binding = AgentProfileBinding(
+            provider=str(row[0]),
+            model=str(row[1]),
+            revision=str(row[2]),
+            sandbox_backend=str(row[3]),
+            credential_handle_ref=None if row[4] is None else str(row[4]),
+        )
+        binding.verify_matches_agent(str(row[5]))
+        return binding
+
+    return _lookup
+
+
+def build_proactive_tool_handlers(
+    writer: WriterLease,
+    claim: WorkRunClaim,
+    *,
+    tx_lock: threading.RLock | None = None,
+    domain_plugins: Sequence[DomainPlugin] = (),
+) -> dict[str, ToolHandler]:
+    """Return fenced proactive condition-scheduling and work_decision tool handlers."""
+    return dict(
+        build_core_proactive_tool_contribution(
+            writer=writer,
+            claim=claim,
+            tx_lock=tx_lock,
+            domain_plugins=domain_plugins,
+        ).handlers
+    )
 
 
 def _read_agent_state(store: Path, company_id: str, agent_id: str) -> tuple[str, str]:
@@ -851,6 +911,208 @@ def build_production_duty_registry(
             ),
         )
 
+    def _find_committed_work_decision(
+        db: Any,
+        *,
+        company_id: str,
+        work_item_id: str,
+        run_id: str,
+    ) -> tuple[str, str, str | None, str] | None:
+        row = db.execute(
+            """SELECT d.decision_id, d.action_kind, d.next_condition_id, d.run_id
+               FROM work_decision d
+               JOIN work_runs r ON r.run_id = d.run_id
+               WHERE d.company_id = ? AND d.work_item_id = ?
+                 AND (d.run_id = ? OR r.status IN ('fenced', 'failed'))
+               ORDER BY CASE WHEN d.run_id = ? THEN 0 ELSE 1 END,
+                        d.decision_at_ns DESC, d.decision_id DESC
+               LIMIT 1""",
+            (company_id, work_item_id, run_id, run_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return (
+            str(row[0]),
+            str(row[1]),
+            None if row[2] is None else str(row[2]),
+            str(row[3]),
+        )
+
+    def _run_work_discovery_review(ctx: DutyContext) -> DutyOutcome:
+        agent_id = ctx.work_item.owner_agent_id
+        receipts: list[dict[str, Any]] = []
+        notes: list[str] = []
+        try:
+            payload = json.loads(ctx.work_item.payload_json)
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        with (
+            ctx.write_lock_ctx(),
+            closing(open_writer(ctx.writer.store, lease=ctx.writer)) as db,
+            write_tx(db),
+        ):
+            assert_run_fencing(
+                db, ctx.run.run_id, ctx.run.fencing_token, now_ns=ctx.now_ns
+            )
+            committed = _find_committed_work_decision(
+                db,
+                company_id=ctx.company_id,
+                work_item_id=ctx.work_item.work_item_id,
+                run_id=ctx.run.run_id,
+            )
+            if committed is not None:
+                dec_id, act_kind, next_cid, dec_run_id = committed
+                return DutyOutcome(
+                    disposition="completed",
+                    result={
+                        "decision_id": dec_id,
+                        "action_kind": act_kind,
+                        "next_condition_id": next_cid,
+                        "recovered_committed_decision": True,
+                        "recovered_from_run_id": dec_run_id,
+                        "cost_minor_units": 0,
+                    },
+                )
+            _hydrate_resolved_child_peer_outcome(
+                db,
+                company_id=ctx.company_id,
+                work_item_id=ctx.work_item.work_item_id,
+                run_id=ctx.run.run_id,
+                agent_id=agent_id,
+                receipts=receipts,
+                notes=notes,
+            )
+            if payload:
+                receipts.append({"kind": "discovery_trigger", **payload})
+                notes.append(
+                    f"Watched condition trigger ({payload.get('trigger_kind', 'manual')}): "
+                    f"source={payload.get('source_identity')} rev={payload.get('observed_revision')}"
+                )
+            resp_id = payload.get("responsibility_id")
+            if isinstance(resp_id, str) and resp_id.strip():
+                resp_row = db.execute(
+                    """SELECT remit, readable_scope_json
+                       FROM work_responsibilities
+                       WHERE company_id = ? AND responsibility_id = ?""",
+                    (ctx.company_id, resp_id),
+                ).fetchone()
+                if resp_row is not None:
+                    receipts.append(
+                        {
+                            "kind": "responsibility",
+                            "responsibility_id": resp_id,
+                            "remit": str(resp_row[0]),
+                            "readable_scope_json": str(resp_row[1]),
+                        }
+                    )
+                    notes.append(f"Standing responsibility remit: {resp_row[0]}")
+            source_id = payload.get("source_identity")
+            if isinstance(source_id, str) and source_id.strip():
+                try:
+                    asset = shared_asset_for(db, agent_id, source_id)
+                except DutyRefused:
+                    asset = None
+                if asset is not None:
+                    asset_rev = sha256(asset.content.encode("utf-8")).hexdigest()
+                    receipts.append(
+                        {
+                            "kind": "shared_asset",
+                            "asset_id": asset.asset_id,
+                            "project_id": asset.project_id,
+                            "author_id": asset.author_id,
+                            "revision": asset_rev,
+                            "content": asset.content,
+                        }
+                    )
+                    notes.append(
+                        f"Shared publication {asset.asset_id} (rev {asset_rev}): {asset.content[:500]}"
+                    )
+            claim = work_run_claim_from_context(db, ctx, purpose="discovery_review")
+
+        proactive = build_core_proactive_tool_contribution(
+            writer=ctx.writer,
+            claim=claim,
+            tx_lock=ctx.tx_lock,
+            domain_plugins=domain_plugins,
+        )
+        collab = build_core_collab_tool_contribution(
+            writer=ctx.writer,
+            claim=claim,
+            purpose=claim.purpose,
+            tx_lock=ctx.tx_lock,
+            include_messaging=True,
+            include_peer_request=True,
+            include_peer_respond=False,
+            include_handoffs=True,
+            include_roster=True,
+        )
+        merged_specs, merged_handlers, merged_recoverable = merge_tool_contributions(
+            (), {}, (proactive, collab)
+        )
+        run_res = shift_runner.run(
+            ctx,
+            mandate_summary=(
+                "Review your standing responsibility conditions within your standing grant. "
+                "Ground every work decision in verified DecisionEvidence via record_work_decision."
+            ),
+            instruction=(
+                f"Conduct discovery review for work item {ctx.work_item.work_item_id}. "
+                "Inspect available evidence, update watched conditions if needed, and call "
+                "record_work_decision (or request_peer_response if you need a colleague's input)."
+            ),
+            purpose="discovery_review",
+            base_tools=merged_specs,
+            base_handlers=merged_handlers,
+            history_notes=tuple(notes),
+            open_receipts=tuple(receipts),
+            include_core_desk_tools=True,
+            include_plugin_tools=True,
+            extra_recoverable_exceptions=merged_recoverable,
+        )
+        if run_res.run_status == "waiting":
+            return DutyOutcome(
+                disposition="waiting",
+                wait_until_ns=run_res.wait_until_ns,
+                wait_event_key=run_res.wait_event_key,
+                wait_reason="waiting_for_peer_response",
+                result={"waiting": True},
+            )
+        with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
+            dec = _find_committed_work_decision(
+                db,
+                company_id=ctx.company_id,
+                work_item_id=ctx.work_item.work_item_id,
+                run_id=ctx.run.run_id,
+            )
+        if dec is None:
+            return DutyOutcome(
+                disposition="blocked",
+                result={
+                    "reason": "no_work_decision",
+                    "output_text": run_res.shift_result.output_text.strip(),
+                    "cost_minor_units": run_res.settlement.cost_minor_units,
+                    "journal_entry_id": run_res.settlement.journal_entry_id,
+                },
+            )
+        dec_id, act_kind, next_cid, dec_run_id = dec
+        outcome_result: dict[str, Any] = {
+            "decision_id": dec_id,
+            "action_kind": act_kind,
+            "next_condition_id": next_cid,
+            "output_text": run_res.shift_result.output_text.strip(),
+            "provider": run_res.shift_result.provider,
+            "model": run_res.shift_result.model,
+            "cost_minor_units": run_res.settlement.cost_minor_units,
+            "journal_entry_id": run_res.settlement.journal_entry_id,
+        }
+        if dec_run_id != ctx.run.run_id:
+            outcome_result["recovered_committed_decision"] = True
+            outcome_result["recovered_from_run_id"] = dec_run_id
+        return DutyOutcome(disposition="completed", result=outcome_result)
+
     extra_map = dict(extra_handlers or {})
     core_descriptors = (
         DutyDescriptor(
@@ -872,6 +1134,10 @@ def build_production_duty_registry(
         DutyDescriptor(
             duty_kind=DUTY_WORK_HANDOFF_FOLLOWUP,
             execute=_run_work_handoff_followup,
+        ),
+        DutyDescriptor(
+            duty_kind=DUTY_WORK_DISCOVERY_REVIEW,
+            execute=_run_work_discovery_review,
         ),
     )
     for descriptor in core_descriptors:

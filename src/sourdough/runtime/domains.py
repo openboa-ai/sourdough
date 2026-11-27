@@ -378,6 +378,15 @@ class DomainPlugin(Protocol):
 
     def handle_cli_command(self, args: argparse.Namespace) -> int | None: ...
 
+    def validate_decision_evidence(
+        self,
+        connection: sqlite3.Connection,
+        company_id: str,
+        agent_id: str,
+        decision_at_ns: int,
+        evidence: Any,
+    ) -> None: ...
+
 
 class BaseDomainPlugin:
     """Default no-op implementations for optional DomainPlugin hooks."""
@@ -438,6 +447,16 @@ class BaseDomainPlugin:
         return None
 
     def handle_cli_command(self, args: argparse.Namespace) -> int | None:
+        return None
+
+    def validate_decision_evidence(
+        self,
+        connection: sqlite3.Connection,
+        company_id: str,
+        agent_id: str,
+        decision_at_ns: int,
+        evidence: Any,
+    ) -> None:
         return None
 
 

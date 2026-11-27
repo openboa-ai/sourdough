@@ -590,6 +590,7 @@ def publish_selection(
                 _json(sorted(selection.audience)),
             ),
         )
+        excerpt_sha = sha256(excerpt.encode("utf-8")).hexdigest()
         append_audit_event(
             database,
             company_id=claim.company_id,
@@ -603,7 +604,9 @@ def publish_selection(
                 "asset_id": asset.asset_id,
                 "project_id": asset.project_id,
                 "work_item_id": asset.duty_id,
-                "excerpt_sha256": sha256(excerpt.encode("utf-8")).hexdigest(),
+                "author_id": asset.author_id,
+                "revision": excerpt_sha,
+                "excerpt_sha256": excerpt_sha,
             },
         )
         writer.verify()

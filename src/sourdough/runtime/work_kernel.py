@@ -3,8 +3,8 @@
 import json
 import sqlite3
 from collections import deque
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from hashlib import sha256
 from time import time_ns
 from typing import Any
@@ -16,6 +16,9 @@ from ..storage.kernel import append_audit_event
 MAX_PEER_CHAIN_DEPTH = 4
 PAIRWISE_RATE_LIMIT_COUNT = 6
 PAIR_WINDOW_NS = 3600 * 1_000_000_000
+DEFAULT_DISCOVERY_WAKE_WINDOW_NS = 3_600_000_000_000
+DEFAULT_DISCOVERY_WAKE_BUDGET = 16
+MAX_DISCOVERY_COOLDOWN_NS = 3_600_000_000_000
 
 
 class WorkKernelRefused(Exception):
@@ -96,6 +99,53 @@ class WorkCondition:
     cooldown_ns: int = 0
     max_fires: int | None = None
     fire_count: int = 0
+
+
+@dataclass(frozen=True)
+class WorkDiscoveryState:
+    company_id: str
+    responsibility_id: str
+    consecutive_noops: int
+    cooldown_until_ns: int
+    window_started_ns: int
+    window_wakes: int
+    updated_at_ns: int
+
+
+@dataclass(frozen=True)
+class WorkEventBatch:
+    last_event_seq: int
+    observed_assets: dict[str, str] = field(default_factory=dict)
+    asset_authors: dict[str, str] = field(default_factory=dict)
+    peer_events: dict[str, str] = field(default_factory=dict)
+    events_processed: int = 0
+    has_more: bool = False
+
+
+@dataclass(frozen=True)
+class DecisionEvidence:
+    kind: str
+    resource_id: str
+    revision: str
+    observed_at_ns: int
+    available_at_ns: int
+
+
+@dataclass(frozen=True)
+class WorkDecision:
+    decision_id: str
+    company_id: str
+    work_item_id: str
+    run_id: str
+    agent_id: str
+    action_id: str
+    action_kind: str
+    evidence_refs_json: str
+    evidence_digest: str
+    rationale: str
+    next_condition_id: str | None
+    active_snapshot_id: str | None
+    decision_at_ns: int
 
 
 @dataclass(frozen=True)
@@ -1286,6 +1336,7 @@ def wake_waiting_runs(
     now_ns: int,
     event_key: str | None = None,
     triggering_actor_id: str | None = None,
+    event_actors: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Wake eligible waiting runs while enforcing the anti-self-wake invariant."""
     rows = connection.execute(
@@ -1295,16 +1346,36 @@ def wake_waiting_runs(
            ORDER BY created_at_ns, run_id""",
         (company_id,),
     ).fetchall()
+    merged_actors: dict[str, str] = {}
+    if event_actors:
+        for key, actor in event_actors.items():
+            if (
+                isinstance(key, str)
+                and key.strip()
+                and isinstance(actor, str)
+                and actor.strip()
+            ):
+                merged_actors[key] = actor.strip()
+    if (
+        isinstance(event_key, str)
+        and event_key.strip()
+        and isinstance(triggering_actor_id, str)
+        and triggering_actor_id.strip()
+    ):
+        merged_actors[event_key] = triggering_actor_id.strip()
+
     woken_items: list[str] = []
-    has_actor = isinstance(triggering_actor_id, str) and bool(
-        triggering_actor_id.strip()
-    )
     for run_id, work_item_id, agent_id, wait_until_ns, wait_event_key in rows:
         timer_due = wait_until_ns is not None and now_ns >= int(wait_until_ns)
         event_matched = False
-        if event_key is not None and wait_event_key == event_key:
-            if has_actor and triggering_actor_id == agent_id:
-                event_entity = f"{run_id}:{event_key}"
+        matched_actor = (
+            merged_actors.get(wait_event_key)
+            if isinstance(wait_event_key, str)
+            else None
+        )
+        if matched_actor is not None:
+            if matched_actor == agent_id:
+                event_entity = f"{run_id}:{wait_event_key}"
                 recorded = connection.execute(
                     """SELECT 1 FROM audit_event
                        WHERE company_id = ? AND domain = 'work'
@@ -1324,10 +1395,10 @@ def wake_waiting_runs(
                         event_type="work.self_authored_event_suppressed",
                         actor_id=agent_id,
                         run_id=run_id,
-                        payload={"event_key": event_key},
+                        payload={"event_key": wait_event_key},
                         recorded_at_ns=now_ns,
                     )
-            elif has_actor:
+            else:
                 if isinstance(wait_event_key, str) and wait_event_key.startswith(
                     "peer_response:"
                 ):
@@ -1397,9 +1468,7 @@ def wake_waiting_runs(
                         now_ns=now_ns,
                     )
         audit_actor = (
-            triggering_actor_id
-            if reason == "event" and triggering_actor_id
-            else "work_scheduler"
+            matched_actor if reason == "event" and matched_actor else "work_scheduler"
         )
         append_audit_event(
             connection,
@@ -1410,7 +1479,10 @@ def wake_waiting_runs(
             event_type="work.wait_woken",
             actor_id=audit_actor,
             run_id=run_id,
-            payload={"reason": reason, "event_key": event_key},
+            payload={
+                "reason": reason,
+                "event_key": wait_event_key if reason == "event" else event_key,
+            },
             recorded_at_ns=now_ns,
         )
         woken_items.append(str(work_item_id))
@@ -1549,6 +1621,94 @@ def fail_work_run(
     )
 
 
+def _resolve_next_condition_revision(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    next_condition: Mapping[str, Any],
+) -> int:
+    if "condition_revision" in next_condition:
+        return int(next_condition["condition_revision"])
+    source_identity = next_condition.get("source_identity")
+    if isinstance(source_identity, str) and source_identity.strip():
+        max_cond_rev = int(
+            connection.execute(
+                """SELECT COALESCE(MAX(condition_revision), 0)
+                   FROM work_conditions
+                   WHERE company_id = ? AND source_identity = ?""",
+                (company_id, source_identity),
+            ).fetchone()[0]
+        )
+        prefix = f"{source_identity}@"
+        max_occ_rev = int(
+            connection.execute(
+                """SELECT COALESCE(MAX(condition_revision), 0)
+                   FROM work_condition_occurrences
+                   WHERE company_id = ?
+                     AND (
+                         source_identity = ?
+                         OR substr(source_identity, 1, ?) = ?
+                         OR condition_id IN (
+                             SELECT condition_id
+                             FROM work_conditions
+                             WHERE company_id = ? AND source_identity = ?
+                         )
+                     )""",
+                (
+                    company_id,
+                    source_identity,
+                    len(prefix),
+                    prefix,
+                    company_id,
+                    source_identity,
+                ),
+            ).fetchone()[0]
+        )
+        return max(max_cond_rev, max_occ_rev) + 1
+    return 1
+
+
+def _arm_next_condition(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    owner_agent_id: str,
+    work_item_id: str,
+    next_condition: Mapping[str, Any],
+    now_ns: int,
+    always_link_work_item: bool = False,
+) -> WorkCondition:
+    next_revision = _resolve_next_condition_revision(
+        connection, company_id=company_id, next_condition=next_condition
+    )
+    resp_arg = next_condition.get("responsibility_id")
+    item_arg = (
+        work_item_id
+        if always_link_work_item
+        else (
+            work_item_id
+            if resp_arg is None and next_condition.get("work_item_id") is None
+            else next_condition.get("work_item_id")
+        )
+    )
+    return set_condition(
+        connection,
+        company_id=company_id,
+        owner_agent_id=owner_agent_id,
+        trigger_kind=next_condition["trigger_kind"],
+        responsibility_id=resp_arg,
+        work_item_id=item_arg,
+        due_at_ns=next_condition.get("due_at_ns"),
+        source_identity=next_condition.get("source_identity"),
+        expected_revision=next_condition.get("expected_revision"),
+        expires_at_ns=next_condition.get("expires_at_ns"),
+        cooldown_ns=next_condition.get("cooldown_ns", 0),
+        max_fires=next_condition.get("max_fires"),
+        condition_revision=next_revision,
+        now_ns=now_ns,
+    )
+
+
 def complete_work_run(
     connection: sqlite3.Connection,
     run_id: str,
@@ -1566,6 +1726,11 @@ def complete_work_run(
     run = assert_run_fencing(connection, run_id, fencing_token, now_ns=timestamp)
     if not has_active_grant(connection, run.company_id, run.agent_id):
         raise RunFenced(f"Agent {run.agent_id} no longer holds an active grant")
+    validated_next = (
+        validate_next_condition_dict(next_condition)
+        if next_condition is not None
+        else None
+    )
     outcome_json = _canonical_json(outcome)
     changed = connection.execute(
         """UPDATE work_runs
@@ -1581,43 +1746,15 @@ def complete_work_run(
         (item_state, timestamp, run.work_item_id),
     )
     armed: WorkCondition | None = None
-    if next_condition is not None:
-        source_identity = next_condition.get("source_identity")
-        if "condition_revision" in next_condition:
-            next_revision = next_condition["condition_revision"]
-        elif source_identity:
-            max_cond_rev = int(
-                connection.execute(
-                    """SELECT COALESCE(MAX(condition_revision), 0)
-                       FROM work_conditions
-                       WHERE company_id = ? AND source_identity = ?""",
-                    (run.company_id, source_identity),
-                ).fetchone()[0]
-            )
-            max_occ_rev = int(
-                connection.execute(
-                    """SELECT COALESCE(MAX(condition_revision), 0)
-                       FROM work_condition_occurrences
-                       WHERE company_id = ? AND source_identity = ?""",
-                    (run.company_id, source_identity),
-                ).fetchone()[0]
-            )
-            next_revision = max(max_cond_rev, max_occ_rev) + 1
-        else:
-            next_revision = 1
-        armed = set_condition(
+    if validated_next is not None:
+        armed = _arm_next_condition(
             connection,
             company_id=run.company_id,
             owner_agent_id=run.agent_id,
-            trigger_kind=next_condition["trigger_kind"],
-            responsibility_id=next_condition.get("responsibility_id"),
             work_item_id=run.work_item_id,
-            due_at_ns=next_condition.get("due_at_ns"),
-            source_identity=source_identity,
-            expected_revision=next_condition.get("expected_revision"),
-            expires_at_ns=next_condition.get("expires_at_ns"),
-            condition_revision=next_revision,
+            next_condition=validated_next,
             now_ns=timestamp,
+            always_link_work_item=True,
         )
     append_audit_event(
         connection,
@@ -1748,7 +1885,7 @@ def list_conditions(
     return tuple(WorkCondition(*row) for row in rows)
 
 
-def set_condition(
+def _insert_work_condition(
     connection: sqlite3.Connection,
     *,
     company_id: str,
@@ -1765,8 +1902,9 @@ def set_condition(
     condition_revision: int = 1,
     condition_id: str | None = None,
     now_ns: int | None = None,
+    require_parent_link: bool = True,
 ) -> WorkCondition:
-    """Arm an Agent-owned next condition (timer, shared_asset_revision, or peer_response)."""
+    """Internal helper to validate and insert a work_conditions row."""
     _require_agent(connection, company_id, owner_agent_id)
     if type(condition_revision) is not int or condition_revision < 1:
         raise WorkKernelRefused("condition_revision must be a positive integer")
@@ -1778,6 +1916,12 @@ def set_condition(
         raise WorkKernelRefused(f"Unsupported condition trigger_kind: {trigger_kind}")
     if trigger_kind == "timer" and due_at_ns is None:
         raise WorkKernelRefused("Timer condition requires due_at_ns")
+    if due_at_ns is not None and (type(due_at_ns) is not int or due_at_ns < 0):
+        raise WorkKernelRefused("due_at_ns must be a nonnegative integer")
+    if expires_at_ns is not None and (
+        type(expires_at_ns) is not int or expires_at_ns < 0
+    ):
+        raise WorkKernelRefused("expires_at_ns must be a nonnegative integer")
     if trigger_kind == "shared_asset_revision" and (
         not source_identity or not source_identity.strip()
     ):
@@ -1786,7 +1930,7 @@ def set_condition(
         not source_identity or not source_identity.strip()
     ):
         raise WorkKernelRefused("Peer response condition requires source_identity")
-    if responsibility_id is None and work_item_id is None:
+    if require_parent_link and responsibility_id is None and work_item_id is None:
         raise WorkKernelRefused(
             "Condition must link a responsibility_id or work_item_id"
         )
@@ -1861,6 +2005,80 @@ def set_condition(
     )
 
 
+def set_condition(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    owner_agent_id: str,
+    trigger_kind: str,
+    responsibility_id: str | None = None,
+    work_item_id: str | None = None,
+    due_at_ns: int | None = None,
+    source_identity: str | None = None,
+    expected_revision: str | None = None,
+    expires_at_ns: int | None = None,
+    cooldown_ns: int = 0,
+    max_fires: int | None = None,
+    condition_revision: int = 1,
+    condition_id: str | None = None,
+    now_ns: int | None = None,
+) -> WorkCondition:
+    """Arm an Agent-owned next condition (timer, shared_asset_revision, or peer_response)."""
+    return _insert_work_condition(
+        connection,
+        company_id=company_id,
+        owner_agent_id=owner_agent_id,
+        trigger_kind=trigger_kind,
+        responsibility_id=responsibility_id,
+        work_item_id=work_item_id,
+        due_at_ns=due_at_ns,
+        source_identity=source_identity,
+        expected_revision=expected_revision,
+        expires_at_ns=expires_at_ns,
+        cooldown_ns=cooldown_ns,
+        max_fires=max_fires,
+        condition_revision=condition_revision,
+        condition_id=condition_id,
+        now_ns=now_ns,
+        require_parent_link=True,
+    )
+
+
+def arm_result_continuation(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    owner_agent_id: str,
+    dependency_asset_id: str,
+    due_at_ns: int,
+    now_ns: int | None = None,
+    responsibility_id: str | None = None,
+    work_item_id: str | None = None,
+    expires_at_ns: int | None = None,
+    condition_id: str | None = None,
+) -> WorkCondition:
+    """Arm a timer continuation gated on a committed dependency publication."""
+    _require_nonempty(dependency_asset_id, "dependency_asset_id")
+    if type(due_at_ns) is not int or due_at_ns < 0:
+        raise WorkKernelRefused("due_at_ns must be a nonnegative integer")
+    cid = condition_id or uuid4().hex
+    return _insert_work_condition(
+        connection,
+        company_id=company_id,
+        owner_agent_id=owner_agent_id,
+        trigger_kind="timer",
+        responsibility_id=responsibility_id,
+        work_item_id=work_item_id,
+        due_at_ns=due_at_ns,
+        source_identity=f"result_dep:{cid}",
+        expected_revision=dependency_asset_id,
+        expires_at_ns=expires_at_ns,
+        condition_id=cid,
+        now_ns=now_ns,
+        require_parent_link=False,
+    )
+
+
 def replace_condition(
     connection: sqlite3.Connection,
     condition_id: str,
@@ -1873,6 +2091,7 @@ def replace_condition(
     expires_at_ns: int | None = None,
     cooldown_ns: int | None = None,
     max_fires: int | None = None,
+    expected_condition_revision: int | None = None,
     now_ns: int | None = None,
 ) -> WorkCondition:
     """Supersede an armed condition and arm a successor with incremented condition_revision."""
@@ -1899,12 +2118,24 @@ def replace_condition(
         raise WorkKernelRefused("Condition belongs to another Agent")
     if status != "armed":
         raise WorkKernelRefused(f"Only armed conditions can be replaced (got {status})")
+    if (
+        expected_condition_revision is not None
+        and int(revision) != expected_condition_revision
+    ):
+        raise WorkKernelRefused(
+            f"Condition revision mismatch (expected {expected_condition_revision}, got {revision})"
+        )
     timestamp = time_ns() if now_ns is None else now_ns
-    connection.execute(
-        "UPDATE work_conditions SET status = 'superseded', updated_at_ns = ? WHERE condition_id = ?",
-        (timestamp, condition_id),
+    changed = connection.execute(
+        """UPDATE work_conditions
+           SET status = 'superseded', updated_at_ns = ?
+           WHERE condition_id = ? AND owner_agent_id = ?
+             AND condition_revision = ? AND status = 'armed'""",
+        (timestamp, condition_id, owner_agent_id, int(revision)),
     )
-    return set_condition(
+    if changed.rowcount != 1:
+        raise WorkKernelRefused("Condition was modified concurrently before replace")
+    return _insert_work_condition(
         connection,
         company_id=company_id,
         owner_agent_id=owner_agent_id,
@@ -1919,6 +2150,7 @@ def replace_condition(
         max_fires=prev_max_fires if max_fires is None else max_fires,
         condition_revision=int(revision) + 1,
         now_ns=timestamp,
+        require_parent_link=(resp_id is not None or item_id is not None),
     )
 
 
@@ -1927,17 +2159,344 @@ def cancel_condition(
     condition_id: str,
     *,
     owner_agent_id: str,
+    expected_condition_revision: int | None = None,
     now_ns: int | None = None,
 ) -> None:
     timestamp = time_ns() if now_ns is None else now_ns
-    changed = connection.execute(
-        """UPDATE work_conditions
-           SET status = 'cancelled', updated_at_ns = ?
-           WHERE condition_id = ? AND owner_agent_id = ? AND status = 'armed'""",
-        (timestamp, condition_id, owner_agent_id),
-    )
+    if expected_condition_revision is not None:
+        changed = connection.execute(
+            """UPDATE work_conditions
+               SET status = 'cancelled', updated_at_ns = ?
+               WHERE condition_id = ? AND owner_agent_id = ?
+                 AND condition_revision = ? AND status = 'armed'""",
+            (timestamp, condition_id, owner_agent_id, expected_condition_revision),
+        )
+    else:
+        changed = connection.execute(
+            """UPDATE work_conditions
+               SET status = 'cancelled', updated_at_ns = ?
+               WHERE condition_id = ? AND owner_agent_id = ? AND status = 'armed'""",
+            (timestamp, condition_id, owner_agent_id),
+        )
     if changed.rowcount != 1:
         raise WorkKernelRefused("Armed condition not found for this Agent")
+
+
+def _parse_scope_policy(
+    raw_scope_json: str | None,
+) -> tuple[int, int, int]:
+    """Return (wake_budget, wake_window_ns, configured_cooldown_ns) from responsibility scope."""
+    wake_budget = DEFAULT_DISCOVERY_WAKE_BUDGET
+    wake_window_ns = DEFAULT_DISCOVERY_WAKE_WINDOW_NS
+    configured_cooldown_ns = 0
+    if not isinstance(raw_scope_json, str) or not raw_scope_json.strip():
+        return wake_budget, wake_window_ns, configured_cooldown_ns
+    try:
+        parsed = json.loads(raw_scope_json)
+    except json.JSONDecodeError:
+        return wake_budget, wake_window_ns, configured_cooldown_ns
+    if not isinstance(parsed, dict):
+        return wake_budget, wake_window_ns, configured_cooldown_ns
+    raw_budget = parsed.get("max_wakes_per_window")
+    if type(raw_budget) is int and raw_budget >= 1:
+        wake_budget = raw_budget
+    raw_window = parsed.get("wake_window_ns")
+    if type(raw_window) is int and raw_window >= 1:
+        wake_window_ns = raw_window
+    raw_cooldown = parsed.get("cooldown_ns", parsed.get("backoff_base_ns"))
+    if type(raw_cooldown) is int and raw_cooldown >= 0:
+        configured_cooldown_ns = raw_cooldown
+    return wake_budget, wake_window_ns, configured_cooldown_ns
+
+
+def drain_work_event_cursor(
+    connection: sqlite3.Connection,
+    company_id: str,
+    *,
+    now_ns: int,
+    max_events: int = 256,
+) -> WorkEventBatch:
+    """Sequentially drain durable work-relevant audit events up to max_events."""
+    _require_nonempty(company_id, "company_id")
+    if type(max_events) is not int or max_events < 1:
+        raise WorkKernelRefused("max_events must be a positive integer")
+    cursor_row = connection.execute(
+        "SELECT last_event_seq FROM work_event_cursor WHERE company_id = ?",
+        (company_id,),
+    ).fetchone()
+    last_seq = int(cursor_row[0]) if cursor_row is not None else 0
+    rows = connection.execute(
+        """SELECT event_seq, event_type, entity_id, actor_id, payload_json
+           FROM audit_event
+           WHERE company_id = ? AND event_seq > ?
+           ORDER BY event_seq ASC
+           LIMIT ?""",
+        (company_id, last_seq, max_events + 1),
+    ).fetchall()
+    has_more = len(rows) > max_events
+    batch_rows = rows[:max_events]
+
+    observed_assets: dict[str, str] = {}
+    asset_authors: dict[str, str] = {}
+    peer_events: dict[str, str] = {}
+    max_seq = last_seq
+    for event_seq, event_type, entity_id, actor_id, payload_json in batch_rows:
+        seq = int(event_seq)
+        if seq > max_seq:
+            max_seq = seq
+        try:
+            payload = (
+                json.loads(str(payload_json))
+                if isinstance(payload_json, str) and payload_json.strip()
+                else {}
+            )
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        if event_type in ("company.asset_published", "asset.published"):
+            asset_id = str(payload.get("asset_id") or entity_id or "").strip()
+            if not asset_id:
+                continue
+            pub_row = connection.execute(
+                """SELECT author_id, content FROM shared_publication
+                   WHERE company_id = ? AND asset_id = ?""",
+                (company_id, asset_id),
+            ).fetchone()
+            raw_rev = payload.get("revision") or payload.get("excerpt_sha256")
+            if isinstance(raw_rev, str) and raw_rev.strip():
+                revision = raw_rev.strip()
+            elif pub_row is not None:
+                revision = sha256(str(pub_row[1]).encode("utf-8")).hexdigest()
+            else:
+                revision = f"event:{seq}"
+            if pub_row is not None and str(pub_row[0]).strip():
+                author = str(pub_row[0]).strip()
+            elif isinstance(actor_id, str) and actor_id.strip():
+                author = actor_id.strip()
+            else:
+                author = ""
+            observed_assets[asset_id] = revision
+            if author:
+                asset_authors[asset_id] = author
+        elif event_type in (
+            "work.peer_request_answered",
+            "work.peer_request_declined",
+            "work.peer_request_expired",
+            "work.peer_request_resolved",
+        ):
+            req_id = str(payload.get("request_id") or entity_id or "").strip()
+            if not req_id:
+                continue
+            if event_type == "work.peer_request_expired":
+                eff_actor = "work_scheduler"
+            elif isinstance(actor_id, str) and actor_id.strip():
+                eff_actor = actor_id.strip()
+            else:
+                eff_actor = ""
+            if eff_actor:
+                peer_events[f"peer_response:{req_id}"] = eff_actor
+
+    connection.execute(
+        """INSERT INTO work_event_cursor (company_id, last_event_seq, updated_at_ns)
+           VALUES (?, ?, ?)
+           ON CONFLICT(company_id) DO UPDATE SET
+               last_event_seq = MAX(work_event_cursor.last_event_seq, excluded.last_event_seq),
+               updated_at_ns = excluded.updated_at_ns""",
+        (company_id, max_seq, now_ns),
+    )
+    return WorkEventBatch(
+        last_event_seq=max_seq,
+        observed_assets=observed_assets,
+        asset_authors=asset_authors,
+        peer_events=peer_events,
+        events_processed=len(batch_rows),
+        has_more=has_more,
+    )
+
+
+def _read_discovery_window(
+    connection: sqlite3.Connection,
+    company_id: str,
+    responsibility_id: str,
+    *,
+    now_ns: int,
+    wake_window_ns: int | None = None,
+) -> tuple[int, int, int, int]:
+    """Return (consecutive_noops, cooldown_until_ns, window_started_ns, window_wakes)."""
+    state_row = connection.execute(
+        """SELECT consecutive_noops, cooldown_until_ns, window_started_ns, window_wakes
+           FROM work_discovery_state
+           WHERE company_id = ? AND responsibility_id = ?""",
+        (company_id, responsibility_id),
+    ).fetchone()
+    if state_row is None:
+        return 0, 0, now_ns, 0
+    noops = int(state_row[0])
+    cooldown_until = int(state_row[1])
+    window_started = int(state_row[2])
+    window_wakes = int(state_row[3])
+    if wake_window_ns is not None and not (
+        window_started > 0 and now_ns - window_started < wake_window_ns
+    ):
+        return noops, cooldown_until, now_ns, 0
+    return noops, cooldown_until, window_started, window_wakes
+
+
+def _upsert_discovery_state(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    responsibility_id: str,
+    consecutive_noops: int,
+    cooldown_until_ns: int,
+    window_started_ns: int,
+    window_wakes: int,
+    now_ns: int,
+) -> WorkDiscoveryState:
+    connection.execute(
+        """INSERT INTO work_discovery_state (
+               company_id, responsibility_id, consecutive_noops,
+               cooldown_until_ns, window_started_ns, window_wakes, updated_at_ns
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(company_id, responsibility_id) DO UPDATE SET
+               consecutive_noops = excluded.consecutive_noops,
+               cooldown_until_ns = excluded.cooldown_until_ns,
+               window_started_ns = excluded.window_started_ns,
+               window_wakes = excluded.window_wakes,
+               updated_at_ns = excluded.updated_at_ns""",
+        (
+            company_id,
+            responsibility_id,
+            consecutive_noops,
+            cooldown_until_ns,
+            window_started_ns,
+            window_wakes,
+            now_ns,
+        ),
+    )
+    return WorkDiscoveryState(
+        company_id=company_id,
+        responsibility_id=responsibility_id,
+        consecutive_noops=consecutive_noops,
+        cooldown_until_ns=cooldown_until_ns,
+        window_started_ns=window_started_ns,
+        window_wakes=window_wakes,
+        updated_at_ns=now_ns,
+    )
+
+
+def record_discovery_hysteresis(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    responsibility_id: str,
+    action_kind: str,
+    now_ns: int,
+    base_cooldown_ns: int = 0,
+    condition_id: str | None = None,
+) -> WorkDiscoveryState:
+    """Update work_discovery_state exponential backoff on defer/noop or reset on action."""
+    _require_nonempty(company_id, "company_id")
+    _require_nonempty(responsibility_id, "responsibility_id")
+    _require_nonempty(action_kind, "action_kind")
+    if type(now_ns) is not int or now_ns < 0:
+        raise WorkKernelRefused("now_ns must be a nonnegative integer")
+    if type(base_cooldown_ns) is not int or base_cooldown_ns < 0:
+        raise WorkKernelRefused("base_cooldown_ns must be a nonnegative integer")
+
+    resp_row = connection.execute(
+        """SELECT readable_scope_json FROM work_responsibilities
+           WHERE company_id = ? AND responsibility_id = ?""",
+        (company_id, responsibility_id),
+    ).fetchone()
+    if resp_row is None:
+        raise WorkKernelRefused("Responsibility not found for discovery hysteresis")
+    _, wake_window_ns, scope_cooldown = _parse_scope_policy(str(resp_row[0]))
+    cond_cooldown_row = connection.execute(
+        """SELECT COALESCE(MAX(cooldown_ns), 0)
+           FROM work_conditions
+           WHERE company_id = ? AND responsibility_id = ? AND status = 'armed'""",
+        (company_id, responsibility_id),
+    ).fetchone()
+    cond_cooldown = int(cond_cooldown_row[0]) if cond_cooldown_row is not None else 0
+    if cond_cooldown == 0 and isinstance(condition_id, str) and condition_id.strip():
+        fallback_row = connection.execute(
+            """SELECT cooldown_ns
+               FROM work_conditions
+               WHERE company_id = ? AND responsibility_id = ? AND condition_id = ?""",
+            (company_id, responsibility_id, condition_id.strip()),
+        ).fetchone()
+        if fallback_row is not None:
+            cond_cooldown = int(fallback_row[0])
+    effective_base = max(base_cooldown_ns, scope_cooldown, cond_cooldown)
+
+    old_noops, old_cooldown_until, window_started_ns, window_wakes = (
+        _read_discovery_window(
+            connection,
+            company_id,
+            responsibility_id,
+            now_ns=now_ns,
+            wake_window_ns=wake_window_ns,
+        )
+    )
+
+    normalized_action = action_kind.strip().lower()
+    if normalized_action in ("defer", "noop"):
+        new_noops = old_noops + 1
+        if effective_base > 0:
+            backoff = min(
+                effective_base * (2 ** min(new_noops - 1, 6)),
+                MAX_DISCOVERY_COOLDOWN_NS,
+            )
+            new_cooldown_until = max(old_cooldown_until, now_ns + backoff)
+        else:
+            new_cooldown_until = old_cooldown_until
+    else:
+        new_noops = 0
+        new_cooldown_until = old_cooldown_until
+
+    return _upsert_discovery_state(
+        connection,
+        company_id=company_id,
+        responsibility_id=responsibility_id,
+        consecutive_noops=new_noops,
+        cooldown_until_ns=new_cooldown_until,
+        window_started_ns=window_started_ns,
+        window_wakes=window_wakes,
+        now_ns=now_ns,
+    )
+
+
+def _is_result_committed(
+    connection: sqlite3.Connection,
+    company_id: str,
+    dependency_asset_id: str,
+    *,
+    now_ns: int,
+) -> bool:
+    audit_row = connection.execute(
+        """SELECT 1 FROM audit_event
+           WHERE company_id = ?
+             AND event_type IN ('asset.published', 'company.asset_published')
+             AND recorded_at_ns <= ?
+             AND (
+                 entity_id = ?
+                 OR json_extract(payload_json, '$.asset_id') = ?
+             )
+           LIMIT 1""",
+        (company_id, now_ns, dependency_asset_id, dependency_asset_id),
+    ).fetchone()
+    if audit_row is not None:
+        return True
+    pub_row = connection.execute(
+        """SELECT 1 FROM shared_publication
+           WHERE company_id = ? AND asset_id = ?
+           LIMIT 1""",
+        (company_id, dependency_asset_id),
+    ).fetchone()
+    return pub_row is not None
 
 
 def evaluate_conditions(
@@ -1947,13 +2506,24 @@ def evaluate_conditions(
     now_ns: int,
     observed_assets: dict[str, str] | None = None,
     triggering_actor_id: str | None = None,
+    _cursor_batch: WorkEventBatch | None = None,
 ) -> tuple[WorkItem, ...]:
     """Evaluate armed conditions and admit deduplicated eligible work items."""
-    assets = observed_assets or {}
+    cursor_batch = (
+        drain_work_event_cursor(connection, company_id, now_ns=now_ns)
+        if _cursor_batch is None
+        else _cursor_batch
+    )
+    assets = dict(cursor_batch.observed_assets)
+    if observed_assets:
+        assets.update(observed_assets)
+
     rows = connection.execute(
         """SELECT c.condition_id, c.owner_agent_id, c.responsibility_id, c.work_item_id,
                   c.condition_revision, c.trigger_kind, c.due_at_ns, c.source_identity,
-                  c.expected_revision, c.expires_at_ns, r.duty_kind, r.status
+                  c.expected_revision, c.expires_at_ns,
+                  c.cooldown_ns, c.max_fires, c.fire_count, c.updated_at_ns,
+                  r.duty_kind, r.status, r.readable_scope_json
            FROM work_conditions c
            LEFT JOIN work_responsibilities r ON r.responsibility_id = c.responsibility_id
            WHERE c.company_id = ? AND c.status = 'armed'
@@ -1972,10 +2542,25 @@ def evaluate_conditions(
         source_identity,
         expected_revision,
         expires_at_ns,
+        raw_cooldown_ns,
+        raw_max_fires,
+        raw_fire_count,
+        cond_updated_at_ns,
         resp_duty_kind,
         resp_status,
+        resp_scope_json,
     ) in rows:
+        cooldown_ns = int(raw_cooldown_ns or 0)
+        max_fires = None if raw_max_fires is None else int(raw_max_fires)
+        fire_count = int(raw_fire_count or 0)
+
         if resp_id is not None and resp_status != "active":
+            connection.execute(
+                "UPDATE work_conditions SET status = 'cancelled', updated_at_ns = ? WHERE condition_id = ?",
+                (now_ns, cid),
+            )
+            continue
+        if employment_cutoff(connection, owner_agent_id) is not None:
             connection.execute(
                 "UPDATE work_conditions SET status = 'cancelled', updated_at_ns = ? WHERE condition_id = ?",
                 (now_ns, cid),
@@ -1987,20 +2572,83 @@ def evaluate_conditions(
                 (now_ns, cid),
             )
             continue
+        if max_fires is not None and fire_count >= max_fires:
+            connection.execute(
+                """UPDATE work_conditions
+                   SET status = 'triggered', updated_at_ns = ?
+                   WHERE condition_id = ? AND condition_revision = ? AND status = 'armed'""",
+                (now_ns, cid, int(cond_rev)),
+            )
+            continue
 
         eligible = False
-        matched_revision = None
+        matched_revision: str | None = None
+        resolved_author: str | None = None
+
         if (
             trigger_kind == "timer"
             and due_at_ns is not None
             and now_ns >= int(due_at_ns)
         ):
-            eligible = True
-        elif trigger_kind == "shared_asset_revision" and source_identity in assets:
-            observed_rev = assets[source_identity]
-            rev_entity = f"{source_identity}@{observed_rev}"
-            if triggering_actor_id == owner_agent_id:
-                recorded = connection.execute(
+            if isinstance(source_identity, str) and source_identity.startswith(
+                "result_dep:"
+            ):
+                dep_id = str(expected_revision or "").strip()
+                if dep_id and _is_result_committed(
+                    connection, company_id, dep_id, now_ns=now_ns
+                ):
+                    eligible = True
+                    matched_revision = dep_id
+            else:
+                eligible = True
+        elif trigger_kind == "shared_asset_revision" and source_identity:
+            pub_row = connection.execute(
+                """SELECT author_id, content FROM shared_publication
+                   WHERE company_id = ? AND asset_id = ?""",
+                (company_id, source_identity),
+            ).fetchone()
+            observed_rev: str | None = assets.get(source_identity)
+            if observed_rev is None and pub_row is not None:
+                observed_rev = sha256(str(pub_row[1]).encode("utf-8")).hexdigest()
+            if observed_rev is not None:
+                if pub_row is not None and str(pub_row[0]).strip():
+                    resolved_author = str(pub_row[0]).strip()
+                elif source_identity in cursor_batch.asset_authors:
+                    resolved_author = cursor_batch.asset_authors[source_identity]
+                elif (
+                    isinstance(triggering_actor_id, str) and triggering_actor_id.strip()
+                ):
+                    resolved_author = triggering_actor_id.strip()
+
+                rev_entity = f"{source_identity}@{observed_rev}"
+                if resolved_author == owner_agent_id:
+                    recorded = connection.execute(
+                        """SELECT 1 FROM audit_event
+                           WHERE company_id = ? AND domain = 'work'
+                             AND entity_type = 'shared_asset_revision'
+                             AND entity_id = ? AND actor_id = ?
+                             AND event_type = 'work.self_authored_revision_suppressed'
+                           LIMIT 1""",
+                        (company_id, rev_entity, owner_agent_id),
+                    ).fetchone()
+                    if recorded is None:
+                        append_audit_event(
+                            connection,
+                            company_id=company_id,
+                            domain="work",
+                            entity_type="shared_asset_revision",
+                            entity_id=rev_entity,
+                            event_type="work.self_authored_revision_suppressed",
+                            actor_id=owner_agent_id,
+                            payload={
+                                "source_identity": source_identity,
+                                "revision": observed_rev,
+                                "condition_id": cid,
+                            },
+                            recorded_at_ns=now_ns,
+                        )
+                    continue
+                self_authored = connection.execute(
                     """SELECT 1 FROM audit_event
                        WHERE company_id = ? AND domain = 'work'
                          AND entity_type = 'shared_asset_revision'
@@ -2009,42 +2657,13 @@ def evaluate_conditions(
                        LIMIT 1""",
                     (company_id, rev_entity, owner_agent_id),
                 ).fetchone()
-                if recorded is None:
-                    append_audit_event(
-                        connection,
-                        company_id=company_id,
-                        domain="work",
-                        entity_type="shared_asset_revision",
-                        entity_id=rev_entity,
-                        event_type="work.self_authored_revision_suppressed",
-                        actor_id=owner_agent_id,
-                        payload={
-                            "source_identity": source_identity,
-                            "revision": observed_rev,
-                            "condition_id": cid,
-                        },
-                        recorded_at_ns=now_ns,
-                    )
-                continue  # anti-self-wake persisted for subsequent actor-less sweeps
-            self_authored = connection.execute(
-                """SELECT 1 FROM audit_event
-                   WHERE company_id = ? AND domain = 'work'
-                     AND entity_type = 'shared_asset_revision'
-                     AND entity_id = ? AND actor_id = ?
-                     AND event_type = 'work.self_authored_revision_suppressed'
-                   LIMIT 1""",
-                (company_id, rev_entity, owner_agent_id),
-            ).fetchone()
-            if self_authored is not None:
-                continue
-            if (
-                not isinstance(triggering_actor_id, str)
-                or not triggering_actor_id.strip()
-            ):
-                continue  # fail closed: asset revision wakes require non-self producer identity
-            if expected_revision is None or observed_rev == expected_revision:
-                eligible = True
-                matched_revision = observed_rev
+                if self_authored is not None:
+                    continue
+                if not resolved_author:
+                    continue  # fail closed: asset revision wakes require non-self producer identity
+                if expected_revision is None or observed_rev == expected_revision:
+                    eligible = True
+                    matched_revision = observed_rev
         elif trigger_kind == "peer_response" and source_identity:
             req_id = str(source_identity).removeprefix("peer_response:")
             peer_row = connection.execute(
@@ -2063,26 +2682,55 @@ def evaluate_conditions(
                 if expected_revision is None or res_state == expected_revision:
                     eligible = True
                     matched_revision = res_state
+                    resolved_author = (
+                        "work_scheduler"
+                        if res_state == "expired"
+                        else persisted_responder
+                    )
 
         if not eligible:
             continue
 
-        # Deduplicate strictly by (company_id, source_identity, condition_revision)
-        dedupe_source = (
-            f"{source_identity}@{matched_revision}"
-            if matched_revision is not None
-            else str(source_identity)
-        )
+        # Deduplicate strictly by (company_id, source_identity, condition_revision),
+        # scoping shared_asset_revision and peer_response by condition_id so multiple
+        # watchers on the same revision never collide.
+        if trigger_kind in ("shared_asset_revision", "peer_response"):
+            dedupe_source = (
+                f"{cid}:{source_identity}@{matched_revision}"
+                if matched_revision is not None
+                else f"{cid}:{source_identity}"
+            )
+        else:
+            dedupe_source = (
+                f"{source_identity}@{matched_revision}"
+                if matched_revision is not None
+                else str(source_identity)
+            )
         already = connection.execute(
             """SELECT 1 FROM work_condition_occurrences
                WHERE company_id = ? AND source_identity = ? AND condition_revision = ?""",
             (company_id, dedupe_source, int(cond_rev)),
         ).fetchone()
+        is_multi_fire = trigger_kind == "shared_asset_revision" and (
+            (max_fires is not None and fire_count < max_fires)
+            or (max_fires is None and cooldown_ns > 0)
+        )
         if already is not None:
-            connection.execute(
-                "UPDATE work_conditions SET status = 'triggered', updated_at_ns = ? WHERE condition_id = ?",
-                (now_ns, cid),
-            )
+            if not is_multi_fire:
+                connection.execute(
+                    """UPDATE work_conditions
+                       SET status = 'triggered', updated_at_ns = ?
+                       WHERE condition_id = ? AND condition_revision = ?""",
+                    (now_ns, cid, int(cond_rev)),
+                )
+            continue
+
+        if (
+            trigger_kind == "shared_asset_revision"
+            and fire_count > 0
+            and cooldown_ns > 0
+            and now_ns < int(cond_updated_at_ns) + cooldown_ns
+        ):
             continue
 
         duty_kind = resp_duty_kind
@@ -2094,6 +2742,103 @@ def evaluate_conditions(
             if parent_kind is not None:
                 duty_kind = str(parent_kind[0])
         duty_kind = duty_kind or "work.discovery_review"
+
+        is_discretionary = (
+            resp_id is not None
+            and parent_item_id is None
+            and duty_kind == "work.discovery_review"
+            and not (
+                isinstance(source_identity, str)
+                and source_identity.startswith("result_dep:")
+            )
+        )
+        disc_noops = 0
+        disc_cooldown_until = 0
+        disc_window_started = now_ns
+        disc_window_wakes = 0
+        configured_cooldown_ns = 0
+        if is_discretionary:
+            wake_budget, wake_window_ns, configured_cooldown_ns = _parse_scope_policy(
+                resp_scope_json
+            )
+            (
+                disc_noops,
+                disc_cooldown_until,
+                disc_window_started,
+                disc_window_wakes,
+            ) = _read_discovery_window(
+                connection,
+                company_id,
+                resp_id,
+                now_ns=now_ns,
+                wake_window_ns=wake_window_ns,
+            )
+            if now_ns < disc_cooldown_until:
+                continue
+            if disc_window_wakes >= wake_budget:
+                continue
+
+            open_row = connection.execute(
+                """SELECT work_item_id, state, payload_json
+                   FROM work_items
+                   WHERE company_id = ? AND owner_agent_id = ?
+                     AND duty_kind = 'work.discovery_review'
+                     AND state IN ('due', 'scheduled', 'running')
+                     AND json_extract(payload_json, '$.responsibility_id') = ?
+                   ORDER BY created_at_ns ASC, work_item_id ASC
+                   LIMIT 1""",
+                (company_id, owner_agent_id, resp_id),
+            ).fetchone()
+            if open_row is not None:
+                open_item_id, open_state, open_payload_raw = open_row
+                if str(open_state) in ("due", "scheduled"):
+                    try:
+                        open_payload = json.loads(str(open_payload_raw))
+                    except json.JSONDecodeError:
+                        open_payload = {}
+                    if not isinstance(open_payload, dict):
+                        open_payload = {}
+                    coalesced = open_payload.get("coalesced_revisions")
+                    if not isinstance(coalesced, list):
+                        coalesced = []
+                    coalesced.append(
+                        {
+                            "condition_id": cid,
+                            "condition_revision": int(cond_rev),
+                            "source_identity": source_identity,
+                            "observed_revision": matched_revision,
+                        }
+                    )
+                    open_payload["condition_id"] = cid
+                    open_payload["condition_revision"] = int(cond_rev)
+                    open_payload["responsibility_id"] = resp_id
+                    open_payload["trigger_kind"] = trigger_kind
+                    open_payload["source_identity"] = source_identity
+                    open_payload["observed_revision"] = matched_revision
+                    open_payload["coalesced_revisions"] = coalesced[-32:]
+                    connection.execute(
+                        """UPDATE work_items
+                           SET payload_json = ?, updated_at_ns = ?
+                           WHERE work_item_id = ?""",
+                        (_canonical_json(open_payload), now_ns, str(open_item_id)),
+                    )
+                    connection.execute(
+                        """INSERT INTO work_condition_occurrences (
+                               company_id, source_identity, condition_revision,
+                               condition_id, work_item_id, admitted_at_ns
+                           ) VALUES (?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(company_id, source_identity, condition_revision) DO NOTHING""",
+                        (
+                            company_id,
+                            dedupe_source,
+                            int(cond_rev),
+                            cid,
+                            str(open_item_id),
+                            now_ns,
+                        ),
+                    )
+                continue
+
         item, _ = create_work_item(
             connection,
             company_id=company_id,
@@ -2110,7 +2855,7 @@ def evaluate_conditions(
                 "source_identity": source_identity,
                 "observed_revision": matched_revision,
             },
-            actor_id=triggering_actor_id or "work_scheduler",
+            actor_id=resolved_author or triggering_actor_id or "work_scheduler",
             now_ns=now_ns,
         )
         connection.execute(
@@ -2120,12 +2865,509 @@ def evaluate_conditions(
                ) VALUES (?, ?, ?, ?, ?, ?)""",
             (company_id, dedupe_source, int(cond_rev), cid, item.work_item_id, now_ns),
         )
-        connection.execute(
-            "UPDATE work_conditions SET status = 'triggered', updated_at_ns = ? WHERE condition_id = ?",
-            (now_ns, cid),
+        new_fire_count = fire_count + 1
+        keep_armed = trigger_kind == "shared_asset_revision" and (
+            (max_fires is not None and new_fire_count < max_fires)
+            or (max_fires is None and cooldown_ns > 0)
         )
+        new_status = "armed" if keep_armed else "triggered"
+        connection.execute(
+            """UPDATE work_conditions
+               SET status = ?, fire_count = ?, updated_at_ns = ?
+               WHERE condition_id = ? AND condition_revision = ? AND status = 'armed'""",
+            (new_status, new_fire_count, now_ns, cid, int(cond_rev)),
+        )
+        if is_discretionary:
+            eff_cooldown = max(cooldown_ns, configured_cooldown_ns)
+            if eff_cooldown > 0:
+                step_cooldown = min(
+                    eff_cooldown * (2 ** min(disc_noops, 6)),
+                    MAX_DISCOVERY_COOLDOWN_NS,
+                )
+                new_cooldown_until = max(disc_cooldown_until, now_ns + step_cooldown)
+            else:
+                new_cooldown_until = disc_cooldown_until
+            _upsert_discovery_state(
+                connection,
+                company_id=company_id,
+                responsibility_id=resp_id,
+                consecutive_noops=disc_noops,
+                cooldown_until_ns=new_cooldown_until,
+                window_started_ns=disc_window_started,
+                window_wakes=disc_window_wakes + 1,
+                now_ns=now_ns,
+            )
         admitted.append(item)
     return tuple(admitted)
+
+
+_NEXT_CONDITION_ALLOWED_KEYS = frozenset(
+    {
+        "responsibility_id",
+        "work_item_id",
+        "trigger_kind",
+        "due_at_ns",
+        "source_identity",
+        "expected_revision",
+        "expires_at_ns",
+        "cooldown_ns",
+        "max_fires",
+        "condition_revision",
+    }
+)
+
+
+def validate_next_condition_dict(
+    raw: Any,
+    *,
+    max_str_len: int | None = None,
+    error_cls: type[Exception] = WorkKernelRefused,
+) -> dict[str, Any]:
+    """Validate and normalize a next_condition mapping against canonical schema rules."""
+    if not isinstance(raw, Mapping):
+        raise error_cls("next_condition must be a mapping")
+    extra_keys = set(raw.keys()) - _NEXT_CONDITION_ALLOWED_KEYS
+    if extra_keys:
+        raise error_cls(f"Unsupported next_condition fields: {sorted(extra_keys)}")
+    if "trigger_kind" not in raw:
+        raise error_cls("next_condition requires trigger_kind")
+
+    def _check_str(val: Any, key: str) -> str:
+        if (
+            not isinstance(val, str)
+            or not val.strip()
+            or (max_str_len is not None and len(val) > max_str_len)
+        ):
+            raise error_cls(f"next_condition.{key} must be a nonempty string")
+        return val
+
+    def _check_int(val: Any, key: str, minimum: int) -> int:
+        if type(val) is not int or val < minimum or val >= 2**63:
+            raise error_cls(f"next_condition.{key} must be a valid integer")
+        return val
+
+    parsed: dict[str, Any] = {
+        "trigger_kind": _check_str(raw["trigger_kind"], "trigger_kind")
+    }
+    for key in (
+        "responsibility_id",
+        "work_item_id",
+        "source_identity",
+        "expected_revision",
+    ):
+        if key in raw and raw[key] is not None:
+            parsed[key] = _check_str(raw[key], key)
+    for key, minimum in (
+        ("due_at_ns", 0),
+        ("expires_at_ns", 0),
+        ("cooldown_ns", 0),
+        ("max_fires", 1),
+        ("condition_revision", 1),
+    ):
+        if key in raw and raw[key] is not None:
+            parsed[key] = _check_int(raw[key], key, minimum)
+    return parsed
+
+
+def _normalize_evidence(
+    evidence: Sequence[DecisionEvidence | Mapping[str, Any]],
+) -> tuple[DecisionEvidence, ...]:
+    normalized: list[DecisionEvidence] = []
+    for entry in evidence:
+        if isinstance(entry, DecisionEvidence):
+            ev = entry
+        elif isinstance(entry, Mapping):
+            allowed = {
+                "kind",
+                "resource_id",
+                "revision",
+                "observed_at_ns",
+                "available_at_ns",
+            }
+            keys = set(entry.keys())
+            if not allowed <= keys or not keys <= allowed:
+                raise WorkKernelRefused("DecisionEvidence dict does not match schema")
+            ev = DecisionEvidence(
+                kind=entry["kind"],
+                resource_id=entry["resource_id"],
+                revision=entry["revision"],
+                observed_at_ns=entry["observed_at_ns"],
+                available_at_ns=entry["available_at_ns"],
+            )
+        else:
+            raise WorkKernelRefused("DecisionEvidence entry has invalid type")
+        _require_nonempty(ev.kind, "evidence.kind")
+        _require_nonempty(ev.resource_id, "evidence.resource_id")
+        if not isinstance(ev.revision, str) or not ev.revision.strip():
+            raise WorkKernelRefused("evidence.revision must be a nonempty string")
+        if type(ev.observed_at_ns) is not int or type(ev.available_at_ns) is not int:
+            raise WorkKernelRefused("evidence timestamps must be integers")
+        if ev.available_at_ns < 0 or ev.observed_at_ns < 0:
+            raise WorkKernelRefused("evidence timestamps must be nonnegative")
+        normalized.append(ev)
+    return tuple(normalized)
+
+
+def _validate_core_evidence_entry(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    agent_id: str,
+    decision_at_ns: int,
+    ev: DecisionEvidence,
+) -> None:
+    if ev.available_at_ns > ev.observed_at_ns or ev.observed_at_ns > decision_at_ns:
+        raise WorkKernelRefused(
+            "Decision evidence timestamps violate availability/observation order"
+        )
+    if ev.kind == "private_draft":
+        if "/" in ev.resource_id:
+            owner_prefix = ev.resource_id.split("/", 1)[0]
+            if owner_prefix != agent_id:
+                raise WorkKernelRefused("Cannot cite another Agent's private draft")
+        elif ":" in ev.resource_id:
+            owner_prefix = ev.resource_id.split(":", 1)[0]
+            if owner_prefix != agent_id:
+                raise WorkKernelRefused("Cannot cite another Agent's private draft")
+    elif ev.kind == "shared_publication":
+        pub_row = connection.execute(
+            """SELECT company_id, project_id, audience, content
+               FROM shared_publication
+               WHERE asset_id = ?""",
+            (ev.resource_id,),
+        ).fetchone()
+        if pub_row is not None:
+            pub_company, pub_project, audience_json, content = pub_row
+            if str(pub_company) != company_id:
+                raise WorkKernelRefused(
+                    "Cited shared_publication belongs to another company"
+                )
+            try:
+                audience = set(json.loads(str(audience_json)))
+            except json.JSONDecodeError:
+                audience = set()
+            proj_row = connection.execute(
+                "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
+                (company_id, str(pub_project)),
+            ).fetchone()
+            try:
+                members = set(json.loads(str(proj_row[0]))) if proj_row else set()
+            except json.JSONDecodeError:
+                members = set()
+            if agent_id not in audience or agent_id not in members:
+                raise WorkKernelRefused(
+                    "Agent is not authorized to cite shared_publication"
+                )
+            actual_rev = sha256(str(content).encode("utf-8")).hexdigest()
+            if ev.revision != actual_rev:
+                raise WorkKernelRefused(
+                    "Cited shared_publication revision does not match committed content"
+                )
+    elif ev.kind == "peer_request":
+        req_row = connection.execute(
+            """SELECT company_id, requester_agent_id, recipient_agent_id
+               FROM work_peer_requests WHERE request_id = ?""",
+            (ev.resource_id,),
+        ).fetchone()
+        if req_row is not None and (
+            str(req_row[0]) != company_id
+            or agent_id not in (str(req_row[1]), str(req_row[2]))
+        ):
+            raise WorkKernelRefused("Agent is not authorized to cite peer_request")
+    elif ev.kind == "work_run":
+        run_row = connection.execute(
+            "SELECT company_id, agent_id FROM work_runs WHERE run_id = ?",
+            (ev.resource_id,),
+        ).fetchone()
+        if run_row is not None and (
+            str(run_row[0]) != company_id or str(run_row[1]) != agent_id
+        ):
+            raise WorkKernelRefused("Agent is not authorized to cite work_run")
+    elif ev.kind == "work_item":
+        item_row = connection.execute(
+            "SELECT company_id, owner_agent_id FROM work_items WHERE work_item_id = ?",
+            (ev.resource_id,),
+        ).fetchone()
+        if item_row is not None and (
+            str(item_row[0]) != company_id or str(item_row[1]) != agent_id
+        ):
+            raise WorkKernelRefused("Agent is not authorized to cite work_item")
+    elif ev.kind == "tool_call_receipt":
+        rec_row = connection.execute(
+            """SELECT company_id, agent_id FROM tool_call_receipt
+               WHERE company_id = ? AND call_id = ? LIMIT 1""",
+            (company_id, ev.resource_id),
+        ).fetchone()
+        if rec_row is not None and str(rec_row[1]) != agent_id:
+            raise WorkKernelRefused("Agent is not authorized to cite tool_call_receipt")
+
+
+def record_work_decision(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    work_item_id: str,
+    run_id: str,
+    fencing_token: int,
+    agent_id: str,
+    action_kind: str,
+    rationale: str,
+    evidence: Sequence[DecisionEvidence | Mapping[str, Any]] = (),
+    decision_at_ns: int | None = None,
+    action_id: str | None = None,
+    next_condition: Mapping[str, Any] | None = None,
+    active_snapshot_id: str | None = None,
+    domain_plugins: Sequence[Any] = (),
+) -> WorkDecision:
+    """Validate evidence, persist work_decision + optional next_condition atomically."""
+    _require_nonempty(company_id, "company_id")
+    _require_nonempty(work_item_id, "work_item_id")
+    _require_nonempty(run_id, "run_id")
+    _require_nonempty(agent_id, "agent_id")
+    _require_nonempty(action_kind, "action_kind")
+    _require_nonempty(rationale, "rationale")
+    if action_id is not None:
+        _require_nonempty(action_id, "action_id")
+    effective_action_id = action_id or f"dec-{uuid4().hex}"
+    effective_decision_ns = time_ns() if decision_at_ns is None else decision_at_ns
+    if type(effective_decision_ns) is not int or effective_decision_ns <= 0:
+        raise WorkKernelRefused("decision_at_ns must be a positive integer")
+
+    run = assert_run_fencing(
+        connection, run_id, fencing_token, now_ns=effective_decision_ns
+    )
+    if (
+        run.company_id != company_id
+        or run.work_item_id != work_item_id
+        or run.agent_id != agent_id
+    ):
+        raise WorkKernelRefused("Work decision does not match active run identity")
+    if not has_active_grant(connection, company_id, agent_id):
+        raise RunFenced(f"Agent {agent_id} no longer holds an active grant")
+    item_row = connection.execute(
+        """SELECT owner_agent_id, state, payload_json
+           FROM work_items
+           WHERE company_id = ? AND work_item_id = ?""",
+        (company_id, work_item_id),
+    ).fetchone()
+    if (
+        item_row is None
+        or str(item_row[0]) != agent_id
+        or str(item_row[1]) != "running"
+    ):
+        raise WorkKernelRefused("Work item is not actively running for this Agent")
+
+    normalized_evidence = _normalize_evidence(evidence)
+    for ev in normalized_evidence:
+        _validate_core_evidence_entry(
+            connection,
+            company_id=company_id,
+            agent_id=agent_id,
+            decision_at_ns=effective_decision_ns,
+            ev=ev,
+        )
+        for plugin in domain_plugins:
+            validator = getattr(plugin, "validate_decision_evidence", None)
+            if validator is not None:
+                validator(
+                    connection,
+                    company_id,
+                    agent_id,
+                    effective_decision_ns,
+                    ev,
+                )
+
+    evidence_refs = [
+        {
+            "kind": ev.kind,
+            "resource_id": ev.resource_id,
+            "revision": ev.revision,
+            "observed_at_ns": ev.observed_at_ns,
+            "available_at_ns": ev.available_at_ns,
+        }
+        for ev in normalized_evidence
+    ]
+    evidence_refs_json = _canonical_json(evidence_refs)
+    evidence_digest = sha256(evidence_refs_json.encode("utf-8")).hexdigest()
+
+    validated_next = (
+        validate_next_condition_dict(next_condition)
+        if next_condition is not None
+        else None
+    )
+
+    prior_row = connection.execute(
+        """SELECT decision_id, company_id, work_item_id, run_id, agent_id,
+                  action_id, action_kind, evidence_refs_json, evidence_digest,
+                  rationale, next_condition_id, active_snapshot_id, decision_at_ns
+           FROM work_decision
+           WHERE company_id = ? AND agent_id = ? AND action_id = ?""",
+        (company_id, agent_id, effective_action_id),
+    ).fetchone()
+    if prior_row is not None:
+        prior = WorkDecision(*prior_row)
+        run_replay_ok = prior.run_id == run_id
+        if not run_replay_ok and prior.work_item_id == work_item_id:
+            prior_run_row = connection.execute(
+                "SELECT status FROM work_runs WHERE company_id = ? AND run_id = ?",
+                (company_id, prior.run_id),
+            ).fetchone()
+            run_replay_ok = prior_run_row is not None and str(prior_run_row[0]) in (
+                "fenced",
+                "failed",
+            )
+        if (
+            prior.work_item_id != work_item_id
+            or not run_replay_ok
+            or prior.action_kind != action_kind
+            or prior.evidence_digest != evidence_digest
+            or prior.rationale != rationale
+            or prior.decision_at_ns != effective_decision_ns
+            or prior.active_snapshot_id != active_snapshot_id
+            or (prior.next_condition_id is None) != (validated_next is None)
+        ):
+            raise WorkKernelRefused(
+                "Work decision conflicts with previously recorded action_id"
+            )
+        if validated_next is not None and prior.next_condition_id is not None:
+            cond_row = connection.execute(
+                """SELECT responsibility_id, work_item_id, trigger_kind, due_at_ns,
+                          source_identity, expected_revision, expires_at_ns,
+                          cooldown_ns, max_fires, condition_revision
+                   FROM work_conditions WHERE condition_id = ?""",
+                (prior.next_condition_id,),
+            ).fetchone()
+            if cond_row is None:
+                raise WorkKernelRefused(
+                    "Work decision conflicts with missing next_condition"
+                )
+            exp_resp = validated_next.get("responsibility_id")
+            exp_item = (
+                work_item_id
+                if exp_resp is None and validated_next.get("work_item_id") is None
+                else validated_next.get("work_item_id")
+            )
+            req_source = validated_next.get("source_identity")
+            exp_source = (
+                f"timer:{prior.next_condition_id}" if req_source is None else req_source
+            )
+            if (
+                cond_row[0] != exp_resp
+                or cond_row[1] != exp_item
+                or cond_row[2] != validated_next["trigger_kind"]
+                or cond_row[3] != validated_next.get("due_at_ns")
+                or cond_row[4] != exp_source
+                or cond_row[5] != validated_next.get("expected_revision")
+                or cond_row[6] != validated_next.get("expires_at_ns")
+                or int(cond_row[7]) != int(validated_next.get("cooldown_ns", 0))
+                or cond_row[8] != validated_next.get("max_fires")
+                or (
+                    "condition_revision" in validated_next
+                    and int(cond_row[9]) != int(validated_next["condition_revision"])
+                )
+            ):
+                raise WorkKernelRefused(
+                    "Work decision conflicts with previously armed next_condition"
+                )
+        return prior
+
+    next_condition_id: str | None = None
+    if validated_next is not None:
+        armed = _arm_next_condition(
+            connection,
+            company_id=company_id,
+            owner_agent_id=agent_id,
+            work_item_id=work_item_id,
+            next_condition=validated_next,
+            now_ns=effective_decision_ns,
+            always_link_work_item=False,
+        )
+        next_condition_id = armed.condition_id
+
+    decision_id = uuid4().hex
+    connection.execute(
+        """INSERT INTO work_decision (
+               decision_id, company_id, work_item_id, run_id, agent_id,
+               action_id, action_kind, evidence_refs_json, evidence_digest,
+               rationale, next_condition_id, active_snapshot_id, decision_at_ns
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            decision_id,
+            company_id,
+            work_item_id,
+            run_id,
+            agent_id,
+            effective_action_id,
+            action_kind,
+            evidence_refs_json,
+            evidence_digest,
+            rationale,
+            next_condition_id,
+            active_snapshot_id,
+            effective_decision_ns,
+        ),
+    )
+    append_audit_event(
+        connection,
+        company_id=company_id,
+        domain="work",
+        entity_type="work_decision",
+        entity_id=decision_id,
+        event_type="work.decision_recorded",
+        actor_id=agent_id,
+        run_id=run_id,
+        payload={
+            "work_item_id": work_item_id,
+            "action_id": effective_action_id,
+            "action_kind": action_kind,
+            "evidence_digest": evidence_digest,
+            "next_condition_id": next_condition_id,
+        },
+        recorded_at_ns=effective_decision_ns,
+    )
+
+    try:
+        item_payload = json.loads(str(item_row[2]))
+    except json.JSONDecodeError:
+        item_payload = {}
+    if isinstance(item_payload, dict):
+        linked_resp = item_payload.get("responsibility_id")
+        if isinstance(linked_resp, str) and linked_resp.strip():
+            resp_info = connection.execute(
+                """SELECT duty_kind FROM work_responsibilities
+                   WHERE company_id = ? AND responsibility_id = ?""",
+                (company_id, linked_resp),
+            ).fetchone()
+            if resp_info is not None and str(resp_info[0]) == "work.discovery_review":
+                linked_cond_id = item_payload.get("condition_id")
+                record_discovery_hysteresis(
+                    connection,
+                    company_id=company_id,
+                    responsibility_id=linked_resp,
+                    action_kind=action_kind,
+                    now_ns=effective_decision_ns,
+                    condition_id=(
+                        linked_cond_id.strip()
+                        if isinstance(linked_cond_id, str) and linked_cond_id.strip()
+                        else None
+                    ),
+                )
+
+    return WorkDecision(
+        decision_id=decision_id,
+        company_id=company_id,
+        work_item_id=work_item_id,
+        run_id=run_id,
+        agent_id=agent_id,
+        action_id=effective_action_id,
+        action_kind=action_kind,
+        evidence_refs_json=evidence_refs_json,
+        evidence_digest=evidence_digest,
+        rationale=rationale,
+        next_condition_id=next_condition_id,
+        active_snapshot_id=active_snapshot_id,
+        decision_at_ns=effective_decision_ns,
+    )
 
 
 def open_peer_request(
