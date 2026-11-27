@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 from collections.abc import Callable, Mapping, Sequence
@@ -35,9 +36,10 @@ from ..agent_runtime.protocol import (
     ShiftResult,
     ToolHandler,
     ToolSpec,
+    assign_skill_slugs,
     hydrate_shift_context,
 )
-from ..duty_run import work_run_claim_from_context
+from ..duty_run import DutyRefused, work_run_claim_from_context
 from ..episode_index import upsert_episode_entry
 from ..harness import (
     DEFAULT_OFFLOAD_THRESHOLD_BYTES,
@@ -70,6 +72,7 @@ if TYPE_CHECKING:
     from ..agent_runtime.registry import AgentAdapterRegistry
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_LOGGER = logging.getLogger(__name__)
 
 ActiveMethodsProvider = Callable[
     [Path, str, str, str],
@@ -306,6 +309,23 @@ class ShiftRunner:
                 ctx.work_item.duty_kind,
             )
         active_methods = _normalize_method_dicts(raw_active_methods)
+        slug_map = assign_skill_slugs(
+            [
+                *(m.method_id for m in all_agent_methods),
+                *(
+                    str(m["method_id"])
+                    for m in active_methods
+                    if isinstance(m.get("method_id"), str)
+                ),
+            ]
+        )
+        for m in active_methods:
+            mid = m.get("method_id")
+            if isinstance(mid, str) and mid in slug_map:
+                if not m.get("skill_name"):
+                    m["skill_name"] = slug_map[mid]
+                if not m.get("skill_path"):
+                    m["skill_path"] = f"skills/{slug_map[mid]}/SKILL.md"
         if active_snapshot_id is None and active_methods:
             active_snapshot_id = compute_active_snapshot_id(active_methods)
 
@@ -532,6 +552,7 @@ class ShiftRunner:
 
         shift_result: ShiftResult | None = None
         shift_error: BaseException | None = None
+        projection_error: BaseException | None = None
         settlement: TurnCostSettlement | None = None
         settlement_error: BaseException | None = None
         episode: AgentEpisode | None = None
@@ -553,16 +574,50 @@ class ShiftRunner:
         finally:
             try:
                 cleanup_run_scratch(ctx.writer.store, agent_id, ctx.run.run_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Scratch cleanup failed for agent=%s run=%s: %s",
+                    agent_id,
+                    ctx.run.run_id,
+                    exc,
+                )
             try:
                 sync_desk_harness_projections(
                     ctx.writer.store,
                     ctx.company_id,
                     agent_id,
                 )
-            except Exception:
-                pass
+            except (DutyRefused, OSError) as exc:
+                projection_error = exc
+                _LOGGER.warning(
+                    "Desk harness projection sync failed for agent=%s run=%s: %s",
+                    agent_id,
+                    ctx.run.run_id,
+                    exc,
+                )
+                try:
+                    _append_trace_line(
+                        ctx.writer.store,
+                        session.trace_path,
+                        {
+                            "kind": "desk.harness_projection_error",
+                            "recorded_at_ns": max(1, int(ctx.now_ns)),
+                            "company_id": ctx.company_id,
+                            "agent_id": agent_id,
+                            "run_id": ctx.run.run_id,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Unexpected Desk harness projection error for agent=%s run=%s: %s",
+                    agent_id,
+                    ctx.run.run_id,
+                    exc,
+                )
 
             incurred_usage = (
                 shift_result.usage if shift_result is not None else broker.accrued_usage
@@ -732,6 +787,8 @@ class ShiftRunner:
                 raise settlement_error from shift_error
             if shift_error is None and settlement_error is not None:
                 raise settlement_error
+            if shift_error is None and projection_error is not None:
+                raise projection_error
 
         assert shift_result is not None
         assert settlement is not None

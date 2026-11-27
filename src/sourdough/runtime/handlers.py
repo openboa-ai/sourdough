@@ -347,14 +347,35 @@ def build_production_duty_registry(
         ctx_kind = payload.get("context_kind")
         ctx_id = payload.get("context_id")
         ctx_label = payload.get("context_label")
+        reply_command_id = f"ceo-reply:{ctx.work_item.work_item_id}:{message_id}"
 
         with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
+            prior_reply = db.execute(
+                """SELECT message_id FROM ceo_message
+                   WHERE company_id = ? AND command_id = ? AND sender_kind = 'ceo'
+                   LIMIT 1""",
+                (ctx.company_id, reply_command_id),
+            ).fetchone()
             history_rows = db.execute(
                 """SELECT sender_kind, body FROM ceo_message
                    WHERE company_id = ?
                    ORDER BY recorded_at_ns DESC LIMIT 6""",
                 (ctx.company_id,),
             ).fetchall()
+        if prior_reply is not None:
+            with ctx.write_lock_ctx():
+                mark_ceo_message_delivered(
+                    ctx.writer, message_id=message_id, now_ns=ctx.now_ns
+                )
+            return DutyOutcome(
+                disposition="completed",
+                result={
+                    "inbound_message_id": message_id,
+                    "reply_message_id": str(prior_reply[0]),
+                    "recovered_reply": True,
+                    "cost_minor_units": 0,
+                },
+            )
         history_notes = tuple(
             f"{str(kind)}: {str(text)[:200]}" for kind, text in reversed(history_rows)
         )
@@ -387,10 +408,9 @@ def build_production_duty_registry(
                 context_kind=ctx_kind if isinstance(ctx_kind, str) else None,
                 context_id=ctx_id if isinstance(ctx_id, str) else None,
                 context_label=ctx_label if isinstance(ctx_label, str) else None,
+                command_id=reply_command_id,
+                inbound_message_id=message_id,
                 now_ns=ctx.now_ns,
-            )
-            mark_ceo_message_delivered(
-                ctx.writer, message_id=message_id, now_ns=ctx.now_ns
             )
         return DutyOutcome(
             disposition="completed",
@@ -1077,7 +1097,7 @@ def build_production_duty_registry(
             include_messaging=True,
             include_peer_request=True,
             include_peer_respond=False,
-            include_handoffs=True,
+            include_handoffs=False,
             include_roster=True,
         )
         merged_specs, merged_handlers, merged_recoverable = merge_tool_contributions(

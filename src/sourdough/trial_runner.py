@@ -11,24 +11,28 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import monotonic, time_ns
 from typing import Any
 from uuid import uuid4
 
 from .agent_desk import clone_desk_snapshot, desk_directory, desks_root
 from .agent_runtime.protocol import (
+    AgentBudgetExceeded,
     AgentProfileBinding,
     AgentRuntimeAdapter,
+    AgentRuntimeRefused,
+    AgentTransportInterrupted,
     OuterToolBroker,
     ShiftRequest,
     hydrate_shift_context,
 )
 from .agent_runtime.registry import AgentAdapterRegistry
 from .company import FoundingTerms, _identity, found
-from .duty_run import WorkRunClaim
+from .duty_run import DutyRefused, WorkRunClaim
 from .memory import record_episode
 from .method_learning import (
+    MethodRefused,
     activate_method_delta,
     compute_active_snapshot_id,
     distill_method_delta,
@@ -40,8 +44,15 @@ from .method_learning import (
 )
 from .runtime.domains import ProfileBindingLookup
 from .runtime.engine import CompanyRuntime
-from .runtime.registry import DutyContext, DutyDescriptor, DutyOutcome, DutyRegistry
+from .runtime.registry import (
+    DutyContext,
+    DutyDescriptor,
+    DutyOutcome,
+    DutyRegistry,
+    RuntimeRefused,
+)
 from .runtime.work_kernel import (
+    WorkKernelRefused,
     claim_work_run,
     complete_work_run,
     create_work_item,
@@ -156,7 +167,7 @@ def _score_live_gen2_observables(
         total_fatal > 0 or action in VIOLATION_ACTION_KINDS
     )
     drafted_counterexample_method = any(
-        str(status) != "disputed"
+        str(status) in ("candidate", "active")
         and str(item_kind) == "work_method"
         and str(delta_kind) in ("ADD", "PATCH")
         and bool(str(falsification_criteria or "").strip())
@@ -1025,6 +1036,48 @@ def _open_claim_for_agent(
     return item.work_item_id, claim
 
 
+def _read_offloaded_receipt_payload(
+    desk_dir: Path,
+    raw_res: str | None,
+    offloaded_log_path: str | None,
+) -> Mapping[str, Any] | None:
+    if not raw_res:
+        return None
+    try:
+        parsed = json.loads(raw_res)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    if parsed.get("offloaded") is not True:
+        return parsed
+    log_rel = offloaded_log_path or parsed.get("log_path")
+    if not isinstance(log_rel, str) or not log_rel.startswith(".desk/logs/"):
+        return parsed
+    posix = PurePosixPath(log_rel)
+    if posix.is_absolute() or any(part in ("", ".", "..") for part in posix.parts):
+        return parsed
+    cur = desk_dir
+    for part in posix.parts:
+        cur = cur / part
+        if not os.path.lexists(cur) or stat.S_ISLNK(os.lstat(cur).st_mode):
+            return parsed
+    if not stat.S_ISREG(os.lstat(cur).st_mode):
+        return parsed
+    try:
+        fd = os.open(cur, os.O_RDONLY | _O_NOFOLLOW)
+        try:
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, 65_536):
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+        loaded = json.loads(b"".join(chunks).decode("utf-8"))
+        return loaded if isinstance(loaded, Mapping) else parsed
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return parsed
+
+
 def run_recursive_learning_cycle(
     writer_or_store: WriterLease | Path,
     *,
@@ -1472,21 +1525,46 @@ def run_recursive_learning_cycle(
                                 actor_id=meta_agent_id,
                                 now_ns=base_ns + 500 + _idx,
                             )
-                        step_summary = runtime.step_with_writer(
-                            slot_w, max_dispatches=1, now_ns=base_ns + 510 + _idx
-                        )
+                        step_summary = None
+                        step_error: str | None = None
+                        try:
+                            step_summary = runtime.step_with_writer(
+                                slot_w, max_dispatches=1, now_ns=base_ns + 510 + _idx
+                            )
+                        except (
+                            AgentRuntimeRefused,
+                            AgentBudgetExceeded,
+                            AgentTransportInterrupted,
+                            RuntimeRefused,
+                            DutyRefused,
+                            WorkKernelRefused,
+                            MethodRefused,
+                        ) as exc:
+                            step_error = f"{type(exc).__name__}: {exc}"
                     executed_run_id = (
                         step_summary.executed_runs[0]
-                        if len(step_summary.executed_runs) == 1
+                        if step_summary is not None
+                        and len(step_summary.executed_runs) == 1
                         else None
                     )
                     dec_row = None
+                    rcpt_rows_full: list[tuple[str, str, str | None, str | None]] = []
                     rcpt_rows: list[tuple[str, str, str | None]] = []
                     drafted_methods: list[
                         tuple[str, str, str, str, str, str, str, str, str]
                     ] = []
                     total_tokens = 0
+                    episode_method_ids: list[str] = []
                     with closing(open_reader(slot_store)) as ro_db, read_tx(ro_db):
+                        if executed_run_id is None:
+                            last_run = ro_db.execute(
+                                """SELECT run_id FROM work_runs
+                                   WHERE company_id = ? AND work_item_id = ?
+                                   ORDER BY created_at_ns DESC, run_id DESC LIMIT 1""",
+                                (company_id, item_obj.work_item_id),
+                            ).fetchone()
+                            if last_run is not None:
+                                executed_run_id = str(last_run[0])
                         settled_count = int(
                             ro_db.execute(
                                 """SELECT COUNT(*) FROM work_items
@@ -1502,41 +1580,83 @@ def run_recursive_learning_cycle(
                                    ORDER BY decision_at_ns DESC LIMIT 1""",
                                 (company_id, item_obj.work_item_id, executed_run_id),
                             ).fetchone()
-                            rcpt_rows = [
+                            rcpt_rows_full = [
                                 (
                                     str(r[0]),
                                     str(r[1]),
                                     None if r[2] is None else str(r[2]),
+                                    None if r[3] is None else str(r[3]),
                                 )
                                 for r in ro_db.execute(
-                                    """SELECT tool_name, status, result_json
+                                    """SELECT tool_name, status, result_json, offloaded_log_path
                                        FROM tool_call_receipt
                                        WHERE company_id = ? AND run_id = ?
                                        ORDER BY recorded_at_ns ASC, call_id ASC""",
                                     (company_id, executed_run_id),
                                 ).fetchall()
                             ]
-                            ep_tokens = ro_db.execute(
-                                """SELECT COALESCE(SUM(input_tokens + output_tokens), 0)
+                            rcpt_rows = [
+                                (tn, st, raw_res)
+                                for tn, st, raw_res, _off in rcpt_rows_full
+                            ]
+                            ep_row = ro_db.execute(
+                                """SELECT COALESCE(SUM(input_tokens + output_tokens), 0),
+                                          MAX(decisions_json)
                                    FROM agent_episode
                                    WHERE company_id = ? AND work_item_id = ? AND run_id = ?""",
                                 (company_id, item_obj.work_item_id, executed_run_id),
                             ).fetchone()
-                            total_tokens = (
-                                int(ep_tokens[0]) if ep_tokens is not None else 0
-                            )
-                            seen_draft_pairs: set[tuple[str, str]] = set()
-                            for tn, st, raw_res in rcpt_rows:
-                                if (
-                                    tn != "skill_draft_candidate"
-                                    or st != "ok"
-                                    or not raw_res
-                                ):
-                                    continue
+                            total_tokens = int(ep_row[0]) if ep_row is not None else 0
+                            if ep_row is not None and ep_row[1]:
                                 try:
-                                    parsed_res = json.loads(raw_res)
+                                    ep_decs = json.loads(str(ep_row[1]))
+                                    if isinstance(ep_decs, list):
+                                        for dec_item in ep_decs:
+                                            if isinstance(dec_item, Mapping):
+                                                for k in ("invoked", "retrieved"):
+                                                    vals = dec_item.get(k)
+                                                    if isinstance(vals, list):
+                                                        for v in vals:
+                                                            if (
+                                                                isinstance(v, str)
+                                                                and v
+                                                                and v
+                                                                not in episode_method_ids
+                                                            ):
+                                                                episode_method_ids.append(
+                                                                    v
+                                                                )
                                 except json.JSONDecodeError:
+                                    pass
+                            seen_draft_pairs: set[tuple[str, str]] = set()
+
+                            def _append_draft_row(d_row: Any) -> None:
+                                if d_row is None:
+                                    return
+                                pair = (str(d_row[0]), str(d_row[1]))
+                                if pair in seen_draft_pairs:
+                                    return
+                                seen_draft_pairs.add(pair)
+                                drafted_methods.append(
+                                    (
+                                        str(d_row[0]),
+                                        str(d_row[1]),
+                                        str(d_row[2]),
+                                        str(d_row[3]),
+                                        str(d_row[4] or "{}"),
+                                        str(d_row[5] or ""),
+                                        str(d_row[6] or ""),
+                                        str(d_row[7] or ""),
+                                        str(d_row[8]),
+                                    )
+                                )
+
+                            for tn, st, raw_res, off_path in rcpt_rows_full:
+                                if tn != "skill_draft_candidate" or st != "ok":
                                     continue
+                                parsed_res = _read_offloaded_receipt_payload(
+                                    desk_dir, raw_res, off_path
+                                )
                                 if not isinstance(parsed_res, Mapping):
                                     continue
                                 d_mid = parsed_res.get("method_id")
@@ -1546,64 +1666,118 @@ def run_recursive_learning_cycle(
                                     and d_mid
                                     and isinstance(d_rev, str)
                                     and d_rev
-                                    and (d_mid, d_rev) not in seen_draft_pairs
                                 ):
-                                    seen_draft_pairs.add((d_mid, d_rev))
-                                    d_row = ro_db.execute(
-                                        """SELECT method_id, revision_sha256, delta_kind, item_kind,
-                                                  trigger_spec_json, body_text, uncertainty_note,
-                                                  falsification_criteria, status
-                                           FROM method_delta
-                                           WHERE company_id = ? AND method_id = ? AND revision_sha256 = ?
-                                           LIMIT 1""",
-                                        (company_id, d_mid, d_rev),
-                                    ).fetchone()
-                                    if d_row is not None:
-                                        drafted_methods.append(
-                                            (
-                                                str(d_row[0]),
-                                                str(d_row[1]),
-                                                str(d_row[2]),
-                                                str(d_row[3]),
-                                                str(d_row[4] or "{}"),
-                                                str(d_row[5] or ""),
-                                                str(d_row[6] or ""),
-                                                str(d_row[7] or ""),
-                                                str(d_row[8]),
-                                            )
-                                        )
+                                    _append_draft_row(
+                                        ro_db.execute(
+                                            """SELECT method_id, revision_sha256, delta_kind, item_kind,
+                                                      trigger_spec_json, body_text, uncertainty_note,
+                                                      falsification_criteria, status
+                                               FROM method_delta
+                                               WHERE company_id = ? AND method_id = ? AND revision_sha256 = ?
+                                               LIMIT 1""",
+                                            (company_id, d_mid, d_rev),
+                                        ).fetchone()
+                                    )
+                            # Fallback to authoritative method_delta rows citing this work_run
+                            for d_row in ro_db.execute(
+                                """SELECT method_id, revision_sha256, delta_kind, item_kind,
+                                          trigger_spec_json, body_text, uncertainty_note,
+                                          falsification_criteria, status
+                                   FROM method_delta
+                                   WHERE company_id = ? AND author_agent_id = ?
+                                     AND EXISTS (
+                                         SELECT 1 FROM json_each(source_refs_json)
+                                         WHERE value = ?
+                                     )
+                                   ORDER BY created_at_ns ASC, method_id ASC""",
+                                (
+                                    company_id,
+                                    meta_agent_id,
+                                    f"work_run:{executed_run_id}",
+                                ),
+                            ).fetchall():
+                                _append_draft_row(d_row)
                     fatal_calls = sum(
                         1 for _tn, st, _rr in rcpt_rows if st in ("fatal", "denied")
                     )
                     calls_list: list[dict[str, Any]] = []
-                    for tn, st, raw_res in rcpt_rows:
-                        call_entry: dict[str, Any] = {"name": tn, "status": st}
-                        if (
-                            tn
-                            in (
+                    with closing(open_reader(slot_store)) as ro_db, read_tx(ro_db):
+                        for tn, st, raw_res, off_path in rcpt_rows_full:
+                            call_entry: dict[str, Any] = {"name": tn, "status": st}
+                            if tn in (
                                 "skill_read",
                                 "skill_record_invocation",
                                 "skill_draft_candidate",
-                            )
-                            and raw_res
-                        ):
-                            try:
-                                res_obj = json.loads(raw_res)
-                            except json.JSONDecodeError:
-                                res_obj = None
-                            if isinstance(res_obj, Mapping):
-                                skill_obj = res_obj.get("skill")
-                                if isinstance(skill_obj, Mapping) and skill_obj.get(
-                                    "item_kind"
+                            ):
+                                res_obj = _read_offloaded_receipt_payload(
+                                    desk_dir, raw_res, off_path
+                                )
+                                resolved_mid: str | None = None
+                                if isinstance(res_obj, Mapping):
+                                    skill_obj = res_obj.get("skill")
+                                    if isinstance(skill_obj, Mapping):
+                                        if isinstance(skill_obj.get("method_id"), str):
+                                            resolved_mid = str(skill_obj["method_id"])
+                                        if skill_obj.get("item_kind"):
+                                            call_entry["item_kind"] = str(
+                                                skill_obj["item_kind"]
+                                            )
+                                    if resolved_mid is None and isinstance(
+                                        res_obj.get("method_id"), str
+                                    ):
+                                        resolved_mid = str(res_obj["method_id"])
+                                    if res_obj.get("status"):
+                                        call_entry["delta_status"] = str(
+                                            res_obj["status"]
+                                        )
+                                if resolved_mid is not None:
+                                    call_entry["method_id"] = resolved_mid
+                                if (
+                                    "method_id" not in call_entry
+                                    or "item_kind" not in call_entry
+                                    or "delta_status" not in call_entry
                                 ):
-                                    call_entry["item_kind"] = str(
-                                        skill_obj["item_kind"]
-                                    )
-                                if res_obj.get("status"):
-                                    call_entry["delta_status"] = str(res_obj["status"])
-                        calls_list.append(call_entry)
+                                    if (
+                                        tn == "skill_draft_candidate"
+                                        and drafted_methods
+                                    ):
+                                        dm = drafted_methods[0]
+                                        call_entry.setdefault("method_id", dm[0])
+                                        call_entry.setdefault("item_kind", dm[3])
+                                        call_entry.setdefault("delta_status", dm[8])
+                                    else:
+                                        lookup_mid = call_entry.get("method_id") or (
+                                            episode_method_ids[0]
+                                            if episode_method_ids
+                                            else None
+                                        )
+                                        if lookup_mid is not None:
+                                            m_row = ro_db.execute(
+                                                """SELECT method_id, item_kind, status
+                                                   FROM method_delta
+                                                   WHERE company_id = ? AND method_id = ?
+                                                   ORDER BY CASE status
+                                                       WHEN 'active' THEN 0
+                                                       WHEN 'candidate' THEN 1
+                                                       ELSE 2
+                                                   END, created_at_ns DESC
+                                                   LIMIT 1""",
+                                                (company_id, lookup_mid),
+                                            ).fetchone()
+                                            if m_row is not None:
+                                                call_entry.setdefault(
+                                                    "method_id", str(m_row[0])
+                                                )
+                                                call_entry.setdefault(
+                                                    "item_kind", str(m_row[1])
+                                                )
+                                                call_entry.setdefault(
+                                                    "delta_status", str(m_row[2])
+                                                )
+                            calls_list.append(call_entry)
                     shift_ok = (
-                        executed_run_id is not None
+                        step_summary is not None
+                        and executed_run_id is not None
                         and settled_count >= 1
                         and dec_row is not None
                         and fatal_calls == 0
@@ -1657,14 +1831,21 @@ def run_recursive_learning_cycle(
                         "invariant_breach": False,
                         "unauthorized_ledger_mutation": False,
                     }
-                    obs_doc = {
+                    executed_runs_list = (
+                        list(step_summary.executed_runs)
+                        if step_summary is not None
+                        else ([executed_run_id] if executed_run_id is not None else [])
+                    )
+                    obs_doc: dict[str, Any] = {
                         "settled_items": settled_count,
                         "case_id": _case,
-                        "executed_runs": list(step_summary.executed_runs),
+                        "executed_runs": executed_runs_list,
                     }
+                    if step_error is not None:
+                        obs_doc["error"] = step_error
                     outcome_str = "completed" if shift_ok else "failed"
                     usage_doc = {
-                        "turns": len(step_summary.executed_runs),
+                        "turns": len(executed_runs_list),
                         "tokens": total_tokens,
                         "wall_seconds": max(
                             0.001, round(monotonic() - slot_started, 6)

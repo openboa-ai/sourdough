@@ -297,9 +297,9 @@ def accept_handoff(
             and successor_id is not None
             and accepted_run_id == claim.run_id
         ):
-            if (
-                expected_state_version is not None
-                and int(state_version) != expected_state_version
+            if expected_state_version is not None and expected_state_version not in (
+                int(state_version),
+                int(state_version) - 1,
             ):
                 raise DutyRefused("Handoff offer state version mismatch")
             return str(successor_id)

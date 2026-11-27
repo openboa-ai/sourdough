@@ -173,6 +173,18 @@ def read_messages(
             and revision != expected_membership_revision
         ):
             raise DutyRefused("Project discussion membership changed")
+        after_position: int | None = None
+        if after != "":
+            cursor_row = database.execute(
+                """SELECT rowid
+                   FROM project_message
+                   WHERE company_id=? AND project_id=? AND message_id=?
+                     AND EXISTS (SELECT 1 FROM json_each(audience) WHERE value=?)""",
+                (claim.company_id, project_id, after, claim.founder_id),
+            ).fetchone()
+            if cursor_row is None:
+                raise DutyRefused("Project discussion cursor is unavailable")
+            after_position = int(cursor_row[0])
         page = database.execute(
             f"""WITH visible AS (
                     SELECT rowid AS position,{_FIELDS} FROM project_message
@@ -180,9 +192,15 @@ def read_messages(
                       AND EXISTS (SELECT 1 FROM json_each(audience) WHERE value=?)
                 )
                 SELECT {_FIELDS} FROM visible
-                WHERE ?='' OR position>(SELECT position FROM visible WHERE message_id=?)
+                WHERE ? IS NULL OR position > ?
                 ORDER BY position LIMIT 17""",
-            (claim.company_id, project_id, claim.founder_id, after, after),
+            (
+                claim.company_id,
+                project_id,
+                claim.founder_id,
+                after_position,
+                after_position,
+            ),
         ).fetchall()
         messages = []
         for row in page[:16]:

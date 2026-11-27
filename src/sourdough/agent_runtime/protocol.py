@@ -6,7 +6,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -267,12 +267,38 @@ class ContextPack:
 
 
 def skill_slug(method_id: str) -> str:
-    """Return a safe normalized directory slug for an active method/skill ID."""
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", method_id.strip()).strip(".-")
+    """Return a safe case-normalized directory slug for an active method/skill ID."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", method_id.strip()).strip(".-").lower()
     return slug or "skill"
 
 
 _skill_slug = skill_slug
+
+
+def assign_skill_slugs(method_ids: Sequence[str]) -> dict[str, str]:
+    """Map distinct method_ids to collision-free, case-folded directory slugs."""
+    unique_ids = sorted({str(mid).strip() for mid in method_ids if str(mid).strip()})
+    groups: dict[str, list[str]] = {}
+    for mid in unique_ids:
+        groups.setdefault(skill_slug(mid), []).append(mid)
+
+    assigned: dict[str, str] = {}
+    used: set[str] = set()
+    for base, mids in sorted(groups.items()):
+        if len(mids) == 1 and base not in used:
+            assigned[mids[0]] = base
+            used.add(base)
+            continue
+        for mid in mids:
+            digest = sha256(mid.encode("utf-8")).hexdigest()
+            width = 8
+            candidate = f"{base}-{digest[:width]}"
+            while candidate in used:
+                width += 4
+                candidate = f"{base}-{digest[:width]}"
+            assigned[mid] = candidate
+            used.add(candidate)
+    return assigned
 
 
 def summarize_when_to_use(raw: Mapping[str, Any]) -> str:
@@ -359,6 +385,17 @@ def project_skill_index(
 ) -> list[dict[str, Any]]:
     """Return a deterministically sorted lean Skill Index list for ContextPack v2."""
     entries = [project_skill_index_entry(item) for item in active_methods]
+    slug_map = assign_skill_slugs([e["method_id"] for e in entries])
+    for entry in entries:
+        disambiguated = slug_map.get(entry["method_id"])
+        if disambiguated and disambiguated != entry["skill_name"]:
+            default_slug = _skill_slug(entry["method_id"])
+            if (
+                entry["skill_name"] == default_slug
+                or entry["skill_name"].lower() == default_slug
+            ):
+                entry["skill_name"] = disambiguated
+                entry["skill_path"] = f"skills/{disambiguated}/SKILL.md"
     entries.sort(
         key=lambda e: (e["method_id"], e["revision_sha256"], e["audience_scope"])
     )

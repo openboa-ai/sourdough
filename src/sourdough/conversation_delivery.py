@@ -71,26 +71,50 @@ def read_inbox(
     claim: DutyClaim | WorkRunClaim,
     purpose: str,
     after: str,
+    *,
+    project_id: str | None = None,
 ) -> tuple[tuple[Delivery, ...], str]:
     _check_cursor(after, allow_empty=True)
+    if project_id is not None:
+        _check_reference(project_id)
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
         require_desk(database, claim, purpose)
+        after_rowid: int | None = None
+        if after != "":
+            cursor_row = database.execute(
+                """SELECT d.rowid
+                   FROM project_delivery d
+                   JOIN project_message m ON m.message_id = d.message_id
+                   JOIN shared_project p ON p.project_id = m.project_id
+                   WHERE d.company_id = ? AND d.recipient_id = ? AND d.delivery_id = ?
+                     AND EXISTS (SELECT 1 FROM json_each(p.members) WHERE value = d.recipient_id)
+                     AND (? IS NULL OR m.project_id = ?)""",
+                (
+                    claim.company_id,
+                    claim.founder_id,
+                    after,
+                    project_id,
+                    project_id,
+                ),
+            ).fetchone()
+            if cursor_row is None:
+                raise DutyRefused("Project delivery cursor is unavailable")
+            after_rowid = int(cursor_row[0])
         rows = database.execute(
             """SELECT d.delivery_id,d.message_id,m.project_id,m.sender_id,d.read_run_id """
             + _VISIBLE
-            + """ AND (?='' OR d.rowid>(
-                SELECT rowid FROM project_delivery
-                WHERE company_id=? AND recipient_id=? AND delivery_id=?
-               )) ORDER BY d.rowid LIMIT 17""",
+            + """ AND (? IS NULL OR m.project_id = ?)
+                AND (? IS NULL OR d.rowid > ?)
+                ORDER BY d.rowid LIMIT 17""",
             (
                 claim.company_id,
                 claim.founder_id,
-                after,
-                claim.company_id,
-                claim.founder_id,
-                after,
+                project_id,
+                project_id,
+                after_rowid,
+                after_rowid,
             ),
         ).fetchall()
         page = tuple(Delivery(*row) for row in rows[:16])

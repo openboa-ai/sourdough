@@ -23,6 +23,7 @@ from .agent_desk import (
     write_desk_harness_files,
 )
 from .agent_runtime.protocol import (
+    assign_skill_slugs as _assign_skill_slugs,
     skill_slug as _skill_slug,
     summarize_when_to_use as _summarize_when_to_use,
 )
@@ -55,9 +56,11 @@ _MAX_BODY_BYTES = 65_536
 _MAX_NOTE_CHARS = 2000
 
 _PRIVATE_DESK_PATH_RE = re.compile(
-    r"(?:\.desk/(?:drafts|scratch|logs|mounts)/[^\s,;)\]}\"']+|"
-    r"(?:^|(?<=[\s\"'(/]))desks/[A-Za-z0-9._-]+/[^\s,;)\]}\"']*|"
-    r"private_(?:desk|draft):[A-Za-z0-9._:/-]+)"
+    r"(?:"
+    r"\.desk(?:/|\\|%2[fF]|%5[cC])(?:drafts|scratch|logs|mounts)(?:(?:/|\\|%2[fF]|%5[cC])[^\s,;)\]}\"']*)?|"
+    r"(?<![A-Za-z0-9_])(?i:desks)(?:/|\\|%2[fF]|%5[cC])[A-Za-z0-9._-]+(?:(?:/|\\|%2[fF]|%5[cC])[^\s,;)\]}\"']*)?|"
+    r"private_(?:desk|draft):[A-Za-z0-9._:/\\%-]*"
+    r")"
 )
 _SECRET_TOKEN_RE = re.compile(
     r"(?:"
@@ -238,14 +241,14 @@ class ActiveMethod:
             payload["procedure_meta"] = dict(self.procedure_meta)
         return payload
 
-    def to_index_dict(self) -> dict[str, Any]:
-        slug = _skill_slug(self.method_id)
+    def to_index_dict(self, *, slug: str | None = None) -> dict[str, Any]:
+        eff_slug = slug or _skill_slug(self.method_id)
         return {
             "method_id": self.method_id,
-            "skill_name": slug,
+            "skill_name": eff_slug,
             "item_kind": self.item_kind,
             "when_to_use": _summarize_when_to_use({"trigger_spec": self.trigger_spec}),
-            "skill_path": f"skills/{slug}/SKILL.md",
+            "skill_path": f"skills/{eff_slug}/SKILL.md",
             "revision_sha256": self.revision_sha256,
             "audience_scope": self.audience_scope,
         }
@@ -507,17 +510,24 @@ def _verify_source_refs(
 
         elif kind == "tool_call_receipt":
             rec_row = db.execute(
-                """SELECT company_id, agent_id FROM tool_call_receipt
-                   WHERE company_id = ? AND call_id = ?
+                """SELECT 1 FROM tool_call_receipt
+                   WHERE company_id = ? AND agent_id = ? AND call_id = ?
                    LIMIT 1""",
-                (company_id, ident),
+                (company_id, agent_id, ident),
             ).fetchone()
             if rec_row is None:
-                missing.append(ref)
-            elif str(rec_row[1]) != agent_id:
-                raise MethodRefused(
-                    f"Agent '{agent_id}' is not authorized to cite tool_call_receipt '{ident}'"
-                )
+                any_row = db.execute(
+                    """SELECT 1 FROM tool_call_receipt
+                       WHERE company_id = ? AND call_id = ?
+                       LIMIT 1""",
+                    (company_id, ident),
+                ).fetchone()
+                if any_row is None:
+                    missing.append(ref)
+                else:
+                    raise MethodRefused(
+                        f"Agent '{agent_id}' is not authorized to cite tool_call_receipt '{ident}'"
+                    )
 
         elif kind == "agent_episode":
             ep_row = db.execute(
@@ -1782,6 +1792,50 @@ def activate_method_delta(
             raise MethodRefused(
                 "Candidate or its lineage ancestor/snapshot is quarantined"
             )
+        quarantined_target = db.execute(
+            """SELECT 1 FROM method_activation
+               WHERE company_id = ? AND method_id = ? AND quarantined = 1
+               LIMIT 1""",
+            (company_id, delta.method_id),
+        ).fetchone()
+        if quarantined_target is None:
+            quarantined_target = db.execute(
+                """SELECT 1 FROM method_delta
+                   WHERE company_id = ? AND method_id = ? AND status = 'quarantined'
+                   LIMIT 1""",
+                (company_id, delta.method_id),
+            ).fetchone()
+        if quarantined_target is not None:
+            raise MethodRefused(
+                f"Method '{delta.method_id}' has an active quarantine and cannot be activated"
+            )
+        active_row = db.execute(
+            """SELECT revision_sha256 FROM method_delta
+               WHERE company_id = ? AND method_id = ?
+                 AND audience_scope = ?
+                 AND (audience_target_id IS ? OR audience_target_id = ?)
+                 AND status = 'active'
+               LIMIT 1""",
+            (
+                company_id,
+                delta.method_id,
+                delta.audience_scope,
+                delta.audience_target_id,
+                delta.audience_target_id,
+            ),
+        ).fetchone()
+        if delta.delta_kind == "ADD":
+            if active_row is not None:
+                raise MethodRefused(
+                    f"CAS conflict: method '{delta.method_id}' already has active revision "
+                    f"'{active_row[0]}' (use PATCH or DEPRECATE)"
+                )
+        elif delta.delta_kind in ("PATCH", "DEPRECATE"):
+            if active_row is None or str(active_row[0]) != delta.superseded_revision:
+                raise MethodRefused(
+                    f"CAS conflict: superseded_revision '{delta.superseded_revision}' "
+                    f"does not match active revision '{active_row[0] if active_row is not None else None}'"
+                )
 
         if qualification_id is not None:
             q_row = db.execute(
@@ -2503,12 +2557,13 @@ def skill_precedence_key(method: ActiveMethod) -> tuple[int, int, str, str]:
     )
 
 
-def _render_skill_markdown(method: ActiveMethod) -> str:
+def _render_skill_markdown(method: ActiveMethod, *, slug: str | None = None) -> str:
+    eff_slug = slug or _skill_slug(method.method_id)
     summary = " ".join(method.body_text.strip().splitlines())[:160].strip()
     trigger_json = _canonical_json(method.trigger_spec)
     frontmatter = [
         "---",
-        f"name: {_skill_slug(method.method_id)}",
+        f"name: {eff_slug}",
         f"description: {json.dumps(summary)}",
         f"method_id: {method.method_id}",
         f"revision_sha256: {method.revision_sha256}",
@@ -2561,6 +2616,7 @@ def _render_agents_markdown(
     projects: Sequence[str],
     active_methods: Sequence[ActiveMethod],
     active_snapshot_id: str | None,
+    slug_by_method_id: Mapping[str, str] | None = None,
 ) -> str:
     lines = [
         f"# Agent Desk — {display_name} ({agent_id})",
@@ -2599,7 +2655,11 @@ def _render_agents_markdown(
     lines.append("## Active Skills (`skills/<skill-name>/SKILL.md`)")
     if active_methods:
         for method in active_methods:
-            slug = _skill_slug(method.method_id)
+            slug = (
+                slug_by_method_id.get(method.method_id)
+                if slug_by_method_id is not None
+                else None
+            ) or _skill_slug(method.method_id)
             lines.append(
                 f"- `{method.method_id}` (`{method.item_kind}`, scope=`{method.audience_scope}`, "
                 f"rev=`{method.revision_sha256[:12]}`): `skills/{slug}/SKILL.md`"
@@ -2726,6 +2786,13 @@ def sync_desk_harness_projections(
         if active_snapshot_id is not None
         else compute_active_snapshot_id(methods)
     )
+    winning_by_method: dict[str, ActiveMethod] = {}
+    for method in methods:
+        prior = winning_by_method.get(method.method_id)
+        if prior is None or skill_precedence_key(method) > skill_precedence_key(prior):
+            winning_by_method[method.method_id] = method
+    slug_by_method_id = _assign_skill_slugs(list(winning_by_method.keys()))
+
     agents_md = _render_agents_markdown(
         company_id=company_id,
         charter_revision=charter_revision,
@@ -2738,18 +2805,16 @@ def sync_desk_harness_projections(
         projects=projects,
         active_methods=methods,
         active_snapshot_id=eff_snap,
+        slug_by_method_id=slug_by_method_id,
     )
-    winning_by_slug: dict[str, ActiveMethod] = {}
-    for method in methods:
-        slug = _skill_slug(method.method_id)
-        prior = winning_by_slug.get(slug)
-        if prior is None or skill_precedence_key(method) > skill_precedence_key(prior):
-            winning_by_slug[slug] = method
+    winning_by_slug: dict[str, ActiveMethod] = {
+        slug_by_method_id[mid]: method for mid, method in winning_by_method.items()
+    }
 
     skills_payload: dict[str, dict[str, bytes]] = {}
     for slug, method in winning_by_slug.items():
         skill_files: dict[str, bytes] = {
-            "SKILL.md": _render_skill_markdown(method).encode("utf-8")
+            "SKILL.md": _render_skill_markdown(method, slug=slug).encode("utf-8")
         }
         if method.item_kind == "helper_script":
             meta = method.procedure_meta or {}
@@ -2815,9 +2880,9 @@ def rehydrate_desk(store: Path, company_id: str, agent_id: str) -> Path:
     return desk
 
 
-def render_skill_markdown(method: ActiveMethod) -> str:
+def render_skill_markdown(method: ActiveMethod, *, slug: str | None = None) -> str:
     """Render deterministic SKILL.md frontmatter + Markdown body for an ActiveMethod."""
-    return _render_skill_markdown(method)
+    return _render_skill_markdown(method, slug=slug)
 
 
 def build_causal_method_trace(

@@ -115,8 +115,8 @@ class GeminiGenerateContentAdapter:
             usage_obj = response.get("usageMetadata")
             if isinstance(usage_obj, dict):
                 round_usage = TokenUsage(
-                    input_tokens=int(usage_obj.get("promptTokenCount", 0)),
-                    output_tokens=int(usage_obj.get("candidatesTokenCount", 0)),
+                    input_tokens=int(usage_obj.get("promptTokenCount") or 0),
+                    output_tokens=int(usage_obj.get("candidatesTokenCount") or 0),
                 )
                 total_usage = total_usage + round_usage
                 broker.record_usage(round_usage)

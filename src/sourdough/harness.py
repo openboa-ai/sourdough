@@ -286,6 +286,7 @@ def build_desk_sandbox_profile(
     )
     read_subpaths = "\n".join(f"    (subpath {_sbpl_quote(Path(r))})" for r in py_roots)
     rw_entries = [f"    (subpath {_sbpl_quote(resolved_desk)})"]
+    resolved_scratch: Path | None = None
     if scratch_dir is not None:
         resolved_scratch = scratch_dir.resolve(strict=False)
         for forbidden in (resolved_parent, resolved_desks, resolved_traces):
@@ -314,6 +315,20 @@ def build_desk_sandbox_profile(
     store_shm = Path(f"{resolved_store}-shm")
     agents_md_path = resolved_desk / "AGENTS.md"
     skills_dir_path = resolved_desk / "skills"
+    dotdesk_dir_path = resolved_desk / ".desk"
+    dotdesk_scratch_path = dotdesk_dir_path / "scratch"
+    drafts_dir_path = resolved_desk / ".desk" / "drafts"
+    logs_dir_path = resolved_desk / ".desk" / "logs"
+    scratch_rules: list[str] = []
+    if resolved_scratch is not None:
+        scratch_rules.extend(
+            [
+                f"(allow file-write* (subpath {_sbpl_quote(dotdesk_scratch_path)}))",
+                f"(deny file-write* (literal {_sbpl_quote(dotdesk_scratch_path)}))",
+                f"(allow file-write* (subpath {_sbpl_quote(resolved_scratch)}))",
+                f"(deny file-write* (literal {_sbpl_quote(resolved_scratch)}))",
+            ]
+        )
     return "\n".join(
         [
             "(version 1)",
@@ -333,7 +348,11 @@ def build_desk_sandbox_profile(
             *extra_file_lines,
             "(deny file-write*",
             f"    (literal {_sbpl_quote(agents_md_path)})",
-            f"    (subpath {_sbpl_quote(skills_dir_path)}))",
+            f"    (subpath {_sbpl_quote(skills_dir_path)})",
+            f"    (subpath {_sbpl_quote(dotdesk_dir_path)})",
+            f"    (subpath {_sbpl_quote(drafts_dir_path)})",
+            f"    (subpath {_sbpl_quote(logs_dir_path)}))",
+            *scratch_rules,
             "(deny file-read* file-write*",
             f"    (literal {_sbpl_quote(resolved_store)})",
             f"    (literal {_sbpl_quote(store_wal)})",

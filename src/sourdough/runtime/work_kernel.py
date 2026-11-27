@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
+from pathlib import Path
 from time import time_ns
 from typing import Any
 from uuid import uuid4
@@ -389,6 +390,12 @@ def sync_duty_terminal(
                 """UPDATE work_items
                    SET state = 'cancelled', updated_at_ns = ?
                    WHERE work_item_id = ?""",
+                (timestamp, target_id),
+            )
+            connection.execute(
+                """UPDATE work_conditions
+                   SET status = 'cancelled', updated_at_ns = ?
+                   WHERE work_item_id = ? AND status = 'armed'""",
                 (timestamp, target_id),
             )
             outbound = connection.execute(
@@ -1496,15 +1503,25 @@ def reclaim_expired_runs(
 ) -> tuple[str, ...]:
     """Fence running work_runs whose lease expired and return items to due."""
     expired = connection.execute(
-        """SELECT run_id, work_item_id, fencing_token
+        """SELECT run_id, work_item_id, fencing_token, agent_id
            FROM work_runs
            WHERE company_id = ? AND status = 'running'
              AND lease_expires_at_ns IS NOT NULL AND lease_expires_at_ns <= ?
            ORDER BY created_at_ns, run_id""",
         (company_id, now_ns),
     ).fetchall()
+    store_path: Path | None = None
+    for _seq, db_name, db_file in connection.execute("PRAGMA database_list").fetchall():
+        if (
+            db_name == "main"
+            and isinstance(db_file, str)
+            and db_file
+            and db_file != ":memory:"
+        ):
+            store_path = Path(db_file)
+            break
     fenced_runs: list[str] = []
-    for run_id, work_item_id, token in expired:
+    for run_id, work_item_id, token, agent_id in expired:
         changed = connection.execute(
             """UPDATE work_runs
                SET status = 'fenced', lease_owner = NULL, updated_at_ns = ?
@@ -1531,6 +1548,13 @@ def reclaim_expired_runs(
             payload={"work_item_id": work_item_id, "fencing_token": token},
             recorded_at_ns=now_ns,
         )
+        if store_path is not None:
+            try:
+                from ..agent_desk import cleanup_run_scratch
+
+                cleanup_run_scratch(store_path, str(agent_id), str(run_id))
+            except Exception:
+                pass
         fenced_runs.append(str(run_id))
     return tuple(fenced_runs)
 
@@ -1684,15 +1708,26 @@ def _arm_next_condition(
         connection, company_id=company_id, next_condition=next_condition
     )
     resp_arg = next_condition.get("responsibility_id")
-    item_arg = (
-        work_item_id
-        if always_link_work_item
-        else (
-            work_item_id
-            if resp_arg is None and next_condition.get("work_item_id") is None
-            else next_condition.get("work_item_id")
-        )
-    )
+    is_discretionary_resp = False
+    if isinstance(resp_arg, str) and resp_arg.strip():
+        r_row = connection.execute(
+            """SELECT duty_kind FROM work_responsibilities
+               WHERE company_id = ? AND responsibility_id = ?""",
+            (company_id, resp_arg.strip()),
+        ).fetchone()
+        if r_row is not None and str(r_row[0]) in (
+            "work.discovery_review",
+            "work.dreaming",
+        ):
+            is_discretionary_resp = True
+    if is_discretionary_resp:
+        item_arg = None
+    elif always_link_work_item:
+        item_arg = work_item_id
+    elif resp_arg is None and next_condition.get("work_item_id") is None:
+        item_arg = work_item_id
+    else:
+        item_arg = next_condition.get("work_item_id")
     return set_condition(
         connection,
         company_id=company_id,
@@ -1756,7 +1791,10 @@ def complete_work_run(
             work_item_id=run.work_item_id,
             next_condition=validated_next,
             now_ns=timestamp,
-            always_link_work_item=True,
+            always_link_work_item=(
+                run.duty_kind not in ("work.discovery_review", "work.dreaming")
+                and validated_next.get("responsibility_id") is None
+            ),
         )
     append_audit_event(
         connection,
@@ -1887,6 +1925,41 @@ def list_conditions(
     return tuple(WorkCondition(*row) for row in rows)
 
 
+def _is_authorized_for_shared_publication(
+    connection: sqlite3.Connection,
+    company_id: str,
+    agent_id: str,
+    asset_id: str,
+) -> bool | None:
+    """Return True if agent may access existing shared_publication, False if unauthorized, None if nonexistent."""
+    pub_row = connection.execute(
+        """SELECT company_id, project_id, audience
+           FROM shared_publication
+           WHERE asset_id = ?""",
+        (asset_id,),
+    ).fetchone()
+    if pub_row is None:
+        return None
+    pub_company, pub_project, audience_json = pub_row
+    if str(pub_company) != company_id:
+        return False
+    try:
+        audience = set(json.loads(str(audience_json)))
+    except json.JSONDecodeError:
+        return False
+    proj_row = connection.execute(
+        "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
+        (company_id, str(pub_project)),
+    ).fetchone()
+    if proj_row is None:
+        return False
+    try:
+        members = set(json.loads(str(proj_row[0])))
+    except json.JSONDecodeError:
+        return False
+    return agent_id in audience and agent_id in members
+
+
 def _insert_work_condition(
     connection: sqlite3.Connection,
     *,
@@ -1924,10 +1997,18 @@ def _insert_work_condition(
         type(expires_at_ns) is not int or expires_at_ns < 0
     ):
         raise WorkKernelRefused("expires_at_ns must be a nonnegative integer")
-    if trigger_kind == "shared_asset_revision" and (
-        not source_identity or not source_identity.strip()
-    ):
-        raise WorkKernelRefused("Asset revision condition requires source_identity")
+    if trigger_kind == "shared_asset_revision":
+        if not source_identity or not source_identity.strip():
+            raise WorkKernelRefused("Asset revision condition requires source_identity")
+        if (
+            _is_authorized_for_shared_publication(
+                connection, company_id, owner_agent_id, source_identity
+            )
+            is False
+        ):
+            raise WorkKernelRefused(
+                "Agent is not authorized to watch shared_publication"
+            )
     if trigger_kind == "peer_response" and (
         not source_identity or not source_identity.strip()
     ):
@@ -2532,8 +2613,11 @@ def evaluate_conditions(
            ORDER BY
                CASE
                    WHEN c.trigger_kind = 'peer_response'
-                        OR c.work_item_id IS NOT NULL
                         OR c.source_identity LIKE 'result_dep:%'
+                        OR (
+                            c.work_item_id IS NOT NULL
+                            AND COALESCE(r.duty_kind, '') NOT IN ('work.discovery_review', 'work.dreaming')
+                        )
                         OR (
                             r.duty_kind IS NOT NULL
                             AND r.duty_kind NOT IN ('work.discovery_review', 'work.dreaming')
@@ -2576,6 +2660,17 @@ def evaluate_conditions(
                 (now_ns, cid),
             )
             continue
+        if parent_item_id is not None:
+            p_state_row = connection.execute(
+                "SELECT state FROM work_items WHERE company_id = ? AND work_item_id = ?",
+                (company_id, parent_item_id),
+            ).fetchone()
+            if p_state_row is not None and str(p_state_row[0]) == "cancelled":
+                connection.execute(
+                    "UPDATE work_conditions SET status = 'cancelled', updated_at_ns = ? WHERE condition_id = ?",
+                    (now_ns, cid),
+                )
+                continue
         if employment_cutoff(connection, owner_agent_id) is not None:
             connection.execute(
                 "UPDATE work_conditions SET status = 'cancelled', updated_at_ns = ? WHERE condition_id = ?",
@@ -2618,6 +2713,17 @@ def evaluate_conditions(
             else:
                 eligible = True
         elif trigger_kind == "shared_asset_revision" and source_identity:
+            if (
+                _is_authorized_for_shared_publication(
+                    connection, company_id, owner_agent_id, source_identity
+                )
+                is False
+            ):
+                connection.execute(
+                    "UPDATE work_conditions SET status = 'cancelled', updated_at_ns = ? WHERE condition_id = ?",
+                    (now_ns, cid),
+                )
+                continue
             pub_row = connection.execute(
                 """SELECT author_id, content FROM shared_publication
                    WHERE company_id = ? AND asset_id = ?""",
@@ -2728,7 +2834,7 @@ def evaluate_conditions(
             (company_id, dedupe_source, int(cond_rev)),
         ).fetchone()
         is_multi_fire = trigger_kind == "shared_asset_revision" and (
-            (max_fires is not None and fire_count < max_fires)
+            (max_fires is not None and max_fires > 1)
             or (max_fires is None and cooldown_ns > 0)
         )
         if already is not None:
@@ -2759,14 +2865,20 @@ def evaluate_conditions(
                 duty_kind = str(parent_kind[0])
         duty_kind = duty_kind or "work.discovery_review"
 
+        is_result_dep = isinstance(source_identity, str) and source_identity.startswith(
+            "result_dep:"
+        )
+        effective_parent_id = (
+            None
+            if duty_kind in ("work.discovery_review", "work.dreaming")
+            and not is_result_dep
+            else parent_item_id
+        )
         is_discretionary = (
             resp_id is not None
-            and parent_item_id is None
+            and effective_parent_id is None
             and duty_kind in ("work.discovery_review", "work.dreaming")
-            and not (
-                isinstance(source_identity, str)
-                and source_identity.startswith("result_dep:")
-            )
+            and not is_result_dep
         )
         disc_noops = 0
         disc_cooldown_until = 0
@@ -2853,6 +2965,13 @@ def evaluate_conditions(
                             now_ns,
                         ),
                     )
+                    if not is_multi_fire:
+                        connection.execute(
+                            """UPDATE work_conditions
+                               SET status = 'triggered', fire_count = fire_count + 1, updated_at_ns = ?
+                               WHERE condition_id = ? AND condition_revision = ? AND status = 'armed'""",
+                            (now_ns, cid, int(cond_rev)),
+                        )
                 continue
 
         item, _ = create_work_item(
@@ -2862,7 +2981,7 @@ def evaluate_conditions(
             duty_kind=duty_kind,
             source_kind="condition",
             source_id=cid,
-            parent_work_item_id=parent_item_id,
+            parent_work_item_id=effective_parent_id,
             payload={
                 "condition_id": cid,
                 "condition_revision": int(cond_rev),
@@ -3052,42 +3171,45 @@ def _validate_core_evidence_entry(
                WHERE asset_id = ?""",
             (ev.resource_id,),
         ).fetchone()
-        if pub_row is not None:
-            pub_company, pub_project, audience_json, content = pub_row
-            if str(pub_company) != company_id:
-                raise WorkKernelRefused(
-                    "Cited shared_publication belongs to another company"
-                )
-            try:
-                audience = set(json.loads(str(audience_json)))
-            except json.JSONDecodeError:
-                audience = set()
-            proj_row = connection.execute(
-                "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
-                (company_id, str(pub_project)),
-            ).fetchone()
-            try:
-                members = set(json.loads(str(proj_row[0]))) if proj_row else set()
-            except json.JSONDecodeError:
-                members = set()
-            if agent_id not in audience or agent_id not in members:
-                raise WorkKernelRefused(
-                    "Agent is not authorized to cite shared_publication"
-                )
-            actual_rev = sha256(str(content).encode("utf-8")).hexdigest()
-            if ev.revision != actual_rev:
-                raise WorkKernelRefused(
-                    "Cited shared_publication revision does not match committed content"
-                )
+        if pub_row is None:
+            raise WorkKernelRefused("Cited shared_publication does not exist")
+        pub_company, pub_project, audience_json, content = pub_row
+        if str(pub_company) != company_id:
+            raise WorkKernelRefused(
+                "Cited shared_publication belongs to another company"
+            )
+        try:
+            audience = set(json.loads(str(audience_json)))
+        except json.JSONDecodeError:
+            audience = set()
+        proj_row = connection.execute(
+            "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
+            (company_id, str(pub_project)),
+        ).fetchone()
+        try:
+            members = set(json.loads(str(proj_row[0]))) if proj_row else set()
+        except json.JSONDecodeError:
+            members = set()
+        if agent_id not in audience or agent_id not in members:
+            raise WorkKernelRefused(
+                "Agent is not authorized to cite shared_publication"
+            )
+        actual_rev = sha256(str(content).encode("utf-8")).hexdigest()
+        if ev.revision != actual_rev:
+            raise WorkKernelRefused(
+                "Cited shared_publication revision does not match committed content"
+            )
     elif ev.kind == "peer_request":
         req_row = connection.execute(
             """SELECT company_id, requester_agent_id, recipient_agent_id
                FROM work_peer_requests WHERE request_id = ?""",
             (ev.resource_id,),
         ).fetchone()
-        if req_row is not None and (
-            str(req_row[0]) != company_id
-            or agent_id not in (str(req_row[1]), str(req_row[2]))
+        if req_row is None:
+            raise WorkKernelRefused("Cited peer_request does not exist")
+        if str(req_row[0]) != company_id or agent_id not in (
+            str(req_row[1]),
+            str(req_row[2]),
         ):
             raise WorkKernelRefused("Agent is not authorized to cite peer_request")
     elif ev.kind == "work_run":
@@ -3095,26 +3217,35 @@ def _validate_core_evidence_entry(
             "SELECT company_id, agent_id FROM work_runs WHERE run_id = ?",
             (ev.resource_id,),
         ).fetchone()
-        if run_row is not None and (
-            str(run_row[0]) != company_id or str(run_row[1]) != agent_id
-        ):
+        if run_row is None:
+            raise WorkKernelRefused("Cited work_run does not exist")
+        if str(run_row[0]) != company_id or str(run_row[1]) != agent_id:
             raise WorkKernelRefused("Agent is not authorized to cite work_run")
     elif ev.kind == "work_item":
         item_row = connection.execute(
             "SELECT company_id, owner_agent_id FROM work_items WHERE work_item_id = ?",
             (ev.resource_id,),
         ).fetchone()
-        if item_row is not None and (
-            str(item_row[0]) != company_id or str(item_row[1]) != agent_id
-        ):
+        if item_row is None:
+            raise WorkKernelRefused("Cited work_item does not exist")
+        if str(item_row[0]) != company_id or str(item_row[1]) != agent_id:
             raise WorkKernelRefused("Agent is not authorized to cite work_item")
     elif ev.kind == "tool_call_receipt":
         rec_row = connection.execute(
-            """SELECT company_id, agent_id FROM tool_call_receipt
-               WHERE company_id = ? AND call_id = ? LIMIT 1""",
-            (company_id, ev.resource_id),
+            """SELECT 1 FROM tool_call_receipt
+               WHERE company_id = ? AND agent_id = ? AND call_id = ?
+               LIMIT 1""",
+            (company_id, agent_id, ev.resource_id),
         ).fetchone()
-        if rec_row is not None and str(rec_row[1]) != agent_id:
+        if rec_row is None:
+            any_row = connection.execute(
+                """SELECT 1 FROM tool_call_receipt
+                   WHERE company_id = ? AND call_id = ?
+                   LIMIT 1""",
+                (company_id, ev.resource_id),
+            ).fetchone()
+            if any_row is None:
+                raise WorkKernelRefused("Cited tool_call_receipt does not exist")
             raise WorkKernelRefused("Agent is not authorized to cite tool_call_receipt")
 
 
@@ -3417,6 +3548,7 @@ def open_peer_request(
         _require_nonempty(project_id, "project_id")
     _require_agent(connection, company_id, recipient_agent_id)
     evidence_json = _canonical_json(sorted(evidence_refs))
+    timestamp = time_ns() if now_ns is None else now_ns
 
     existing = None
     if request_key is not None:
@@ -3433,6 +3565,47 @@ def open_peer_request(
         ).fetchone()
     if existing is not None:
         prior = PeerRequest(*existing)
+        run_row = connection.execute(
+            """SELECT run_id, company_id, work_item_id, agent_id, duty_kind, status,
+                      fencing_token, lease_owner, lease_expires_at_ns, wait_until_ns,
+                      wait_event_key, budget_ceiling_minor, dedupe_key, outcome_json,
+                      created_at_ns, updated_at_ns
+               FROM work_runs
+               WHERE run_id = ?""",
+            (requester_run_id,),
+        ).fetchone()
+        if run_row is None:
+            raise RunFenced("Work run does not exist")
+        replay_run = WorkRun(*run_row)
+        if replay_run.fencing_token != fencing_token:
+            raise RunFenced(
+                f"Run {requester_run_id} is fenced (token={replay_run.fencing_token} != {fencing_token})"
+            )
+        if replay_run.status == "running":
+            replay_run = assert_run_fencing(
+                connection, requester_run_id, fencing_token, now_ns=timestamp
+            )
+        elif (
+            replay_run.status == "waiting"
+            and prior.requester_run_id == requester_run_id
+        ):
+            if employment_cutoff(connection, replay_run.agent_id) is not None:
+                raise RunFenced(
+                    f"Agent {replay_run.agent_id} employment has been retired"
+                )
+            if not has_active_grant(connection, company_id, replay_run.agent_id):
+                raise RunFenced(
+                    f"Agent {replay_run.agent_id} no longer holds an active grant"
+                )
+        else:
+            raise RunFenced(
+                f"Run {requester_run_id} is fenced (status={replay_run.status})"
+            )
+        if (
+            replay_run.work_item_id != requester_work_item_id
+            or replay_run.company_id != company_id
+        ):
+            raise WorkKernelRefused("Peer request does not match active run identity")
         if (
             prior.company_id != company_id
             or prior.requester_work_item_id != requester_work_item_id
@@ -3448,7 +3621,6 @@ def open_peer_request(
             raise WorkKernelRefused("Peer request conflicts with the original receipt")
         return prior, True
 
-    timestamp = time_ns() if now_ns is None else now_ns
     run = assert_run_fencing(
         connection, requester_run_id, fencing_token, now_ns=timestamp
     )

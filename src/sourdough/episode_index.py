@@ -135,18 +135,39 @@ def _insert_episode_row(conn: sqlite3.Connection, episode: AgentEpisode) -> None
     )
 
 
+def _quarantine_corrupt_index(store: Path, company_id: str) -> None:
+    db_path = episode_index_path(store, company_id)
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if os.path.lexists(candidate):
+            st = os.lstat(candidate)
+            if stat.S_ISLNK(st.st_mode):
+                raise EpisodeIndexRefused("Episode index path must not be a symlink")
+            candidate.unlink()
+
+
 def upsert_episode_entry(store: Path, episode: AgentEpisode) -> None:
     """Incrementally update the derived FTS5 index for one AgentEpisode."""
-    with closing(_open_index_db(store, episode.company_id)) as idx:
-        with idx:
-            _insert_episode_row(idx, episode)
-            idx.execute(
-                """INSERT INTO episodes_fts_meta (singleton, company_id, last_recorded_at_ns)
-                   VALUES (1, ?, ?)
-                   ON CONFLICT(singleton) DO UPDATE SET
-                       last_recorded_at_ns = MAX(episodes_fts_meta.last_recorded_at_ns, excluded.last_recorded_at_ns)""",
-                (episode.company_id, episode.recorded_at_ns),
-            )
+
+    def _write_entry() -> None:
+        with closing(_open_index_db(store, episode.company_id)) as idx:
+            with idx:
+                _insert_episode_row(idx, episode)
+                idx.execute(
+                    """INSERT INTO episodes_fts_meta (singleton, company_id, last_recorded_at_ns)
+                       VALUES (1, ?, ?)
+                       ON CONFLICT(singleton) DO UPDATE SET
+                           last_recorded_at_ns = MAX(episodes_fts_meta.last_recorded_at_ns, excluded.last_recorded_at_ns)""",
+                    (episode.company_id, episode.recorded_at_ns),
+                )
+
+    try:
+        _write_entry()
+    except sqlite3.DatabaseError:
+        _quarantine_corrupt_index(store, episode.company_id)
+        if os.path.lexists(store) and store.is_file():
+            rebuild_episodes_index(store, episode.company_id)
+        _write_entry()
 
 
 def rebuild_episodes_index(store: Path, company_id: str) -> int:

@@ -449,9 +449,11 @@ class M4DeskHarnessRuntimeTests(unittest.TestCase):
             assert_writable_desk_relative_path("AGENTS.md")
         with self.assertRaises(DutyRefused):
             assert_writable_desk_relative_path("skills/m1/SKILL.md")
+        with self.assertRaises(DutyRefused):
+            assert_writable_desk_relative_path(".desk/drafts/ok.json")
         self.assertEqual(
-            assert_writable_desk_relative_path(".desk/drafts/ok.json").as_posix(),
-            ".desk/drafts/ok.json",
+            assert_writable_desk_relative_path("notes/ok.md").as_posix(),
+            "notes/ok.md",
         )
 
         if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():

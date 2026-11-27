@@ -19,7 +19,7 @@ from time import time_ns
 from typing import Any
 
 from ..agent_desk import desk_directory, require_desk
-from ..agent_runtime.protocol import ToolHandler, ToolSpec
+from ..agent_runtime.protocol import ToolHandler, ToolSpec, assign_skill_slugs
 from ..duty_run import DutyRefused, WorkRunClaim
 from ..method_learning import (
     MethodRefused,
@@ -69,7 +69,7 @@ def build_core_skill_tool_contribution(
             if os.path.lexists(part) and stat.S_ISLNK(os.lstat(part).st_mode):
                 raise MethodRefused("Symlinks are forbidden inside Desk skills/")
         if not allow_disk or not os.path.lexists(skill_file):
-            return render_skill_markdown(method)
+            return render_skill_markdown(method, slug=slug)
         st = os.lstat(skill_file)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
             raise MethodRefused("Projected SKILL.md must be a regular file")
@@ -99,20 +99,33 @@ def build_core_skill_tool_contribution(
         writer.verify_for(writer.store, claim.company_id)
         with closing(open_reader(writer.store)) as db, read_tx(db):
             _verify_fencing_and_desk(db)
-            methods = resolve_active_methods(
+            all_methods = resolve_active_methods(
                 db,
                 claim.company_id,
                 agent_id=claim.founder_id,
-                duty_kind=duty_filter,
+                duty_kind=None,
+            )
+            methods = (
+                all_methods
+                if duty_filter is None
+                else resolve_active_methods(
+                    db,
+                    claim.company_id,
+                    agent_id=claim.founder_id,
+                    duty_kind=duty_filter,
+                )
             )
         snap = active_snapshot_id or compute_active_snapshot_id(methods)
         sorted_methods = sorted(
             methods, key=lambda m: (m.method_id, m.revision_sha256, m.audience_scope)
         )
+        slug_map = assign_skill_slugs([m.method_id for m in all_methods])
         return {
             "ok": True,
             "active_snapshot_id": snap,
-            "skills": [m.to_index_dict() for m in sorted_methods],
+            "skills": [
+                m.to_index_dict(slug=slug_map.get(m.method_id)) for m in sorted_methods
+            ],
         }
 
     def _skill_read(args: dict[str, Any]) -> dict[str, Any]:
@@ -153,11 +166,12 @@ def build_core_skill_tool_contribution(
                 agent_id=claim.founder_id,
                 duty_kind=None,
             )
+        slug_map = assign_skill_slugs([m.method_id for m in methods])
         candidates = [
             m
             for m in methods
             if (method_id is None or m.method_id == method_id)
-            and (slug_filter is None or m.to_index_dict()["skill_name"] == slug_filter)
+            and (slug_filter is None or slug_map.get(m.method_id) == slug_filter)
             and (rev_filter is None or m.revision_sha256 == rev_filter)
         ]
         matched = max(candidates, key=skill_precedence_key) if candidates else None
@@ -168,9 +182,9 @@ def build_core_skill_tool_contribution(
             )
         if retrieved_recorder is not None:
             retrieved_recorder(matched.method_id)
-        idx = matched.to_index_dict()
+        idx = matched.to_index_dict(slug=slug_map.get(matched.method_id))
         slug = str(idx["skill_name"])
-        slug_peers = [m for m in methods if m.to_index_dict()["skill_name"] == slug]
+        slug_peers = [m for m in methods if slug_map.get(m.method_id) == slug]
         disk_winner = (
             max(slug_peers, key=skill_precedence_key) if slug_peers else matched
         )

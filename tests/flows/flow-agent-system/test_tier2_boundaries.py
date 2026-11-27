@@ -2670,7 +2670,57 @@ class TestF32DiscoveryDecisionTier2(unittest.TestCase):
         with CoreCompanyHarness() as h:
             h.found_company()
             a = h.hire_agent("dec-a")
+            proj_rev = h.create_project(
+                "p-dec-ev", [a.agent_id], publishers=[a.agent_id]
+            )
             item, _, ca = h.open_work_run_claim(a.agent_id, a.grant_id, a.grant_scope)
+            with h.writer() as w:
+                d_ev1 = save_draft(
+                    w,
+                    ca,
+                    ca.purpose,
+                    name="ev-one",
+                    content="Evidence body one",
+                    expected_revision=None,
+                )
+                asset1 = publish_selection(
+                    w,
+                    ca,
+                    ca.purpose,
+                    Selection(
+                        "pub-ev-1",
+                        "ev-one",
+                        d_ev1.revision,
+                        "p-dec-ev",
+                        proj_rev,
+                        (a.agent_id,),
+                        0,
+                        len(d_ev1.content),
+                    ),
+                )
+                d_ev2 = save_draft(
+                    w,
+                    ca,
+                    ca.purpose,
+                    name="ev-two",
+                    content="Evidence body two",
+                    expected_revision=None,
+                )
+                asset2 = publish_selection(
+                    w,
+                    ca,
+                    ca.purpose,
+                    Selection(
+                        "pub-ev-2",
+                        "ev-two",
+                        d_ev2.revision,
+                        "p-dec-ev",
+                        proj_rev,
+                        (a.agent_id,),
+                        0,
+                        len(d_ev2.content),
+                    ),
+                )
             record_work_decision = lazy_attr(
                 "sourdough.runtime.work_kernel", "record_work_decision"
             )
@@ -2680,8 +2730,8 @@ class TestF32DiscoveryDecisionTier2(unittest.TestCase):
             ev1 = (
                 DecisionEvidence(
                     "shared_publication",
-                    "res-1",
-                    "rev-1",
+                    asset1.asset_id,
+                    sha256_hex(asset1.content),
                     observed_at_ns=1_500,
                     available_at_ns=1_000,
                 ),
@@ -2689,8 +2739,8 @@ class TestF32DiscoveryDecisionTier2(unittest.TestCase):
             ev2 = (
                 DecisionEvidence(
                     "shared_publication",
-                    "res-1",
-                    "rev-2",
+                    asset2.asset_id,
+                    sha256_hex(asset2.content),
                     observed_at_ns=1_500,
                     available_at_ns=1_000,
                 ),

@@ -5,7 +5,8 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Mapping, Sequence
+import unicodedata
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
@@ -111,17 +112,76 @@ def _dir_bytes(directory: Path) -> int:
     return total
 
 
+def _safe_unlink_tree_no_follow(path: Path) -> None:
+    """Remove a file, symlink, or directory tree without ever following symlinks."""
+    if not os.path.lexists(path):
+        return
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        os.unlink(path)
+        return
+    for root_str, dirs, files in os.walk(path, topdown=False, followlinks=False):
+        root_path = Path(root_str)
+        for fname in files:
+            os.unlink(root_path / fname)
+        for dname in dirs:
+            dpath = root_path / dname
+            dst = os.lstat(dpath)
+            if stat.S_ISLNK(dst.st_mode):
+                os.unlink(dpath)
+            else:
+                os.rmdir(dpath)
+    os.rmdir(path)
+
+
+def _active_scratch_run_ids(store: Path, agent_id: str) -> set[str]:
+    if not os.path.lexists(store) or not store.is_file():
+        return set()
+    active: set[str] = set()
+    try:
+        with closing(open_reader(store)) as db, read_tx(db):
+            for (rid,) in db.execute(
+                "SELECT run_id FROM work_runs WHERE agent_id = ? AND status = 'running'",
+                (agent_id,),
+            ).fetchall():
+                if isinstance(rid, str) and rid:
+                    active.add(rid)
+            for (rid,) in db.execute(
+                """SELECT dr.run_id
+                   FROM duty_run dr
+                   JOIN duty d ON d.id = dr.duty_id
+                   WHERE d.agent_id = ? AND d.state = 'running' AND dr.is_current = 1""",
+                (agent_id,),
+            ).fetchall():
+                if isinstance(rid, str) and rid:
+                    active.add(rid)
+    except Exception:
+        return set()
+    return active
+
+
 def allocate_run_scratch(
     store: Path,
     agent_id: str,
     run_id: str,
     *,
     limits: DeskLimits = PRODUCTION_DESK_LIMITS,
+    active_run_ids: Collection[str] | None = None,
 ) -> Path:
     """Create an isolated ephemeral scratch directory for one run under .desk/scratch/<run_id>/."""
     root = store.resolve(strict=False).parent
     scratch_root = desk_directory(store, agent_id) / ".desk" / "scratch"
     target = scratch_directory(store, agent_id, run_id)
+    _ensure_private_dir(scratch_root, root)
+    keep_runs = (
+        set(active_run_ids)
+        if active_run_ids is not None
+        else _active_scratch_run_ids(store, agent_id)
+    )
+    keep_runs.add(run_id)
+    for entry in sorted(scratch_root.iterdir(), key=lambda p: p.name):
+        if entry.name not in keep_runs:
+            _safe_unlink_tree_no_follow(entry)
     _ensure_private_dir(target, root)
     if _dir_bytes(scratch_root) > limits.max_scratch_bytes:
         raise DutyRefused("Private Desk scratch byte quota exceeded")
@@ -132,9 +192,11 @@ def cleanup_run_scratch(store: Path, agent_id: str, run_id: str) -> None:
     """Remove an ephemeral per-run scratch directory safely without following symlinks."""
     root = store.resolve(strict=False).parent
     target = scratch_directory(store, agent_id, run_id)
-    if not _check_no_symlinks(target, root):
+    if not os.path.lexists(target):
         return
-    shutil.rmtree(target, ignore_errors=False)
+    if os.path.lexists(target.parent) and not _check_no_symlinks(target.parent, root):
+        return
+    _safe_unlink_tree_no_follow(target)
 
 
 def compute_agent_desk_digest(store: Path, agent_id: str) -> str:
@@ -211,11 +273,11 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-_HOST_MANAGED_ROOTS = frozenset({"AGENTS.md", "skills"})
+_HOST_MANAGED_ROOTS = frozenset({"agents.md", "skills", ".desk", ".sourdough-traces"})
 
 
 def assert_writable_desk_relative_path(relative_path: str) -> PurePosixPath:
-    """Reject writes targeting host-managed Desk harness projections (AGENTS.md, skills/)."""
+    """Reject writes targeting host-managed Desk roots (AGENTS.md, skills/, .desk/, .sourdough-traces/)."""
     if (
         not isinstance(relative_path, str)
         or not relative_path
@@ -227,9 +289,13 @@ def assert_writable_desk_relative_path(relative_path: str) -> PurePosixPath:
     posix = PurePosixPath(relative_path)
     if not posix.parts or any(part in ("", ".", "..") for part in posix.parts):
         raise DutyRefused("Invalid Desk relative path")
-    if posix.parts[0] in _HOST_MANAGED_ROOTS:
+    top = posix.parts[0]
+    if (
+        unicodedata.normalize("NFC", top).casefold() in _HOST_MANAGED_ROOTS
+        or unicodedata.normalize("NFKC", top).casefold() in _HOST_MANAGED_ROOTS
+    ):
         raise DutyRefused(
-            "Host-managed Desk harness files (AGENTS.md, skills/) are read-only"
+            "Host-managed Desk harness files (AGENTS.md, skills/, .desk/, .sourdough-traces/) are read-only"
         )
     return posix
 
@@ -273,6 +339,14 @@ def write_desk_harness_files(
 
     skills_root = desk / "skills"
     _ensure_private_dir(skills_root, root)
+    seen_folded_skills: dict[str, str] = {}
+    for skill_name in sorted(skills.keys()):
+        folded = unicodedata.normalize("NFC", str(skill_name)).casefold()
+        if folded in seen_folded_skills:
+            raise DutyRefused(
+                f"Skill directory names collide case-insensitively: {seen_folded_skills[folded]!r} vs {skill_name!r}"
+            )
+        seen_folded_skills[folded] = str(skill_name)
     expected_skills = set(skills.keys())
     for entry in sorted(skills_root.iterdir(), key=lambda p: p.name):
         est = os.lstat(entry)

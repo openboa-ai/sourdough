@@ -123,6 +123,9 @@ class CompanyRuntime:
         ):
             return False, True, None
 
+        if isinstance(error, (TypeError, ValueError)):
+            return False, True, None
+
         next_attempts = item.attempt_count + 1
         if isinstance(error, AgentTransportInterrupted):
             if next_attempts >= self._max_transient_attempts:
@@ -406,7 +409,8 @@ class CompanyRuntime:
                        CASE
                            WHEN duty_kind IN ('ceo.respond_message', 'board.apply_decision') THEN 0
                            WHEN duty_kind = 'work.peer_response' THEN 1
-                           WHEN parent_work_item_id IS NOT NULL THEN 2
+                           WHEN parent_work_item_id IS NOT NULL
+                                AND duty_kind NOT IN ('work.discovery_review', 'work.dreaming') THEN 2
                            WHEN source_kind = 'condition'
                                 AND json_valid(payload_json)
                                 AND json_extract(payload_json, '$.source_identity') LIKE 'result_dep:%' THEN 2

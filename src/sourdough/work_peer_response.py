@@ -725,19 +725,42 @@ def answer_peer_question(
             )
             if existing_peer is not None and existing_peer.state != "open":
                 run_row = database.execute(
-                    """SELECT work_item_id, agent_id, fencing_token
+                    """SELECT work_item_id, agent_id, fencing_token, status
                        FROM work_runs
                        WHERE company_id = ? AND run_id = ?""",
                     (claim.company_id, claim.run_id),
                 ).fetchone()
-                if run_row is None or (
-                    str(run_row[0]),
-                    str(run_row[1]),
-                    int(run_row[2]),
-                ) != (claim.duty_id, claim.founder_id, claim.fencing_token):
+                if (
+                    run_row is None
+                    or (str(run_row[0]), str(run_row[1]), int(run_row[2]))
+                    != (claim.duty_id, claim.founder_id, claim.fencing_token)
+                    or str(run_row[3]) not in ("running", "completed")
+                ):
                     raise DutyRefused(
                         "Response duty claim does not match peer question"
                     )
+                if employment_cutoff(database, claim.founder_id) is not None:
+                    raise DutyRefused("Agent employment is fenced")
+                if not has_active_grant(database, claim.company_id, claim.founder_id):
+                    raise DutyRefused("Agent has no active standing grant")
+                grant_row = database.execute(
+                    """SELECT g.scope FROM standing_grant g
+                       JOIN agent a ON a.id = g.agent_id
+                       WHERE g.id = ? AND g.agent_id = ? AND a.company_id = ?""",
+                    (claim.grant_id, claim.founder_id, claim.company_id),
+                ).fetchone()
+                if (
+                    grant_row is None
+                    or not str(grant_row[0]).strip()
+                    or str(grant_row[0]).strip().lower() == "revoked"
+                ):
+                    raise DutyRefused("Work run claim grant is revoked")
+                desk_row = database.execute(
+                    "SELECT manifest_revision FROM private_desk WHERE agent_id = ?",
+                    (claim.founder_id,),
+                ).fetchone()
+                if desk_row is None:
+                    raise DutyRefused("The current Agent has no private Desk")
                 saved_payload = (
                     json.loads(existing_peer.response_json)
                     if existing_peer.response_json is not None

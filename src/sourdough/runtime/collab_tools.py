@@ -219,11 +219,9 @@ def build_core_collab_tool_contribution(
         if not isinstance(after, str):
             raise DutyRefused("after must be a string")
         _verify_fencing()
-        deliveries, next_cursor = read_inbox(writer, claim, purpose, after)
-        if scoped_project_id is not None:
-            deliveries = tuple(
-                d for d in deliveries if d.project_id == scoped_project_id
-            )
+        deliveries, next_cursor = read_inbox(
+            writer, claim, purpose, after, project_id=scoped_project_id
+        )
         return {
             "ok": True,
             "deliveries": [

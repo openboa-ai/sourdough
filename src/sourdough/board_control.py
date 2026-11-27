@@ -737,10 +737,22 @@ def record_ceo_reply(
     context_kind: str | None = None,
     context_id: str | None = None,
     context_label: str | None = None,
+    command_id: str | None = None,
+    inbound_message_id: str | None = None,
     now_ns: int | None = None,
 ) -> str:
-    """Record a CEO reply in the Board <-> CEO direct thread."""
+    """Record a CEO reply in the Board <-> CEO direct thread (idempotently when command_id is set)."""
     safe_body = _require_text(body, "body", max_len=4000)
+    safe_command_id = (
+        None
+        if command_id is None
+        else _require_text(command_id, "command_id", max_len=128)
+    )
+    safe_inbound_id = (
+        None
+        if inbound_message_id is None
+        else _require_text(inbound_message_id, "inbound_message_id", max_len=128)
+    )
     timestamp = time_ns() if now_ns is None else now_ns
     message_id = f"msg-{uuid4().hex[:16]}"
     writer.verify()
@@ -748,12 +760,41 @@ def record_ceo_reply(
         if _identity(db) != writer.company_id:
             raise BoardControlForbidden("Company identity mismatch")
         founder_id = _founder_agent_id(db, writer.company_id)
+        if safe_command_id is not None:
+            existing = db.execute(
+                """SELECT message_id FROM ceo_message
+                   WHERE company_id = ? AND command_id = ? AND sender_kind = 'ceo'
+                   LIMIT 1""",
+                (writer.company_id, safe_command_id),
+            ).fetchone()
+            if existing is not None:
+                if safe_inbound_id is not None:
+                    cur = db.execute(
+                        """UPDATE ceo_message
+                           SET delivery_state = 'delivered'
+                           WHERE company_id = ? AND message_id = ?
+                             AND sender_kind = 'board' AND delivery_state != 'delivered'""",
+                        (writer.company_id, safe_inbound_id),
+                    )
+                    if cur.rowcount > 0:
+                        append_audit_event(
+                            db,
+                            company_id=writer.company_id,
+                            domain="messages",
+                            entity_type="ceo_message",
+                            entity_id=safe_inbound_id,
+                            event_type="ceo.message_delivered",
+                            actor_id=founder_id,
+                            payload={"message_id": safe_inbound_id},
+                            recorded_at_ns=timestamp,
+                        )
+                return str(existing[0])
         db.execute(
             """INSERT INTO ceo_message (
                    message_id, company_id, sender_kind, sender_id, target_agent_id,
                    body, context_kind, context_id, context_label, command_id,
                    delivery_state, recorded_at_ns
-               ) VALUES (?, ?, 'ceo', ?, ?, ?, ?, ?, ?, NULL, 'delivered', ?)""",
+               ) VALUES (?, ?, 'ceo', ?, ?, ?, ?, ?, ?, ?, 'delivered', ?)""",
             (
                 message_id,
                 writer.company_id,
@@ -763,6 +804,7 @@ def record_ceo_reply(
                 context_kind,
                 context_id,
                 context_label,
+                safe_command_id,
                 timestamp,
             ),
         )
@@ -777,6 +819,26 @@ def record_ceo_reply(
             payload={"message_id": message_id},
             recorded_at_ns=timestamp,
         )
+        if safe_inbound_id is not None:
+            cur = db.execute(
+                """UPDATE ceo_message
+                   SET delivery_state = 'delivered'
+                   WHERE company_id = ? AND message_id = ?
+                     AND sender_kind = 'board' AND delivery_state != 'delivered'""",
+                (writer.company_id, safe_inbound_id),
+            )
+            if cur.rowcount > 0:
+                append_audit_event(
+                    db,
+                    company_id=writer.company_id,
+                    domain="messages",
+                    entity_type="ceo_message",
+                    entity_id=safe_inbound_id,
+                    event_type="ceo.message_delivered",
+                    actor_id=founder_id,
+                    payload={"message_id": safe_inbound_id},
+                    recorded_at_ns=timestamp,
+                )
     return message_id
 
 

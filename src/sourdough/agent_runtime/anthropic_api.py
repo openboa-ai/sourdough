@@ -137,11 +137,11 @@ class AnthropicMessagesAdapter:
             usage_obj = response.get("usage")
             if isinstance(usage_obj, dict):
                 input_count = (
-                    int(usage_obj.get("input_tokens", 0))
-                    + int(usage_obj.get("cache_creation_input_tokens", 0))
-                    + int(usage_obj.get("cache_read_input_tokens", 0))
+                    int(usage_obj.get("input_tokens") or 0)
+                    + int(usage_obj.get("cache_creation_input_tokens") or 0)
+                    + int(usage_obj.get("cache_read_input_tokens") or 0)
                 )
-                output_count = int(usage_obj.get("output_tokens", 0))
+                output_count = int(usage_obj.get("output_tokens") or 0)
                 round_usage = TokenUsage(
                     input_tokens=input_count,
                     output_tokens=output_count,
