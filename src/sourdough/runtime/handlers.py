@@ -745,7 +745,7 @@ def build_production_duty_registry(
             base_handlers=collab.handlers,
             history_notes=tuple(evidence_notes),
             open_receipts=(peer_receipt, *child_receipts),
-            include_core_desk_tools=True,
+            include_core_desk_tools=False,
             include_plugin_tools=False,
             extra_recoverable_exceptions=collab.recoverable_exceptions,
         )

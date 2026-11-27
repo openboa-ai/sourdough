@@ -503,37 +503,16 @@ def run_isolated_trial_slot(
             raise TrialRefused(
                 "company_fixture and worker_input must be supplied together"
             )
-
-        def _adapter_case(
-            runtime: CompanyRuntime, desk_dir: Path, payload: TrialWorkerInput
-        ) -> dict[str, Any]:
-            if execute_case is not None:
-                return execute_case(runtime, desk_dir, payload)
-            step_summary = runtime.step(max_dispatches=payload.limits.turns)
-            return {
-                "outcome": "completed",
-                "observation": {
-                    "slot_id": slot.slot_id,
-                    "case_id": slot.case_id,
-                    "family_id": slot.family_id,
-                    "executed_runs": list(step_summary.executed_runs),
-                },
-                "decision": {
-                    "action": "trial_decision",
-                    "grounded": True,
-                    "relevant_constraints": True,
-                    "feasible_next_action": True,
-                },
-                "tool_trace": {"calls": [], "violations": 0},
-                "service_effects": {"service_correct": True, "invariant_breach": False},
-                "usage": {"turns": 1, "tokens": 120, "wall_seconds": 0.01},
-            }
+        if execute_case is None:
+            raise TrialRefused(
+                "Fixture-backed isolated trial requires an execute_case callback"
+            )
 
         adapter = CompanyRuntimeOfflineAdapter(
             trial_root=trial_root,
             evaluator_store=evaluator_store,
             profile=slot.inputs.runtime_profile,
-            execute_case=_adapter_case,
+            execute_case=execute_case,
             max_turns=max_turns,
             max_wall_seconds=max_wall_seconds,
             max_tokens=max_tokens,
