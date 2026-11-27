@@ -3946,6 +3946,181 @@ class TestM5Tier5Hardening(unittest.TestCase):
             self.assertIn("FORK_KERNEL_DENIED", res["stdout"])
             self.assertNotIn("ESCAPE_ALLOWED", res["stdout"])
 
+    def test_pr191_r4_private_desk_tool_receipts_stay_out_of_company_sqlite(
+        self,
+    ) -> None:
+        """PR #191 R4 P2: durable tool_call_receipt must redact private Desk filenames and bodies."""
+        from sourdough.runtime.domains import ToolContribution
+        from sourdough.runtime.registry import DutyContext
+        from sourdough.runtime.shift_runner import ShiftRunner
+
+        seen_outputs: list[dict[str, Any]] = []
+
+        class _DeskToolsAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ):
+                del profile
+                r1 = broker.invoke(
+                    "c-save",
+                    "desk_save_draft",
+                    {
+                        "name": "board-note",
+                        "content": "TOP_SECRET_DESK_BODY_99",
+                        "expected_revision": None,
+                    },
+                )
+                r2 = broker.invoke("c-list", "desk_list_drafts", {})
+                r3 = broker.invoke("c-read", "desk_read_draft", {"name": "board-note"})
+                seen_outputs.extend([r1, r2, r3])
+                return ShiftResult(
+                    provider=PROVIDER_OPENAI,
+                    model="gpt-mock",
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    output_text="Saved and reviewed draft.",
+                    usage=TokenUsage(input_tokens=10, output_tokens=5),
+                    tool_calls_executed=3,
+                    events=(),
+                )
+
+        reg = AgentAdapterRegistry()
+        reg.register(_DeskToolsAdapter())
+        runner = ShiftRunner(
+            adapter_registry=reg,
+            profile_bindings={self.founder_id: self.profile},
+            default_budget_ceiling_minor=10_000,
+            read_agent_state=lambda _s, _c, _a: (
+                self.profile.profile_id(),
+                "manage-company",
+            ),
+            resolve_profile=lambda bindings, aid: bindings[aid],
+            contribute_tools=lambda _q: ToolContribution(),
+        )
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, run, _claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+            dctx = DutyContext(
+                writer=w,
+                company_id=self.company_id,
+                work_item=item,
+                run=run,
+                _clock=2_000,
+            )
+            runner.run(
+                dctx,
+                mandate_summary="Save and inspect private note",
+                instruction="Use desk tools",
+            )
+        # Live agent received full results
+        self.assertEqual(seen_outputs[0]["name"], "board-note")
+        self.assertEqual(seen_outputs[2]["content"], "TOP_SECRET_DESK_BODY_99")
+        # Durable receipts in company.sqlite must NEVER contain private filename or body
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            rows = ro.execute(
+                "SELECT call_id, result_digest, result_json FROM tool_call_receipt ORDER BY call_id"
+            ).fetchall()
+        self.assertEqual(len(rows), 3)
+        for _cid, rdigest, rjson in rows:
+            self.assertTrue(rdigest)
+            self.assertNotIn("board-note", rjson)
+            self.assertNotIn("TOP_SECRET_DESK_BODY_99", rjson)
+            parsed = json.loads(rjson)
+            self.assertEqual(parsed["redacted"], "private_desk_payload")
+            self.assertEqual(parsed["result_digest"], rdigest)
+
+    def test_pr191_r4_desk_run_command_enforces_aggregate_scratch_quota(
+        self,
+    ) -> None:
+        """PR #191 R4 P2: multi-file scratch writes exceeding aggregate quota must fail and clean up."""
+        if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+            self.skipTest("macOS sandbox-exec required")
+        from sourdough.agent_desk import DeskLimits, _dir_bytes
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                    now_ns=1_000,
+                )
+            session = create_agent_session(w, claim, claim.purpose)
+            # Five 400 KB files = 2 MB > 1 MB aggregate scratch quota (each well below max_file_bytes)
+            small_quota = DeskLimits(max_scratch_bytes=1_048_576)
+            writer_code = (
+                "import os, pathlib\n"
+                "d = pathlib.Path(os.environ['TMPDIR'])\n"
+                "for i in range(5):\n"
+                "    (d / f'f{i}.bin').write_bytes(b'A' * 400_000)\n"
+            )
+            res = run_desk_command_sandboxed(
+                session,
+                [sys.executable, "-c", writer_code],
+                store=self.store,
+                sandbox_backend="local-macos",
+                limits=DeskCommandLimits(timeout_seconds=10),
+                desk_limits=small_quota,
+                granted_capabilities=("desk:exec",),
+            )
+            self.assertFalse(res["ok"], res)
+            self.assertTrue(res["quota_exceeded"], res)
+            scratch_dir = session.desk_path / ".desk" / "scratch" / claim.run_id
+            self.assertEqual(_dir_bytes(scratch_dir), 0)
+
+            # Empty-file inode storm exceeding max_scratch_entries must ALSO fail & clean up
+            tiny_entries = DeskLimits(
+                max_scratch_bytes=1_048_576, max_scratch_entries=16
+            )
+            inode_storm = (
+                "import os, pathlib\n"
+                "d = pathlib.Path(os.environ['TMPDIR'])\n"
+                "for i in range(64):\n"
+                "    (d / f'empty-{i}.txt').write_bytes(b'')\n"
+            )
+            res_entries = run_desk_command_sandboxed(
+                session,
+                [sys.executable, "-c", inode_storm],
+                store=self.store,
+                sandbox_backend="local-macos",
+                limits=DeskCommandLimits(timeout_seconds=10),
+                desk_limits=tiny_entries,
+                granted_capabilities=("desk:exec",),
+            )
+            self.assertFalse(res_entries["ok"], res_entries)
+            self.assertTrue(res_entries["quota_exceeded"], res_entries)
+            self.assertEqual(list(scratch_dir.iterdir()), [])
+
+            # Pre-populated entry overflow must refuse allocate_run_scratch
+            for i in range(20):
+                (scratch_dir / f"pre-{i}.txt").write_bytes(b"")
+            with self.assertRaisesRegex(DutyRefused, "entry quota"):
+                allocate_run_scratch(
+                    self.store,
+                    self.founder_id,
+                    claim.run_id,
+                    limits=tiny_entries,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

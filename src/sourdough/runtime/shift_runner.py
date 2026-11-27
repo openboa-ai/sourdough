@@ -73,6 +73,48 @@ if TYPE_CHECKING:
     from ..agent_runtime.registry import AgentAdapterRegistry
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_PRIVATE_DESK_RECEIPT_TOOLS = frozenset(
+    {
+        "desk_list_drafts",
+        "desk_read_draft",
+        "desk_save_draft",
+        "desk_delete_draft",
+        "desk_read_offloaded_log",
+        "desk_run_command",
+    }
+)
+_SAFE_DESK_RECEIPT_FIELDS = (
+    "ok",
+    "revision",
+    "count",
+    "deleted",
+    "returncode",
+    "timed_out",
+    "quota_exceeded",
+)
+
+
+def _sanitize_receipt_result_json(
+    tool_name: str, result_digest: str, raw_result_json: str
+) -> str:
+    """Keep private Desk filenames, draft bodies, and command outputs out of company.sqlite."""
+    if tool_name not in _PRIVATE_DESK_RECEIPT_TOOLS:
+        return raw_result_json
+    safe_payload: dict[str, Any] = {
+        "redacted": "private_desk_payload",
+        "result_digest": result_digest,
+    }
+    try:
+        parsed = json.loads(raw_result_json)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, Mapping):
+        for key in _SAFE_DESK_RECEIPT_FIELDS:
+            if key in parsed:
+                safe_payload[key] = parsed[key]
+    return json.dumps(safe_payload, sort_keys=True, separators=(",", ":"))
+
+
 _LOGGER = logging.getLogger(__name__)
 
 ActiveMethodsProvider = Callable[
@@ -448,6 +490,11 @@ class ShiftRunner:
                 )
 
         def _record_receipt(receipt: dict[str, Any]) -> None:
+            stored_result_json = _sanitize_receipt_result_json(
+                str(receipt["tool_name"]),
+                str(receipt["result_digest"]),
+                str(receipt["result_json"]),
+            )
             with (
                 ctx.write_lock_ctx(),
                 closing(open_writer(ctx.writer.store, lease=ctx.writer)) as db,
@@ -469,7 +516,7 @@ class ShiftRunner:
                         receipt["arg_digest"],
                         receipt["status"],
                         receipt["result_digest"],
-                        receipt["result_json"],
+                        stored_result_json,
                         receipt["error_type"],
                         receipt["error_message"],
                         receipt["offloaded_log_path"],

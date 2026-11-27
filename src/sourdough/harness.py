@@ -23,6 +23,8 @@ from .agent_desk import (
     LEGACY_DESK_LIMITS,
     PRODUCTION_DESK_LIMITS,
     DeskLimits,
+    _dir_usage,
+    _safe_unlink_tree_no_follow,
     allocate_run_scratch,
     desk_directory,
     desks_root,
@@ -531,6 +533,7 @@ def run_desk_command_sandboxed(
     store: Path,
     sandbox_backend: str = "local-macos",
     limits: DeskCommandLimits = DeskCommandLimits(),
+    desk_limits: DeskLimits = PRODUCTION_DESK_LIMITS,
     granted_capabilities: Collection[str] | None = None,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -572,7 +575,14 @@ def run_desk_command_sandboxed(
 
     root = store.resolve(strict=False).parent
     _ensure_private_directory(session.desk_path, root)
-    scratch_dir = allocate_run_scratch(store, session.agent_id, session.run_id)
+    scratch_dir = allocate_run_scratch(
+        store, session.agent_id, session.run_id, limits=desk_limits
+    )
+    scratch_root = session.desk_path / ".desk" / "scratch"
+    max_scratch_bytes = desk_limits.max_scratch_bytes
+    max_scratch_entries = desk_limits.max_scratch_entries
+    max_desk_bytes = desk_limits.max_total_bytes + desk_limits.max_scratch_bytes
+    max_desk_entries = desk_limits.max_drafts * 4 + desk_limits.max_scratch_entries
     profile = build_desk_sandbox_profile(
         store,
         session.desk_path,
@@ -645,12 +655,41 @@ def run_desk_command_sandboxed(
     t_out.start()
     t_err.start()
     timed_out = False
+    quota_exceeded = False
     returncode: int | None = None
+    stop_quota_watch = threading.Event()
+
+    def _scratch_over_quota() -> bool:
+        try:
+            s_bytes, s_entries = _dir_usage(scratch_root)
+            if s_bytes > max_scratch_bytes or s_entries > max_scratch_entries:
+                return True
+            d_bytes, d_entries = _dir_usage(session.desk_path)
+            if d_bytes > max_desk_bytes or d_entries > max_desk_entries:
+                return True
+        except (OSError, DutyRefused):
+            return True
+        return False
+
+    def _watch_quota() -> None:
+        nonlocal quota_exceeded
+        while not stop_quota_watch.wait(0.02):
+            if _scratch_over_quota():
+                quota_exceeded = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                return
+
+    t_quota = threading.Thread(target=_watch_quota, daemon=True)
+    t_quota.start()
     try:
         returncode = proc.wait(timeout=limits.timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
     finally:
+        stop_quota_watch.set()
         # Terminate any surviving descendants in the command's process group on every exit path.
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -661,18 +700,28 @@ def run_desk_command_sandboxed(
                 proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 pass
+        t_quota.join(timeout=2.0)
         t_out.join(timeout=5.0)
         t_err.join(timeout=5.0)
 
+    if not quota_exceeded and _scratch_over_quota():
+        quota_exceeded = True
+    if quota_exceeded:
+        if os.path.lexists(scratch_dir):
+            for entry in list(scratch_dir.iterdir()):
+                _safe_unlink_tree_no_follow(entry)
+
     return {
-        "ok": (not timed_out and returncode == 0),
+        "ok": (not timed_out and not quota_exceeded and returncode == 0),
         "timed_out": timed_out,
-        "returncode": returncode,
+        "quota_exceeded": quota_exceeded,
+        "returncode": None if quota_exceeded else returncode,
         "stdout": stdout_sink["text"],
         "stderr": stderr_sink["text"],
         "stdout_truncated": stdout_sink["truncated"],
         "stderr_truncated": stderr_sink["truncated"],
         "scratch_dir": f".desk/scratch/{session.run_id}",
+        **({"error": "Desk scratch quota exceeded"} if quota_exceeded else {}),
     }
 
 

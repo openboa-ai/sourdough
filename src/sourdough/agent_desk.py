@@ -41,6 +41,7 @@ class DeskLimits:
     max_content_bytes: int = 65_536
     max_total_bytes: int = 4_194_304
     max_scratch_bytes: int = 16_777_216
+    max_scratch_entries: int = 512
 
 
 LEGACY_DESK_LIMITS = DeskLimits(
@@ -96,20 +97,34 @@ def scratch_directory(store: Path, agent_id: str, run_id: str) -> Path:
     return desk_directory(store, agent_id) / ".desk" / "scratch" / run_id
 
 
-def _dir_bytes(directory: Path) -> int:
-    total = 0
+def _dir_usage(directory: Path) -> tuple[int, int]:
+    """Return (total_regular_bytes, total_entry_count) without following symlinks."""
+    total_bytes = 0
+    total_entries = 0
     if not os.path.lexists(directory):
-        return 0
-    for root_str, _dirs, files in os.walk(directory, followlinks=False):
+        return 0, 0
+    for root_str, dirs, files in os.walk(directory, followlinks=False):
         root_path = Path(root_str)
+        for dname in dirs:
+            dpath = root_path / dname
+            st = os.lstat(dpath)
+            if stat.S_ISLNK(st.st_mode):
+                raise DutyRefused("Symlinks are forbidden inside private Desk storage")
+            total_entries += 1
         for fname in files:
             fpath = root_path / fname
             st = os.lstat(fpath)
             if stat.S_ISLNK(st.st_mode):
                 raise DutyRefused("Symlinks are forbidden inside private Desk storage")
+            total_entries += 1
             if stat.S_ISREG(st.st_mode):
-                total += st.st_size
-    return total
+                total_bytes += st.st_size
+    return total_bytes, total_entries
+
+
+def _dir_bytes(directory: Path) -> int:
+    total_bytes, _entries = _dir_usage(directory)
+    return total_bytes
 
 
 def _safe_unlink_tree_no_follow(path: Path) -> None:
@@ -183,8 +198,11 @@ def allocate_run_scratch(
         if entry.name not in keep_runs:
             _safe_unlink_tree_no_follow(entry)
     _ensure_private_dir(target, root)
-    if _dir_bytes(scratch_root) > limits.max_scratch_bytes:
+    used_bytes, used_entries = _dir_usage(scratch_root)
+    if used_bytes > limits.max_scratch_bytes:
         raise DutyRefused("Private Desk scratch byte quota exceeded")
+    if used_entries > limits.max_scratch_entries:
+        raise DutyRefused("Private Desk scratch entry quota exceeded")
     return target
 
 
