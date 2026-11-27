@@ -26,6 +26,8 @@ if TYPE_CHECKING:
         DUTY_QUANT_AGENT_SANDBOX,
         DUTY_QUANT_PAPER_DECISION,
         DUTY_QUANT_RECONCILE,
+        DUTY_TRADING_DECISION,
+        DUTY_TRADING_RECONCILE,
         TradingDomainPlugin,
         create_domain_plugin,
     )
@@ -35,6 +37,8 @@ _PLUGIN_EXPORTS = frozenset(
         "DUTY_QUANT_AGENT_SANDBOX",
         "DUTY_QUANT_PAPER_DECISION",
         "DUTY_QUANT_RECONCILE",
+        "DUTY_TRADING_DECISION",
+        "DUTY_TRADING_RECONCILE",
         "TradingDomainPlugin",
         "create_domain_plugin",
     }
@@ -53,6 +57,8 @@ __all__ = [
     "DUTY_QUANT_AGENT_SANDBOX",
     "DUTY_QUANT_PAPER_DECISION",
     "DUTY_QUANT_RECONCILE",
+    "DUTY_TRADING_DECISION",
+    "DUTY_TRADING_RECONCILE",
     "FIRST_DUTY_SCOPE",
     "PAPER_EXECUTION",
     "POSITION_REVIEW",

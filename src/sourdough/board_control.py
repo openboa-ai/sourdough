@@ -1320,6 +1320,113 @@ def apply_company_restriction(
         return _outcome_from_receipt(receipt)
 
 
+def record_system_restriction(
+    writer: WriterLease,
+    *,
+    restriction_id: str,
+    cause_category: str,
+    scope_ref: str,
+    reason: str,
+    operator_releasable: bool = True,
+    actor_id: str = "system_safety",
+    now_ns: int | None = None,
+) -> dict[str, Any]:
+    """Idempotently activate a system-owned safety restriction (e.g., live venue drift).
+
+    Records `last_command_id = NULL` and explicit system `actor_id` without spoofing
+    a Board principal, surfacing immediately in Board Client Controls until cleared.
+    """
+    writer.verify()
+    safe_rid = _require_text(restriction_id, "restriction_id", max_len=128)
+    safe_cat = _require_text(cause_category, "cause_category", max_len=64)
+    safe_scope = _require_text(scope_ref, "scope_ref", max_len=128)
+    safe_reason = _require_text(reason, "reason", max_len=1000)
+    safe_actor = _require_text(actor_id, "actor_id", max_len=128)
+    timestamp = time_ns() if now_ns is None else now_ns
+
+    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
+        writer.verify()
+        if _identity(db) != writer.company_id:
+            raise BoardControlRefused("Company identity mismatch")
+        existing = db.execute(
+            """SELECT restriction_revision, active, cause_category, scope_ref, reason
+               FROM restriction_cause
+               WHERE company_id = ? AND restriction_id = ?""",
+            (writer.company_id, safe_rid),
+        ).fetchone()
+        if existing is not None and int(existing[1]) == 1:
+            return {
+                "restriction_id": safe_rid,
+                "effective_revision": int(existing[0]),
+                "active": True,
+                "replayed": True,
+                "scope_ref": str(existing[3]),
+                "reason": str(existing[4]),
+            }
+        next_rev = (int(existing[0]) if existing is not None else 0) + 1
+        if existing is None:
+            db.execute(
+                """INSERT INTO restriction_cause (
+                       restriction_id, company_id, cause_category, scope_ref,
+                       restriction_revision, active, operator_releasable, reason,
+                       recorded_at_ns, cleared_at_ns, last_command_id
+                   ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL)""",
+                (
+                    safe_rid,
+                    writer.company_id,
+                    safe_cat,
+                    safe_scope,
+                    next_rev,
+                    int(operator_releasable),
+                    safe_reason,
+                    timestamp,
+                ),
+            )
+        else:
+            db.execute(
+                """UPDATE restriction_cause
+                   SET cause_category = ?, scope_ref = ?, restriction_revision = ?,
+                       active = 1, operator_releasable = ?, reason = ?,
+                       recorded_at_ns = ?, cleared_at_ns = NULL, last_command_id = NULL
+                   WHERE company_id = ? AND restriction_id = ?""",
+                (
+                    safe_cat,
+                    safe_scope,
+                    next_rev,
+                    int(operator_releasable),
+                    safe_reason,
+                    timestamp,
+                    writer.company_id,
+                    safe_rid,
+                ),
+            )
+        append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="governance",
+            entity_type="restriction_cause",
+            entity_id=safe_rid,
+            event_type="governance.system_restriction_applied",
+            actor_id=safe_actor,
+            payload={
+                "cause_category": safe_cat,
+                "scope_ref": safe_scope,
+                "effective_revision": next_rev,
+                "reason": safe_reason,
+            },
+            recorded_at_ns=timestamp,
+        )
+        writer.verify()
+        return {
+            "restriction_id": safe_rid,
+            "effective_revision": next_rev,
+            "active": True,
+            "replayed": False,
+            "scope_ref": safe_scope,
+            "reason": safe_reason,
+        }
+
+
 def clear_company_restriction(
     writer: WriterLease,
     *,
