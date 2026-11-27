@@ -1794,16 +1794,34 @@ def activate_method_delta(
             )
         quarantined_target = db.execute(
             """SELECT 1 FROM method_activation
-               WHERE company_id = ? AND method_id = ? AND quarantined = 1
+               WHERE company_id = ? AND method_id = ?
+                 AND audience_scope = ?
+                 AND (audience_target_id IS ? OR audience_target_id = ?)
+                 AND quarantined = 1
                LIMIT 1""",
-            (company_id, delta.method_id),
+            (
+                company_id,
+                delta.method_id,
+                delta.audience_scope,
+                delta.audience_target_id,
+                delta.audience_target_id,
+            ),
         ).fetchone()
         if quarantined_target is None:
             quarantined_target = db.execute(
                 """SELECT 1 FROM method_delta
-                   WHERE company_id = ? AND method_id = ? AND status = 'quarantined'
+                   WHERE company_id = ? AND method_id = ?
+                     AND audience_scope = ?
+                     AND (audience_target_id IS ? OR audience_target_id = ?)
+                     AND status = 'quarantined'
                    LIMIT 1""",
-                (company_id, delta.method_id),
+                (
+                    company_id,
+                    delta.method_id,
+                    delta.audience_scope,
+                    delta.audience_target_id,
+                    delta.audience_target_id,
+                ),
             ).fetchone()
         if quarantined_target is not None:
             raise MethodRefused(
@@ -2231,8 +2249,7 @@ def quarantine_method_lineage(
             for p_mid, p_rev, p_qid, p_dkind, p_status, p_passed, _ in prior_rows:
                 node = (str(p_mid), str(p_rev))
                 if (
-                    str(p_dkind) == "DEPRECATE"
-                    or str(p_status) == "quarantined"
+                    str(p_status) == "quarantined"
                     or not bool(p_passed)
                     or _has_quarantined_ancestor(
                         db,
@@ -2243,6 +2260,10 @@ def quarantine_method_lineage(
                     )
                 ):
                     continue
+                if str(p_dkind) == "DEPRECATE":
+                    # Clean deprecation is a valid incumbent state (intentionally removed);
+                    # stop restoration here instead of resurrecting an older pre-deprecation ADD.
+                    break
                 db.execute(
                     """UPDATE method_delta
                        SET status = 'active'

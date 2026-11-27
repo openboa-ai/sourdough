@@ -4772,6 +4772,309 @@ class TestM5Tier5Hardening(unittest.TestCase):
                 )
                 self.assertTrue(dec.decision_id)
 
+    def test_pr191_r7_quarantining_replacement_add_stops_at_clean_deprecation(
+        self,
+    ) -> None:
+        """PR #191 R7 P2: ADD -> DEPRECATE -> ADD then quarantining final ADD must NOT resurrect first ADD."""
+        from sourdough.method_learning import resolve_active_methods
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _item, run, claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            src = (f"work_run:{run.run_id}",)
+            # 1. Original ADD
+            add1 = distill_method_delta(
+                w,
+                claim,
+                method_id="m-dep-stop",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="company",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Original deprecated method v1.",
+                falsification_criteria="Fails if v1 is resurrected after deprecation.",
+                source_refs=src,
+                now_ns=1_100,
+            )
+            qualify_method_delta(
+                w,
+                add1.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_150,
+            )
+            activate_method_delta(
+                w,
+                add1.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=1_200,
+            )
+            # 2. Clean intentional DEPRECATE
+            dep = distill_method_delta(
+                w,
+                claim,
+                method_id="m-dep-stop",
+                delta_kind="DEPRECATE",
+                item_kind="work_method",
+                audience_scope="company",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Intentionally retire v1.",
+                falsification_criteria="N/A retirement.",
+                superseded_revision=add1.revision_sha256,
+                source_refs=src,
+                now_ns=1_300,
+            )
+            qualify_method_delta(
+                w,
+                dep.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_350,
+            )
+            activate_method_delta(
+                w,
+                dep.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=1_400,
+            )
+            with closing(open_reader(self.store)) as ro, read_tx(ro):
+                self.assertEqual(
+                    resolve_active_methods(
+                        ro, self.company_id, agent_id=self.founder_id
+                    ),
+                    (),
+                )
+            # 3. Replacement ADD
+            add2 = distill_method_delta(
+                w,
+                claim,
+                method_id="m-dep-stop",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="company",
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Replacement method v2.",
+                falsification_criteria="Fails if v2 regresses.",
+                source_refs=src,
+                now_ns=1_500,
+            )
+            qualify_method_delta(
+                w,
+                add2.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_550,
+            )
+            activate_method_delta(
+                w,
+                add2.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=1_600,
+            )
+            # 4. Quarantine replacement ADD -> must stop at clean DEPRECATE, NOT resurrect v1!
+            receipt = quarantine_method_lineage(
+                w,
+                self.company_id,
+                method_id="m-dep-stop",
+                revision_sha256=add2.revision_sha256,
+                reason="v2 faulted",
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=1_700,
+            )
+            self.assertIsNone(receipt.restored_revision_sha256)
+            with closing(open_reader(self.store)) as ro, read_tx(ro):
+                self.assertEqual(
+                    resolve_active_methods(
+                        ro, self.company_id, agent_id=self.founder_id
+                    ),
+                    (),
+                )
+
+    def test_pr191_r7_quarantine_activation_check_is_scoped_to_audience(
+        self,
+    ) -> None:
+        """PR #191 R7 P2: quarantining Alice's one_agent method must not block Bob's unrelated method_id."""
+        with hold_company_writer(self.store, self.company_id) as w:
+            alice_id, alice_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="alice-r7",
+                profile_id=self.profile.profile_id(),
+            )
+            bob_id, bob_g = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="bob-r7",
+                profile_id=self.profile.profile_id(),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, run_a, claim_a = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=alice_id,
+                    grant_id=alice_g,
+                    grant_scope="assessment",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+                _, run_b, claim_b = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=bob_id,
+                    grant_id=bob_g,
+                    grant_scope="assessment",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                    now_ns=1_000,
+                )
+            alice_v1 = distill_method_delta(
+                w,
+                claim_a,
+                method_id="shared-slug",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="one_agent",
+                audience_target_id=alice_id,
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Alice private heuristic v1.",
+                falsification_criteria="Fails if Alice heuristic regresses.",
+                source_refs=(f"work_run:{run_a.run_id}",),
+                now_ns=1_100,
+            )
+            bob_v1 = distill_method_delta(
+                w,
+                claim_b,
+                method_id="shared-slug",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="one_agent",
+                audience_target_id=bob_id,
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Bob unrelated private heuristic v1.",
+                falsification_criteria="Fails if Bob heuristic regresses.",
+                source_refs=(f"work_run:{run_b.run_id}",),
+                now_ns=1_150,
+            )
+            qualify_method_delta(
+                w,
+                bob_v1.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_200,
+            )
+            # Quarantine Alice's candidate revision only
+            quarantine_method_lineage(
+                w,
+                self.company_id,
+                method_id="shared-slug",
+                revision_sha256=alice_v1.revision_sha256,
+                reason="Alice method faulted",
+                actor_id=alice_id,
+                grant_id=alice_g,
+                now_ns=1_250,
+            )
+            # Alice's own replacement candidate under the same audience is still blocked
+            alice_v2 = distill_method_delta(
+                w,
+                claim_a,
+                method_id="shared-slug",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="one_agent",
+                audience_target_id=alice_id,
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Alice retry heuristic v2.",
+                falsification_criteria="Fails if Alice retry regresses.",
+                source_refs=(f"work_run:{run_a.run_id}",),
+                now_ns=1_300,
+            )
+            qualify_method_delta(
+                w,
+                alice_v2.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=1_350,
+            )
+            with self.assertRaisesRegex(MethodRefused, "active quarantine"):
+                activate_method_delta(
+                    w,
+                    alice_v2.delta_id,
+                    actor_id=alice_id,
+                    grant_id=alice_g,
+                    now_ns=1_400,
+                )
+            # Bob's unrelated qualified revision with the same method_id activates cleanly!
+            bob_act = activate_method_delta(
+                w,
+                bob_v1.delta_id,
+                actor_id=bob_id,
+                grant_id=bob_g,
+                now_ns=1_450,
+            )
+            self.assertEqual(bob_act.method_id, "shared-slug")
+            self.assertEqual(bob_act.audience_target_id, bob_id)
+
+            # A descendant citing Alice's quarantined node as parent is STILL refused
+            derived = distill_method_delta(
+                w,
+                claim_b,
+                method_id="derived-from-alice",
+                delta_kind="ADD",
+                item_kind="work_method",
+                audience_scope="one_agent",
+                audience_target_id=bob_id,
+                trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                body="Derived from Alice quarantined revision.",
+                falsification_criteria="Fails if tainted lineage activates.",
+                parent_method_ids=(f"shared-slug:{alice_v1.revision_sha256}",),
+                source_refs=(f"work_run:{run_b.run_id}",),
+                now_ns=1_500,
+            )
+            with self.assertRaisesRegex(MethodRefused, "quarantined"):
+                qualify_method_delta(
+                    w,
+                    derived.delta_id,
+                    passed_k=3,
+                    negative_trigger_passed=True,
+                    safety_passed=True,
+                    holdout_margin=0.1,
+                    now_ns=1_550,
+                )
+            with self.assertRaisesRegex(MethodRefused, "quarantined"):
+                activate_method_delta(
+                    w,
+                    derived.delta_id,
+                    actor_id=bob_id,
+                    grant_id=bob_g,
+                    now_ns=1_600,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
