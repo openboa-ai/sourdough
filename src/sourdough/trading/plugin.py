@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -53,8 +54,16 @@ from .commands import (
     execute_execution_tier_command,
     execute_strategy_command,
 )
+from .company_tools import (
+    COMPANY_TRADING_TOOL_SPECS,
+    CompanyTradingTools,
+    READ_MARKET_QUOTE_SPEC,
+    READ_TRADING_BOOKS_SPEC,
+    read_trading_books_summary,
+)
 from .domain import ENV_LIVE, ENV_PAPER, ExecutionTierRefused
 from .duty import TRADING_WORK_POLICY, has_trading_committed_result
+from .external_venue import ExternalVenueAdapter
 from .migration import execute_paper_to_live_migration, read_execution_tiers_snapshot
 from .projections import (
     PROJECTION_ORDER_TRACE,
@@ -65,6 +74,13 @@ from .projections import (
     read_strategies_projection,
     read_trading_desk_projection,
 )
+from .quotes import (
+    MarketQuoteProvider,
+    QuoteRefused,
+    build_quote_provider_from_spec,
+    normalize_instrument_id,
+)
+from .reconcile import reconcile_trading_books
 from .risk import (
     TRADING_RISK_CAUSE_CATEGORY,
     TradingRestrictionGuard,
@@ -75,7 +91,9 @@ from .sandbox_tools import AgentSandboxTools
 DUTY_QUANT_AGENT_SANDBOX = "quant.agent_sandbox"
 DUTY_TRADING_AGENT_SANDBOX = "trading.agent_sandbox"
 DUTY_QUANT_PAPER_DECISION = "quant.paper_decision"
+DUTY_TRADING_DECISION = "trading.decision"
 DUTY_QUANT_RECONCILE = "quant.reconcile"
+DUTY_TRADING_RECONCILE = "trading.reconcile"
 
 _READ_EXECUTION_TIERS_SPEC = ToolSpec(
     name="read_execution_tiers",
@@ -397,7 +415,7 @@ def _handle_migrate_paper_to_live(ctx: DecisionActionContext) -> str:
 
 
 class TradingDomainPlugin(BaseDomainPlugin):
-    """M2 bridge plugging Trading duties, tools, decisions, timeline, commands, and CLI into Core OS.
+    """Bridge plugging Trading duties, tools, decisions, timeline, commands, and CLI into Core OS.
 
     ``restore_guard()`` intentionally fails closed (returns ``None``) unless an
     explicit external-venue ``RestoreDomainGuard`` is supplied at composition time,
@@ -405,6 +423,21 @@ class TradingDomainPlugin(BaseDomainPlugin):
     """
 
     domain_name: str = "trading"
+
+    def __init__(
+        self,
+        *,
+        quote_provider: MarketQuoteProvider | None = None,
+        live_venue_resolver: Callable[[str], ExternalVenueAdapter | None] | None = None,
+        max_quote_age_ns: int = 60 * 10**9,
+    ) -> None:
+        if quote_provider is None:
+            env_spec = os.environ.get("SOURDOUGH_TRADING_QUOTE_SOURCE", "").strip()
+            if env_spec:
+                quote_provider = build_quote_provider_from_spec(env_spec)
+        self._quote_provider = quote_provider
+        self._live_venue_resolver = live_venue_resolver
+        self._max_quote_age_ns = max_quote_age_ns
 
     def work_policy(self) -> WorkDomainPolicy:
         return TRADING_WORK_POLICY
@@ -415,14 +448,48 @@ class TradingDomainPlugin(BaseDomainPlugin):
             and "paper" not in ctx.installed_domains
         ):
             return ToolContribution()
-        return ToolContribution(
-            specs=(_READ_EXECUTION_TIERS_SPEC,),
-            handlers={
-                "read_execution_tiers": lambda _args: _read_tiers(
-                    ctx.store, ctx.company_id
+        specs: list[ToolSpec] = [_READ_EXECUTION_TIERS_SPEC, READ_TRADING_BOOKS_SPEC]
+        handlers: dict[str, Any] = {
+            "read_execution_tiers": lambda _args: _read_tiers(
+                ctx.store, ctx.company_id
+            ),
+            "read_trading_books": lambda args: read_trading_books_summary(
+                ctx.store,
+                ctx.company_id,
+                environment=str(
+                    (args if isinstance(args, dict) else {}).get(
+                        "environment", ENV_PAPER
+                    )
                 )
-            },
-        )
+                .strip()
+                .lower(),
+            ),
+        }
+        if self._quote_provider is not None:
+            provider = self._quote_provider
+
+            def _read_quote(args: dict[str, Any]) -> dict[str, Any]:
+                if not isinstance(args, dict) or set(args) != {"instrument_id"}:
+                    raise ExecutionTierRefused("Invalid read_market_quote arguments")
+                try:
+                    norm = normalize_instrument_id(args["instrument_id"])
+                except QuoteRefused as exc:
+                    raise ExecutionTierRefused(str(exc)) from exc
+                q = provider.latest_quote(norm)
+                if q is None:
+                    raise ExecutionTierRefused(
+                        f"No market quote available for '{norm}'"
+                    )
+                return {
+                    "instrument_id": q.instrument_id,
+                    "price_minor_units": q.price_minor_units,
+                    "observed_at_ns": q.observed_at_ns,
+                    "source": q.source,
+                }
+
+            specs.append(READ_MARKET_QUOTE_SPEC)
+            handlers["read_market_quote"] = _read_quote
+        return ToolContribution(specs=tuple(specs), handlers=handlers)
 
     def contribute_duties(
         self, services: DutyRuntimeServices
@@ -518,26 +585,40 @@ class TradingDomainPlugin(BaseDomainPlugin):
             payload = json.loads(ctx.work_item.payload_json)
             instruction = str(
                 payload.get("instruction")
-                or "Evaluate company paper execution tier posture and record decision summary."
+                or "Evaluate market quotes and active Company Trading books, execute authorized trades or recommendations, and schedule your next check."
             )
             agent_id = ctx.work_item.owner_agent_id
             persisted_profile, grant_scope = services.read_agent_state(
                 ctx.writer.store, ctx.company_id, agent_id
             )
             profile = services.resolve_profile(services.profile_bindings, agent_id)
+            trading_tools = CompanyTradingTools(
+                writer=ctx.writer,
+                agent_id=agent_id,
+                run_id=ctx.run.run_id,
+                quote_provider=self._quote_provider,
+                live_venue_resolver=self._live_venue_resolver,
+                max_quote_age_ns=self._max_quote_age_ns,
+            )
+            broker_handlers: dict[str, Any] = {
+                "read_company_status": lambda _args: services.read_company_status(
+                    ctx.writer.store, ctx.company_id
+                ),
+                "read_execution_tiers": lambda _args: _read_tiers(
+                    ctx.writer.store, ctx.company_id
+                ),
+            }
+            for spec in COMPANY_TRADING_TOOL_SPECS:
+                tool_name = spec.name
+                broker_handlers[tool_name] = (
+                    lambda a, _name=tool_name: trading_tools.invoke(_name, a)
+                )
             broker = OuterToolBroker(
                 company_id=ctx.company_id,
                 agent_id=agent_id,
                 run_id=ctx.run.run_id,
                 fencing_token=ctx.run.fencing_token,
-                handlers={
-                    "read_company_status": lambda _args: services.read_company_status(
-                        ctx.writer.store, ctx.company_id
-                    ),
-                    "read_execution_tiers": lambda _args: _read_tiers(
-                        ctx.writer.store, ctx.company_id
-                    ),
-                },
+                handlers=broker_handlers,
             )
             desk = desk_directory(ctx.writer.store, agent_id)
             desk.mkdir(parents=True, exist_ok=True)
@@ -547,7 +628,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 run_id=ctx.run.run_id,
                 fencing_token=ctx.run.fencing_token,
                 grant_scope=grant_scope,
-                mandate_summary="Company Tier 2 paper decision shift.",
+                mandate_summary="Autonomous Company Trading decision shift (Paper & Board-approved Live).",
             )
             budget_ceiling = (
                 ctx.run.budget_ceiling_minor
@@ -561,6 +642,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     parameters={"type": "object", "properties": {}, "required": []},
                 ),
                 _READ_EXECUTION_TIERS_SPEC,
+                *COMPANY_TRADING_TOOL_SPECS,
             )
             req = ShiftRequest(
                 company_id=ctx.company_id,
@@ -594,6 +676,8 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 result={
                     "agent_id": agent_id,
                     "provider": result.provider,
+                    "model": result.model,
+                    "tool_calls_executed": result.tool_calls_executed,
                     "output_text": result.output_text,
                     "cost_minor_units": settlement.cost_minor_units,
                     "journal_entry_id": settlement.journal_entry_id,
@@ -601,6 +685,13 @@ class TradingDomainPlugin(BaseDomainPlugin):
             )
 
         def _run_quant_reconcile(ctx: DutyContext) -> DutyOutcome:
+            reconcile_summary = reconcile_trading_books(
+                ctx.writer,
+                quote_provider=self._quote_provider,
+                live_venue_resolver=self._live_venue_resolver,
+                max_quote_age_ns=self._max_quote_age_ns,
+                now_ns=ctx.now_ns,
+            )
             snapshot = _read_tiers(ctx.writer.store, ctx.company_id)
             return DutyOutcome(
                 disposition="completed",
@@ -610,6 +701,13 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "company_live_active": snapshot["company_live"] is not None,
                     "active_agent_sandboxes": len(snapshot["agent_sandboxes"]),
                     "reconciled_at_ns": ctx.now_ns,
+                    "books_marked": reconcile_summary["books_marked"],
+                    "live_actions_reconciled": reconcile_summary[
+                        "live_actions_reconciled"
+                    ],
+                    "live_fills_booked": reconcile_summary["live_fills_booked"],
+                    "drift_detected": reconcile_summary["drift_detected"],
+                    "restrictions_applied": reconcile_summary["restrictions_applied"],
                 },
             )
 
@@ -628,7 +726,16 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 precondition=_no_trading_risk_restriction,
             ),
             DutyDescriptor(
+                duty_kind=DUTY_TRADING_DECISION,
+                execute=_run_quant_paper_decision,
+                precondition=_no_trading_risk_restriction,
+            ),
+            DutyDescriptor(
                 duty_kind=DUTY_QUANT_RECONCILE,
+                execute=_run_quant_reconcile,
+            ),
+            DutyDescriptor(
+                duty_kind=DUTY_TRADING_RECONCILE,
                 execute=_run_quant_reconcile,
             ),
         )

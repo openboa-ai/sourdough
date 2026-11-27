@@ -13,12 +13,15 @@ from ..duty_run import DutyRefused, count_company_runs
 from ..runtime.domains import DomainCliRefused
 from ..supervisor import SupervisionRefused, supervise_worker
 from ..writer_lease import hold_company_writer
+from .domain import ExecutionTierRefused
 from .engine import EngineRefused, prepare_engine
 from .execution import BindingRefused, VenueRefused
 from .fund_returns import ReturnRefused
 from .market_runtime import observe_market
 from .market_worker import MarketRefused
 from .nautilus_runtime import prepare_paper, supervise_paper
+from .quotes import QuoteRefused, build_quote_provider_from_spec
+from .reconcile import reconcile_trading_books
 from .statement_store import (
     StatementRequest,
     read_retained_statement,
@@ -40,6 +43,7 @@ TRADING_CLI_COMMANDS = frozenset(
         "observe-trading-market",
         "prepare-nautilus-paper",
         "serve-nautilus-paper",
+        "reconcile-trading-books",
     }
 )
 
@@ -180,6 +184,17 @@ def register_trading_subcommands(
         else:
             sandbox.add_argument("--seconds", type=int, default=60)
             sandbox.add_argument("--replay-tape", type=Path)
+    rec_cmd = commands.add_parser(
+        "reconcile-trading-books",
+        help="Run mark-to-market valuations and live external reconciliation on active trading books",
+    )
+    rec_cmd.add_argument("store", type=Path)
+    rec_cmd.add_argument("--company-id", required=True)
+    rec_cmd.add_argument(
+        "--quote-source",
+        help="Optional read-only quote source: binance-spot, binance-futures, or journal:<path>",
+    )
+    rec_cmd.add_argument("--max-quote-age-seconds", type=int, default=60)
 
 
 def handle_trading_cli_command(args: argparse.Namespace) -> int | None:
@@ -191,7 +206,9 @@ def handle_trading_cli_command(args: argparse.Namespace) -> int | None:
         BindingRefused,
         DutyRefused,
         EngineRefused,
+        ExecutionTierRefused,
         MarketRefused,
+        QuoteRefused,
         ReturnRefused,
         SupervisionRefused,
         ValuationRefused,
@@ -278,6 +295,22 @@ def _dispatch_trading_command(args: argparse.Namespace) -> int:
         )
         print(json.dumps(asdict(result)))
         return 0 if result.completed else 1
+    elif args.command == "reconcile-trading-books":
+        if args.max_quote_age_seconds <= 0:
+            raise QuoteRefused("--max-quote-age-seconds must be positive")
+        provider = (
+            build_quote_provider_from_spec(args.quote_source)
+            if args.quote_source
+            else None
+        )
+        with hold_company_writer(args.store, args.company_id) as writer:
+            summary = reconcile_trading_books(
+                writer,
+                quote_provider=provider,
+                max_quote_age_ns=args.max_quote_age_seconds * 10**9,
+            )
+        print(json.dumps(summary, sort_keys=True))
+        return 0
     else:
         raise DomainCliRefused(f"Unsupported trading CLI command: {args.command}")
     print(json.dumps(asdict(result)))

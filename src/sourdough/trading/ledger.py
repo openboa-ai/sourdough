@@ -1128,6 +1128,86 @@ def submit_company_paper_book_order(
         }
 
 
+def cancel_company_paper_book_order(
+    writer: WriterLease,
+    *,
+    binding_id: str,
+    actor_id: str,
+    order_id: str,
+    reason: str = "agent_cancelled",
+    now_ns: int | None = None,
+) -> dict[str, Any]:
+    """Idempotently cancel an open resting order strictly within an active company_paper book."""
+    writer.verify()
+    _require_safe_id(binding_id, "binding_id")
+    _require_safe_id(actor_id, "actor_id")
+    _require_safe_id(order_id, "order_id")
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 256:
+        raise ExecutionTierRefused("cancel reason must be a non-empty string")
+    clean_reason = reason.strip()
+    now = time_ns() if now_ns is None else now_ns
+
+    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
+        writer.verify()
+        if _identity(db) != writer.company_id:
+            raise ExecutionTierRefused("Company identity mismatch")
+        if not is_domain_installed(db, "trading"):
+            raise ExecutionTierRefused("Trading domain is not installed")
+        _assert_active_agent(db, writer.company_id, actor_id)
+        row = db.execute(
+            """SELECT binding_id, status
+               FROM trading_book_order
+               WHERE company_id = ? AND binding_id = ? AND environment = 'paper' AND order_id = ?""",
+            (writer.company_id, binding_id, order_id),
+        ).fetchone()
+        if row is None:
+            raise ExecutionTierRefused(
+                f"Company paper order '{order_id}' not found on book '{binding_id}'"
+            )
+        status = str(row[1])
+        if status == "cancelled":
+            return {
+                "order_id": order_id,
+                "binding_id": binding_id,
+                "status": "cancelled",
+                "replayed": True,
+            }
+        if status != "open":
+            raise ExecutionTierRefused(
+                f"Cannot cancel company paper order in terminal state '{status}'"
+            )
+        db.execute(
+            """UPDATE trading_book_order
+               SET status = 'cancelled', cancelled_at_ns = ?,
+                   cancel_reason = ?, updated_at_ns = ?
+               WHERE company_id = ? AND binding_id = ? AND environment = 'paper' AND order_id = ?""",
+            (now, clean_reason, now, writer.company_id, binding_id, order_id),
+        )
+        append_audit_event(
+            db,
+            company_id=writer.company_id,
+            domain="trading",
+            entity_type="trading_book_order",
+            entity_id=order_id,
+            event_type="company_paper.order_cancelled",
+            actor_id=actor_id,
+            payload={
+                "order_id": order_id,
+                "binding_id": binding_id,
+                "environment": ENV_PAPER,
+                "reason": clean_reason,
+            },
+            recorded_at_ns=now,
+        )
+        writer.verify()
+        return {
+            "order_id": order_id,
+            "binding_id": binding_id,
+            "status": "cancelled",
+            "replayed": False,
+        }
+
+
 def _binding_has_paper_soak_evidence(
     db: Connection, company_id: str, binding_id: str, *, fill_count: int
 ) -> bool:
