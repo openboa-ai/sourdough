@@ -34,6 +34,8 @@ class WorkItem:
     payload_json: str
     created_at_ns: int
     updated_at_ns: int
+    attempt_count: int = 0
+    next_retry_at_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,9 @@ class WorkCondition:
     status: str
     created_at_ns: int
     updated_at_ns: int
+    cooldown_ns: int = 0
+    max_fires: int | None = None
+    fire_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -109,13 +114,18 @@ class PeerRequest:
     read_run_id: str | None = None
     answered_run_id: str | None = None
     resumed_run_id: str | None = None
+    hop_count: int = 0
+    chain_depth: int = 0
+    root_work_item_id: str | None = None
+    delegation_path_json: str = "[]"
 
 
 _PEER_REQUEST_COLUMNS = """request_id, company_id, requester_work_item_id, requester_run_id,
     requester_agent_id, recipient_agent_id, response_work_item_id,
     question, expected_decision, evidence_refs_json, deadline_ns,
     state, response_json, resolved_at_ns, created_at_ns,
-    request_key, project_id, read_run_id, answered_run_id, resumed_run_id"""
+    request_key, project_id, read_run_id, answered_run_id, resumed_run_id,
+    hop_count, chain_depth, root_work_item_id, delegation_path_json"""
 
 
 def _canonical_json(value: Any) -> str:
@@ -523,7 +533,8 @@ def create_work_item(
         existing = connection.execute(
             """SELECT work_item_id, company_id, owner_agent_id, duty_kind, state,
                       source_kind, source_id, parent_work_item_id, dedupe_key,
-                      payload_json, created_at_ns, updated_at_ns
+                      payload_json, created_at_ns, updated_at_ns,
+                      attempt_count, next_retry_at_ns
                FROM work_items WHERE dedupe_key = ?""",
             (dedupe_key,),
         ).fetchone()
@@ -975,7 +986,7 @@ def claim_work_run(
 
     changed = connection.execute(
         """UPDATE work_items
-           SET state = 'running', updated_at_ns = ?
+           SET state = 'running', next_retry_at_ns = NULL, updated_at_ns = ?
            WHERE work_item_id = ? AND state IN ('due', 'scheduled')""",
         (timestamp, work_item_id),
     )
@@ -1079,7 +1090,7 @@ def yield_run_to_wait(
     if changed.rowcount != 1:
         raise RunFenced("Run was fenced before yielding to durable wait")
     connection.execute(
-        "UPDATE work_items SET state = 'waiting', updated_at_ns = ? WHERE work_item_id = ?",
+        "UPDATE work_items SET state = 'waiting', next_retry_at_ns = NULL, updated_at_ns = ? WHERE work_item_id = ?",
         (timestamp, run.work_item_id),
     )
     append_audit_event(
@@ -1194,7 +1205,7 @@ def wake_waiting_runs(
             continue
         connection.execute(
             """UPDATE work_items
-               SET state = 'due', updated_at_ns = ?
+               SET state = 'due', next_retry_at_ns = NULL, updated_at_ns = ?
                WHERE work_item_id = ? AND state = 'waiting'""",
             (now_ns, work_item_id),
         )
@@ -1297,9 +1308,15 @@ def fail_work_run(
     *,
     error_summary: str,
     return_to_due: bool = True,
+    increment_attempt: bool = False,
+    next_retry_at_ns: int | None = None,
     now_ns: int | None = None,
 ) -> WorkRun:
     """Record a failed active run and release the Agent's active execution slot."""
+    if next_retry_at_ns is not None and (
+        type(next_retry_at_ns) is not int or next_retry_at_ns < 0
+    ):
+        raise WorkKernelRefused("next_retry_at_ns must be a nonnegative integer")
     timestamp = time_ns() if now_ns is None else now_ns
     run = assert_run_fencing(connection, run_id, fencing_token, now_ns=timestamp)
     outcome_json = _canonical_json({"disposition": "failed", "error": error_summary})
@@ -1313,10 +1330,27 @@ def fail_work_run(
     if changed.rowcount != 1:
         raise RunFenced("Run was fenced before failure transition")
     next_state = "due" if return_to_due else "blocked"
+    effective_retry_ns = next_retry_at_ns if return_to_due else None
     connection.execute(
-        "UPDATE work_items SET state = ?, updated_at_ns = ? WHERE work_item_id = ?",
-        (next_state, timestamp, run.work_item_id),
+        """UPDATE work_items
+           SET state = ?,
+               attempt_count = CASE WHEN ? THEN attempt_count + 1 ELSE attempt_count END,
+               next_retry_at_ns = ?,
+               updated_at_ns = ?
+           WHERE work_item_id = ?""",
+        (
+            next_state,
+            1 if increment_attempt else 0,
+            effective_retry_ns,
+            timestamp,
+            run.work_item_id,
+        ),
     )
+    attempt_row = connection.execute(
+        "SELECT attempt_count FROM work_items WHERE work_item_id = ?",
+        (run.work_item_id,),
+    ).fetchone()
+    current_attempt = int(attempt_row[0]) if attempt_row is not None else 0
     append_audit_event(
         connection,
         company_id=run.company_id,
@@ -1330,6 +1364,8 @@ def fail_work_run(
             "work_item_id": run.work_item_id,
             "error": error_summary,
             "item_state": next_state,
+            "attempt_count": current_attempt,
+            "next_retry_at_ns": effective_retry_ns,
         },
         recorded_at_ns=timestamp,
     )
@@ -1381,7 +1417,7 @@ def complete_work_run(
     if changed.rowcount != 1:
         raise RunFenced("Run was fenced before completion")
     connection.execute(
-        "UPDATE work_items SET state = ?, updated_at_ns = ? WHERE work_item_id = ?",
+        "UPDATE work_items SET state = ?, next_retry_at_ns = NULL, updated_at_ns = ? WHERE work_item_id = ?",
         (item_state, timestamp, run.work_item_id),
     )
     armed: WorkCondition | None = None
@@ -1543,7 +1579,7 @@ def list_conditions(
         """SELECT condition_id, company_id, owner_agent_id, responsibility_id,
                   work_item_id, condition_revision, trigger_kind, due_at_ns,
                   source_identity, expected_revision, expires_at_ns, status,
-                  created_at_ns, updated_at_ns
+                  created_at_ns, updated_at_ns, cooldown_ns, max_fires, fire_count
            FROM work_conditions
            WHERE company_id = ? AND owner_agent_id = ?
            ORDER BY created_at_ns, condition_id""",
@@ -1564,14 +1600,20 @@ def set_condition(
     source_identity: str | None = None,
     expected_revision: str | None = None,
     expires_at_ns: int | None = None,
+    cooldown_ns: int = 0,
+    max_fires: int | None = None,
     condition_revision: int = 1,
     condition_id: str | None = None,
     now_ns: int | None = None,
 ) -> WorkCondition:
-    """Arm an Agent-owned next condition (timer or shared_asset_revision)."""
+    """Arm an Agent-owned next condition (timer, shared_asset_revision, or peer_response)."""
     _require_agent(connection, company_id, owner_agent_id)
     if type(condition_revision) is not int or condition_revision < 1:
         raise WorkKernelRefused("condition_revision must be a positive integer")
+    if type(cooldown_ns) is not int or cooldown_ns < 0:
+        raise WorkKernelRefused("cooldown_ns must be a nonnegative integer")
+    if max_fires is not None and (type(max_fires) is not int or max_fires < 1):
+        raise WorkKernelRefused("max_fires must be a positive integer")
     if trigger_kind not in ("timer", "shared_asset_revision", "peer_response"):
         raise WorkKernelRefused(f"Unsupported condition trigger_kind: {trigger_kind}")
     if trigger_kind == "timer" and due_at_ns is None:
@@ -1616,9 +1658,10 @@ def set_condition(
         """INSERT INTO work_conditions (
                condition_id, company_id, owner_agent_id, responsibility_id,
                work_item_id, condition_revision, trigger_kind, due_at_ns,
-               source_identity, expected_revision, expires_at_ns, status,
+               source_identity, expected_revision, expires_at_ns,
+               cooldown_ns, max_fires, fire_count, status,
                created_at_ns, updated_at_ns
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?)""",
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'armed', ?, ?)""",
         (
             cid,
             company_id,
@@ -1631,6 +1674,8 @@ def set_condition(
             effective_source,
             expected_revision,
             expires_at_ns,
+            cooldown_ns,
+            max_fires,
             timestamp,
             timestamp,
         ),
@@ -1650,6 +1695,9 @@ def set_condition(
         "armed",
         timestamp,
         timestamp,
+        cooldown_ns=cooldown_ns,
+        max_fires=max_fires,
+        fire_count=0,
     )
 
 
@@ -1663,18 +1711,30 @@ def replace_condition(
     source_identity: str | None = None,
     expected_revision: str | None = None,
     expires_at_ns: int | None = None,
+    cooldown_ns: int | None = None,
+    max_fires: int | None = None,
     now_ns: int | None = None,
 ) -> WorkCondition:
     """Supersede an armed condition and arm a successor with incremented condition_revision."""
     row = connection.execute(
         """SELECT condition_id, company_id, owner_agent_id, responsibility_id,
-                  work_item_id, condition_revision, status
+                  work_item_id, condition_revision, status, cooldown_ns, max_fires
            FROM work_conditions WHERE condition_id = ?""",
         (condition_id,),
     ).fetchone()
     if row is None:
         raise WorkKernelRefused("Condition not found")
-    _, company_id, actual_owner, resp_id, item_id, revision, status = row
+    (
+        _,
+        company_id,
+        actual_owner,
+        resp_id,
+        item_id,
+        revision,
+        status,
+        prev_cooldown_ns,
+        prev_max_fires,
+    ) = row
     if actual_owner != owner_agent_id:
         raise WorkKernelRefused("Condition belongs to another Agent")
     if status != "armed":
@@ -1695,6 +1755,8 @@ def replace_condition(
         source_identity=source_identity,
         expected_revision=expected_revision,
         expires_at_ns=expires_at_ns,
+        cooldown_ns=int(prev_cooldown_ns) if cooldown_ns is None else cooldown_ns,
+        max_fires=prev_max_fires if max_fires is None else max_fires,
         condition_revision=int(revision) + 1,
         now_ns=timestamp,
     )
@@ -2156,6 +2218,10 @@ def record_peer_request_read(
         read_run_id=response_run_id,
         answered_run_id=prior.answered_run_id,
         resumed_run_id=prior.resumed_run_id,
+        hop_count=prior.hop_count,
+        chain_depth=prior.chain_depth,
+        root_work_item_id=prior.root_work_item_id,
+        delegation_path_json=prior.delegation_path_json,
     )
 
 
@@ -2309,6 +2375,10 @@ def resolve_peer_request(
             read_run_id=prior.read_run_id,
             answered_run_id=answered_run,
             resumed_run_id=prior.resumed_run_id,
+            hop_count=prior.hop_count,
+            chain_depth=prior.chain_depth,
+            root_work_item_id=prior.root_work_item_id,
+            delegation_path_json=prior.delegation_path_json,
         ),
         True,
     )

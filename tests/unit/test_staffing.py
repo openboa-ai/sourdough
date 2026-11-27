@@ -347,7 +347,7 @@ class Staffing(unittest.TestCase):
                 ),
                 hire.duty_id,
             )
-        self.assertEqual(self.rows("SELECT count(*) FROM private_desk"), [(1,)])
+        self.assertEqual(self.rows("SELECT count(*) FROM private_desk"), [(2,)])
         self.assertEqual(
             self.rows("SELECT count(*) FROM onboarding_acceptance"), [(1,)]
         )
@@ -651,7 +651,7 @@ class Staffing(unittest.TestCase):
         employee.staffing.assert_not_called()
         self.assertTrue(result.accepted)
         self.assertEqual(self.rows("SELECT count(*) FROM hire_receipt"), [(1,)])
-        self.assertEqual(self.rows("SELECT count(*) FROM private_desk"), [(1,)])
+        self.assertEqual(self.rows("SELECT count(*) FROM private_desk"), [(2,)])
         return result
 
     def test_committed_hire_resumes_before_another_staffing_turn(self):

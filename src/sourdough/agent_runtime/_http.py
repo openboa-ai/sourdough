@@ -40,28 +40,44 @@ def resolve_endpoint_base(
     return override.rstrip("/")
 
 
-def render_context_system_prompt(request: ShiftRequest) -> str:
-    """Serialize the versioned ContextPack into a deterministic system prompt."""
+def render_context_system_blocks(request: ShiftRequest) -> tuple[str, str]:
+    """Split ContextPack v2 into a prompt-cache-stable prefix and per-run dynamic suffix."""
     ctx = request.context
-    envelope = {
+    stable_envelope = {
         "company_id": ctx.company_id,
         "agent_id": ctx.agent_id,
-        "run_id": ctx.run_id,
-        "fencing_token": ctx.fencing_token,
         "grant_scope": ctx.grant_scope,
         "mandate_summary": ctx.mandate_summary,
+        "active_snapshot_id": ctx.active_snapshot_id,
+        "active_methods": list(ctx.active_methods),
+    }
+    dynamic_envelope = {
+        "run_id": ctx.run_id,
+        "fencing_token": ctx.fencing_token,
+        "desk_manifest": list(ctx.desk_manifest),
         "open_receipts": list(ctx.open_receipts),
+        "recent_episodes": list(ctx.recent_episodes),
         "history_notes": list(ctx.history_notes),
         "context_digest": ctx.digest,
         "compacted": ctx.compacted,
     }
-    encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
-    return (
+    stable_json = json.dumps(stable_envelope, sort_keys=True, separators=(",", ":"))
+    dynamic_json = json.dumps(dynamic_envelope, sort_keys=True, separators=(",", ":"))
+    stable_prefix = (
         "You are operating inside a Sourdough fenced Agent shift. "
         "Respect your grant_scope and open_receipts, never spoof server identity arguments "
-        "(agent_id, company_id, run_id, fencing_token, tier), and invoke only declared tools.\n"
-        f"SHIFT_CONTEXT_PACK={encoded}"
+        "(agent_id, company_id, run_id, fencing_token, tier, actor_id, created_by_agent_id), "
+        "and invoke only declared tools.\n"
+        f"SHIFT_STABLE_CONTEXT={stable_json}"
     )
+    dynamic_suffix = f"SHIFT_DYNAMIC_CONTEXT={dynamic_json}"
+    return stable_prefix, dynamic_suffix
+
+
+def render_context_system_prompt(request: ShiftRequest) -> str:
+    """Serialize the versioned ContextPack into a deterministic system prompt."""
+    stable_prefix, dynamic_suffix = render_context_system_blocks(request)
+    return f"{stable_prefix}\n{dynamic_suffix}"
 
 
 def post_json_request(

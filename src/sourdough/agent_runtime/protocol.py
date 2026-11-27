@@ -22,7 +22,15 @@ VALID_PROVIDERS = frozenset(
 )
 
 _FORBIDDEN_TOOL_ARG_KEYS = frozenset(
-    {"agent_id", "company_id", "run_id", "fencing_token", "tier"}
+    {
+        "agent_id",
+        "company_id",
+        "run_id",
+        "fencing_token",
+        "tier",
+        "actor_id",
+        "created_by_agent_id",
+    }
 )
 _SECRET_HANDLE_RE = re.compile(
     r"^(?P<scheme>keychain|envref):(?P<target>[A-Za-z0-9][A-Za-z0-9._:/-]{2,120})$"
@@ -252,6 +260,10 @@ class ContextPack:
     history_notes: tuple[str, ...]
     digest: str
     compacted: bool
+    desk_manifest: tuple[dict[str, Any], ...] = ()
+    active_methods: tuple[dict[str, Any], ...] = ()
+    active_snapshot_id: str | None = None
+    recent_episodes: tuple[dict[str, Any], ...] = ()
 
 
 def hydrate_shift_context(
@@ -264,10 +276,15 @@ def hydrate_shift_context(
     mandate_summary: str,
     open_receipts: tuple[dict[str, Any], ...] = (),
     history_notes: tuple[str, ...] = (),
+    desk_manifest: tuple[dict[str, Any], ...] = (),
+    active_methods: tuple[dict[str, Any], ...] = (),
+    active_snapshot_id: str | None = None,
+    recent_episodes: tuple[dict[str, Any], ...] = (),
     max_context_bytes: int = 16_384,
 ) -> ContextPack:
-    """Build a bounded ContextPack without EVER evicting open_receipts or grant scope."""
+    """Build a bounded ContextPack without EVER evicting open_receipts, grants, or active methods."""
     kept_history = list(history_notes)
+    kept_episodes = list(recent_episodes)
     compacted = False
     while True:
         body = {
@@ -279,14 +296,24 @@ def hydrate_shift_context(
             "mandate_summary": mandate_summary,
             "open_receipts": list(open_receipts),
             "history_notes": kept_history,
+            "desk_manifest": list(desk_manifest),
+            "active_methods": list(active_methods),
+            "active_snapshot_id": active_snapshot_id,
+            "recent_episodes": kept_episodes,
         }
         encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
         )
-        if len(encoded) <= max_context_bytes or not kept_history:
+        if len(encoded) <= max_context_bytes:
             break
-        kept_history.pop(0)
-        compacted = True
+        if kept_history:
+            kept_history.pop(0)
+            compacted = True
+        elif kept_episodes:
+            kept_episodes.pop()
+            compacted = True
+        else:
+            break
     digest = sha256(encoded).hexdigest()
     return ContextPack(
         company_id=company_id,
@@ -299,6 +326,10 @@ def hydrate_shift_context(
         history_notes=tuple(kept_history),
         digest=digest,
         compacted=compacted,
+        desk_manifest=tuple(desk_manifest),
+        active_methods=tuple(active_methods),
+        active_snapshot_id=active_snapshot_id,
+        recent_episodes=tuple(kept_episodes),
     )
 
 
@@ -334,11 +365,76 @@ class ShiftResult:
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
 
 
+def _is_fatal_tool_exception(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            SystemExit,
+            KeyboardInterrupt,
+            AgentRuntimeRefused,
+            AgentTransportInterrupted,
+        ),
+    ):
+        return True
+    from ..company import FoundingRefused
+    from ..runtime.registry import RuntimeRefused
+    from ..runtime.work_kernel import RunFenced
+    from ..storage.checkpoint import CheckpointRefused
+    from ..storage.db import StorageRefused
+    from ..writer_lease import WriterRefused
+
+    # Check RunFenced BEFORE WorkKernelRefused because RunFenced subclasses WorkKernelRefused.
+    return isinstance(
+        exc,
+        (
+            RunFenced,
+            StorageRefused,
+            FoundingRefused,
+            WriterRefused,
+            CheckpointRefused,
+            RuntimeRefused,
+        ),
+    )
+
+
+def _is_recoverable_tool_exception(
+    exc: BaseException,
+    extra_recoverable: tuple[type[BaseException], ...],
+) -> bool:
+    if _is_fatal_tool_exception(exc):
+        return False
+    if isinstance(exc, (ValueError, TypeError, KeyError)):
+        return True
+    if extra_recoverable and isinstance(exc, extra_recoverable):
+        return True
+    from ..board_control import BoardControlRefused
+    from ..duty_run import DutyRefused
+    from ..episode_index import EpisodeIndexRefused
+    from ..general_ledger import JournalRefused
+    from ..memory import MemoryRefused
+    from ..runtime.domains import DomainActionRefused
+    from ..runtime.work_kernel import WorkKernelRefused
+
+    return isinstance(
+        exc,
+        (
+            WorkKernelRefused,
+            DutyRefused,
+            BoardControlRefused,
+            DomainActionRefused,
+            JournalRefused,
+            MemoryRefused,
+            EpisodeIndexRefused,
+        ),
+    )
+
+
 class OuterToolBroker:
     """Trusted Outer Capability Broker mediating every model-requested tool call.
 
     Enforces strict allowlisting, rejects spoofed server-identity keys, bounds total
-    invocations, and caches receipts by `call_id` so retries never duplicate effects.
+    invocations, prevents trajectory loops, classifies recoverable domain refusals vs
+    fatal aborts, and caches receipts by `call_id` so retries never duplicate effects.
     """
 
     def __init__(
@@ -350,6 +446,14 @@ class OuterToolBroker:
         fencing_token: int,
         handlers: dict[str, ToolHandler],
         max_tool_calls: int = 8,
+        fencing_check: Callable[[], None] | None = None,
+        receipt_recorder: Callable[[dict[str, Any]], None] | None = None,
+        trace_recorder: Callable[[dict[str, Any]], None] | None = None,
+        offload_handler: Callable[[int, str, dict[str, Any]], dict[str, Any]]
+        | None = None,
+        recoverable_exceptions: tuple[type[BaseException], ...] = (),
+        max_repeated_identical_calls: int = 3,
+        clock: Callable[[], int] = time_ns,
     ) -> None:
         self._company_id = company_id
         self._agent_id = agent_id
@@ -357,8 +461,17 @@ class OuterToolBroker:
         self._fencing_token = fencing_token
         self._handlers = dict(handlers)
         self._max_tool_calls = max_tool_calls
+        self._fencing_check = fencing_check
+        self._receipt_recorder = receipt_recorder
+        self._trace_recorder = trace_recorder
+        self._offload_handler = offload_handler
+        self._recoverable_exceptions = tuple(recoverable_exceptions)
+        self._max_repeated_identical_calls = max(1, int(max_repeated_identical_calls))
+        self._clock = clock
         self._call_cache: dict[str, tuple[str, str, dict[str, Any]]] = {}
+        self._identical_call_counts: dict[tuple[str, str], int] = {}
         self._call_count = 0
+        self._accrued_usage = TokenUsage(0, 0)
         self._events: list[AdapterEvent] = []
 
     @property
@@ -366,12 +479,95 @@ class OuterToolBroker:
         return self._call_count
 
     @property
+    def accrued_usage(self) -> TokenUsage:
+        return self._accrued_usage
+
+    def record_usage(self, delta: TokenUsage) -> None:
+        self._accrued_usage = self._accrued_usage + delta
+
+    @property
     def events(self) -> tuple[AdapterEvent, ...]:
         return tuple(self._events)
+
+    def _emit_records(
+        self,
+        *,
+        seq: int,
+        call_id: str,
+        tool_name: str,
+        arg_digest: str,
+        arg_keys: list[str],
+        status: str,
+        result: dict[str, Any],
+        error_type: str | None = None,
+        error_message: str | None = None,
+        best_effort: bool = False,
+    ) -> None:
+        now_ns = max(1, int(self._clock()))
+        result_json = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        result_digest = sha256(result_json.encode("utf-8")).hexdigest()
+        offloaded_path = (
+            str(result["log_path"])
+            if result.get("offloaded") is True
+            and isinstance(result.get("log_path"), str)
+            else None
+        )
+        if self._receipt_recorder is not None:
+            receipt_payload = {
+                "company_id": self._company_id,
+                "run_id": self._run_id,
+                "agent_id": self._agent_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "arg_digest": arg_digest,
+                "status": status,
+                "result_digest": result_digest,
+                "result_json": result_json,
+                "error_type": error_type,
+                "error_message": error_message,
+                "offloaded_log_path": offloaded_path,
+                "recorded_at_ns": now_ns,
+            }
+            if best_effort:
+                try:
+                    self._receipt_recorder(receipt_payload)
+                except Exception:
+                    pass
+            else:
+                self._receipt_recorder(receipt_payload)
+        if self._trace_recorder is not None:
+            trace_payload = {
+                "seq": seq,
+                "recorded_at_ns": now_ns,
+                "company_id": self._company_id,
+                "agent_id": self._agent_id,
+                "run_id": self._run_id,
+                "fencing_token": self._fencing_token,
+                "call_id": call_id,
+                "tool": tool_name,
+                "status": status,
+                "arg_keys": arg_keys,
+                "arg_digest": arg_digest,
+                "result_sha256": result_digest,
+                "error_kind": error_type,
+                "offloaded_log_path": offloaded_path,
+            }
+            if best_effort:
+                try:
+                    self._trace_recorder(trace_payload)
+                except Exception:
+                    pass
+            else:
+                self._trace_recorder(trace_payload)
 
     def invoke(
         self, call_id: str, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        # Step A1: Live fencing check BEFORE cache replay so fenced runs cannot replay.
+        if self._fencing_check is not None:
+            self._fencing_check()
+
+        # Step A2: Structural argument checks (always fatal).
         if not isinstance(call_id, str) or not call_id.strip():
             raise AgentRuntimeRefused("Tool call_id is required")
         if not isinstance(arguments, dict):
@@ -379,7 +575,9 @@ class OuterToolBroker:
         arg_digest = sha256(
             json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        arg_keys = sorted(str(k) for k in arguments.keys())
 
+        # Step A3: Idempotent replay cache check.
         cached = self._call_cache.get(call_id)
         if cached is not None:
             prior_name, prior_digest, prior_result = cached
@@ -389,6 +587,7 @@ class OuterToolBroker:
                 )
             return prior_result
 
+        # Step A4: Tool cap, allowlist, and identity-spoofing checks (always fatal).
         if self._call_count >= self._max_tool_calls:
             raise AgentRuntimeRefused("Shift exceeded maximum permitted tool calls")
         if tool_name not in self._handlers:
@@ -401,10 +600,37 @@ class OuterToolBroker:
                 f"Server-bound identity fields cannot be supplied in tool arguments: {sorted(spoofed)}"
             )
 
+        # Step B: Trajectory loop-breaker on repeated identical (tool_name, arg_digest) calls.
+        loop_key = (tool_name, arg_digest)
+        prior_identical = self._identical_call_counts.get(loop_key, 0)
+        if prior_identical >= self._max_repeated_identical_calls + 1:
+            err_msg = (
+                f"Trajectory loop-breaker aborted shift after repeated identical "
+                f"calls to '{tool_name}'"
+            )
+            self._emit_records(
+                seq=self._call_count + 1,
+                call_id=call_id,
+                tool_name=tool_name,
+                arg_digest=arg_digest,
+                arg_keys=arg_keys,
+                status="fatal",
+                result={
+                    "ok": False,
+                    "error": err_msg,
+                    "error_type": "AgentRuntimeRefused",
+                },
+                error_type="AgentRuntimeRefused",
+                error_message=err_msg,
+                best_effort=True,
+            )
+            raise AgentRuntimeRefused(err_msg)
+
+        now_ns = max(1, int(self._clock()))
         self._events.append(
             AdapterEvent(
                 kind="tool_request",
-                recorded_at_ns=time_ns(),
+                recorded_at_ns=now_ns,
                 payload={
                     "call_id": call_id,
                     "tool": tool_name,
@@ -413,17 +639,144 @@ class OuterToolBroker:
             )
         )
         self._call_count += 1
-        result = self._handlers[tool_name](arguments)
-        if not isinstance(result, dict):
+        seq = self._call_count
+        self._identical_call_counts[loop_key] = prior_identical + 1
+
+        if prior_identical >= self._max_repeated_identical_calls:
+            refusal_result: dict[str, Any] = {
+                "ok": False,
+                "error": (
+                    f"Trajectory loop detected for tool '{tool_name}' with identical "
+                    "arguments; choose a different action or conclude."
+                ),
+                "error_type": "TrajectoryLoopDetected",
+            }
+            self._call_cache[call_id] = (tool_name, arg_digest, refusal_result)
+            self._emit_records(
+                seq=seq,
+                call_id=call_id,
+                tool_name=tool_name,
+                arg_digest=arg_digest,
+                arg_keys=arg_keys,
+                status="refused",
+                result=refusal_result,
+                error_type="TrajectoryLoopDetected",
+                error_message=refusal_result["error"],
+            )
+            self._events.append(
+                AdapterEvent(
+                    kind="tool_result",
+                    recorded_at_ns=max(1, int(self._clock())),
+                    payload={
+                        "call_id": call_id,
+                        "tool": tool_name,
+                        "ok": False,
+                        "error_type": "TrajectoryLoopDetected",
+                        "result_keys": sorted(refusal_result.keys()),
+                    },
+                )
+            )
+            return refusal_result
+
+        # Step C: Handler execution and fatal vs recoverable classification.
+        try:
+            raw_result = self._handlers[tool_name](arguments)
+        except BaseException as exc:
+            if _is_fatal_tool_exception(exc):
+                self._emit_records(
+                    seq=seq,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    arg_digest=arg_digest,
+                    arg_keys=arg_keys,
+                    status="fatal",
+                    result={
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:1000],
+                    best_effort=True,
+                )
+                raise
+            if _is_recoverable_tool_exception(exc, self._recoverable_exceptions):
+                recoverable_result: dict[str, Any] = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+                self._call_cache[call_id] = (tool_name, arg_digest, recoverable_result)
+                self._emit_records(
+                    seq=seq,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    arg_digest=arg_digest,
+                    arg_keys=arg_keys,
+                    status="refused",
+                    result=recoverable_result,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:1000],
+                )
+                self._events.append(
+                    AdapterEvent(
+                        kind="tool_result",
+                        recorded_at_ns=max(1, int(self._clock())),
+                        payload={
+                            "call_id": call_id,
+                            "tool": tool_name,
+                            "ok": False,
+                            "error_type": type(exc).__name__,
+                            "result_keys": sorted(recoverable_result.keys()),
+                        },
+                    )
+                )
+                return recoverable_result
+            self._emit_records(
+                seq=seq,
+                call_id=call_id,
+                tool_name=tool_name,
+                arg_digest=arg_digest,
+                arg_keys=arg_keys,
+                status="error",
+                result={
+                    "ok": False,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+                error_type=type(exc).__name__,
+                error_message=str(exc)[:1000],
+                best_effort=True,
+            )
+            raise
+
+        if not isinstance(raw_result, dict):
             raise AgentRuntimeRefused("Tool handler must return a JSON object")
+        result = (
+            self._offload_handler(seq, tool_name, raw_result)
+            if self._offload_handler is not None
+            else raw_result
+        )
+        if not isinstance(result, dict):
+            raise AgentRuntimeRefused("Tool offload handler must return a JSON object")
         self._call_cache[call_id] = (tool_name, arg_digest, result)
+        self._emit_records(
+            seq=seq,
+            call_id=call_id,
+            tool_name=tool_name,
+            arg_digest=arg_digest,
+            arg_keys=arg_keys,
+            status="ok",
+            result=result,
+        )
         self._events.append(
             AdapterEvent(
                 kind="tool_result",
-                recorded_at_ns=time_ns(),
+                recorded_at_ns=max(1, int(self._clock())),
                 payload={
                     "call_id": call_id,
                     "tool": tool_name,
+                    "ok": result.get("ok", True),
                     "result_keys": sorted(result.keys()),
                 },
             )

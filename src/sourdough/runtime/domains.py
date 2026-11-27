@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..agent_runtime.protocol import AgentProfileBinding, ToolHandler, ToolSpec
     from ..agent_runtime.registry import AgentAdapterRegistry
     from ..board_control import AuthorizeBoard, BoardCommandOutcome
+    from .shift_runner import ShiftRunner
 
     ProfileBindingLookup = (
         Mapping[str, AgentProfileBinding] | Callable[[str], AgentProfileBinding]
@@ -55,6 +56,7 @@ class ToolQueryContext:
 class ToolContribution:
     specs: tuple[ToolSpec, ...] = ()
     handlers: Mapping[str, ToolHandler] = field(default_factory=dict)
+    recoverable_exceptions: tuple[type[BaseException], ...] = ()
 
 
 @runtime_checkable
@@ -69,9 +71,12 @@ def merge_tool_contributions(
     base_specs: Sequence[ToolSpec],
     base_handlers: Mapping[str, ToolHandler],
     contributions: Sequence[ToolContribution],
-) -> tuple[tuple[ToolSpec, ...], dict[str, ToolHandler]]:
+) -> tuple[
+    tuple[ToolSpec, ...], dict[str, ToolHandler], tuple[type[BaseException], ...]
+]:
     specs: list[ToolSpec] = list(base_specs)
     handlers: dict[str, ToolHandler] = dict(base_handlers)
+    recoverable: list[type[BaseException]] = []
     seen = {spec.name for spec in specs} | set(handlers)
     for contrib in contributions:
         for spec in contrib.specs:
@@ -84,7 +89,10 @@ def merge_tool_contributions(
             if name in handlers and name not in spec_names:
                 raise RuntimeRefused(f"Duplicate tool handler registration: {name}")
             handlers[name] = fn
-    return tuple(specs), handlers
+        for exc_type in contrib.recoverable_exceptions:
+            if exc_type not in recoverable:
+                recoverable.append(exc_type)
+    return tuple(specs), handlers, tuple(recoverable)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +109,7 @@ class DutyRuntimeServices:
     resolve_profile: Callable[[ProfileBindingLookup, str], AgentProfileBinding]
     read_company_status: Callable[[Path, str], dict[str, Any]]
     contribute_tools: Callable[[ToolQueryContext], ToolContribution]
+    shift_runner: ShiftRunner | None = None
 
 
 @runtime_checkable

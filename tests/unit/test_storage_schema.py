@@ -49,13 +49,18 @@ class CanonicalV1Schema(unittest.TestCase):
                 "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE 'paper_%'"
             ).fetchall()
             self.assertEqual(paper_tables, [])
-            # Every user table must be STRICT
+            # Every user table must be STRICT and company.sqlite must have zero FTS5 virtual tables
             non_strict = reader.execute(
                 """SELECT name FROM pragma_table_list
                    WHERE schema = 'main' AND type = 'table'
                      AND name NOT LIKE 'sqlite_%' AND strict != 1"""
             ).fetchall()
             self.assertEqual(non_strict, [])
+            fts_tables = reader.execute(
+                """SELECT name FROM sqlite_schema
+                   WHERE lower(COALESCE(sql, '')) LIKE '%fts5%'"""
+            ).fetchall()
+            self.assertEqual(fts_tables, [])
 
     def test_paper_domain_activates_idempotently_and_audits_once(self):
         receipt = found(self.store, self.terms)

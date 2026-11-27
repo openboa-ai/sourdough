@@ -1288,3 +1288,235 @@ class CanonicalV1SchemaMigrationTests(unittest.TestCase):
                     ).fetchone()[0],
                     1,
                 )
+
+    def test_migrate_upgrades_pre_m1_core_store_with_new_tables_and_columns(self):
+        from sourdough.company import FoundingTerms, found
+        from sourdough.storage.migration import CORE_NEW_TABLES
+
+        with TemporaryDirectory() as tmp:
+            store = Path(tmp) / "pre-m1.sqlite"
+            receipt = found(
+                store,
+                FoundingTerms("pre-m1", "charter-v1", "manage-company", "profile-v1"),
+            )
+            with closing(sqlite3.connect(store)) as conn:
+                conn.execute("PRAGMA foreign_keys = OFF")
+                with conn:
+                    for new_tbl in CORE_NEW_TABLES:
+                        conn.execute(f"DROP TABLE IF EXISTS {new_tbl}")
+                    # Replace all 4 CORE_ALTERED_TABLES with exact pre-M1 schemas and sample rows
+                    for altered in (
+                        "work_handoff",
+                        "work_peer_requests",
+                        "work_conditions",
+                        "work_items",
+                    ):
+                        conn.execute(f"DROP TABLE IF EXISTS {altered}")
+
+                    conn.executescript(
+                        """
+                        CREATE TABLE work_items (
+                            work_item_id TEXT PRIMARY KEY,
+                            company_id TEXT NOT NULL REFERENCES company(id),
+                            owner_agent_id TEXT NOT NULL REFERENCES agent(id),
+                            duty_kind TEXT NOT NULL,
+                            state TEXT NOT NULL CHECK (
+                                state IN ('due', 'scheduled', 'running', 'waiting', 'settled', 'cancelled', 'blocked')
+                            ),
+                            source_kind TEXT NOT NULL,
+                            source_id TEXT NOT NULL,
+                            parent_work_item_id TEXT REFERENCES work_items(work_item_id),
+                            dedupe_key TEXT UNIQUE,
+                            payload_json TEXT NOT NULL,
+                            created_at_ns INTEGER NOT NULL,
+                            updated_at_ns INTEGER NOT NULL
+                        ) STRICT;
+                        CREATE INDEX idx_work_items_company_state
+                            ON work_items(company_id, state, created_at_ns);
+
+                        CREATE TABLE work_conditions (
+                            condition_id TEXT PRIMARY KEY,
+                            company_id TEXT NOT NULL REFERENCES company(id),
+                            owner_agent_id TEXT NOT NULL REFERENCES agent(id),
+                            responsibility_id TEXT REFERENCES work_responsibilities(responsibility_id),
+                            work_item_id TEXT REFERENCES work_items(work_item_id),
+                            condition_revision INTEGER NOT NULL DEFAULT 1,
+                            trigger_kind TEXT NOT NULL CHECK (
+                                trigger_kind IN ('timer', 'shared_asset_revision', 'peer_response')
+                            ),
+                            due_at_ns INTEGER,
+                            source_identity TEXT,
+                            expected_revision TEXT,
+                            expires_at_ns INTEGER,
+                            status TEXT NOT NULL CHECK (
+                                status IN ('armed', 'triggered', 'superseded', 'cancelled', 'expired')
+                            ),
+                            created_at_ns INTEGER NOT NULL,
+                            updated_at_ns INTEGER NOT NULL
+                        ) STRICT;
+                        CREATE INDEX idx_work_conditions_armed
+                            ON work_conditions(company_id, status, trigger_kind, due_at_ns);
+
+                        CREATE TABLE work_peer_requests (
+                            request_id TEXT PRIMARY KEY,
+                            company_id TEXT NOT NULL REFERENCES company(id),
+                            requester_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id),
+                            requester_run_id TEXT NOT NULL REFERENCES work_runs(run_id),
+                            requester_agent_id TEXT NOT NULL REFERENCES agent(id),
+                            recipient_agent_id TEXT NOT NULL REFERENCES agent(id),
+                            response_work_item_id TEXT NOT NULL UNIQUE REFERENCES work_items(work_item_id),
+                            request_key TEXT,
+                            project_id TEXT,
+                            question TEXT NOT NULL,
+                            expected_decision TEXT NOT NULL,
+                            evidence_refs_json TEXT NOT NULL,
+                            deadline_ns INTEGER NOT NULL,
+                            state TEXT NOT NULL CHECK (state IN ('open', 'answered', 'declined', 'expired')),
+                            read_run_id TEXT REFERENCES work_runs(run_id),
+                            answered_run_id TEXT REFERENCES work_runs(run_id),
+                            resumed_run_id TEXT UNIQUE REFERENCES work_runs(run_id),
+                            response_json TEXT,
+                            resolved_at_ns INTEGER,
+                            created_at_ns INTEGER NOT NULL
+                        ) STRICT;
+                        CREATE UNIQUE INDEX ux_work_peer_requests_open_duty
+                            ON work_peer_requests(requester_work_item_id) WHERE state = 'open';
+                        CREATE UNIQUE INDEX ux_work_peer_requests_duty_key
+                            ON work_peer_requests(requester_work_item_id, request_key)
+                            WHERE request_key IS NOT NULL;
+
+                        CREATE TABLE work_handoff (
+                            offer_id TEXT PRIMARY KEY NOT NULL,
+                            company_id TEXT NOT NULL REFERENCES company(id),
+                            request_id TEXT NOT NULL,
+                            sender_id TEXT NOT NULL REFERENCES agent(id),
+                            sender_run_id TEXT NOT NULL REFERENCES work_runs(run_id),
+                            original_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id),
+                            recipient_id TEXT NOT NULL REFERENCES agent(id),
+                            asset_id TEXT NOT NULL REFERENCES shared_publication(asset_id),
+                            expires_at INTEGER NOT NULL,
+                            expected_result TEXT NOT NULL,
+                            successor_work_item_id TEXT REFERENCES work_items(work_item_id),
+                            accepted_run_id TEXT REFERENCES work_runs(run_id),
+                            UNIQUE (sender_id, request_id)
+                        ) STRICT;
+                        """
+                    )
+
+                    conn.execute(
+                        """INSERT INTO work_items (
+                               work_item_id, company_id, owner_agent_id, duty_kind, state,
+                               source_kind, source_id, parent_work_item_id, dedupe_key,
+                               payload_json, created_at_ns, updated_at_ns
+                           ) VALUES (?, ?, ?, 'work.test', 'due', 'manual', 's1', NULL, NULL, '{}', 10, 10)""",
+                        ("wi-pre-1", receipt.company_id, receipt.founder_id),
+                    )
+                    conn.execute(
+                        """INSERT INTO work_items (
+                               work_item_id, company_id, owner_agent_id, duty_kind, state,
+                               source_kind, source_id, parent_work_item_id, dedupe_key,
+                               payload_json, created_at_ns, updated_at_ns
+                           ) VALUES (?, ?, ?, 'work.peer_response', 'due', 'peer_request', 'pr-pre-1', 'wi-pre-1', NULL, '{}', 11, 11)""",
+                        ("wi-pre-resp", receipt.company_id, receipt.founder_id),
+                    )
+                    conn.execute(
+                        """INSERT INTO work_runs (
+                               run_id, company_id, work_item_id, agent_id, duty_kind,
+                               status, fencing_token, created_at_ns, updated_at_ns
+                           ) VALUES (?, ?, 'wi-pre-1', ?, 'work.test', 'waiting', 1, 10, 10)""",
+                        ("run-pre-1", receipt.company_id, receipt.founder_id),
+                    )
+                    conn.execute(
+                        """INSERT INTO work_conditions (
+                               condition_id, company_id, owner_agent_id, responsibility_id,
+                               work_item_id, condition_revision, trigger_kind, due_at_ns,
+                               source_identity, expected_revision, expires_at_ns, status,
+                               created_at_ns, updated_at_ns
+                           ) VALUES (?, ?, ?, NULL, 'wi-pre-1', 1, 'timer', 50, 'timer:pre', NULL, NULL, 'armed', 10, 10)""",
+                        ("cond-pre-1", receipt.company_id, receipt.founder_id),
+                    )
+                    conn.execute(
+                        """INSERT INTO work_peer_requests (
+                               request_id, company_id, requester_work_item_id, requester_run_id,
+                               requester_agent_id, recipient_agent_id, response_work_item_id,
+                               request_key, project_id, question, expected_decision,
+                               evidence_refs_json, deadline_ns, state, created_at_ns
+                           ) VALUES (?, ?, 'wi-pre-1', 'run-pre-1', ?, ?, 'wi-pre-resp', 'k1', NULL, 'Q?', 'yes/no', '[]', 999, 'open', 10)""",
+                        (
+                            "pr-pre-1",
+                            receipt.company_id,
+                            receipt.founder_id,
+                            receipt.founder_id,
+                        ),
+                    )
+                    conn.execute(
+                        """INSERT INTO shared_project (project_id, company_id, revision, members, publishers)
+                           VALUES ('proj-pre-1', ?, 'rev-1', ?, ?)""",
+                        (
+                            receipt.company_id,
+                            f'["{receipt.founder_id}"]',
+                            f'["{receipt.founder_id}"]',
+                        ),
+                    )
+                    conn.execute(
+                        """INSERT INTO shared_publication (
+                               asset_id, company_id, project_id, author_id, work_item_id,
+                               request_id, request_digest, audience, content
+                           ) VALUES ('asset-pre-1', ?, 'proj-pre-1', ?, 'wi-pre-1', 'pub-1', 'dig-1', ?, 'body')""",
+                        (
+                            receipt.company_id,
+                            receipt.founder_id,
+                            f'["{receipt.founder_id}"]',
+                        ),
+                    )
+                    conn.execute(
+                        """INSERT INTO work_handoff (
+                               offer_id, company_id, request_id, sender_id, sender_run_id,
+                               original_work_item_id, recipient_id, asset_id, expires_at,
+                               expected_result, successor_work_item_id, accepted_run_id
+                           ) VALUES ('offer-pre-1', ?, 'req-ho-1', ?, 'run-pre-1', 'wi-pre-1', ?, 'asset-pre-1', 999, 'done', NULL, NULL)""",
+                        (receipt.company_id, receipt.founder_id, receipt.founder_id),
+                    )
+
+            with self.assertRaisesRegex(StorageRefused, "sqlite_schema"):
+                open_reader(store)
+
+            domains = migrate_v1_store_to_canonical(store)
+            self.assertEqual(domains, frozenset({"core"}))
+            # Idempotent second pass
+            self.assertEqual(migrate_v1_store_to_canonical(store), frozenset({"core"}))
+            with closing(open_reader(store)) as reader, read_tx(reader):
+                self.assertEqual(verify_v1_schema(reader), frozenset({"core"}))
+                self.assertEqual(
+                    reader.execute("PRAGMA foreign_key_check").fetchall(), []
+                )
+                self.assertEqual(
+                    reader.execute(
+                        "SELECT attempt_count, next_retry_at_ns FROM work_items WHERE work_item_id = 'wi-pre-1'"
+                    ).fetchone(),
+                    (0, None),
+                )
+                self.assertEqual(
+                    reader.execute(
+                        "SELECT cooldown_ns, max_fires, fire_count FROM work_conditions WHERE condition_id = 'cond-pre-1'"
+                    ).fetchone(),
+                    (0, None, 0),
+                )
+                self.assertEqual(
+                    reader.execute(
+                        "SELECT hop_count, chain_depth, root_work_item_id, delegation_path_json FROM work_peer_requests WHERE request_id = 'pr-pre-1'"
+                    ).fetchone(),
+                    (0, 0, None, "[]"),
+                )
+                self.assertEqual(
+                    reader.execute(
+                        "SELECT state, state_version FROM work_handoff WHERE offer_id = 'offer-pre-1'"
+                    ).fetchone(),
+                    ("offered", 1),
+                )
+                for new_tbl in CORE_NEW_TABLES:
+                    exists = reader.execute(
+                        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?",
+                        (new_tbl,),
+                    ).fetchone()
+                    self.assertIsNotNone(exists, f"Missing migrated table {new_tbl}")

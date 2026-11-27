@@ -36,6 +36,25 @@ CORE_REBUILD_TABLES: tuple[str, ...] = (
     "work_follow_up",
 )
 
+CORE_ALTERED_TABLES: tuple[str, ...] = (
+    "work_items",
+    "work_conditions",
+    "work_peer_requests",
+    "work_handoff",
+)
+
+CORE_NEW_TABLES: tuple[str, ...] = (
+    "agent_runtime_binding",
+    "work_decision",
+    "work_event_cursor",
+    "work_discovery_state",
+    "tool_call_receipt",
+    "agent_episode",
+    "method_delta",
+    "method_qualification",
+    "method_activation",
+)
+
 _MIGRATABLE_DOMAINS = frozenset({"core", "trading", "paper"})
 
 _VALID_DUTY_STATES = frozenset(
@@ -166,7 +185,7 @@ def _rebuild_single_table(
     *,
     normalize_paper_domain: bool = False,
 ) -> None:
-    if table_name not in CORE_REBUILD_TABLES:
+    if table_name not in CORE_REBUILD_TABLES and table_name not in CORE_ALTERED_TABLES:
         raise StorageRefused(f"Unsupported core rebuild table: {table_name}")
     columns = _table_columns(connection, table_name)
     if not columns:
@@ -277,7 +296,9 @@ def rebuild_core_v1_tables(
     normalize_paper = (
         target_domain is not None and canonical_domain_name(target_domain) == "trading"
     )
-    table_ddl, index_ddl = extract_table_ddl("core", CORE_REBUILD_TABLES)
+    table_ddl, index_ddl = extract_table_ddl(
+        "core", (*CORE_REBUILD_TABLES, *CORE_ALTERED_TABLES, *CORE_NEW_TABLES)
+    )
     for table_name in CORE_REBUILD_TABLES:
         _rebuild_single_table(
             connection,
@@ -286,6 +307,24 @@ def rebuild_core_v1_tables(
             index_ddl[table_name],
             normalize_paper_domain=normalize_paper,
         )
+    for table_name in CORE_ALTERED_TABLES:
+        if _has_table(connection, table_name):
+            _rebuild_single_table(
+                connection,
+                table_name,
+                table_ddl[table_name],
+                index_ddl[table_name],
+                normalize_paper_domain=False,
+            )
+        else:
+            connection.execute(table_ddl[table_name])
+            for idx_sql in index_ddl[table_name]:
+                connection.execute(idx_sql)
+    for table_name in CORE_NEW_TABLES:
+        if not _has_table(connection, table_name):
+            connection.execute(table_ddl[table_name])
+            for idx_sql in index_ddl[table_name]:
+                connection.execute(idx_sql)
 
     active = frozenset(installed_domains(connection))
     if domain_migrator is not None:

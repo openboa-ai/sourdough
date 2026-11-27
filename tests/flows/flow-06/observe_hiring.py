@@ -91,7 +91,7 @@ def observe(output, employee):
                         (blocked,) = statuses
                         assert blocked[-2:] == ("workspace_unavailable", None)
                         assert rows(company, "SELECT count(*) FROM private_desk") == [
-                            (0,)
+                            (1,)
                         ]
                         assert rows(company, "SELECT count(*) FROM duty_run") == [(1,)]
                         break
@@ -119,7 +119,7 @@ def observe(output, employee):
     assert rows(
         company, "SELECT scope FROM standing_grant WHERE id=?", (original["grant_id"],)
     ) == [("assessment",)]
-    assert rows(company, "SELECT count(*) FROM private_desk") == [(1,)]
+    assert rows(company, "SELECT count(*) FROM private_desk") == [(2,)]
     assert rows(company, "SELECT count(*) FROM duty_run") == [(2,)]
     assert rows(
         company,

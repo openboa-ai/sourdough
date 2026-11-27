@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .agent_desk import draft_at_revision, require_desk
 from .company import _connect
-from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused
+from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, WorkRunClaim
 from .runtime.work_kernel import sync_work_item, upsert_project_peer_responsibility
 from .storage.kernel import append_audit_event
 from .writer_lease import WriterLease
@@ -262,7 +262,9 @@ def seal_project_review(
         writer.verify()
 
 
-def project_review_instruction(writer: WriterLease, claim: DutyClaim) -> str | None:
+def project_review_instruction(
+    writer: WriterLease, claim: DutyClaim | WorkRunClaim
+) -> str | None:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
@@ -312,7 +314,7 @@ class Selection:
             or len(set(self.audience)) != len(self.audience)
             or type(self.start) is not int
             or type(self.end) is not int
-            or not 0 <= self.start < self.end <= 800
+            or not 0 <= self.start < self.end <= 65_536
         ):
             raise DutyRefused("Invalid private publication selection")
 
@@ -352,7 +354,7 @@ class PublicationReceipt:
 
 def discover_project_references(
     writer: WriterLease,
-    claim: DutyClaim,
+    claim: DutyClaim | WorkRunClaim,
     purpose: str,
     after: str,
 ) -> tuple[tuple[SharedAssetReference, ...], tuple[PublicationReceipt, ...], str]:
@@ -370,14 +372,20 @@ def discover_project_references(
                                 AND EXISTS (SELECT 1 FROM json_each(p.publishers) WHERE value=:actor)
                                 THEN a.request_id END AS receipt
                        FROM shared_publication a JOIN shared_project p ON p.project_id=a.project_id
-                       WHERE EXISTS (SELECT 1 FROM json_each(p.members) WHERE value=:actor)
+                       WHERE p.company_id=:company
+                         AND EXISTS (SELECT 1 FROM json_each(p.members) WHERE value=:actor)
                    ), visible AS (
                        SELECT * FROM scoped WHERE can_read OR receipt IS NOT NULL
                    )
                    SELECT asset_id,project_id,author_id,work_item_id,can_read,receipt FROM visible
                    WHERE :after='' OR position<(SELECT position FROM visible WHERE asset_id=:after)
                    ORDER BY position DESC LIMIT 33""",
-            {"actor": claim.founder_id, "duty": claim.duty_id, "after": after},
+            {
+                "company": claim.company_id,
+                "actor": claim.founder_id,
+                "duty": claim.duty_id,
+                "after": after,
+            },
         ).fetchall()
         assets = tuple(
             SharedAssetReference(asset, project, author, duty)
@@ -394,7 +402,7 @@ def discover_project_references(
 
 def project_access(
     writer: WriterLease,
-    claim: DutyClaim,
+    claim: DutyClaim | WorkRunClaim,
     purpose: str,
 ) -> tuple[ProjectAccess, ...]:
     writer.verify_for(writer.store, claim.company_id)
@@ -421,7 +429,7 @@ def project_access(
 
 def publish_selection(
     writer: WriterLease,
-    claim: DutyClaim,
+    claim: DutyClaim | WorkRunClaim,
     purpose: str,
     selection: Selection,
 ) -> SharedAsset:
@@ -507,7 +515,7 @@ def publish_selection(
 
 def read_shared_asset(
     writer: WriterLease,
-    claim: DutyClaim,
+    claim: DutyClaim | WorkRunClaim,
     purpose: str,
     asset_id: str,
 ) -> SharedAsset:

@@ -61,7 +61,14 @@ class CompanyRuntime:
         lease_directory: Path | None = None,
         expected_store_key: tuple[int, int] | None = None,
         clock: Callable[[], int] | None = None,
+        max_transient_attempts: int = 5,
+        retry_base_backoff_ns: int = 2_000_000_000,
+        retry_max_backoff_ns: int = 60_000_000_000,
     ) -> None:
+        if max_transient_attempts < 1:
+            raise RuntimeRefused("max_transient_attempts must be at least 1")
+        if retry_base_backoff_ns < 0 or retry_max_backoff_ns < 0:
+            raise RuntimeRefused("retry backoff bounds must be nonnegative")
         self._store = store.absolute()
         self._company_id = company_id
         self._registry = registry
@@ -70,6 +77,60 @@ class CompanyRuntime:
         self._lease_directory = lease_directory
         self._expected_store_key = expected_store_key
         self._clock = clock or time_ns
+        self._max_transient_attempts = int(max_transient_attempts)
+        self._retry_base_backoff_ns = int(retry_base_backoff_ns)
+        self._retry_max_backoff_ns = int(retry_max_backoff_ns)
+
+    def _classify_failure(
+        self, error: Exception, item: WorkItem, fail_now: int
+    ) -> tuple[bool, bool, int | None]:
+        """Return (return_to_due, increment_attempt, next_retry_at_ns) for a failed run."""
+        from ..agent_runtime.protocol import (
+            AgentRuntimeRefused,
+            AgentTransportInterrupted,
+        )
+        from ..board_control import BoardControlRefused
+        from ..company import FoundingRefused
+        from ..duty_run import DutyRefused
+        from ..general_ledger import JournalRefused
+        from ..storage.checkpoint import CheckpointRefused
+        from ..storage.db import StorageRefused
+        from ..writer_lease import WriterRefused
+        from .domains import DomainActionRefused
+        from .work_kernel import WorkKernelRefused
+
+        if isinstance(error, RunFenced):
+            return False, True, None
+
+        if isinstance(
+            error,
+            (
+                AgentRuntimeRefused,
+                RuntimeRefused,
+                DutyRefused,
+                WorkKernelRefused,
+                JournalRefused,
+                StorageRefused,
+                FoundingRefused,
+                BoardControlRefused,
+                DomainActionRefused,
+                CheckpointRefused,
+                WriterRefused,
+            ),
+        ):
+            return False, True, None
+
+        next_attempts = item.attempt_count + 1
+        if isinstance(error, AgentTransportInterrupted):
+            if next_attempts >= self._max_transient_attempts:
+                return False, True, None
+            delay_ns = min(
+                self._retry_base_backoff_ns * (2 ** (next_attempts - 1)),
+                self._retry_max_backoff_ns,
+            )
+            return True, True, fail_now + delay_ns
+
+        return next_attempts < self._max_transient_attempts, True, None
 
     def step(
         self,
@@ -168,12 +229,22 @@ class CompanyRuntime:
             # Execute outside any open SQLite write transaction or tx_lock with a live clock.
             try:
                 outcome = descriptor.execute(
-                    DutyContext(writer, self._company_id, item, run, read_clock)
+                    DutyContext(
+                        writer,
+                        self._company_id,
+                        item,
+                        run,
+                        read_clock,
+                        tx_lock=tx_lock,
+                    )
                 )
             except Exception as error:
                 try:
                     writer.verify()
                     fail_now = read_clock()
+                    return_to_due, increment_attempt, next_retry_at_ns = (
+                        self._classify_failure(error, item, fail_now)
+                    )
                     with (
                         lock_ctx,
                         closing(open_writer(self._store, lease=writer)) as conn,
@@ -184,7 +255,9 @@ class CompanyRuntime:
                             run.run_id,
                             run.fencing_token,
                             error_summary=type(error).__name__,
-                            return_to_due=True,
+                            return_to_due=return_to_due,
+                            increment_attempt=increment_attempt,
+                            next_retry_at_ns=next_retry_at_ns,
                             now_ns=fail_now,
                         )
                     if on_commit is not None:
@@ -294,9 +367,11 @@ class CompanyRuntime:
             rows = conn.execute(
                 """SELECT work_item_id, company_id, owner_agent_id, duty_kind, state,
                           source_kind, source_id, parent_work_item_id, dedupe_key,
-                          payload_json, created_at_ns, updated_at_ns
+                          payload_json, created_at_ns, updated_at_ns,
+                          attempt_count, next_retry_at_ns
                    FROM work_items
                    WHERE company_id = ? AND state = 'due'
+                     AND (next_retry_at_ns IS NULL OR next_retry_at_ns <= ?)
                      AND owner_agent_id NOT IN (
                          SELECT agent_id FROM work_runs WHERE status = 'running'
                      )
@@ -304,7 +379,7 @@ class CompanyRuntime:
                          SELECT agent_id FROM duty WHERE state = 'running'
                      )
                    ORDER BY created_at_ns, work_item_id""",
-                (self._company_id,),
+                (self._company_id, now_ns),
             ).fetchall()
             for row in rows:
                 item = WorkItem(*row)

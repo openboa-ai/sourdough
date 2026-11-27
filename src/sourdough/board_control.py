@@ -1850,7 +1850,16 @@ def execute_cut_checkpoint_command(
     if os.path.lexists(archive_path) and stat.S_ISLNK(os.lstat(archive_path).st_mode):
         raise BoardControlRefused("Refusing to write checkpoint through symlink")
     try:
-        manifest = checkpoint_store(writer.store, writer.company_id, archive_path)
+        from .agent_desk import desks_root
+
+        desks = desks_root(writer.store)
+        manifest = checkpoint_store(
+            writer.store,
+            writer.company_id,
+            archive_path,
+            desk_root=desks if os.path.lexists(desks) else None,
+            writer=writer,
+        )
     except CheckpointRefused as error:
         raise BoardControlRefused(str(error)) from error
 

@@ -9,16 +9,11 @@ from pathlib import Path
 from time import time_ns
 from typing import TYPE_CHECKING, Any
 
-from ..agent_desk import desk_directory
 from ..agent_runtime.protocol import (
     AgentProfileBinding,
-    OuterToolBroker,
-    ShiftRequest,
     ToolHandler,
     ToolSpec,
-    hydrate_shift_context,
 )
-from ..agent_runtime.cost_accounting import settle_shift_cost_to_ledger
 
 if TYPE_CHECKING:
     from ..agent_runtime.registry import AgentAdapterRegistry
@@ -31,7 +26,6 @@ from ..board_control import (
     upsert_agent_profile,
 )
 from ..storage.db import open_reader, open_writer, read_tx, write_tx
-from ..storage.schema import installed_domains
 from ..writer_lease import WriterLease
 from .domains import (
     DecisionActionContext,
@@ -51,6 +45,7 @@ from .registry import (
     DutyRegistry,
     RuntimeRefused,
 )
+from .shift_runner import ActiveMethodsProvider, ShiftRunner
 from .work_kernel import create_work_item
 
 DUTY_CEO_RESPOND_MESSAGE = "ceo.respond_message"
@@ -229,6 +224,7 @@ def build_production_duty_registry(
     default_budget_ceiling_minor: int = 10_000,
     domain_plugins: Sequence[DomainPlugin] = (),
     extra_handlers: Mapping[str, Callable[[DutyContext], DutyOutcome]] | None = None,
+    active_methods_provider: ActiveMethodsProvider | None = None,
 ) -> DutyRegistry:
     """Build the production DutyRegistry connecting live LLM adapters and domain plugins."""
     registry = DutyRegistry()
@@ -241,8 +237,22 @@ def build_production_duty_registry(
         contributions = tuple(
             plugin.contribute_tools(tool_ctx) for plugin in domain_plugins
         )
-        specs, handlers = merge_tool_contributions((), {}, contributions)
-        return ToolContribution(specs=specs, handlers=handlers)
+        specs, handlers, recoverable = merge_tool_contributions((), {}, contributions)
+        return ToolContribution(
+            specs=specs,
+            handlers=handlers,
+            recoverable_exceptions=recoverable,
+        )
+
+    shift_runner = ShiftRunner(
+        adapter_registry=adapter_registry,
+        profile_bindings=profile_bindings,
+        default_budget_ceiling_minor=default_budget_ceiling_minor,
+        read_agent_state=_read_agent_state,
+        resolve_profile=_resolve_profile,
+        contribute_tools=_contribute_tools,
+        active_methods_provider=active_methods_provider,
+    )
 
     def _run_ceo_respond_message(ctx: DutyContext) -> DutyOutcome:
         payload = json.loads(ctx.work_item.payload_json)
@@ -252,14 +262,7 @@ def build_production_duty_registry(
         ctx_id = payload.get("context_id")
         ctx_label = payload.get("context_label")
 
-        agent_id = ctx.work_item.owner_agent_id
-        persisted_profile, grant_scope = _read_agent_state(
-            ctx.writer.store, ctx.company_id, agent_id
-        )
-        profile = _resolve_profile(profile_bindings, agent_id)
-
         with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
-            active_domains = frozenset(installed_domains(db))
             history_rows = db.execute(
                 """SELECT sender_kind, body FROM ceo_message
                    WHERE company_id = ?
@@ -270,88 +273,39 @@ def build_production_duty_registry(
             f"{str(kind)}: {str(text)[:200]}" for kind, text in reversed(history_rows)
         )
 
-        desk = desk_directory(ctx.writer.store, agent_id)
-        desk.mkdir(parents=True, exist_ok=True)
-        context_pack = hydrate_shift_context(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            fencing_token=ctx.run.fencing_token,
-            grant_scope=grant_scope,
-            mandate_summary="Founder-CEO direct advisory response to the Board.",
-            history_notes=history_notes,
-        )
         base_handlers: dict[str, ToolHandler] = {
             "read_company_status": lambda _args: _read_company_status(
                 ctx.writer.store, ctx.company_id
             ),
         }
-        contrib = _contribute_tools(
-            ToolQueryContext(
-                store=ctx.writer.store,
-                company_id=ctx.company_id,
-                writer=ctx.writer,
-                agent_id=agent_id,
-                duty_kind=DUTY_CEO_RESPOND_MESSAGE,
-                grant_scope=grant_scope,
-                installed_domains=active_domains,
-            )
-        )
-        tool_specs, tool_handlers = merge_tool_contributions(
-            _CEO_READONLY_TOOLS, base_handlers, (contrib,)
-        )
-        broker = OuterToolBroker(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            fencing_token=ctx.run.fencing_token,
-            handlers=tool_handlers,
-        )
-        budget_ceiling = (
-            ctx.run.budget_ceiling_minor
-            if ctx.run.budget_ceiling_minor > 0
-            else default_budget_ceiling_minor
-        )
-        shift_req = ShiftRequest(
-            company_id=ctx.company_id,
-            agent_id=agent_id,
-            run_id=ctx.run.run_id,
-            turn_id="turn-1",
-            fencing_token=ctx.run.fencing_token,
+        run_res = shift_runner.run(
+            ctx,
+            mandate_summary="Founder-CEO direct advisory response to the Board.",
             instruction=f"Respond concisely as Founder-CEO to Board message ({message_id}): {board_body}",
-            context=context_pack,
-            tools=tool_specs,
-            budget_ceiling_minor_units=budget_ceiling,
-            desk_path=desk,
-            store_path=ctx.writer.store,
+            base_tools=_CEO_READONLY_TOOLS,
+            base_handlers=base_handlers,
+            history_notes=history_notes,
+            include_core_desk_tools=True,
+            include_plugin_tools=True,
         )
-        result = adapter_registry.execute_shift(
-            persisted_profile_id=persisted_profile,
-            profile=profile,
-            request=shift_req,
-            broker=broker,
-        )
-        settlement = settle_shift_cost_to_ledger(
-            ctx.writer,
-            profile=profile,
-            run_id=ctx.run.run_id,
-            turn_id="turn-1",
-            usage=result.usage,
-            budget_ceiling_minor_units=budget_ceiling,
-        )
+        result = run_res.shift_result
+        settlement = run_res.settlement
         reply_text = (
             result.output_text.strip()
             or "Acknowledged by Founder-CEO; reviewing company state."
         )
-        reply_id = record_ceo_reply(
-            ctx.writer,
-            body=reply_text,
-            context_kind=ctx_kind if isinstance(ctx_kind, str) else None,
-            context_id=ctx_id if isinstance(ctx_id, str) else None,
-            context_label=ctx_label if isinstance(ctx_label, str) else None,
-            now_ns=ctx.now_ns,
-        )
-        mark_ceo_message_delivered(ctx.writer, message_id=message_id, now_ns=ctx.now_ns)
+        with ctx.write_lock_ctx():
+            reply_id = record_ceo_reply(
+                ctx.writer,
+                body=reply_text,
+                context_kind=ctx_kind if isinstance(ctx_kind, str) else None,
+                context_id=ctx_id if isinstance(ctx_id, str) else None,
+                context_label=ctx_label if isinstance(ctx_label, str) else None,
+                now_ns=ctx.now_ns,
+            )
+            mark_ceo_message_delivered(
+                ctx.writer, message_id=message_id, now_ns=ctx.now_ns
+            )
         return DutyOutcome(
             disposition="completed",
             result={
@@ -382,14 +336,15 @@ def build_production_duty_registry(
         summary = "no_op"
 
         def _record_failure(failure_summary: str) -> DutyOutcome:
-            record_decision_application_result(
-                ctx.writer,
-                question_id=question_id,
-                application_status="failed",
-                delivery_status="delivered",
-                effect_summary=failure_summary,
-                now_ns=ctx.now_ns,
-            )
+            with ctx.write_lock_ctx():
+                record_decision_application_result(
+                    ctx.writer,
+                    question_id=question_id,
+                    application_status="failed",
+                    delivery_status="delivered",
+                    effect_summary=failure_summary,
+                    now_ns=ctx.now_ns,
+                )
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -451,15 +406,16 @@ def build_production_duty_registry(
                     if raw_variant in ALLOWED_AVATAR_VARIANTS
                     else "wide-oval-top"
                 )
-                upsert_agent_profile(
-                    ctx.writer,
-                    agent_id=target_agent,
-                    display_name=display_name,
-                    role_label=role_label,
-                    avatar_variant=avatar_variant,
-                    monthly_budget_minor=new_budget,
-                    now_ns=ctx.now_ns,
-                )
+                with ctx.write_lock_ctx():
+                    upsert_agent_profile(
+                        ctx.writer,
+                        agent_id=target_agent,
+                        display_name=display_name,
+                        role_label=role_label,
+                        avatar_variant=avatar_variant,
+                        monthly_budget_minor=new_budget,
+                        now_ns=ctx.now_ns,
+                    )
                 summary = (
                     f"updated monthly_budget_minor={new_budget} for {target_agent}"
                 )
@@ -475,17 +431,18 @@ def build_production_duty_registry(
             domain_handler = decision_actions.get(action)
             if domain_handler is not None:
                 try:
-                    summary = domain_handler(
-                        DecisionActionContext(
-                            writer=ctx.writer,
-                            company_id=ctx.company_id,
-                            question_id=question_id,
-                            kind=kind,
-                            revision=revision,
-                            impact=impact,
-                            now_ns=ctx.now_ns,
+                    with ctx.write_lock_ctx():
+                        summary = domain_handler(
+                            DecisionActionContext(
+                                writer=ctx.writer,
+                                company_id=ctx.company_id,
+                                question_id=question_id,
+                                kind=kind,
+                                revision=revision,
+                                impact=impact,
+                                now_ns=ctx.now_ns,
+                            )
                         )
-                    )
                 except (DomainActionRefused, BoardControlRefused) as exc:
                     return _record_failure(f"{action}_refused: {exc}")
             elif action in ("", "advisory"):
@@ -495,14 +452,15 @@ def build_production_duty_registry(
             else:
                 return _record_failure(f"unsupported_decision_action: {action}")
 
-        record_decision_application_result(
-            ctx.writer,
-            question_id=question_id,
-            application_status="applied",
-            delivery_status="delivered",
-            effect_summary=summary,
-            now_ns=ctx.now_ns,
-        )
+        with ctx.write_lock_ctx():
+            record_decision_application_result(
+                ctx.writer,
+                question_id=question_id,
+                application_status="applied",
+                delivery_status="delivered",
+                effect_summary=summary,
+                now_ns=ctx.now_ns,
+            )
         return DutyOutcome(
             disposition="completed",
             result={
@@ -532,6 +490,7 @@ def build_production_duty_registry(
         resolve_profile=_resolve_profile,
         read_company_status=_read_company_status,
         contribute_tools=_contribute_tools,
+        shift_runner=shift_runner,
     )
     for plugin in domain_plugins:
         for descriptor in plugin.contribute_duties(services):

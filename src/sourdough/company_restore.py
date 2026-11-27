@@ -94,6 +94,7 @@ def _restore_checkpoint(
     archive: Path,
     destination: Path,
     *,
+    desk_destination: Path | None = None,
     check_original: Callable[[Connection], None] | None = None,
     reconcile: Callable[[Path], None] | None = None,
     external_scope: tuple[object, ...] | None = None,
@@ -103,6 +104,7 @@ def _restore_checkpoint(
         company_id,
         archive,
         destination,
+        desk_destination=desk_destination,
         check_original=check_original,
         reconcile=reconcile,
         external_scope=external_scope,
@@ -115,6 +117,7 @@ def restore_core_checkpoint(
     archive: Path,
     destination: Path,
     *,
+    desk_destination: Path | None = None,
     domain_guards: Mapping[str, RestoreDomainGuard] | None = None,
 ) -> CoreRestore:
     external_scope: tuple[object, ...] | None = None
@@ -147,6 +150,7 @@ def restore_core_checkpoint(
         company_id,
         archive,
         destination,
+        desk_destination=desk_destination,
         check_original=lambda conn: _check_active_domains(conn, domain_guards),
         reconcile=reconcile_fn,
         external_scope=external_scope,

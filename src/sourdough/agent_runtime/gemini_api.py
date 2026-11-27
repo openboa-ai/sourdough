@@ -119,6 +119,7 @@ class GeminiGenerateContentAdapter:
                     output_tokens=int(usage_obj.get("candidatesTokenCount", 0)),
                 )
                 total_usage = total_usage + round_usage
+                broker.record_usage(round_usage)
                 events.append(
                     AdapterEvent(
                         kind="usage",
