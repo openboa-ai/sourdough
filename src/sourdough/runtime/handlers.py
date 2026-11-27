@@ -900,6 +900,14 @@ def build_production_duty_registry(
                     )
             claim = work_run_claim_from_context(db, ctx, purpose=purpose)
 
+        has_peer_prompt = (
+            purpose == "handoff_followup"
+            or handoff_row is not None
+            or any(
+                isinstance(r, dict) and r.get("kind") == "peer_outcome"
+                for r in receipts
+            )
+        )
         collab = build_core_collab_tool_contribution(
             writer=ctx.writer,
             claim=claim,
@@ -920,7 +928,7 @@ def build_production_duty_registry(
             base_handlers=collab.handlers,
             history_notes=tuple(notes),
             open_receipts=tuple(receipts),
-            include_core_desk_tools=True,
+            include_core_desk_tools=not has_peer_prompt,
             include_plugin_tools=True,
             extra_recoverable_exceptions=collab.recoverable_exceptions,
         )
@@ -966,7 +974,7 @@ def build_production_duty_registry(
             mandate_summary="Execute accepted handoff follow-up within your standing grant.",
             default_instruction=(
                 f"Execute handoff follow-up work item {ctx.work_item.work_item_id} "
-                "using the accepted handoff receipt, shared evidence, Desk, and collaboration tools."
+                "using the accepted handoff receipt, shared evidence, and collaboration tools."
             ),
         )
 
@@ -1050,6 +1058,14 @@ def build_production_duty_registry(
                     f"Watched condition trigger ({payload.get('trigger_kind', 'manual')}): "
                     f"source={payload.get('source_identity')} rev={payload.get('observed_revision')}"
                 )
+                if "case_inputs" in payload:
+                    notes.append(
+                        f"Trial case inputs: {json.dumps(payload['case_inputs'], sort_keys=True)[:1000]}"
+                    )
+                if "worker_context" in payload:
+                    notes.append(
+                        f"Trial worker context: {json.dumps(payload['worker_context'], sort_keys=True)[:1000]}"
+                    )
                 coalesced_entries = payload.get("coalesced_revisions")
                 if isinstance(coalesced_entries, list) and len(coalesced_entries) > 1:
                     summary_parts = [
@@ -1136,13 +1152,24 @@ def build_production_duty_registry(
             domain_plugins=domain_plugins,
             active_snapshot_id=resolved_snapshot_id,
         )
+        has_peer_discovery_input = any(
+            isinstance(r, dict)
+            and (
+                r.get("kind") == "peer_outcome"
+                or (
+                    r.get("kind") == "shared_asset"
+                    and r.get("author_id") not in (None, agent_id)
+                )
+            )
+            for r in receipts
+        )
         collab = build_core_collab_tool_contribution(
             writer=ctx.writer,
             claim=claim,
             purpose=claim.purpose,
             tx_lock=ctx.tx_lock,
-            include_messaging=True,
-            include_peer_request=True,
+            include_messaging=not has_peer_discovery_input,
+            include_peer_request=not has_peer_discovery_input,
             include_peer_respond=False,
             include_handoffs=False,
             include_roster=True,

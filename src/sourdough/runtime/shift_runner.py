@@ -79,6 +79,32 @@ if TYPE_CHECKING:
     from ..agent_runtime.registry import AgentAdapterRegistry
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_PRIVATE_DESK_READ_TOOLS = frozenset(
+    {
+        "desk_list_drafts",
+        "desk_read_draft",
+        "desk_read_offloaded_log",
+        "desk_run_command",
+        "search_episodes",
+        "skill_read",
+    }
+)
+_PEER_INPUT_TOOLS = frozenset(
+    {
+        "read_messages",
+        "read_inbox",
+        "discover_handoffs",
+        "desk_read_shared_asset",
+    }
+)
+_PEER_OUTBOUND_SINKS = frozenset(
+    {
+        "append_message",
+        "request_peer_response",
+        "respond_peer_request",
+        "offer_handoff",
+    }
+)
 _PRIVATE_DESK_RECEIPT_TOOLS = frozenset(
     {
         "desk_list_drafts",
@@ -400,23 +426,34 @@ class ShiftRunner:
                 "result_digest": str(r_result_digest),
                 "recorded_at_ns": int(r_recorded_at_ns),
             }
-            if r_offloaded_log_path is not None:
+            is_private_receipt = str(r_tool_name) in _PRIVATE_DESK_RECEIPT_TOOLS
+            if r_offloaded_log_path is not None and (
+                include_core_desk_tools or not is_private_receipt
+            ):
                 receipt_entry["offloaded_log_path"] = str(r_offloaded_log_path)
-            if isinstance(r_result_json, str) and len(r_result_json) <= 1024:
+            if (
+                isinstance(r_result_json, str)
+                and len(r_result_json) <= 1024
+                and (include_core_desk_tools or not is_private_receipt)
+            ):
                 try:
                     receipt_entry["result"] = json.loads(r_result_json)
                 except json.JSONDecodeError:
                     receipt_entry["result_preview"] = r_result_json[:256]
             prior_tool_receipts.append(receipt_entry)
-        recent_episodes = tuple(
-            {
-                "episode_id": ep.episode_id,
-                "duty_kind": ep.duty_kind,
-                "outcome_status": ep.outcome_status,
-                "summary_text": ep.summary_text[:300],
-                "recorded_at_ns": ep.recorded_at_ns,
-            }
-            for ep in recent_eps
+        recent_episodes = (
+            tuple(
+                {
+                    "episode_id": ep.episode_id,
+                    "duty_kind": ep.duty_kind,
+                    "outcome_status": ep.outcome_status,
+                    "summary_text": ep.summary_text[:300],
+                    "recorded_at_ns": ep.recorded_at_ns,
+                }
+                for ep in recent_eps
+            )
+            if include_core_desk_tools
+            else ()
         )
 
         all_agent_methods = resolve_active_methods(
@@ -560,18 +597,40 @@ class ShiftRunner:
         )
         tool_specs = tuple(sorted(tool_specs, key=lambda spec: spec.name))
         merged_recoverable = tuple(
-            dict.fromkeys((*contributed_recoverable, *extra_recoverable_exceptions))
+            dict.fromkeys(
+                (*contributed_recoverable, *extra_recoverable_exceptions, DutyRefused)
+            )
         )
 
-        def _wrap_handler(fn: ToolHandler) -> ToolHandler:
+        flow_state = {"read_private_desk": False, "read_peer_input": False}
+
+        def _wrap_handler(name: str, fn: ToolHandler, *, use_lock: bool) -> ToolHandler:
             def _wrapped(args: dict[str, Any]) -> dict[str, Any]:
-                with ctx.write_lock_ctx():
-                    return fn(args)
+                if name in _PEER_OUTBOUND_SINKS and flow_state["read_private_desk"]:
+                    raise DutyRefused(
+                        "Cannot write free-form peer messages or requests in the same shift "
+                        "after reading private Desk data; publish explicitly via desk_publish_selection"
+                    )
+                if name in _PRIVATE_DESK_READ_TOOLS and flow_state["read_peer_input"]:
+                    raise DutyRefused(
+                        "Cannot read private Desk data in the same shift after reading "
+                        "peer-authored messages, handoffs, or shared assets"
+                    )
+                if use_lock:
+                    with ctx.write_lock_ctx():
+                        out = fn(args)
+                else:
+                    out = fn(args)
+                if name in _PRIVATE_DESK_READ_TOOLS:
+                    flow_state["read_private_desk"] = True
+                if name in _PEER_INPUT_TOOLS:
+                    flow_state["read_peer_input"] = True
+                return out
 
             return _wrapped
 
         locked_handlers: dict[str, ToolHandler] = {
-            name: (fn if name == "desk_run_command" else _wrap_handler(fn))
+            name: _wrap_handler(name, fn, use_lock=(name != "desk_run_command"))
             for name, fn in merged_handlers.items()
         }
 

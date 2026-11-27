@@ -662,7 +662,7 @@ class M2CollabRuntimeTests(unittest.TestCase):
                         outcome={"pub": True},
                         now_ns=2_500,
                     )
-                    # Give A a fresh item & B a review item to discover/accept
+                    # Give B a handoff_followup item (earlier) & A an assessment_review item (later)
                     item_b, _ = create_work_item(
                         db,
                         company_id=receipt.company_id,
@@ -670,7 +670,7 @@ class M2CollabRuntimeTests(unittest.TestCase):
                         duty_kind=DUTY_WORK_HANDOFF_FOLLOWUP,
                         source_kind="unit",
                         source_id="b-check",
-                        now_ns=3_000,
+                        now_ns=2_600,
                     )
                     # Also test tool messaging + recoverable duplicate-body refusal in B's shift
                     item_a_offer, _ = create_work_item(
@@ -680,7 +680,7 @@ class M2CollabRuntimeTests(unittest.TestCase):
                         duty_kind=DUTY_WORK_ASSESSMENT_REVIEW,
                         source_kind="unit",
                         source_id="a-offer-item",
-                        now_ns=2_600,
+                        now_ns=3_000,
                     )
 
             registry = build_production_duty_registry(

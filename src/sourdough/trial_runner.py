@@ -644,6 +644,33 @@ def run_isolated_trial_slot(
                 ),
             )
     else:
+
+        def _decode_trial_blob(blob: bytes) -> Any:
+            try:
+                text = blob.decode("utf-8")
+            except UnicodeDecodeError:
+                return {
+                    "bytes_sha256": sha256(blob).hexdigest(),
+                    "bytes_len": len(blob),
+                }
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
+
+        trial_payload: dict[str, Any] = {
+            "slot_id": slot.slot_id,
+            "case_id": slot.case_id,
+            "family_id": slot.family_id,
+        }
+        if worker_input is not None:
+            trial_payload["case_inputs"] = _decode_trial_blob(worker_input.case_inputs)
+            trial_payload["worker_context"] = _decode_trial_blob(
+                worker_input.worker_context
+            )
+            trial_payload["tool_manifest"] = _decode_trial_blob(
+                worker_input.tool_manifest
+            )
         with hold_company_writer(
             run_store, target_cid, lease_directory=lease_dir
         ) as trial_w:
@@ -658,7 +685,7 @@ def run_isolated_trial_slot(
                     duty_kind="work.discovery_review",
                     source_kind="offline_trial",
                     source_id=slot.slot_id,
-                    payload={"slot_id": slot.slot_id, "case_id": slot.case_id},
+                    payload=trial_payload,
                     dedupe_key=f"offline-trial:{run_id}:{slot.slot_id}",
                     actor_id=actor_id,
                     now_ns=max(1, time_ns()),
@@ -1943,6 +1970,7 @@ def run_recursive_learning_cycle(
                 slot_run_dir = desk_dir.parent
                 slot_store = slot_run_dir / "company.sqlite"
                 slot_leases = slot_run_dir / "leases"
+                agent_desk_dir = desk_directory(slot_store, meta_agent_id)
                 slot_started = monotonic()
                 if use_live_runtime:
                     slot_now_ns = max(post_gen1_ns + 500 + _idx, time_ns())
@@ -2098,7 +2126,7 @@ def run_recursive_learning_cycle(
                                 if tn != "skill_draft_candidate" or st != "ok":
                                     continue
                                 parsed_res = _read_offloaded_receipt_payload(
-                                    desk_dir, raw_res, off_path
+                                    agent_desk_dir, raw_res, off_path
                                 )
                                 if not isinstance(parsed_res, Mapping):
                                     continue
@@ -2153,7 +2181,7 @@ def run_recursive_learning_cycle(
                                 "skill_draft_candidate",
                             ):
                                 res_obj = _read_offloaded_receipt_payload(
-                                    desk_dir, raw_res, off_path
+                                    agent_desk_dir, raw_res, off_path
                                 )
                                 resolved_mid: str | None = None
                                 if isinstance(res_obj, Mapping):
