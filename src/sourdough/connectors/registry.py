@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import urllib.parse
 from collections.abc import Mapping, Sequence
+from hashlib import sha256
 from time import time_ns
 from typing import Any
 from uuid import uuid4
@@ -22,6 +23,7 @@ from ..writer_lease import WriterLease
 from .protocol import (
     VALID_CONNECTOR_ENVIRONMENTS,
     ConnectorAdapter,
+    ConnectorAdmission,
     ConnectorBinding,
     ConnectorEnvironment,
     ConnectorEnvironmentMismatch,
@@ -579,6 +581,291 @@ def read_connector_grants(
     return tuple(_row_to_grant(r) for r in rows)
 
 
+def compute_admission_payload_sha256(
+    *,
+    binding_id: str,
+    binding_revision: int,
+    operation: str,
+    request_id: str,
+    payload: Mapping[str, Any],
+    environment: str,
+    endpoint_url: str,
+) -> str:
+    """Compute canonical SHA-256 binding an admission to immutable invocation terms."""
+    return sha256(
+        _canonical_json(
+            {
+                "binding_id": binding_id,
+                "binding_revision": binding_revision,
+                "operation": operation,
+                "request_id": request_id,
+                "payload": dict(payload),
+                "environment": environment,
+                "endpoint_url": endpoint_url.rstrip("/"),
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _row_to_admission(row: tuple[Any, ...]) -> ConnectorAdmission:
+    return ConnectorAdmission(
+        admission_id=str(row[0]),
+        company_id=str(row[1]),
+        binding_id=str(row[2]),
+        binding_revision=int(row[3]),
+        operation=str(row[4]),
+        request_id=str(row[5]),
+        payload_sha256=str(row[6]),
+        environment=str(row[7]),  # type: ignore[arg-type]
+        endpoint_url=str(row[8]),
+        issued_by_service=str(row[9]),
+        actor_id=str(row[10]),
+        status=str(row[11]),
+        expires_at_ns=None if row[12] is None else int(row[12]),
+        created_at_ns=int(row[13]),
+        consumed_at_ns=None if row[14] is None else int(row[14]),
+    )
+
+
+def issue_connector_admission(
+    writer: WriterLease,
+    *,
+    company_id: str,
+    binding_id: str,
+    binding_revision: int,
+    operation: str,
+    request_id: str,
+    payload: Mapping[str, Any],
+    issued_by_service: str,
+    actor_id: str,
+    admission_id: str | None = None,
+    expires_at_ns: int | None = None,
+    now_ns: int | None = None,
+    tx_lock: threading.RLock | None = None,
+) -> ConnectorAdmission:
+    """Persist a service-issued admission bound to immutable effectful request terms.
+
+    Only trusted outer-host domain services holding WriterLease can call this function;
+    Agents and runtimes cannot fabricate admissions.
+    """
+    if writer.company_id != company_id:
+        raise ConnectorRefused("Writer company_id mismatch")
+    if not isinstance(issued_by_service, str) or not issued_by_service.strip():
+        raise ConnectorRefused("issued_by_service must be nonempty")
+    if not isinstance(actor_id, str) or not actor_id.strip():
+        raise ConnectorRefused("actor_id must be nonempty")
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ConnectorRefused("request_id must be nonempty")
+    if not isinstance(payload, Mapping):
+        raise ConnectorRefused("payload must be a mapping")
+    timestamp = time_ns() if now_ns is None else now_ns
+    if expires_at_ns is not None and (
+        type(expires_at_ns) is not int or expires_at_ns <= timestamp
+    ):
+        raise ConnectorRefused("expires_at_ns must be in the future")
+    aid = admission_id or f"cadm-{uuid4().hex[:16]}"
+    with write_uow(writer, tx_lock=tx_lock) as db:
+        binding = read_connector_binding(
+            db, company_id=company_id, binding_id=binding_id, revision=binding_revision
+        )
+        if binding is None or binding.status != "active":
+            raise ConnectorRefused(
+                f"Active connector binding '{binding_id}:r{binding_revision}' not found"
+            )
+        op_spec = binding.operation(operation)
+        if op_spec is None:
+            raise ConnectorRefused(
+                f"Operation '{operation}' is not registered on '{binding_id}:r{binding_revision}'"
+            )
+        payload_digest = compute_admission_payload_sha256(
+            binding_id=binding.binding_id,
+            binding_revision=binding.revision,
+            operation=op_spec.name,
+            request_id=request_id.strip(),
+            payload=payload,
+            environment=binding.environment,
+            endpoint_url=binding.endpoint_url,
+        )
+        db.execute(
+            """INSERT INTO connector_admission (
+                   admission_id, company_id, binding_id, binding_revision,
+                   operation, request_id, payload_sha256, environment,
+                   endpoint_url, issued_by_service, actor_id, status,
+                   expires_at_ns, created_at_ns, consumed_at_ns
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', ?, ?, NULL)""",
+            (
+                aid,
+                company_id,
+                binding.binding_id,
+                binding.revision,
+                op_spec.name,
+                request_id.strip(),
+                payload_digest,
+                binding.environment,
+                binding.endpoint_url,
+                issued_by_service.strip(),
+                actor_id.strip(),
+                expires_at_ns,
+                timestamp,
+            ),
+        )
+        append_audit_event(
+            db,
+            company_id=company_id,
+            domain="connectors",
+            entity_type="connector_admission",
+            entity_id=aid,
+            event_type="connectors.admission_issued",
+            actor_id=actor_id.strip(),
+            payload={
+                "admission_id": aid,
+                "binding_id": binding.binding_id,
+                "binding_revision": binding.revision,
+                "operation": op_spec.name,
+                "request_id": request_id.strip(),
+                "payload_sha256": payload_digest,
+                "environment": binding.environment,
+                "issued_by_service": issued_by_service.strip(),
+            },
+            recorded_at_ns=timestamp,
+        )
+        row = db.execute(
+            """SELECT admission_id, company_id, binding_id, binding_revision,
+                      operation, request_id, payload_sha256, environment,
+                      endpoint_url, issued_by_service, actor_id, status,
+                      expires_at_ns, created_at_ns, consumed_at_ns
+               FROM connector_admission WHERE admission_id = ?""",
+            (aid,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_admission(row)
+
+
+def revoke_connector_admission(
+    writer: WriterLease,
+    *,
+    company_id: str,
+    admission_id: str,
+    actor_id: str,
+    now_ns: int | None = None,
+    tx_lock: threading.RLock | None = None,
+) -> None:
+    """Revoke an unconsumed connector admission."""
+    if writer.company_id != company_id:
+        raise ConnectorRefused("Writer company_id mismatch")
+    timestamp = time_ns() if now_ns is None else now_ns
+    with write_uow(writer, tx_lock=tx_lock) as db:
+        cur = db.execute(
+            """UPDATE connector_admission
+               SET status = 'revoked'
+               WHERE company_id = ? AND admission_id = ? AND status = 'admitted'""",
+            (company_id, admission_id),
+        )
+        if cur.rowcount != 1:
+            raise ConnectorRefused(
+                f"Active unconsumed admission '{admission_id}' not found"
+            )
+        append_audit_event(
+            db,
+            company_id=company_id,
+            domain="connectors",
+            entity_type="connector_admission",
+            entity_id=admission_id,
+            event_type="connectors.admission_revoked",
+            actor_id=actor_id,
+            payload={"admission_id": admission_id},
+            recorded_at_ns=timestamp,
+        )
+
+
+def verify_and_consume_connector_admission(
+    connection: sqlite3.Connection,
+    *,
+    company_id: str,
+    admission_id: str,
+    binding_id: str,
+    binding_revision: int,
+    operation: str,
+    request_id: str,
+    payload: Mapping[str, Any],
+    environment: str,
+    endpoint_url: str,
+    allow_already_consumed: bool,
+    now_ns: int,
+) -> ConnectorAdmission:
+    """Verify an authoritative connector_admission matches exact immutable request terms and consume it."""
+    row = connection.execute(
+        """SELECT admission_id, company_id, binding_id, binding_revision,
+                  operation, request_id, payload_sha256, environment,
+                  endpoint_url, issued_by_service, actor_id, status,
+                  expires_at_ns, created_at_ns, consumed_at_ns
+           FROM connector_admission
+           WHERE company_id = ? AND admission_id = ?""",
+        (company_id, admission_id),
+    ).fetchone()
+    if row is None:
+        raise ConnectorUnauthorized(
+            f"Effectful admission '{admission_id}' was not issued by an authorized domain service"
+        )
+    admission = _row_to_admission(row)
+    expected_digest = compute_admission_payload_sha256(
+        binding_id=binding_id,
+        binding_revision=binding_revision,
+        operation=operation,
+        request_id=request_id,
+        payload=payload,
+        environment=environment,
+        endpoint_url=endpoint_url,
+    )
+    if (
+        admission.binding_id != binding_id
+        or admission.binding_revision != binding_revision
+        or admission.operation != operation
+        or admission.request_id != request_id
+        or admission.environment != environment
+        or admission.endpoint_url.rstrip("/") != endpoint_url.rstrip("/")
+        or admission.payload_sha256 != expected_digest
+    ):
+        raise ConnectorUnauthorized(
+            f"Admission '{admission_id}' does not match immutable request payload, binding, or destination"
+        )
+    if admission.status == "revoked":
+        raise ConnectorUnauthorized(f"Admission '{admission_id}' has been revoked")
+    if admission.status == "consumed":
+        if allow_already_consumed:
+            return admission
+        raise ConnectorUnauthorized(f"Admission '{admission_id}' was already consumed")
+    if admission.expires_at_ns is not None and now_ns > admission.expires_at_ns:
+        raise ConnectorUnauthorized(f"Admission '{admission_id}' has expired")
+    cur = connection.execute(
+        """UPDATE connector_admission
+           SET status = 'consumed', consumed_at_ns = ?
+           WHERE company_id = ? AND admission_id = ? AND status = 'admitted'""",
+        (now_ns, company_id, admission_id),
+    )
+    if cur.rowcount != 1:
+        raise ConnectorUnauthorized(
+            f"Admission '{admission_id}' could not be consumed atomically"
+        )
+    return ConnectorAdmission(
+        admission_id=admission.admission_id,
+        company_id=admission.company_id,
+        binding_id=admission.binding_id,
+        binding_revision=admission.binding_revision,
+        operation=admission.operation,
+        request_id=admission.request_id,
+        payload_sha256=admission.payload_sha256,
+        environment=admission.environment,
+        endpoint_url=admission.endpoint_url,
+        issued_by_service=admission.issued_by_service,
+        actor_id=admission.actor_id,
+        status="consumed",
+        expires_at_ns=admission.expires_at_ns,
+        created_at_ns=admission.created_at_ns,
+        consumed_at_ns=now_ns,
+    )
+
+
 class ConnectorAdapterRegistry:
     """In-process registry mapping connector_kind to ConnectorAdapter implementations."""
 
@@ -617,12 +904,16 @@ class ConnectorAdapterRegistry:
 
 __all__ = [
     "ConnectorAdapterRegistry",
+    "compute_admission_payload_sha256",
     "disable_connector_binding",
     "grant_connector_access",
+    "issue_connector_admission",
     "list_connector_bindings",
     "read_connector_binding",
     "read_connector_grants",
     "register_connector_binding",
+    "revoke_connector_admission",
     "revoke_connector_grant",
     "validate_endpoint_and_hosts",
+    "verify_and_consume_connector_admission",
 ]

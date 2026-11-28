@@ -20,7 +20,7 @@ API keys or secrets.
   - Raw secret values are resolved strictly in memory inside the trusted outer
     host at request-signing time and are scrubbed from errors, logs, audit
     events, and persisted receipts.
-- **Authoritative Registry (`connector_binding` & `connector_grant`, `STRICT`):**
+- **Authoritative Registry (`connector_binding`, `connector_grant`, `connector_admission`, `STRICT`):**
   - `connector_binding` pins `(binding_id, revision)` to `company_id`,
     `connector_kind`, `environment`, `endpoint_url`, `allowed_hosts_json`,
     versioned `operations_json`, opaque `credential_handle_ref` (enforced by
@@ -32,19 +32,28 @@ API keys or secrets.
   - Registering a connector does **not** grant permission to act. Every Agent
     invocation requires an active `connector_grant` bound to an active
     `standing_grant` and explicitly naming the allowed operations.
+  - `connector_admission` records service-issued admissions bound to the exact
+    immutable `(binding_id, binding_revision, operation, request_id,
+    payload_sha256, environment, endpoint_url)`. `admission_id` is never exposed
+    as a model-visible tool argument in `OuterToolBroker`.
 - **Outer-Host Gateway (`ConnectorProxy`):**
   - Enforces before any outbound dispatch:
     1. Live `WorkRunClaim` fencing token, unexpired lease, and active standing grant.
     2. Active `connector_binding` + exact `environment` + pinned host allowlist
-       (loopback-only when `loopback_only=True`; HTTP 3xx redirects disabled).
+       (loopback-only when `loopback_only=True`; HTTP 3xx redirects disabled;
+       malformed CR/LF/NUL secret header values rejected without exposing contents).
     3. Active `connector_grant` authorizing the exact requested `operation`.
     4. `ShiftFlowGuard` taint checks (no external exfiltration after reading
        private Desk data; no `write`/`effectful` dispatch after reading peer input).
-    5. Sliding-window rate limit and company/grant minor-unit budget ceilings.
-    6. For `effectful` operations, an explicit service-issued `admission_id`.
+    5. Sliding-window rate limit (accounting for every outbound attempt,
+       including unresolved `read` retries) and company/grant minor-unit budget ceilings.
+    6. For `effectful` operations, verification and atomic consumption of a
+       service-issued `connector_admission` matching the exact immutable request.
     7. Idempotent persistence of the outbound intent in `external_actions`
        (`prepared` → `in_flight`) **before** releasing the SQLite write lock and
-       performing network I/O.
+       performing network I/O, followed by a post-secret-resolution sender
+       fencing recheck immediately before `adapter.execute()` (retaining
+       `'unknown'` + recovery item without sending if the sender was fenced).
   - **SQLite Lock Hygiene:** No SQLite transaction or write lock is ever held
     across outbound HTTP/network I/O.
   - **Indeterminate Outcome & Recovery:** Transport timeouts or indeterminate
@@ -52,7 +61,8 @@ API keys or secrets.
     `ConnectorResponse(status='unknown', indeterminate=True)`, refuse blind
     write resends on retry, and create an idempotent recovery `work_item`
     (`duty_kind='connector.reconcile'`). Observation/reconciliation of an
-    existing `'unknown'` effect remains allowed even after new writes or grants
+    existing action is restricted strictly to the action's originating Agent or
+    assigned recovery owner, and remains allowed even after new writes or grants
     are suspended/revoked.
   - **GL & Audit Settlement:** Positive invocation costs post balanced
     double-entry journal lines (`expense:connector_usage` /

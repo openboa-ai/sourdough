@@ -63,3 +63,30 @@ CREATE TABLE connector_grant (
 
 CREATE INDEX idx_connector_grant_lookup
     ON connector_grant(company_id, agent_id, binding_id, binding_revision, status);
+
+CREATE TABLE connector_admission (
+    admission_id TEXT PRIMARY KEY NOT NULL,
+    company_id TEXT NOT NULL REFERENCES company(id),
+    binding_id TEXT NOT NULL,
+    binding_revision INTEGER NOT NULL CHECK (binding_revision >= 1),
+    operation TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    environment TEXT NOT NULL CHECK (
+        environment IN ('paper', 'external_test', 'live', 'internal')
+    ),
+    endpoint_url TEXT NOT NULL,
+    issued_by_service TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'admitted' CHECK (
+        status IN ('admitted', 'consumed', 'revoked')
+    ),
+    expires_at_ns INTEGER,
+    created_at_ns INTEGER NOT NULL,
+    consumed_at_ns INTEGER,
+    FOREIGN KEY (binding_id, binding_revision)
+        REFERENCES connector_binding(binding_id, revision)
+) STRICT;
+
+CREATE INDEX idx_connector_admission_lookup
+    ON connector_admission(company_id, binding_id, binding_revision, operation, request_id);

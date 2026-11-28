@@ -83,6 +83,23 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         )
 
 
+def _assert_safe_header_pair(name: str, value: str) -> None:
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or any(ord(ch) < 33 or ord(ch) > 126 or ch == ":" for ch in name)
+    ):
+        raise ConnectorRefused("Connector HTTP header name is invalid")
+    if (
+        not isinstance(value, str)
+        or any(ch in value for ch in ("\r", "\n", "\x00"))
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+    ):
+        raise ConnectorRefused(
+            "Connector credential header contains prohibited control characters"
+        )
+
+
 def _post_pinned_json(
     url: str,
     *,
@@ -97,6 +114,8 @@ def _post_pinned_json(
         raise ConnectorRefused(
             f"Refused outbound LLM connector request to unpinned host '{hostname}'"
         )
+    for h_name, h_val in headers.items():
+        _assert_safe_header_pair(h_name, h_val)
     raw_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -123,6 +142,10 @@ def _post_pinned_json(
             ) from error
         raise ConnectorRefused(
             f"LLM connector rejected request (HTTP {error.code}): {err_excerpt}"
+        ) from error
+    except ValueError as error:
+        raise ConnectorRefused(
+            "LLM connector HTTP request construction failed due to malformed header or URL"
         ) from error
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise ConnectorIndeterminate(

@@ -35,6 +35,17 @@ class ParsedSecretHandle:
     raw: str
 
 
+def _assert_safe_secret_value(
+    value: str, handle_ref: str, *, field_label: str = "secret"
+) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise CredentialRefused(f"Resolved {field_label} value is empty")
+    if any(ch in value for ch in ("\r", "\n", "\x00")):
+        raise CredentialRefused(
+            f"Resolved {field_label} for '{handle_ref}' contains prohibited control characters"
+        )
+
+
 @dataclass(frozen=True)
 class MaskedSecret:
     """In-memory single API secret that masks itself in repr/str."""
@@ -43,10 +54,9 @@ class MaskedSecret:
     handle_ref: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value.strip():
-            raise CredentialRefused("Resolved secret value is empty")
         if not isinstance(self.handle_ref, str) or not self.handle_ref.strip():
             raise CredentialRefused("handle_ref must be a nonempty string")
+        _assert_safe_secret_value(self.value, self.handle_ref)
 
     def __repr__(self) -> str:
         return f"MaskedSecret(handle_ref={self.handle_ref!r}, value='***')"
@@ -74,8 +84,9 @@ class MaskedSecretBundle:
         for k, v in self.values.items():
             if not isinstance(k, str) or not k.strip():
                 raise CredentialRefused("Secret bundle field name must be nonempty")
-            if not isinstance(v, str) or not v.strip():
-                raise CredentialRefused(f"Resolved secret field '{k}' is empty")
+            _assert_safe_secret_value(
+                v, self.handle_ref, field_label=f"secret field '{k}'"
+            )
             normalized[k] = v
         object.__setattr__(self, "values", normalized)
 

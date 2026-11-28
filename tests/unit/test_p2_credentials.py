@@ -49,6 +49,19 @@ class UnifiedSecretVaultTests(unittest.TestCase):
         with self.assertRaises(CredentialRefused):
             b.get("missing")
 
+        # Embedded newline / CR / NUL must be rejected with a value-free error!
+        bad_secret = "sk-sensitive-canary\naccidentally-pasted-line"
+        with self.assertRaises(CredentialRefused) as ctx:
+            MaskedSecret(value=bad_secret, handle_ref="envref:OPENAI_KEY")
+        self.assertNotIn("sk-sensitive-canary", str(ctx.exception))
+        self.assertNotIn("accidentally-pasted-line", str(ctx.exception))
+        with self.assertRaises(CredentialRefused) as bctx:
+            MaskedSecretBundle(
+                values={"api_key": bad_secret, "api_secret": "ok-secret"},
+                handle_ref="envref:VENUE_CRED",
+            )
+        self.assertNotIn("sk-sensitive-canary", str(bctx.exception))
+
     def test_handle_validation_and_environment_isolation(self) -> None:
         parsed = parse_secret_handle("envref:OPENAI_TESTNET_KEY")
         self.assertEqual(parsed.scheme, "envref")

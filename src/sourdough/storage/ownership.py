@@ -158,6 +158,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Core scoped connector registry & actor grant tables
     "connector_binding": frozenset({"connectors/registry.py"}),
     "connector_grant": frozenset({"connectors/registry.py"}),
+    "connector_admission": frozenset({"connectors/registry.py"}),
     # Separate derived episode FTS5 search index (outside company store)
     "episodes_fts": frozenset({"episode_index.py"}),
     "episodes_fts_meta": frozenset({"episode_index.py"}),

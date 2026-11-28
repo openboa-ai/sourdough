@@ -22,6 +22,7 @@ from sourdough.connectors import (
     ScopedLlmInferenceConnector,
     disable_connector_binding,
     grant_connector_access,
+    issue_connector_admission,
     register_connector_binding,
     revoke_connector_grant,
 )
@@ -112,7 +113,9 @@ class _LoopbackMockLlmServer:
 class _SimulatedIndeterminateVenue:
     """Simulated external testnet venue that loses the first submit reply then resolves via query_order."""
 
-    def __init__(self) -> None:
+    def __init__(self, endpoint_url: str, credential_handle_ref: str) -> None:
+        self.endpoint_url = endpoint_url
+        self.credential_handle_ref = credential_handle_ref
         self.submit_calls = 0
         self.query_calls = 0
         self.accepted_orders: dict[str, ExternalOrderRequest] = {}
@@ -178,11 +181,16 @@ class ConnectedFlow(unittest.TestCase):
             fid = founding.founder_id
             now = time_ns()
 
-            sim_venue = _SimulatedIndeterminateVenue()
+            sim_venue = _SimulatedIndeterminateVenue(
+                endpoint_url="http://127.0.0.1:9999",
+                credential_handle_ref="envref:SIM_VENUE_TESTNET",
+            )
             adapters = ConnectorAdapterRegistry(
                 [
                     ScopedLlmInferenceConnector(),
-                    TradingVenueConnectorAdapter(venue_resolver=lambda _req: sim_venue),
+                    TradingVenueConnectorAdapter(
+                        venue_resolver=lambda _req, _sec: sim_venue
+                    ),
                 ]
             )
             vault = InMemorySecretVault(
@@ -337,20 +345,48 @@ class ConnectedFlow(unittest.TestCase):
                     now_ns=now + 45,
                 )
 
+                order_payload = {
+                    "action_id": "ord-p2-1",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": "0.01",
+                    "limit_price": "50000",
+                }
+                # Forged or missing admission via Agent tool handler MUST be refused!
+                with self.assertRaises(ConnectorUnauthorized):
+                    handler(
+                        {
+                            "binding_id": "sim-testnet",
+                            "operation": "submit_order",
+                            "request_id": "ord-p2-1",
+                            "payload": order_payload,
+                            "admission_id": "invented-by-agent",
+                        }
+                    )
+                self.assertEqual(sim_venue.submit_calls, 0)
+
+                # Trusted domain service issues authoritative immutable admission
+                admission = issue_connector_admission(
+                    w,
+                    company_id=cid,
+                    binding_id=venue_binding.binding_id,
+                    binding_revision=venue_binding.revision,
+                    operation="submit_order",
+                    request_id="ord-p2-1",
+                    payload=order_payload,
+                    issued_by_service="trading.execution_service",
+                    actor_id=fid,
+                    now_ns=now + 48,
+                )
+
                 ord_resp = proxy.invoke(
                     w,
                     claim,
                     binding_id="sim-testnet",
                     operation="submit_order",
                     request_id="ord-p2-1",
-                    payload={
-                        "action_id": "ord-p2-1",
-                        "symbol": "BTCUSDT",
-                        "side": "BUY",
-                        "quantity": "0.01",
-                        "limit_price": "50000",
-                    },
-                    admission_id="adm-p2-order-1",
+                    payload=order_payload,
+                    admission_id=admission.admission_id,
                     now_ns=now + 50,
                 )
                 self.assertEqual(ord_resp.status, "unknown")

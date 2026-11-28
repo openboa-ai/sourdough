@@ -184,6 +184,27 @@ class ConnectorGrant:
 
 
 @dataclass(frozen=True)
+class ConnectorAdmission:
+    """Service-issued immutable admission authorizing one effectful connector invocation."""
+
+    admission_id: str
+    company_id: str
+    binding_id: str
+    binding_revision: int
+    operation: str
+    request_id: str
+    payload_sha256: str
+    environment: ConnectorEnvironment
+    endpoint_url: str
+    issued_by_service: str
+    actor_id: str
+    status: str
+    expires_at_ns: int | None
+    created_at_ns: int
+    consumed_at_ns: int | None
+
+
+@dataclass(frozen=True)
 class ConnectorRequest:
     """Validated, host-assembled connector invocation envelope."""
 
@@ -251,6 +272,7 @@ class ConnectorAdapter(Protocol):
 
 __all__ = [
     "ConnectorAdapter",
+    "ConnectorAdmission",
     "ConnectorBinding",
     "ConnectorBudgetExceeded",
     "ConnectorEnvironment",

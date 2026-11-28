@@ -1,4 +1,4 @@
-"""Trusted outer-host ConnectorProxy enforcing fencing, grants, taint, rate/budget, and GL settlement."""
+"""Trusted outer-host ConnectorProxy enforcing fencing, grants, admissions, taint, rate/budget, and GL settlement."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ from time import time_ns
 from typing import Any
 
 from ..agent_runtime.protocol import ToolHandler, ToolSpec
+from ..duty_run import DutyRefused, ExecutionClaim, resolve_run
+from ..general_ledger import JournalEntry, JournalLine, post_journal
+from ..runtime.kernel import RunFenced, create_work_item
+from ..runtime.shift.flow_guard import ShiftFlowGuard
 from ..secret_vault import (
     CredentialRefused,
     HostSecretVault,
@@ -22,11 +26,7 @@ from ..secret_vault import (
     redact_secret_structure,
     redact_secret_values,
 )
-from ..duty_run import DutyRefused, ExecutionClaim, resolve_run
-from ..general_ledger import JournalEntry, JournalLine, post_journal
-from ..runtime.kernel import create_work_item
-from ..runtime.shift.flow_guard import ShiftFlowGuard
-from ..storage.db import write_uow
+from ..storage.db import scoped_reader, write_uow
 from ..storage.kernel import (
     ExternalActionConflict,
     append_audit_event,
@@ -53,6 +53,7 @@ from .registry import (
     read_connector_binding,
     read_connector_grants,
     validate_endpoint_and_hosts,
+    verify_and_consume_connector_admission,
 )
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -190,6 +191,19 @@ class ConnectorProxy:
         self._loopback_only = loopback_only
         self._tx_lock = tx_lock
 
+    def _assert_claim_still_current(
+        self, writer: WriterLease, claim: ExecutionClaim
+    ) -> None:
+        """Re-check sender fencing & active standing grant right before outbound dispatch."""
+        with scoped_reader(writer.store) as ro_db:
+            try:
+                authority = resolve_run(ro_db, claim)
+                authority.require_current(claim.purpose)
+            except (DutyRefused, RunFenced) as error:
+                raise ConnectorUnauthorized(str(error)) from error
+            if authority.current_scope == "revoked":
+                raise ConnectorUnauthorized("Agent standing grant is revoked")
+
     def invoke(
         self,
         writer: WriterLease,
@@ -206,7 +220,7 @@ class ConnectorProxy:
         effective_date: date | None = None,
         now_ns: int | None = None,
     ) -> ConnectorResponse:
-        """Authorize, outbox-persist, credential-inject, dispatch, and settle one connector call.
+        """Authorize, outbox-persist, credential-inject, recheck fencing, dispatch, and settle.
 
         SQLite write locks are strictly released before secret resolution and outbound I/O.
         """
@@ -245,7 +259,7 @@ class ConnectorProxy:
             try:
                 authority = resolve_run(db, claim)
                 authority.require_current(claim.purpose)
-            except DutyRefused as error:
+            except (DutyRefused, RunFenced) as error:
                 raise ConnectorUnauthorized(str(error)) from error
             if authority.current_scope == "revoked":
                 raise ConnectorUnauthorized("Agent standing grant is revoked")
@@ -340,7 +354,8 @@ class ConnectorProxy:
                         "after reading peer-authored messages, handoffs, or shared assets"
                     )
 
-            # Effectful invocations MUST carry an explicit service-issued admission_id.
+            # Effectful invocations MUST carry an authoritative service-issued admission
+            # bound to exact immutable payload, binding, environment, and endpoint terms.
             clean_admission = (
                 admission_id.strip()
                 if isinstance(admission_id, str) and admission_id.strip()
@@ -349,7 +364,7 @@ class ConnectorProxy:
             if op_spec.mode == "effectful" and clean_admission is None:
                 raise ConnectorUnauthorized(
                     f"Effectful operation '{op_spec.name}' on '{binding.binding_id}' "
-                    "requires a service-issued admission_id"
+                    "requires an authoritative service-issued admission"
                 )
 
             idempotency_key = (
@@ -382,6 +397,23 @@ class ConnectorProxy:
             except ExternalActionConflict as error:
                 raise ConnectorRefused(str(error)) from error
 
+            if op_spec.mode == "effectful":
+                assert clean_admission is not None
+                verify_and_consume_connector_admission(
+                    db,
+                    company_id=company_id,
+                    admission_id=clean_admission,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    operation=op_spec.name,
+                    request_id=request_id.strip(),
+                    payload=payload,
+                    environment=binding.environment,
+                    endpoint_url=clean_url,
+                    allow_already_consumed=replayed,
+                    now_ns=ts,
+                )
+
             if replayed:
                 if ext_action.status in ("confirmed", "rejected"):
                     mode_action = "replay"
@@ -403,28 +435,30 @@ class ConnectorProxy:
                             indeterminate=True,
                         )
                 else:
-                    # Idempotent read retry is permitted if prior attempt did not settle.
+                    # Unresolved read retry: still subject to rate & budget ceilings below!
                     mode_action = "execute"
-            else:
-                # Sliding-window rate limit check (prepared row is included in this transaction).
+
+            if mode_action == "execute":
+                # Account for EVERY outbound execute attempt (including unresolved read retries).
                 window_start_ns = ts - (binding.window_seconds * _NS_PER_SECOND)
-                prefix = f"{binding.binding_id}:r"
-                recent_count = int(
+                recent_attempts = int(
                     db.execute(
-                        """SELECT COUNT(*) FROM external_actions
+                        """SELECT COUNT(*) FROM audit_event
                            WHERE company_id = ?
-                             AND substr(connector, 1, ?) = ?
-                             AND created_at_ns >= ?""",
-                        (company_id, len(prefix), prefix, window_start_ns),
+                             AND domain = 'connectors'
+                             AND event_type = 'connectors.dispatch_attempt'
+                             AND json_extract(payload_json, '$.binding_id') = ?
+                             AND recorded_at_ns >= ?""",
+                        (company_id, binding.binding_id, window_start_ns),
                     ).fetchone()[0]
                 )
-                if recent_count > binding.max_requests_per_window:
+                if recent_attempts >= binding.max_requests_per_window:
                     raise ConnectorRateLimited(
                         f"Connector '{binding.binding_id}' exceeded rate limit "
                         f"({binding.max_requests_per_window} per {binding.window_seconds}s)"
                     )
 
-                # Binding & grant cumulative cost ceiling check before outbound dispatch.
+                prefix = f"{binding.binding_id}:r"
                 if binding.budget_ceiling_minor_units > 0:
                     spent_binding = int(
                         db.execute(
@@ -462,7 +496,6 @@ class ConnectorProxy:
                             f"({grant.max_cost_minor_units}) exhausted"
                         )
 
-                # Transition intent to in_flight with redacted dispatch envelope BEFORE releasing TX!
                 settle_external_action(
                     db,
                     idempotency_key,
@@ -480,14 +513,32 @@ class ConnectorProxy:
                     },
                     now_ns=ts,
                 )
+                append_audit_event(
+                    db,
+                    company_id=company_id,
+                    domain="connectors",
+                    entity_type="external_action",
+                    entity_id=idempotency_key,
+                    event_type="connectors.dispatch_attempt",
+                    actor_id=agent_id,
+                    run_id=claim.run_id,
+                    command_id=clean_admission,
+                    payload={
+                        "binding_id": binding.binding_id,
+                        "binding_revision": binding.revision,
+                        "operation": op_spec.name,
+                        "retry": replayed,
+                    },
+                    recorded_at_ns=ts,
+                )
 
         if mode_action == "replay":
             assert replay_response is not None
             return replay_response
 
         # ------------------------------------------------------------------
-        # Phase 2: Trusted-host memory-only secret injection & network I/O
-        #          (NO SQLite connection or write lock held here!)
+        # Phase 2: Trusted-host memory-only secret injection, fencing recheck,
+        #          and outbound dispatch (NO SQLite write lock held here!)
         # ------------------------------------------------------------------
         try:
             secret = _resolve_secret_for_binding(self._vault, binding, adapter)
@@ -532,6 +583,75 @@ class ConnectorProxy:
                 )
             raise
         raw_secrets = secret.raw_values() if secret is not None else ()
+
+        # Recheck sender fencing immediately before outbound execute so a run
+        # fenced during blocking secret resolution (e.g. Keychain lookup) cannot newly send.
+        if mode_action == "execute":
+            try:
+                self._assert_claim_still_current(writer, claim)
+            except ConnectorUnauthorized:
+                secret = None
+                del raw_secrets
+                fenced_ts = time_ns() if now_ns is None else (now_ns + 1)
+                with write_uow(writer, tx_lock=self._tx_lock) as db:
+                    settle_external_action(
+                        db,
+                        idempotency_key,
+                        status="unknown",
+                        receipt={
+                            "binding_id": binding.binding_id,
+                            "binding_revision": binding.revision,
+                            "connector_kind": binding.connector_kind,
+                            "operation": op_spec.name,
+                            "request_id": request_id.strip(),
+                            "agent_id": agent_id,
+                            "grant_binding_id": grant.grant_binding_id,
+                            "admission_id": clean_admission,
+                            "request_sha256": req_sha256,
+                            "response_payload": {
+                                "idempotency_key": idempotency_key,
+                                "reason": "sender_fenced_before_dispatch",
+                            },
+                        },
+                        now_ns=fenced_ts,
+                    )
+                    if op_spec.mode in ("write", "effectful"):
+                        create_work_item(
+                            db,
+                            company_id=company_id,
+                            owner_agent_id=agent_id,
+                            duty_kind="connector.reconcile",
+                            source_kind="connector_recovery",
+                            source_id=idempotency_key,
+                            payload={
+                                "idempotency_key": idempotency_key,
+                                "binding_id": binding.binding_id,
+                                "binding_revision": binding.revision,
+                                "operation": op_spec.name,
+                                "request_id": request_id.strip(),
+                            },
+                            now_ns=fenced_ts,
+                        )
+                    append_audit_event(
+                        db,
+                        company_id=company_id,
+                        domain="connectors",
+                        entity_type="external_action",
+                        entity_id=idempotency_key,
+                        event_type="connectors.operation_fenced",
+                        actor_id=agent_id,
+                        run_id=claim.run_id,
+                        command_id=clean_admission,
+                        payload={
+                            "binding_id": binding.binding_id,
+                            "binding_revision": binding.revision,
+                            "operation": op_spec.name,
+                            "reason": "sender_fenced_before_dispatch",
+                        },
+                        recorded_at_ns=fenced_ts,
+                    )
+                raise
+
         conn_request = ConnectorRequest(
             company_id=company_id,
             binding_id=binding.binding_id,
@@ -572,6 +692,16 @@ class ConnectorProxy:
                     "error": redact_secret_values(str(error), raw_secrets),
                 },
                 indeterminate=False,
+            )
+        except Exception as error:
+            # Never allow unexpected transport/client exceptions to leak resolved credentials.
+            raw_response = ConnectorResponse(
+                status="unknown",
+                payload={
+                    "idempotency_key": idempotency_key,
+                    "error": f"{type(error).__name__}: {redact_secret_values(str(error), raw_secrets)}",
+                },
+                indeterminate=True,
             )
         finally:
             secret = None
@@ -716,8 +846,9 @@ class ConnectorProxy:
     ) -> ConnectorResponse:
         """Reconcile an existing unresolved external_actions record via adapter.lookup.
 
-        Succeeds even if new writes were subsequently suspended or the original
-        connector_grant/binding was revoked/disabled, preserving recovery ownership.
+        Restricted strictly to the action's originating Agent or explicitly assigned
+        `connector_recovery` work-item owner, while still succeeding after the
+        original connector_grant or connector_binding is revoked/disabled.
         """
         company_id = writer.company_id
         if claim.company_id != company_id:
@@ -728,7 +859,7 @@ class ConnectorProxy:
             try:
                 authority = resolve_run(db, claim)
                 authority.require_current(claim.purpose)
-            except DutyRefused as error:
+            except (DutyRefused, RunFenced) as error:
                 raise ConnectorUnauthorized(str(error)) from error
             if authority.current_scope == "revoked":
                 raise ConnectorUnauthorized("Agent standing grant is revoked")
@@ -751,8 +882,6 @@ class ConnectorProxy:
                 row[4],
                 None if row[5] is None else str(row[5]),
             )
-            if current_status in ("confirmed", "rejected"):
-                return _response_from_cached_receipt(current_status, raw_receipt)
 
             prior_meta: dict[str, Any] = {}
             if isinstance(raw_receipt, str) and raw_receipt:
@@ -762,6 +891,32 @@ class ConnectorProxy:
                         prior_meta = parsed_meta
                 except json.JSONDecodeError:
                     prior_meta = {}
+
+            # Enforce strict ownership or explicit recovery work-item assignment BEFORE
+            # exposing cached receipts or invoking destination lookup.
+            origin_agent = prior_meta.get("agent_id")
+            is_originator = isinstance(origin_agent, str) and origin_agent == agent_id
+            is_assigned_recovery_owner = (
+                db.execute(
+                    """SELECT 1 FROM work_items
+                       WHERE company_id = ?
+                         AND source_kind = 'connector_recovery'
+                         AND source_id = ?
+                         AND owner_agent_id = ?
+                       LIMIT 1""",
+                    (company_id, idempotency_key, agent_id),
+                ).fetchone()
+                is not None
+            )
+            if not (is_originator or is_assigned_recovery_owner):
+                raise ConnectorUnauthorized(
+                    f"Agent '{agent_id}' is neither the originator nor the assigned "
+                    f"recovery owner for external action '{idempotency_key}'"
+                )
+
+            if current_status in ("confirmed", "rejected"):
+                return _response_from_cached_receipt(current_status, raw_receipt)
+
             if ":r" not in connector_col:
                 raise ConnectorRefused(
                     f"Malformed connector reference on external_action '{idempotency_key}'"
@@ -825,6 +980,15 @@ class ConnectorProxy:
                     "error": redact_secret_values(str(error), raw_secrets),
                 },
                 indeterminate=False,
+            )
+        except Exception as error:
+            raw_response = ConnectorResponse(
+                status="unknown",
+                payload={
+                    "idempotency_key": idempotency_key,
+                    "error": f"{type(error).__name__}: {redact_secret_values(str(error), raw_secrets)}",
+                },
+                indeterminate=True,
             )
         finally:
             secret = None
@@ -904,7 +1068,12 @@ class ConnectorProxy:
 
     @staticmethod
     def tool_spec() -> ToolSpec:
-        """Return OuterToolBroker ToolSpec declaring `invoke_connector` as an external write sink."""
+        """Return OuterToolBroker ToolSpec declaring `invoke_connector` as an external write sink.
+
+        Note: `admission_id` is intentionally omitted from model-visible arguments;
+        effectful operations require a trusted domain service to issue and pass a
+        server-owned `connector_admission`.
+        """
         return ToolSpec(
             name="invoke_connector",
             description=(
@@ -918,7 +1087,6 @@ class ConnectorProxy:
                     "operation": {"type": "string"},
                     "request_id": {"type": "string"},
                     "payload": {"type": "object"},
-                    "admission_id": {"type": "string"},
                     "expected_environment": {"type": "string"},
                 },
                 "required": ["binding_id", "operation", "request_id", "payload"],
@@ -934,7 +1102,11 @@ class ConnectorProxy:
         flow_guard: ShiftFlowGuard | None = None,
         timeout_seconds: float = 15.0,
     ) -> ToolHandler:
-        """Create an OuterToolBroker tool handler bound to a live fenced claim."""
+        """Create an OuterToolBroker tool handler bound to a live fenced claim.
+
+        Never forwards caller-supplied `admission_id` values so Agents cannot
+        fabricate domain admissions for effectful operations.
+        """
 
         def _handle(args: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(args, Mapping):
@@ -949,11 +1121,7 @@ class ConnectorProxy:
                 if isinstance(args.get("payload"), Mapping)
                 else {},
                 flow_guard=flow_guard,
-                admission_id=(
-                    str(args["admission_id"])
-                    if isinstance(args.get("admission_id"), str)
-                    else None
-                ),
+                admission_id=None,
                 expected_environment=(
                     str(args["expected_environment"])
                     if isinstance(args.get("expected_environment"), str)

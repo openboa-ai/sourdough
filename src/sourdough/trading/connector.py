@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hmac
+import urllib.parse
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -16,6 +18,12 @@ from ..connectors.protocol import (
     OperationSpec,
 )
 from ..secret_vault import MaskedSecret, MaskedSecretBundle
+from .binance_venue import (
+    MARKET_SPOT,
+    BinanceVenueAdapter,
+    BinanceVenueConfig,
+)
+from .credentials import InMemoryTestCredentialProvider
 from .external_venue import (
     ExternalEnvironmentMismatch,
     ExternalOrderReplyUnknown,
@@ -25,6 +33,7 @@ from .external_venue import (
 )
 
 CONNECTOR_KIND_TRADING_VENUE = "trading_venue"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 TRADING_SUBMIT_ORDER_OP = OperationSpec(
     name="submit_order",
@@ -91,12 +100,104 @@ def _to_decimal(raw: Any, field: str) -> Decimal:
         raise ConnectorRefused(f"Invalid decimal value for '{field}'") from error
 
 
+def build_bound_binance_venue(
+    request: ConnectorRequest,
+    secret: MaskedSecretBundle,
+    *,
+    market_kind: str = MARKET_SPOT,
+    account_id: str | None = None,
+    destination_id: str | None = None,
+    timeout_seconds: float = 10.0,
+) -> BinanceVenueAdapter:
+    """Construct a BinanceVenueAdapter pinned to the authorized ConnectorRequest and secret."""
+    parsed = urllib.parse.urlparse(request.endpoint_url)
+    host = (parsed.hostname or "").lower()
+    is_loopback = host in _LOOPBACK_HOSTS
+    cfg = BinanceVenueConfig(
+        environment=request.environment,
+        market_kind=market_kind,
+        account_id=account_id or f"conn:{request.binding_id}",
+        destination_id=destination_id or request.endpoint_url,
+        credential_handle_ref=secret.handle_ref,
+        base_url_override=request.endpoint_url if is_loopback else None,
+        allow_loopback_override=is_loopback,
+        timeout_seconds=timeout_seconds,
+    )
+    provider = InMemoryTestCredentialProvider(
+        {secret.handle_ref: (secret.get("api_key"), secret.get("api_secret"))}
+    )
+    return BinanceVenueAdapter(cfg, provider)
+
+
+def _verify_venue_binding(
+    venue: ExternalVenueAdapter,
+    request: ConnectorRequest,
+    secret: MaskedSecretBundle,
+) -> None:
+    """Fail closed unless resolved venue's effective environment, endpoint, and credentials match."""
+    if venue.capabilities.environment != request.environment:
+        raise ConnectorEnvironmentMismatch(
+            f"Resolved venue environment '{venue.capabilities.environment}' "
+            f"does not match binding environment '{request.environment}'"
+        )
+
+    cfg = getattr(venue, "_config", None)
+    effective_url = (
+        getattr(cfg, "base_url", None)
+        or getattr(venue, "endpoint_url", None)
+        or getattr(venue, "base_url", None)
+    )
+    if not isinstance(effective_url, str) or not effective_url.strip():
+        raise ConnectorEnvironmentMismatch(
+            "Resolved trading venue adapter must expose its effective endpoint_url/base_url for binding verification"
+        )
+    norm_effective = effective_url.strip().rstrip("/")
+    norm_expected = request.endpoint_url.strip().rstrip("/")
+    if norm_effective != norm_expected:
+        raise ConnectorEnvironmentMismatch(
+            f"Resolved venue endpoint '{norm_effective}' does not match authorized binding endpoint '{norm_expected}'"
+        )
+    effective_host = (urllib.parse.urlparse(norm_effective).hostname or "").lower()
+    if effective_host not in request.allowed_hosts:
+        raise ConnectorEnvironmentMismatch(
+            f"Resolved venue host '{effective_host}' is not in pinned allowed_hosts"
+        )
+
+    # Verify credential identity if venue exposes config or credential provider.
+    cfg_handle = getattr(cfg, "credential_handle_ref", None) or getattr(
+        venue, "credential_handle_ref", None
+    )
+    if cfg_handle is not None and str(cfg_handle) != secret.handle_ref:
+        raise ConnectorEnvironmentMismatch(
+            "Resolved venue credential_handle_ref does not match authorized connector binding handle"
+        )
+    venue_creds = getattr(venue, "_credentials", None)
+    if venue_creds is not None and hasattr(venue_creds, "resolve"):
+        try:
+            resolved_pair = venue_creds.resolve(
+                secret.handle_ref, expected_environment=request.environment
+            )
+        except Exception as error:
+            raise ConnectorEnvironmentMismatch(
+                "Resolved venue credential provider failed verification against authorized secret handle"
+            ) from error
+        if not (
+            hmac.compare_digest(resolved_pair.api_key, secret.get("api_key"))
+            and hmac.compare_digest(resolved_pair.api_secret, secret.get("api_secret"))
+        ):
+            raise ConnectorEnvironmentMismatch(
+                "Resolved venue credentials do not match the ConnectorProxy-injected secret bundle"
+            )
+
+
 class TradingVenueConnectorAdapter:
     """Bridge ExternalVenueAdapter into Sourdough's shared ConnectorProxy boundary."""
 
     def __init__(
         self,
-        venue_resolver: Callable[[ConnectorRequest], ExternalVenueAdapter]
+        venue_resolver: Callable[
+            [ConnectorRequest, MaskedSecretBundle], ExternalVenueAdapter
+        ]
         | None = None,
     ) -> None:
         self._venue_resolver = venue_resolver
@@ -119,17 +220,15 @@ class TradingVenueConnectorAdapter:
     def manifest(self) -> ConnectorManifest:
         return self._manifest
 
-    def _resolve_venue(self, request: ConnectorRequest) -> ExternalVenueAdapter:
+    def _resolve_venue(
+        self, request: ConnectorRequest, secret: MaskedSecretBundle
+    ) -> ExternalVenueAdapter:
         if self._venue_resolver is None:
             raise ConnectorRefused(
                 "TradingVenueConnectorAdapter requires a configured venue_resolver"
             )
-        venue = self._venue_resolver(request)
-        if venue.capabilities.environment != request.environment:
-            raise ConnectorEnvironmentMismatch(
-                f"Resolved venue environment '{venue.capabilities.environment}' "
-                f"does not match binding environment '{request.environment}'"
-            )
+        venue = self._venue_resolver(request, secret)
+        _verify_venue_binding(venue, request, secret)
         return venue
 
     def execute(
@@ -144,7 +243,7 @@ class TradingVenueConnectorAdapter:
             raise ConnectorRefused(
                 "trading_venue connector requires a resolved api_key/api_secret MaskedSecretBundle"
             )
-        venue = self._resolve_venue(request)
+        venue = self._resolve_venue(request, secret)
         try:
             if request.operation == "submit_order":
                 order_req = ExternalOrderRequest(
@@ -232,7 +331,7 @@ class TradingVenueConnectorAdapter:
             raise ConnectorRefused(
                 "trading_venue lookup requires a resolved MaskedSecretBundle"
             )
-        venue = self._resolve_venue(request)
+        venue = self._resolve_venue(request, secret)
         symbol = str(request.payload.get("symbol") or "")
         coid = str(
             request.payload.get("client_order_id")
@@ -282,4 +381,5 @@ __all__ = [
     "TRADING_QUERY_ORDER_OP",
     "TRADING_SUBMIT_ORDER_OP",
     "TradingVenueConnectorAdapter",
+    "build_bound_binance_venue",
 ]

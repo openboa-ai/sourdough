@@ -55,6 +55,7 @@ CORE_NEW_TABLES: tuple[str, ...] = (
     "method_activation",
     "connector_binding",
     "connector_grant",
+    "connector_admission",
 )
 
 _MIGRATABLE_DOMAINS = frozenset({"core", "trading", "paper"})

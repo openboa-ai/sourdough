@@ -74,6 +74,7 @@ TABLES = (
     "agent_profile",
     "connector_binding",
     "connector_grant",
+    "connector_admission",
 )
 
 
