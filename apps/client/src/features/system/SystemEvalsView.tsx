@@ -23,6 +23,8 @@ import {
 import type { SystemEvalsProjection } from "../../api/types";
 import { useProjection } from "../../api/useProjection";
 import { formatNsWithClock } from "../../lib/format";
+import { MethodLearningPanel } from "./MethodLearningPanel";
+import { RsiTransferPanel } from "./RsiTransferPanel";
 
 export function SystemEvalsView({ embedded = false }: { embedded?: boolean } = {}) {
   const { data, loading, error, refetch } =
@@ -316,6 +318,30 @@ export function SystemEvalsView({ embedded = false }: { embedded?: boolean } = {
                   </Stack>
                 )}
               </Card>
+            ) : null,
+          },
+          {
+            id: "method-learning",
+            label: `Method Learning (${(data.method_deltas?.length ?? 0) + (data.method_activations?.length ?? 0)})`,
+            panel: activeTab === "method-learning" ? (
+              <MethodLearningPanel
+                deltas={data.method_deltas ?? []}
+                qualifications={data.method_qualifications ?? []}
+                activations={data.method_activations ?? []}
+                query={evalQuery}
+                onClearQuery={() => setEvalQuery("")}
+              />
+            ) : null,
+          },
+          {
+            id: "rsi-transfer",
+            label: `RSI Transfer (${data.rsi_transfer_summaries?.length ?? 0})`,
+            panel: activeTab === "rsi-transfer" ? (
+              <RsiTransferPanel
+                summaries={data.rsi_transfer_summaries ?? []}
+                query={evalQuery}
+                onClearQuery={() => setEvalQuery("")}
+              />
             ) : null,
           },
           {

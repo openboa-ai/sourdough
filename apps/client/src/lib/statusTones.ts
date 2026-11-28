@@ -1,12 +1,13 @@
-export type SemanticTone =
+export type BadgeTone =
   | "neutral"
   | "brand"
   | "success"
   | "warning"
-  | "danger"
-  | "info";
+  | "danger";
 
-export function agentStateTone(state: string | null | undefined): SemanticTone {
+export type SemanticTone = BadgeTone | "info";
+
+export function agentStateTone(state: string | null | undefined): BadgeTone {
   switch ((state ?? "").toLowerCase()) {
     case "running":
     case "active":
@@ -32,7 +33,7 @@ export function agentStateTone(state: string | null | undefined): SemanticTone {
   }
 }
 
-export function handoffStateTone(state: string | null | undefined): SemanticTone {
+export function handoffStateTone(state: string | null | undefined): BadgeTone {
   switch ((state ?? "").toLowerCase()) {
     case "accepted":
       return "success";
@@ -48,7 +49,7 @@ export function handoffStateTone(state: string | null | undefined): SemanticTone
   }
 }
 
-export function orderStatusTone(status: string | null | undefined): SemanticTone {
+export function orderStatusTone(status: string | null | undefined): BadgeTone {
   switch ((status ?? "").toLowerCase()) {
     case "filled":
     case "completed":
@@ -73,7 +74,7 @@ export function orderStatusTone(status: string | null | undefined): SemanticTone
   }
 }
 
-export function verdictTone(verdict: string | null | undefined): SemanticTone {
+export function verdictTone(verdict: string | null | undefined): BadgeTone {
   switch ((verdict ?? "").toLowerCase()) {
     case "pass":
     case "passed":

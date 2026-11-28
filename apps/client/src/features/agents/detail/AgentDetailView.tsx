@@ -32,6 +32,7 @@ import {
 } from "../../../state/store";
 import { AgentDeskAuthoritySection } from "./AgentDeskAuthoritySection";
 import { AgentHandoffsTab } from "./AgentHandoffsTab";
+import { AgentMethodsTab } from "./AgentMethodsTab";
 import { AgentReportsTab } from "./AgentReportsTab";
 import { AgentSandboxTab } from "./AgentSandboxTab";
 import { AgentTalksTab } from "./AgentTalksTab";
@@ -356,6 +357,22 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                 workItems={activeData.tabs.work_items}
                 workActivity={activeData.tabs.work_activity}
                 conditions={activeData.tabs.conditions}
+                workDecisions={activeData.tabs.work_decisions ?? []}
+                agentEpisodes={activeData.tabs.agent_episodes ?? []}
+                responsibilities={
+                  activeData.tabs.responsibilities ?? activeData.responsibilities ?? []
+                }
+                dreamingSummary={activeData.dreaming_summary ?? null}
+              />
+            ),
+          },
+          {
+            id: "methods",
+            label: `Active Methods (${(activeData.active_methods ?? []).length})`,
+            panel: (
+              <AgentMethodsTab
+                activeMethods={activeData.active_methods ?? []}
+                activeSnapshotId={activeData.active_snapshot_id ?? null}
               />
             ),
           },

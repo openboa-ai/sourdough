@@ -251,10 +251,21 @@ def _redact_run_outcome_for_board(
                     for v in vals
                 ]
         projected["causal_method_trace"] = safe_trace
+    oa_any_mids = oa_mids | {mid for mid, _ in oa_deltas}
     raw_proposals = projected.get("proposals")
     if isinstance(raw_proposals, list):
         safe_proposals: list[Any] = []
         for entry in raw_proposals:
+            if isinstance(entry, str):
+                safe_proposals.append(
+                    _redact_one_agent_ref_for_board(
+                        entry,
+                        force_opaque=False,
+                        one_agent_deltas=oa_deltas,
+                        one_agent_mids=oa_any_mids,
+                    )
+                )
+                continue
             if not isinstance(entry, Mapping):
                 safe_proposals.append(entry)
                 continue
@@ -262,10 +273,12 @@ def _redact_run_outcome_for_board(
             raw_mid = str(item.get("method_id") or "")
             raw_rev = str(item.get("revision_sha256") or "")
             raw_did = str(item.get("delta_id") or "")
+            explicit_scope = str(item.get("audience_scope") or "")
             is_oa = (
-                str(item.get("audience_scope") or "") == "one_agent"
+                explicit_scope == "one_agent"
                 or (raw_mid, raw_rev) in oa_deltas
                 or raw_mid in oa_mids
+                or (not explicit_scope and not raw_rev and raw_mid in oa_any_mids)
                 or (":" in raw_did and tuple(raw_did.rsplit(":", 1)) in oa_deltas)
             )
             if is_oa:
@@ -279,17 +292,29 @@ def _redact_run_outcome_for_board(
                             raw_did,
                             force_opaque=True,
                             one_agent_deltas=oa_deltas,
-                            one_agent_mids=oa_mids,
+                            one_agent_mids=oa_any_mids,
                         )
                     )
+                for secret_key in ("body", "body_text", "trigger_spec"):
+                    if secret_key in item:
+                        item[secret_key] = None
                 item["method_id_redacted"] = True
             safe_proposals.append(item)
         projected["proposals"] = safe_proposals
     raw_patterns = projected.get("patterns")
     if isinstance(raw_patterns, list):
-        oa_any_mids = oa_mids | {mid for mid, _ in oa_deltas}
         safe_patterns: list[Any] = []
         for entry in raw_patterns:
+            if isinstance(entry, str):
+                safe_patterns.append(
+                    _redact_one_agent_ref_for_board(
+                        entry,
+                        force_opaque=False,
+                        one_agent_deltas=oa_deltas,
+                        one_agent_mids=oa_any_mids,
+                    )
+                )
+                continue
             if not isinstance(entry, Mapping):
                 safe_patterns.append(entry)
                 continue

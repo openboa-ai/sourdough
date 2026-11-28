@@ -25,6 +25,7 @@ import { useProjection } from "../../api/useProjection";
 import { SpaBreadcrumb } from "../../components/SpaBreadcrumb";
 import { formatDeadlineNs, formatNsClock, formatNsWithClock } from "../../lib/format";
 import { useControlPlane, useRouter } from "../../state/store";
+import { DaemonDiagnosticsPanel } from "./DaemonDiagnosticsPanel";
 
 const AUDIT_DOMAINS = [
   "all",
@@ -33,6 +34,7 @@ const AUDIT_DOMAINS = [
   "assets",
   "org",
   "work",
+  "learning",
   "ceo",
   "ops",
   "governance",
@@ -355,6 +357,10 @@ export function SystemAuditView({
       {embedded ? (
         effectiveDaemon ? (
           <>
+            <DaemonDiagnosticsPanel
+              health={meta?.resident_health}
+              eventSeq={data.event_seq}
+            />
             <div className="sd-split-equal">
               {runtimeCard}
               {fencesCard}
@@ -379,7 +385,11 @@ export function SystemAuditView({
           />
           <PageHeader
             title="Daemon Diagnostics"
-            detail="Single-writer UDS runtime identity, installed domains, Board authority bindings, and active fencing leases"
+            detail="Single-writer UDS runtime identity, Always-On scheduler health, Board authority bindings, and active fencing leases"
+          />
+          <DaemonDiagnosticsPanel
+            health={meta?.resident_health}
+            eventSeq={data.event_seq}
           />
           <div className="sd-split-equal">
             {runtimeCard}

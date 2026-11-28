@@ -72,6 +72,13 @@ export function AgentHandoffsTab({
         sortValue: (row) => peerById.get(row.id)?.question ?? "",
       },
       {
+        id: "depth",
+        label: "Chain / Hops",
+        kind: "numeric",
+        align: "end",
+        sortValue: (row) => peerById.get(row.id)?.chain_depth ?? 0,
+      },
+      {
         id: "state",
         label: "State",
         kind: "role",
@@ -129,6 +136,11 @@ export function AgentHandoffsTab({
                 <Text variant="help">Response: Pending</Text>
               )}
             </Stack>
+          ),
+          depth: (
+            <Text className="sd-tabular">
+              d{pr.chain_depth ?? 0} · h{pr.hop_count ?? 0}
+            </Text>
           ),
           state: (
             <Badge
