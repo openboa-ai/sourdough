@@ -3564,13 +3564,37 @@ class TestF43OfflineTrialsRsiTier1(unittest.TestCase):
                 h.evaluator_store, ("fam-1", "fam-2")
             )
             tr = lazy_module("sourdough.trial_runner")
+            TrialWorkerInput = lazy_attr(
+                "sourdough.trial_execution", "TrialWorkerInput"
+            )
+            fix_b = b"core-fixture-v1"
+            tools_b = b'{"tools":["desk_read_draft","record_work_decision"]}'
+            inc_ctx = b'{"gen":1,"procedure":"incumbent"}'
+            cand_ctx = b'{"gen":2,"procedure":"candidate"}'
             for idx, slot in enumerate(suite.slots, start=1):
+                cb = json.dumps(
+                    {"case": slot.case_id, "family": slot.family_id}
+                ).encode("utf-8")
+                ctx = inc_ctx if slot.arm == "incumbent" else cand_ctx
                 ev = tr.run_isolated_trial_slot(
                     h.evaluator_store,
                     revision=rev,
                     slot_id=slot.slot_id,
                     run_id=f"run-{idx}",
                     trial_root=h.root / "trials",
+                    company_fixture=fix_b,
+                    worker_input=TrialWorkerInput(cb, ctx, tools_b, slot.limits),
+                    execute_case=lambda _rt, _d, _wi: {
+                        "outcome": "completed",
+                        "decision": {
+                            "grounded": True,
+                            "relevant_constraints": True,
+                            "feasible_next_action": True,
+                        },
+                        "tool_trace": {"calls": [], "violations": 0},
+                        "service_effects": {"service_correct": True},
+                        "usage": {"turns": 1, "tokens": 120},
+                    },
                 )
                 rec = commit_trial_observation(
                     h.evaluator_store,

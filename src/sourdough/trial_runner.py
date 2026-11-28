@@ -795,13 +795,9 @@ def run_isolated_trial_slot(
             limits=worker_input.limits,
         )
     else:
-        reservation = reserve_trial_launch(
-            evaluator_store,
-            revision=revision,
-            slot_id=slot_id,
-            run_id=run_id,
-            inputs=slot.inputs,
-            limits=slot.limits,
+        raise TrialRefused(
+            "Isolated trial execution requires verified inputs (source_store + worker_input "
+            "or company_fixture + worker_input) and a real executor (execute_case or duty_registry)"
         )
     if not reservation.launch_permitted:
         raise TrialRefused("Trial slot reservation has already been consumed")

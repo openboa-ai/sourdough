@@ -329,13 +329,48 @@ class M4TrialRunnerTests(unittest.TestCase):
                     trial_root=eval_dir / "inside",
                 )
 
-            # Sealed-slot-only mode runs isolated CompanyRuntime and produces valid evidence
+            # Unverified sealed-slot-only mode without verified inputs/executor is refused
+            with self.assertRaises(TrialRefused):
+                run_offline_trial_slot(
+                    eval_store,
+                    revision=rev,
+                    slot_id="p1-inc",
+                    run_id="slot-run-unverified",
+                    trial_root=trial_root,
+                )
+
+            # Fixture-backed verified mode runs isolated CompanyRuntime and produces valid evidence
+            inc_wi = TrialWorkerInput(
+                b"case-1-f1",
+                b"incumbent-ctx",
+                b'["desk_read_draft"]',
+                TrialCeiling(turns=2, wall_seconds=5, tokens=500),
+            )
+            cand_wi = TrialWorkerInput(
+                b"case-1-f1",
+                b"candidate-ctx",
+                b'["desk_read_draft"]',
+                TrialCeiling(turns=2, wall_seconds=5, tokens=500),
+            )
             ev = run_offline_trial_slot(
                 eval_store,
                 revision=rev,
                 slot_id="p1-inc",
                 run_id="slot-run-1",
                 trial_root=trial_root,
+                company_fixture=b"fixture-v1",
+                worker_input=inc_wi,
+                execute_case=lambda _rt, _d, _wi: {
+                    "outcome": "completed",
+                    "decision": {
+                        "grounded": True,
+                        "relevant_constraints": True,
+                        "feasible_next_action": True,
+                    },
+                    "tool_trace": {"calls": [], "violations": 0},
+                    "service_effects": {"service_correct": True},
+                    "usage": {"turns": 1, "tokens": 120},
+                },
             )
             self.assertEqual(ev.outcome, "completed")
             self.assertIsNotNone(ev.decision_digest)
@@ -358,6 +393,8 @@ class M4TrialRunnerTests(unittest.TestCase):
                 slot_id="p1-cand",
                 run_id="slot-run-2",
                 trial_root=trial_root,
+                company_fixture=b"fixture-v1",
+                worker_input=cand_wi,
                 execute_case=lambda _rt, _d, _s: {
                     "outcome": "completed",
                     "decision": {"ok": True},
@@ -375,6 +412,9 @@ class M4TrialRunnerTests(unittest.TestCase):
                     slot_id="p1-inc",
                     run_id="slot-run-replay",
                     trial_root=trial_root,
+                    company_fixture=b"fixture-v1",
+                    worker_input=inc_wi,
+                    execute_case=lambda _rt, _d, _wi: {"outcome": "completed"},
                 )
 
             summary = trial_judgment_summary(eval_store, revision=rev)

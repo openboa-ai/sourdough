@@ -64,7 +64,12 @@ from ..method_learning import (
 from ..storage.db import open_reader, open_writer, read_tx, write_tx
 from ..storage.kernel import append_audit_event
 from ..storage.schema import installed_domains
-from .desk_tools import build_core_desk_tool_contribution
+from .desk_tools import (
+    _DEFAULT_OFFLOAD_READ_BYTES,
+    _MAX_OFFLOAD_READ_BYTES,
+    build_core_desk_tool_contribution,
+    read_offloaded_log_slice,
+)
 from .domains import (
     ProfileBindingLookup,
     ToolContribution,
@@ -674,11 +679,7 @@ class ShiftRunner:
             mid = m.get("method_id")
             if isinstance(mid, str) and mid not in available_method_ids:
                 available_method_ids.append(mid)
-        retrieved_method_ids: list[str] = [
-            str(m["method_id"])
-            for m in active_methods
-            if isinstance(m.get("method_id"), str)
-        ]
+        retrieved_method_ids: list[str] = []
         invoked_method_ids: list[str] = []
 
         def _record_retrieved(mid: str) -> None:
@@ -712,6 +713,7 @@ class ShiftRunner:
             if include_core_skill_tools is None
             else include_core_skill_tools
         )
+        public_offloaded_paths: set[str] = set()
         contributions: list[ToolContribution] = []
         if include_core_desk_tools:
             contributions.append(
@@ -722,6 +724,59 @@ class ShiftRunner:
                     sandbox_backend=profile.sandbox_backend,
                     tx_lock=ctx.tx_lock,
                     desk_limits=PRODUCTION_DESK_LIMITS,
+                )
+            )
+        else:
+
+            def _read_public_offloaded_output(args: dict[str, Any]) -> dict[str, Any]:
+                if not isinstance(args, dict):
+                    raise DutyRefused(
+                        "read_offloaded_output arguments must be a JSON object"
+                    )
+                unknown = set(args) - {"log_path", "offset", "limit"}
+                if unknown or "log_path" not in args:
+                    raise DutyRefused(
+                        "read_offloaded_output arguments do not match schema"
+                    )
+                lp = args["log_path"]
+                if not isinstance(lp, str) or not lp.strip():
+                    raise DutyRefused("log_path must be a nonempty string")
+                if lp not in public_offloaded_paths:
+                    raise DutyRefused(
+                        "Offloaded log path is not an authorized public result of this shift"
+                    )
+                return read_offloaded_log_slice(
+                    ctx.writer.store,
+                    agent_id,
+                    lp,
+                    offset=args.get("offset", 0),
+                    limit=args.get("limit", _DEFAULT_OFFLOAD_READ_BYTES),
+                )
+
+            contributions.append(
+                ToolContribution(
+                    specs=(
+                        ToolSpec(
+                            name="read_offloaded_output",
+                            description="Read a bounded slice of a public tool output offloaded during this shift.",
+                            parameters={
+                                "type": "object",
+                                "properties": {
+                                    "log_path": {"type": "string"},
+                                    "offset": {"type": "integer", "minimum": 0},
+                                    "limit": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": _MAX_OFFLOAD_READ_BYTES,
+                                    },
+                                },
+                                "required": ["log_path"],
+                                "additionalProperties": False,
+                            },
+                        ),
+                    ),
+                    handlers={"read_offloaded_output": _read_public_offloaded_output},
+                    recoverable_exceptions=(DutyRefused,),
                 )
             )
         if eff_skill_tools:
@@ -790,12 +845,22 @@ class ShiftRunner:
 
         def _wrap_handler(name: str, fn: ToolHandler, *, use_lock: bool) -> ToolHandler:
             def _wrapped(args: dict[str, Any]) -> dict[str, Any]:
+                is_public_offload_read = (
+                    name == "desk_read_offloaded_log"
+                    and isinstance(args, Mapping)
+                    and isinstance(args.get("log_path"), str)
+                    and args["log_path"] in public_offloaded_paths
+                )
                 if name in _PEER_OUTBOUND_SINKS and flow_state["read_private_desk"]:
                     raise DutyRefused(
                         "Cannot write free-form peer messages or requests in the same shift "
                         "after reading private Desk data; publish explicitly via desk_publish_selection"
                     )
-                if name in _PRIVATE_DESK_ALL_TOOLS and flow_state["read_peer_input"]:
+                if (
+                    name in _PRIVATE_DESK_ALL_TOOLS
+                    and not is_public_offload_read
+                    and flow_state["read_peer_input"]
+                ):
                     raise DutyRefused(
                         "Cannot access private Desk drafts, publications, or skills in the same shift "
                         "after reading peer-authored messages, handoffs, or shared assets"
@@ -810,7 +875,7 @@ class ShiftRunner:
                         out = fn(args)
                 else:
                     out = fn(args)
-                if name in _PRIVATE_DESK_READ_TOOLS:
+                if name in _PRIVATE_DESK_READ_TOOLS and not is_public_offload_read:
                     flow_state["read_private_desk"] = True
                 if name in _PEER_INPUT_TOOLS:
                     flow_state["read_peer_input"] = True
@@ -912,7 +977,9 @@ class ShiftRunner:
         def _offload(
             seq: int, tool_name: str, payload: dict[str, Any]
         ) -> dict[str, Any]:
-            return offload_large_output(
+            if tool_name in ("desk_read_offloaded_log", "read_offloaded_output"):
+                return payload
+            res = offload_large_output(
                 ctx.writer.store,
                 session,
                 tool_name,
@@ -920,6 +987,13 @@ class ShiftRunner:
                 seq=seq,
                 max_inline_bytes=DEFAULT_OFFLOAD_THRESHOLD_BYTES,
             )
+            if (
+                res.get("offloaded") is True
+                and isinstance(res.get("log_path"), str)
+                and tool_name not in _PRIVATE_DESK_ALL_TOOLS
+            ):
+                public_offloaded_paths.add(res["log_path"])
+            return res
 
         broker = OuterToolBroker(
             company_id=ctx.company_id,
@@ -1111,12 +1185,6 @@ class ShiftRunner:
                     if active_err is not None
                     else "Shift failed"
                 )
-
-            if shift_result is not None and shift_result.output_text:
-                out_text = shift_result.output_text
-                for mid in retrieved_method_ids:
-                    if mid in out_text and mid not in invoked_method_ids:
-                        invoked_method_ids.append(mid)
 
             decision_ids: list[str] = []
             try:

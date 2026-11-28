@@ -1,6 +1,7 @@
 """Three-entity Work kernel: items, fenced runs, responsibilities, conditions, and peer requests."""
 
 import json
+import re
 import sqlite3
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -13,6 +14,16 @@ from uuid import uuid4
 
 from ..duty_run import employment_cutoff, has_turn_capacity
 from ..storage.kernel import append_audit_event
+
+_OPAQUE_ACTION_ID_RE = re.compile(r"^action:[0-9a-f]{16}$")
+
+
+def opaque_decision_action_id(raw_action_id: str) -> str:
+    """Return a deterministic opaque digest identifier for a decision action_id."""
+    if _OPAQUE_ACTION_ID_RE.fullmatch(raw_action_id):
+        return raw_action_id
+    return f"action:{sha256(raw_action_id.encode('utf-8')).hexdigest()[:16]}"
+
 
 MAX_PEER_CHAIN_DEPTH = 4
 PAIRWISE_RATE_LIMIT_COUNT = 6
@@ -4145,7 +4156,7 @@ def record_work_decision(
         run_id=run_id,
         payload={
             "work_item_id": work_item_id,
-            "action_id": effective_action_id,
+            "action_id": opaque_decision_action_id(effective_action_id),
             "action_kind": action_kind,
             "evidence_digest": evidence_digest,
             "next_condition_id": next_condition_id,

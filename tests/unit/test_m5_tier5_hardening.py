@@ -10917,6 +10917,422 @@ class TestM5Tier5Hardening(unittest.TestCase):
         self.assertNotIn("secret-merger-plan-r23", audit_blob)
         self.assertNotIn("secret-child-canary-r23", audit_blob)
 
+    def test_pr191_r24_security_decision_action_id_opaque_mapped_in_audit_and_db(
+        self,
+    ) -> None:
+        """PR #191 R24 Security #21: record_work_decision opaque-maps action_id before audit persistence and LLM tool storage."""
+        now_ns = time_ns()
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="r24-action-id-canary",
+                    now_ns=now_ns,
+                )
+
+        seen: dict[str, Any] = {}
+
+        class _CanaryActionIdAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                r1 = broker.invoke(
+                    "dec-1",
+                    "record_work_decision",
+                    {
+                        "action_kind": "hold",
+                        "action_id": "PRIVATE_DRAFT_ACTION_ID_CANARY_314159",
+                        "rationale": "First attempt.",
+                        "evidence": [],
+                    },
+                )
+                r2 = broker.invoke(
+                    "dec-2",
+                    "record_work_decision",
+                    {
+                        "action_kind": "hold",
+                        "action_id": "PRIVATE_DRAFT_ACTION_ID_CANARY_314159",
+                        "rationale": "First attempt.",
+                        "evidence": [],
+                    },
+                )
+                seen["r1"] = r1
+                seen["r2"] = r2
+                return ShiftResult(
+                    output_text="Done.",
+                    usage=TokenUsage(input_tokens=20, output_tokens=5),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_CanaryActionIdAdapter())
+        dreg = build_production_duty_registry(
+            adapter_registry=areg,
+            profile_bindings={self.founder_id: self.profile},
+        )
+        rt = CompanyRuntime(
+            self.store, self.company_id, dreg, clock=lambda: now_ns + 500
+        )
+        rt.step(
+            max_dispatches=1,
+            now_ns=now_ns + 500,
+            target_work_item_id=item.work_item_id,
+        )
+        self.assertTrue(seen["r1"].get("ok"))
+        self.assertEqual(seen["r1"].get("decision_id"), seen["r2"].get("decision_id"))
+        with closing(open_reader(self.store)) as ro_db, read_tx(ro_db):
+            audits = ro_db.execute(
+                "SELECT payload_json FROM audit_event WHERE event_type = 'work.decision_recorded'"
+            ).fetchall()
+            decs = ro_db.execute("SELECT action_id FROM work_decision").fetchall()
+        self.assertNotIn("PRIVATE_DRAFT_ACTION_ID_CANARY_314159", json.dumps(audits))
+        self.assertNotIn("PRIVATE_DRAFT_ACTION_ID_CANARY_314159", json.dumps(decs))
+        self.assertTrue(
+            json.loads(str(audits[0][0]))["action_id"].startswith("action:")
+        )
+
+    def test_pr191_r24_causal_method_trace_requires_explicit_skill_use_not_output_substring(
+        self,
+    ) -> None:
+        """PR #191 R24 Code P2: mentioning an indexed method in output prose must not record retrieval or invocation."""
+        from sourdough.method_learning import (
+            activate_method_delta,
+            distill_method_delta,
+            qualify_method_delta,
+        )
+
+        now_ns = time_ns()
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, seed_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                )
+            d = distill_method_delta(
+                w,
+                seed_claim,
+                delta_kind="ADD",
+                target_kind="work_method",
+                method_id="unused-method-r24",
+                trigger_spec={"duty_kind": "work.discovery_review"},
+                body="Optional method body.",
+                audience_scope="company",
+                source_refs=[f"work_run:{seed_claim.run_id}"],
+                now_ns=now_ns,
+            )
+            qualify_method_delta(
+                w,
+                d.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=now_ns + 10,
+            )
+            activate_method_delta(
+                w,
+                d.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=now_ns + 20,
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                complete_work_run(
+                    db,
+                    seed_claim.run_id,
+                    seed_claim.fencing_token,
+                    outcome={"done": True},
+                    now_ns=now_ns + 30,
+                )
+                item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="r24-no-skill-call",
+                    now_ns=now_ns + 40,
+                )
+
+        class _MentionOnlyAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                return ShiftResult(
+                    output_text="I did not use method unused-method-r24.",
+                    usage=TokenUsage(input_tokens=15, output_tokens=8),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=0,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_MentionOnlyAdapter())
+        dreg = build_production_duty_registry(
+            adapter_registry=areg,
+            profile_bindings={self.founder_id: self.profile},
+        )
+        rt = CompanyRuntime(
+            self.store, self.company_id, dreg, clock=lambda: now_ns + 500
+        )
+        summary = rt.step(
+            max_dispatches=1,
+            now_ns=now_ns + 500,
+            target_work_item_id=item.work_item_id,
+        )
+        run_id = summary.executed_runs[0]
+        with closing(open_reader(self.store)) as ro_db, read_tx(ro_db):
+            dec_json = ro_db.execute(
+                "SELECT decisions_json FROM agent_episode WHERE company_id = ? AND run_id = ?",
+                (self.company_id, run_id),
+            ).fetchone()[0]
+        trace = json.loads(str(dec_json))[0]
+        self.assertIn("unused-method-r24", trace["available"])
+        self.assertEqual(trace["retrieved"], [])
+        self.assertEqual(trace["invoked"], [])
+
+    def test_pr191_r24_offloaded_peer_output_readable_without_reoffload_and_blocks_private_logs(
+        self,
+    ) -> None:
+        """PR #191 R24 Code P2: offloaded public outputs are readable with default limit (no re-offload) while unrelated Desk logs stay refused."""
+        from sourdough.agent_desk import PRODUCTION_DESK_LIMITS
+        from sourdough.conversations import Post, append_message
+
+        now_ns = time_ns()
+        with hold_company_writer(self.store, self.company_id) as w:
+            peer_b, peer_b_grant = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="offload-b-r24",
+                profile_id=self.profile.profile_id(),
+            )
+            proj_rev = assign_project(
+                w,
+                self.grant_id,
+                "proj-offload-r24",
+                (self.founder_id, peer_b),
+                publishers=(self.founder_id, peer_b),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, a_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                )
+                _, _, b_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=peer_b,
+                    grant_id=peer_b_grant,
+                    grant_scope="assessment",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                )
+            big_body = "SHARED_PUBLIC_CHUNK_" + ("X" * 8000) + "_END"
+            a_draft = save_draft(
+                w,
+                a_claim,
+                a_claim.purpose,
+                name="big-shared-r24",
+                content=big_body,
+                expected_revision=None,
+                limits=PRODUCTION_DESK_LIMITS,
+            )
+            pub = publish_selection(
+                w,
+                a_claim,
+                a_claim.purpose,
+                Selection(
+                    "pub-big-r24",
+                    "big-shared-r24",
+                    a_draft.revision,
+                    "proj-offload-r24",
+                    proj_rev,
+                    (self.founder_id, peer_b),
+                    0,
+                    len(big_body),
+                ),
+            )
+            # Also post large project messages (>5KB total) so read_messages offloads in peer-only shift
+            for m_idx in range(4):
+                append_message(
+                    w,
+                    a_claim,
+                    a_claim.purpose,
+                    Post(
+                        "proj-offload-r24",
+                        proj_rev,
+                        f"big-msg-r24-{m_idx}",
+                        f"MSG_{m_idx}_" + ("M" * 1200),
+                        "",
+                    ),
+                )
+            # Seed an unrelated private Desk log inside peer_b's .desk/logs/
+            priv_log_dir = desk_directory(self.store, peer_b) / ".desk" / "logs"
+            priv_log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            (priv_log_dir / "private-prior-secret.json").write_text(
+                '{"secret":"PRIVATE_PRIOR_LOG_CANARY_888"}', encoding="utf-8"
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                complete_work_run(
+                    db,
+                    a_claim.run_id,
+                    a_claim.fencing_token,
+                    outcome={"done": True},
+                    now_ns=now_ns,
+                )
+                complete_work_run(
+                    db,
+                    b_claim.run_id,
+                    b_claim.fencing_token,
+                    outcome={"done": True},
+                    now_ns=now_ns,
+                )
+                item_desk_shift, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=peer_b,
+                    duty_kind="work.assessment_review",
+                    source_kind="manual",
+                    source_id="r24-offload-desk",
+                    now_ns=now_ns + 10,
+                )
+                item_peer_only, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=peer_b,
+                    duty_kind="work.handoff_followup",
+                    source_kind="manual",
+                    source_id="r24-offload-peer",
+                    now_ns=now_ns + 20,
+                )
+
+        obs: dict[str, Any] = {"shift": 0}
+
+        class _OffloadProbeAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                obs["shift"] += 1
+                if obs["shift"] == 1:
+                    pub_env = broker.invoke(
+                        "s1-pub", "read_shared_asset", {"asset_id": pub.asset_id}
+                    )
+                    obs["s1_pub_offloaded"] = pub_env.get("offloaded") is True
+                    # Default limit read on own offloaded public log MUST succeed inline (no re-offload!)
+                    obs["s1_read_pub_log"] = broker.invoke(
+                        "s1-read-pub-log",
+                        "desk_read_offloaded_log",
+                        {"log_path": pub_env["log_path"]},
+                    )
+                    # Unrelated private Desk log MUST still be refused!
+                    obs["s1_read_priv_log"] = broker.invoke(
+                        "s1-read-priv-log",
+                        "desk_read_offloaded_log",
+                        {"log_path": ".desk/logs/private-prior-secret.json"},
+                    )
+                else:
+                    obs["s2_tools"] = [t.name for t in request.tools]
+                    msg_env = broker.invoke(
+                        "s2-msgs", "read_messages", {"project_id": "proj-offload-r24"}
+                    )
+                    obs["s2_msgs_offloaded"] = msg_env.get("offloaded") is True
+                    obs["s2_read_pub_log"] = broker.invoke(
+                        "s2-read-pub-log",
+                        "read_offloaded_output",
+                        {"log_path": msg_env["log_path"]},
+                    )
+                    obs["s2_read_priv_log"] = broker.invoke(
+                        "s2-read-priv-log",
+                        "read_offloaded_output",
+                        {"log_path": ".desk/logs/private-prior-secret.json"},
+                    )
+                return ShiftResult(
+                    output_text="Done.",
+                    usage=TokenUsage(input_tokens=20, output_tokens=8),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_OffloadProbeAdapter())
+        dreg = build_production_duty_registry(
+            adapter_registry=areg,
+            profile_bindings={self.founder_id: self.profile, peer_b: self.profile},
+        )
+        rt = CompanyRuntime(
+            self.store, self.company_id, dreg, clock=lambda: now_ns + 500
+        )
+        rt.step(
+            max_dispatches=1,
+            now_ns=now_ns + 500,
+            target_work_item_id=item_desk_shift.work_item_id,
+        )
+        self.assertTrue(obs["s1_pub_offloaded"])
+        self.assertTrue(obs["s1_read_pub_log"].get("ok"))
+        self.assertFalse(obs["s1_read_pub_log"].get("offloaded", False))
+        self.assertIn("SHARED_PUBLIC_CHUNK_", obs["s1_read_pub_log"].get("content", ""))
+        self.assertFalse(obs["s1_read_priv_log"].get("ok", True))
+        self.assertEqual(obs["s1_read_priv_log"].get("error_type"), "DutyRefused")
+
+        rt.step(
+            max_dispatches=1,
+            now_ns=now_ns + 1000,
+            target_work_item_id=item_peer_only.work_item_id,
+        )
+        self.assertFalse(any(t.startswith("desk_") for t in obs["s2_tools"]))
+        self.assertIn("read_offloaded_output", obs["s2_tools"])
+        self.assertTrue(obs["s2_msgs_offloaded"])
+        self.assertTrue(obs["s2_read_pub_log"].get("ok"))
+        self.assertFalse(obs["s2_read_pub_log"].get("offloaded", False))
+        self.assertIn("MSG_0_", obs["s2_read_pub_log"].get("content", ""))
+        self.assertFalse(obs["s2_read_priv_log"].get("ok", True))
+        self.assertEqual(obs["s2_read_priv_log"].get("error_type"), "DutyRefused")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,7 @@ from .work_kernel import (
     assert_run_fencing,
     cancel_condition,
     list_conditions,
+    opaque_decision_action_id,
     record_work_decision,
     replace_condition,
     set_condition,
@@ -333,7 +334,12 @@ def build_core_proactive_tool_contribution(
         )
         action_kind = _require_str(obj["action_kind"], "action_kind")
         rationale = _require_str(obj["rationale"], "rationale", max_len=4000)
-        action_id = _optional_str(obj.get("action_id"), "action_id")
+        raw_action_id = _optional_str(obj.get("action_id"), "action_id")
+        action_id = (
+            opaque_decision_action_id(raw_action_id)
+            if raw_action_id is not None
+            else None
+        )
         decision_at_ns = _optional_int(
             obj.get("decision_at_ns"), "decision_at_ns", minimum=1
         )

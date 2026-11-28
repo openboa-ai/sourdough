@@ -78,6 +78,64 @@ def _check_regular_no_symlink(path: Path, stop_at: Path) -> None:
             raise DutyRefused("Symlinks are forbidden inside private Desk storage")
 
 
+_DEFAULT_OFFLOAD_READ_BYTES = 2048
+
+
+def read_offloaded_log_slice(
+    store: Path,
+    agent_id: str,
+    log_path: str,
+    *,
+    offset: int = 0,
+    limit: int = _DEFAULT_OFFLOAD_READ_BYTES,
+) -> dict[str, Any]:
+    """Read a bounded byte slice from <desk>/.desk/logs/<file> with symlink/inode checks."""
+    if "\\" in log_path or "\x00" in log_path or log_path.startswith("/"):
+        raise DutyRefused("Invalid offloaded log path")
+    posix = PurePosixPath(log_path)
+    if (
+        len(posix.parts) != 3
+        or posix.parts[0] != ".desk"
+        or posix.parts[1] != "logs"
+        or posix.parts[2] in ("", ".", "..")
+        or posix.parts[2].startswith(".")
+    ):
+        raise DutyRefused("Offloaded log path must target .desk/logs/<file>")
+    if type(offset) is not int or offset < 0:
+        raise DutyRefused("offset must be a nonnegative integer")
+    if type(limit) is not int or limit < 1:
+        raise DutyRefused("limit must be a positive integer")
+    bounded_limit = min(limit, _MAX_OFFLOAD_READ_BYTES)
+
+    root = store.resolve(strict=False).parent
+    target = desk_directory(store, agent_id) / ".desk" / "logs" / posix.parts[2]
+    _check_regular_no_symlink(target, root)
+    st = os.lstat(target)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        raise DutyRefused("Offloaded log target must be a regular file")
+    fd = os.open(target, os.O_RDONLY | _O_NOFOLLOW)
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+            raise DutyRefused("Offloaded log target failed regular-file validation")
+        total_bytes = int(fst.st_size)
+        if offset >= total_bytes:
+            raw_chunk = b""
+        else:
+            os.lseek(fd, offset, os.SEEK_SET)
+            raw_chunk = os.read(fd, bounded_limit)
+    finally:
+        os.close(fd)
+    return {
+        "ok": True,
+        "log_path": log_path,
+        "offset": offset,
+        "total_bytes": total_bytes,
+        "content": raw_chunk.decode("utf-8", errors="replace"),
+        "eof": offset + len(raw_chunk) >= total_bytes,
+    }
+
+
 def build_core_desk_tool_contribution(
     *,
     writer: WriterLease,
@@ -204,57 +262,15 @@ def build_core_desk_tool_contribution(
         )
         _verify_fencing()
         log_path = _require_str(obj["log_path"], "log_path")
-        if "\\" in log_path or "\x00" in log_path or log_path.startswith("/"):
-            raise DutyRefused("Invalid offloaded log path")
-        posix = PurePosixPath(log_path)
-        if (
-            len(posix.parts) != 3
-            or posix.parts[0] != ".desk"
-            or posix.parts[1] != "logs"
-            or posix.parts[2] in ("", ".", "..")
-            or posix.parts[2].startswith(".")
-        ):
-            raise DutyRefused("Offloaded log path must target .desk/logs/<file>")
         offset = obj.get("offset", 0)
-        limit = obj.get("limit", 4096)
-        if type(offset) is not int or offset < 0:
-            raise DutyRefused("offset must be a nonnegative integer")
-        if type(limit) is not int or limit < 1:
-            raise DutyRefused("limit must be a positive integer")
-        bounded_limit = min(limit, _MAX_OFFLOAD_READ_BYTES)
-
-        root = writer.store.resolve(strict=False).parent
-        target = (
-            desk_directory(writer.store, claim.founder_id)
-            / ".desk"
-            / "logs"
-            / posix.parts[2]
+        limit = obj.get("limit", _DEFAULT_OFFLOAD_READ_BYTES)
+        return read_offloaded_log_slice(
+            writer.store,
+            claim.founder_id,
+            log_path,
+            offset=offset,
+            limit=limit,
         )
-        _check_regular_no_symlink(target, root)
-        st = os.lstat(target)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            raise DutyRefused("Offloaded log target must be a regular file")
-        fd = os.open(target, os.O_RDONLY | _O_NOFOLLOW)
-        try:
-            fst = os.fstat(fd)
-            if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
-                raise DutyRefused("Offloaded log target failed regular-file validation")
-            total_bytes = int(fst.st_size)
-            if offset >= total_bytes:
-                raw_chunk = b""
-            else:
-                os.lseek(fd, offset, os.SEEK_SET)
-                raw_chunk = os.read(fd, bounded_limit)
-        finally:
-            os.close(fd)
-        return {
-            "ok": True,
-            "log_path": log_path,
-            "offset": offset,
-            "total_bytes": total_bytes,
-            "content": raw_chunk.decode("utf-8", errors="replace"),
-            "eof": offset + len(raw_chunk) >= total_bytes,
-        }
 
     def _desk_publish_selection(args: dict[str, Any]) -> dict[str, Any]:
         obj = _require_object(
