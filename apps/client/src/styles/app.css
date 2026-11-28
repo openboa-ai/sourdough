@@ -675,41 +675,42 @@
     max-inline-size: 100%;
   }
 
-  .sd-thread-scroll .yg-transcript,
-  .sd-thread-scroll .yg-scroll {
+  .sd-agent-talks,
+  :is(.sd-thread-scroll, .sd-agent-talks) .yg-transcript,
+  :is(.sd-thread-scroll, .sd-agent-talks) .yg-scroll {
     min-inline-size: 0;
     inline-size: 100%;
     max-inline-size: 100%;
   }
 
-  .sd-thread-scroll .yg-scroll {
-    min-block-size: 260px;
+  :is(.sd-thread-scroll, .sd-agent-talks) .yg-scroll {
     max-block-size: min(560px, 52dvh);
     padding-inline-end: var(--boa-space-4);
   }
 
-  .sd-thread-scroll .yg-message[data-variant="sent"] .yg-message-body {
+  .sd-thread-scroll .yg-scroll {
+    min-block-size: 260px;
+  }
+
+  :is(.sd-thread-scroll, .sd-agent-talks) .yg-message[data-variant="sent"] .yg-message-body {
     inline-size: 100%;
     max-inline-size: 100%;
     min-inline-size: 0;
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .sd-thread-scroll .yg-message[data-variant="sent"] .yg-message-content {
+  :is(.sd-thread-scroll, .sd-agent-talks) .yg-message[data-variant="sent"] .yg-message-content {
     max-inline-size: 100%;
     min-inline-size: 0;
     overflow-wrap: anywhere;
   }
 
-  .sd-thread-scroll .yg-message-content .yg-stack,
-  .sd-thread-scroll .yg-message-content .yg-inline,
-  .sd-thread-scroll .yg-message-content .yg-button,
-  .sd-thread-scroll .yg-message-content .yg-resource-row {
+  :is(.sd-thread-scroll, .sd-agent-talks) .yg-message-content :is(.yg-stack, .yg-inline, .yg-button, .yg-resource-row) {
     max-inline-size: 100%;
     min-inline-size: 0;
   }
 
-  .sd-thread-scroll .yg-message .yg-badge {
+  :is(.sd-thread-scroll, .sd-agent-talks) .yg-message .yg-badge {
     display: block;
     width: fit-content;
     max-inline-size: 100%;
@@ -717,7 +718,7 @@
     line-height: 18px;
   }
 
-  .sd-thread-scroll .yg-message-content p {
+  :is(.sd-thread-scroll, .sd-agent-talks) .yg-message-content p {
     margin-block: 0;
   }
 

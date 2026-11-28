@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment } from "react";
 import { CopyButton } from "@openboa/yogurt/motion-copy-button";
 import {
   Badge,
@@ -21,33 +21,17 @@ import {
   type DataRow,
   type TraceEvent,
 } from "@openboa/yogurt";
-import {
-  ApiError,
-  fetchProjection,
-  formatMinorCurrency,
-  formatNsClock,
-  formatRelativeNs,
-} from "../../api/client";
 import type { OrderTraceProjection } from "../../api/types";
+import { useProjection } from "../../api/useProjection";
 import { SpaBreadcrumb } from "../../components/SpaBreadcrumb";
-import { useApp, useEscapeBack } from "../../state/store";
+import {
+  formatMinorCurrency,
+  formatNsWithClock,
+  normalizeToNs,
+} from "../../lib/format";
+import { useEscapeBack, useRouter } from "../../state/store";
 
 type RelatedPublicationItem = OrderTraceProjection["related_publications"][number];
-
-function normalizeToNs(epoch: number | null | undefined): number | null {
-  if (epoch === null || epoch === undefined || !Number.isFinite(epoch) || epoch <= 0) {
-    return null;
-  }
-  if (epoch < 1e12) return Math.round(epoch * 1_000_000_000);
-  if (epoch < 1e15) return Math.round(epoch * 1_000_000);
-  return epoch;
-}
-
-function formatTimestamp(epoch: number | null | undefined, emptyLabel: string): string {
-  const ns = normalizeToNs(epoch);
-  if (ns === null) return emptyLabel;
-  return `${formatNsClock(ns)} (${formatRelativeNs(ns)})`;
-}
 
 const ORDER_FOCUS_STORAGE_PREFIX = "sd.orderFocusReturn.";
 
@@ -106,13 +90,10 @@ function resolveBackMeta(
 }
 
 export function OrderTraceView({ orderId }: { orderId: string }) {
-  const { navigate, refreshSeq, routeSearchParams, reportApiError, askCeo } = useApp();
-  const [data, setData] = useState<OrderTraceProjection | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [errorStatus, setErrorStatus] = useState<number | null>(null);
-  const [retrySeq, setRetrySeq] = useState(0);
-  const prevOrderIdRef = useRef(orderId);
+  const { navigate, routeSearchParams, askCeo } = useRouter();
+  const { data, loading, error, refetch } = useProjection<OrderTraceProjection>(
+    `orders/${encodeURIComponent(orderId)}`
+  );
 
   const envHint = routeSearchParams.get("env");
   const fallbackBackLink = envHint === "live" ? "/trading/live" : "/trading/paper";
@@ -124,48 +105,12 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
 
   useEscapeBack(backLink, resolvedFocusReturnId);
 
-  useEffect(() => {
-    if (prevOrderIdRef.current !== orderId) {
-      prevOrderIdRef.current = orderId;
-      setLoading(true);
-      setData(null);
-      setError(null);
-      setErrorStatus(null);
-    }
-    const controller = new AbortController();
-    let active = true;
-    void (async () => {
-      try {
-        const res = await fetchProjection<OrderTraceProjection>(
-          `orders/${encodeURIComponent(orderId)}`,
-          { signal: controller.signal }
-        );
-        if (!active || controller.signal.aborted) return;
-        if (res.data) setData(res.data);
-        setError(null);
-        setErrorStatus(null);
-      } catch (err) {
-        if (!active || controller.signal.aborted) return;
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        reportApiError(err);
-        setErrorStatus(err instanceof ApiError ? err.status : null);
-        setError(err instanceof Error ? err.message : "Failed to load order trace");
-      } finally {
-        if (active && !controller.signal.aborted) setLoading(false);
-      }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [orderId, refreshSeq, retrySeq, reportApiError]);
-
   if (loading && !activeData) {
     return <Skeleton label="Loading order causal lineage" lines={5} />;
   }
 
   if (!activeData) {
-    const isNotFound = errorStatus === 404 || error === null;
+    const isNotFound = error === null || /not found|404/i.test(error);
     const fallbackMeta = resolveBackMeta(fallbackBackLink, "Agent");
     return (
       <Result
@@ -173,16 +118,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
         action={
           <Inline gap={8} wrap>
             {!isNotFound ? (
-              <Button
-                emphasis="soft"
-                shape="pill"
-                onClick={() => {
-                  setLoading(true);
-                  setError(null);
-                  setErrorStatus(null);
-                  setRetrySeq((n) => n + 1);
-                }}
-              >
+              <Button emphasis="soft" shape="pill" onClick={refetch}>
                 Retry
               </Button>
             ) : null}
@@ -334,7 +270,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
         </Badge>
       ),
       filled_at: (
-        <Text className="sd-tabular">{formatTimestamp(f.filled_at_ns, "No reading")}</Text>
+        <Text className="sd-tabular">{formatNsWithClock(f.filled_at_ns, "No reading")}</Text>
       ),
     },
   }));
@@ -534,14 +470,14 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                 {
                   id: "created_at",
                   label: "Submitted At",
-                  value: formatTimestamp(order.created_at_ns, "Unavailable"),
+                  value: formatNsWithClock(order.created_at_ns, "Unavailable"),
                 },
                 {
                   id: "cancelled_at",
                   label: "Cancelled At",
                   value:
                     order.cancelled_at_ns !== null
-                      ? formatTimestamp(order.cancelled_at_ns, "No reading")
+                      ? formatNsWithClock(order.cancelled_at_ns, "No reading")
                       : "Not cancelled",
                 },
               ]}
@@ -577,7 +513,7 @@ export function OrderTraceView({ orderId }: { orderId: string }) {
                   {
                     id: "cancel_at",
                     label: "Cancelled At",
-                    value: formatTimestamp(order.cancelled_at_ns, "No reading"),
+                    value: formatNsWithClock(order.cancelled_at_ns, "No reading"),
                   },
                   {
                     id: "cancel_filled_qty",

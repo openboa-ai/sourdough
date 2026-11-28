@@ -17,20 +17,23 @@ import {
   REGISTERED_DOMAIN_MODULES,
   resolveActiveDomainModules,
 } from "../domains/registry";
-import { useApp } from "../state/store";
+import {
+  useControlPlane,
+  usePreferences,
+  useRouter,
+} from "../state/store";
 
 export function SettingsView() {
+  const { meta, lastEventSeq } = useControlPlane();
   const {
-    meta,
-    lastEventSeq,
     appearance,
     setAppearance,
     material,
     setMaterial,
     setHostLocked,
     pushToast,
-    navigate,
-  } = useApp();
+  } = usePreferences();
+  const { navigate } = useRouter();
 
   const activeModules = resolveActiveDomainModules(meta?.active_domains);
   const activeIds = new Set(activeModules.map((m) => m.id));

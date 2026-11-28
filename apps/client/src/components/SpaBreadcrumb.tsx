@@ -1,6 +1,6 @@
 import type { MouseEvent } from "react";
 import { Breadcrumb, type Destination } from "@openboa/yogurt";
-import { useApp } from "../state/store";
+import { useRouter } from "../state/store";
 
 interface SpaBreadcrumbProps {
   items: Destination[];
@@ -9,7 +9,7 @@ interface SpaBreadcrumbProps {
 }
 
 export function SpaBreadcrumb({ items, label, focusReturnId }: SpaBreadcrumbProps) {
-  const { navigate } = useApp();
+  const { navigate } = useRouter();
 
   const handleClick = (event: MouseEvent<HTMLDivElement>) => {
     if (

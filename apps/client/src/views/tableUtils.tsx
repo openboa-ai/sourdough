@@ -1,4 +1,6 @@
-import { formatNsClock, formatRelativeNs } from "../api/client";
+import { formatNsWithClock, normalizeToNs } from "../lib/format";
+
+export { formatNsWithClock, normalizeToNs };
 
 export type SortState = { id: string; descending: boolean } | null;
 
@@ -8,22 +10,6 @@ export interface SortableColumn<T> {
   kind?: "identity" | "text" | "numeric" | "role" | "actions";
   align?: "start" | "end";
   sortValue?: (item: T) => string | number | null | undefined;
-}
-
-export function normalizeToNs(epoch: number | null | undefined): number | null {
-  if (!epoch || !Number.isFinite(epoch)) return null;
-  if (epoch < 1e12) return epoch * 1_000_000_000;
-  if (epoch < 1e15) return epoch * 1_000_000;
-  return epoch;
-}
-
-export function formatNsWithClock(
-  ns: number | null | undefined,
-  emptyLabel = "No reading"
-): string {
-  const normalized = normalizeToNs(ns);
-  if (!normalized) return emptyLabel;
-  return `${formatRelativeNs(normalized)} · ${formatNsClock(normalized)}`;
 }
 
 export function sortItems<T>(

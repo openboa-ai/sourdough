@@ -12,7 +12,7 @@ import {
   Text,
   type ReceiptRecord,
 } from "@openboa/yogurt";
-import { useApp } from "../state/store";
+import { useControlPlane, useOutbox } from "../state/store";
 
 const META_RESULT_KEYS = new Set([
   "disposition",
@@ -38,15 +38,14 @@ function formatResultValue(value: unknown): string | null {
 }
 
 export function CommandOutboxPanel() {
+  const { meta, linkState } = useControlPlane();
   const {
-    meta,
-    linkState,
     outbox,
     lookupUnknownCommand,
     retryNotFoundCommand,
     discardPendingCommand,
     dismissFinalOutbox,
-  } = useApp();
+  } = useOutbox();
 
   const [nowMs, setNowMs] = useState(() => Date.now());
   const isPending =

@@ -23,25 +23,21 @@ import {
   Text,
   type Fact,
 } from "@openboa/yogurt";
+import type { ApprovalQuestionItem } from "../api/types";
+import { ControlledInlineConfirm } from "../components/ControlledInlineConfirm";
+import { SpaBreadcrumb } from "../components/SpaBreadcrumb";
 import {
-  fetchProjection,
   formatDeadlineNs,
   formatRelativeNs,
   newCommandId,
-} from "../api/client";
-import type { ApprovalQuestionItem, ApprovalsProjection } from "../api/types";
-import { ControlledInlineConfirm } from "../components/ControlledInlineConfirm";
-import { SpaBreadcrumb } from "../components/SpaBreadcrumb";
-import { useApp } from "../state/store";
-
-function normalizeToNs(epoch: number | null | undefined): number | null {
-  if (epoch === null || epoch === undefined || !Number.isFinite(epoch) || epoch <= 0) {
-    return null;
-  }
-  if (epoch < 1e12) return Math.round(epoch * 1_000_000_000);
-  if (epoch < 1e15) return Math.round(epoch * 1_000_000);
-  return epoch;
-}
+  normalizeToNs,
+} from "../lib/format";
+import {
+  useApprovalsCache,
+  useControlPlane,
+  useOutbox,
+  useRouter,
+} from "../state/store";
 
 function isQuestionExpired(item: ApprovalQuestionItem, nowMs: number): boolean {
   if (item.state === "expired") return true;
@@ -184,23 +180,11 @@ const LEDGER_COLUMNS: LedgerColumnDef[] = [
 ];
 
 export function ApprovalsView() {
-  const {
-    navigate,
-    askCeo,
-    activeApprovalQuestionId,
-    registerEscapeBack,
-    refreshSeq,
-    meta,
-    canWrite,
-    outbox,
-    dispatchCommand,
-    reportApiError,
-  } = useApp();
+  const { navigate, askCeo, activeApprovalQuestionId, registerEscapeBack } = useRouter();
+  const { meta } = useControlPlane();
+  const { canWrite, outbox, dispatchCommand } = useOutbox();
+  const { projection: data, loading, error, refetch } = useApprovalsCache();
 
-  const [data, setData] = useState<ApprovalsProjection | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [retrySeq, setRetrySeq] = useState(0);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [selectedChoice, setSelectedChoice] = useState<Record<string, string>>({});
   const [query, setQuery] = useState("");
@@ -223,34 +207,6 @@ export function ApprovalsView() {
       `approval-${activeApprovalQuestionId}`
     );
   }, [activeApprovalQuestionId, registerEscapeBack]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let active = true;
-    void (async () => {
-      try {
-        const res = await fetchProjection<ApprovalsProjection>("approvals", {
-          signal: controller.signal,
-        });
-        if (!active || controller.signal.aborted) return;
-        if (res.data) {
-          setData(res.data);
-        }
-        setError(null);
-      } catch (err) {
-        if (!active || controller.signal.aborted) return;
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        reportApiError(err);
-        setError(err instanceof Error ? err.message : "Could not load approvals queue.");
-      } finally {
-        if (active && !controller.signal.aborted) setLoading(false);
-      }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [refreshSeq, retrySeq, reportApiError]);
 
   const hasDeadlines = Boolean(data?.pending.some((p) => p.respond_by_ns !== null));
 
@@ -368,15 +324,7 @@ export function ApprovalsView() {
       <Result
         title="Board Approvals unavailable"
         action={
-          <Button
-            emphasis="soft"
-            shape="pill"
-            onClick={() => {
-              setLoading(true);
-              setError(null);
-              setRetrySeq((n) => n + 1);
-            }}
-          >
+          <Button emphasis="soft" shape="pill" onClick={refetch}>
             Retry
           </Button>
         }
@@ -720,7 +668,7 @@ export function ApprovalsView() {
             {data.promote_candidates.map((c) => {
               const detailMetrics = formatVerdictDetail(c.verdict_detail);
               const evaluatedLabel = c.evaluated_at_ns
-                ? `Evaluated ${formatRelativeNs(normalizeToNs(c.evaluated_at_ns))}`
+                ? `Evaluated ${formatRelativeNs(c.evaluated_at_ns)}`
                 : "Not evaluated";
               return (
                 <li key={c.comparison_id} className="yg-list-item">

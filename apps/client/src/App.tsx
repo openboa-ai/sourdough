@@ -7,7 +7,14 @@ import {
   resolveHomeMode,
   type DomainModuleDefinition,
 } from "./domains/registry";
-import { AppProvider, decodeSingleSegment, splitRoute, useApp } from "./state/store";
+import {
+  AppProvider,
+  decodeSingleSegment,
+  splitRoute,
+  useControlPlane,
+  usePreferences,
+  useRouter,
+} from "./state/store";
 import { AgentDetailView } from "./views/AgentDetailView";
 import { AgentsActivityView } from "./views/AgentsActivityView";
 import { ApprovalsView } from "./views/ApprovalsView";
@@ -28,7 +35,8 @@ import { StrategiesView } from "./views/trading/StrategiesView";
 import { TradingDeskView } from "./views/trading/TradingDeskView";
 
 function CompanyOverviewView({ modules }: { modules: DomainModuleDefinition[] }) {
-  const { navigate, meta } = useApp();
+  const { navigate } = useRouter();
+  const { meta } = useControlPlane();
   return (
     <Stack gap={16}>
       <PageHeader
@@ -77,7 +85,8 @@ function CompanyOverviewView({ modules }: { modules: DomainModuleDefinition[] })
 }
 
 function RouteSwitch() {
-  const { route, routeSearchParams, meta, navigate } = useApp();
+  const { route, routeSearchParams, navigate } = useRouter();
+  const { meta } = useControlPlane();
   const { pathname: path } = splitRoute(route);
   const activeModules = resolveActiveDomainModules(meta?.active_domains);
   const homeMode = resolveHomeMode(activeModules);
@@ -175,7 +184,7 @@ function RouteSwitch() {
 }
 
 function YogurtStage() {
-  const { appearance, material } = useApp();
+  const { appearance, material } = usePreferences();
   return (
     <Yogurt appearance={appearance} material={material} className="sd-stage">
       <AppShell>

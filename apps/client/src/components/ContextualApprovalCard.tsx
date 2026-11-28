@@ -1,42 +1,21 @@
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import { Badge, Button, Card, Inline, Stack, Text } from "@openboa/yogurt";
-import { fetchProjection, formatDeadlineNs, newCommandId } from "../api/client";
-import type { ApprovalQuestionItem, ApprovalsProjection } from "../api/types";
+import { formatDeadlineNs, newCommandId } from "../lib/format";
+import type { ApprovalQuestionItem } from "../api/types";
 import { ControlledInlineConfirm } from "./ControlledInlineConfirm";
-import { useApp } from "../state/store";
+import {
+  useApprovalsCache,
+  useControlPlane,
+  useOutbox,
+  usePreferences,
+  useRouter,
+} from "../state/store";
 
 export function usePendingApprovals(
   predicate: (item: ApprovalQuestionItem) => boolean
 ): ApprovalQuestionItem[] {
-  const { refreshSeq, linkState, reportApiError } = useApp();
-  const [items, setItems] = useState<ApprovalQuestionItem[]>([]);
-
-  useEffect(() => {
-    if (linkState === "unauthorized") return;
-    const controller = new AbortController();
-    let active = true;
-    void (async () => {
-      try {
-        const res = await fetchProjection<ApprovalsProjection>("approvals", {
-          signal: controller.signal,
-        });
-        if (!active || controller.signal.aborted) return;
-        if (res.data) {
-          setItems(res.data.pending.filter((q) => q.state === "open"));
-        }
-      } catch (err) {
-        if (!active || controller.signal.aborted) return;
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        reportApiError(err);
-      }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [refreshSeq, linkState, reportApiError]);
-
-  return items.filter(predicate);
+  const { pendingApprovals } = useApprovalsCache();
+  return useMemo(() => pendingApprovals.filter(predicate), [pendingApprovals, predicate]);
 }
 
 export function ContextualApprovalCard({
@@ -44,7 +23,10 @@ export function ContextualApprovalCard({
 }: {
   question: ApprovalQuestionItem;
 }) {
-  const { meta, canWrite, outbox, dispatchCommand, navigate, pushToast } = useApp();
+  const { meta } = useControlPlane();
+  const { canWrite, outbox, dispatchCommand } = useOutbox();
+  const { navigate } = useRouter();
+  const { pushToast } = usePreferences();
   const [expandedChoice, setExpandedChoice] = useState<string | null>(null);
 
   if (!meta) return null;
