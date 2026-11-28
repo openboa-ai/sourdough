@@ -1368,6 +1368,16 @@ class ConnectorSubsystemTests(unittest.TestCase):
                             now_ns=now + 12,
                         )
                         overlapping_result.append(second)
+                        # Calling reconcile_unknown_action while the original run is actively
+                        # executing MUST be refused so it cannot clear in_flight & bypass budget!
+                        idem_key = (
+                            f"conn:{founding.company_id}:{founding.founder_id}:"
+                            "svc-overlap:r1:fetch_doc:overlap-read-1"
+                        )
+                        with self.assertRaises(ConnectorRefused):
+                            proxy.reconcile_unknown_action(
+                                w, claim, idempotency_key=idem_key, now_ns=now + 12
+                            )
                         # Concurrent DISTINCT request_id under the same budget ceiling MUST ALSO be blocked
                         # while the first budgeted request is still in_flight!
                         with self.assertRaises(ConnectorBudgetExceeded):

@@ -81,6 +81,33 @@ def _extract_lookup_context(
     return ctx
 
 
+def _origin_run_is_live(
+    db: Any, company_id: str, run_id: str | None, now_ns: int
+) -> bool:
+    """Return True when the originating work_run is still actively running with an unexpired lease."""
+    if not isinstance(run_id, str) or not run_id.strip():
+        return False
+    row = db.execute(
+        """SELECT status, lease_expires_at_ns
+           FROM work_runs
+           WHERE company_id = ? AND run_id = ?""",
+        (company_id, run_id),
+    ).fetchone()
+    if row is None:
+        return False
+    return str(row[0]) == "running" and int(row[1]) > now_ns
+
+
+def _parse_receipt_meta(raw_receipt: str | None) -> dict[str, Any]:
+    if not isinstance(raw_receipt, str) or not raw_receipt:
+        return {}
+    try:
+        parsed = json.loads(raw_receipt)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -310,6 +337,7 @@ class ConnectorProxy:
         agent_id: str
         idempotency_key: str
         req_sha256: str
+        exec_gen: int = 1
         mode_action: str = "execute"  # "execute" | "lookup" | "replay"
         replay_response: ConnectorResponse | None = None
 
@@ -487,16 +515,14 @@ class ConnectorProxy:
                 )
 
             if replayed:
-                prior_owner: str | None = None
-                if isinstance(ext_action.receipt_json, str) and ext_action.receipt_json:
-                    try:
-                        p_obj = json.loads(ext_action.receipt_json)
-                        if isinstance(p_obj, dict) and isinstance(
-                            p_obj.get("agent_id"), str
-                        ):
-                            prior_owner = p_obj["agent_id"]
-                    except json.JSONDecodeError:
-                        prior_owner = None
+                prior_obj = _parse_receipt_meta(ext_action.receipt_json)
+                prior_owner = (
+                    prior_obj.get("agent_id")
+                    if isinstance(prior_obj.get("agent_id"), str)
+                    else None
+                )
+                prior_gen_raw = prior_obj.get("execution_generation", 0)
+                prior_gen = int(prior_gen_raw) if type(prior_gen_raw) is int else 0
                 is_owner = prior_owner == agent_id
                 is_recovery_owner = (
                     db.execute(
@@ -519,8 +545,24 @@ class ConnectorProxy:
                     replay_response = _response_from_cached_receipt(
                         ext_action.status, ext_action.receipt_json
                     )
+                elif ext_action.status in ("prepared", "in_flight") and (
+                    op_spec.mode == "read"
+                    or _origin_run_is_live(db, company_id, ext_action.run_id, ts)
+                ):
+                    # Preserve active execution state and budget serialization while
+                    # an attempt is still actively in flight.
+                    mode_action = "replay"
+                    replay_response = ConnectorResponse(
+                        status="unknown",
+                        payload={
+                            "idempotency_key": idempotency_key,
+                            "reason": "action_in_flight",
+                        },
+                        indeterminate=True,
+                    )
                 elif op_spec.mode in ("write", "effectful"):
                     # Never blindly resend an unresolved write/effectful action!
+                    exec_gen = prior_gen
                     if op_spec.supports_lookup or adapter.manifest.supports_lookup:
                         mode_action = "lookup"
                     else:
@@ -533,21 +575,10 @@ class ConnectorProxy:
                             },
                             indeterminate=True,
                         )
-                elif ext_action.status in ("prepared", "in_flight"):
-                    # Do NOT dispatch an overlapping read retry while an attempt is still
-                    # actively in flight on the same action identity and cost receipt.
-                    mode_action = "replay"
-                    replay_response = ConnectorResponse(
-                        status="unknown",
-                        payload={
-                            "idempotency_key": idempotency_key,
-                            "reason": "action_in_flight",
-                        },
-                        indeterminate=True,
-                    )
                 else:
                     # Settled 'unknown' read retry: atomically claims 'in_flight' below
-                    # and still enforces sliding-window rate & budget ceilings!
+                    # with an incremented execution_generation and enforces rate/budget!
+                    exec_gen = prior_gen + 1
                     mode_action = "execute"
 
             if mode_action == "execute":
@@ -651,6 +682,7 @@ class ConnectorProxy:
                         "grant_binding_id": grant.grant_binding_id,
                         "admission_id": clean_admission,
                         "request_sha256": req_sha256,
+                        "execution_generation": exec_gen,
                         "lookup_context": lookup_context,
                     },
                     now_ns=ts,
@@ -758,6 +790,7 @@ class ConnectorProxy:
                             "grant_binding_id": grant.grant_binding_id,
                             "admission_id": clean_admission,
                             "request_sha256": req_sha256,
+                            "execution_generation": exec_gen,
                             "lookup_context": _extract_lookup_context(
                                 payload, request_id.strip()
                             ),
@@ -884,6 +917,7 @@ class ConnectorProxy:
             "grant_binding_id": grant.grant_binding_id,
             "admission_id": clean_admission,
             "request_sha256": req_sha256,
+            "execution_generation": exec_gen,
             "lookup_context": lookup_context,
             "source_ref": clean_response.source_ref,
             "cost_minor_units": clean_response.cost_minor_units,
@@ -1021,7 +1055,7 @@ class ConnectorProxy:
             agent_id = claim.founder_id
 
             row = db.execute(
-                """SELECT company_id, connector, operation, status, receipt_json, command_id
+                """SELECT company_id, connector, operation, status, receipt_json, command_id, run_id
                    FROM external_actions
                    WHERE idempotency_key = ?""",
                 (idempotency_key,),
@@ -1030,22 +1064,25 @@ class ConnectorProxy:
                 raise ConnectorRefused(
                     f"External action '{idempotency_key}' not found for company"
                 )
-            connector_col, op_name, current_status, raw_receipt, cmd_id = (
+            (
+                connector_col,
+                op_name,
+                current_status,
+                raw_receipt,
+                cmd_id,
+                origin_run_id,
+            ) = (
                 str(row[1]),
                 str(row[2]),
                 str(row[3]),
                 row[4],
                 None if row[5] is None else str(row[5]),
+                None if row[6] is None else str(row[6]),
             )
 
-            prior_meta: dict[str, Any] = {}
-            if isinstance(raw_receipt, str) and raw_receipt:
-                try:
-                    parsed_meta = json.loads(raw_receipt)
-                    if isinstance(parsed_meta, dict):
-                        prior_meta = parsed_meta
-                except json.JSONDecodeError:
-                    prior_meta = {}
+            prior_meta = _parse_receipt_meta(raw_receipt)
+            prior_gen_raw = prior_meta.get("execution_generation", 0)
+            expected_gen = int(prior_gen_raw) if type(prior_gen_raw) is int else 0
 
             # Enforce strict ownership or explicit recovery work-item assignment BEFORE
             # exposing cached receipts or invoking destination lookup.
@@ -1071,6 +1108,16 @@ class ConnectorProxy:
 
             if current_status in ("confirmed", "rejected"):
                 return _response_from_cached_receipt(current_status, raw_receipt)
+
+            # Never clear or overwrite an actively executing in_flight action while its
+            # originating run is still live; wait for settlement or lease expiry.
+            if current_status in ("prepared", "in_flight") and _origin_run_is_live(
+                db, company_id, origin_run_id, ts
+            ):
+                raise ConnectorRefused(
+                    f"External action '{idempotency_key}' is actively in flight on a live run; "
+                    "wait for settlement or lease expiry before reconciling"
+                )
 
             if ":r" not in connector_col:
                 raise ConnectorRefused(
@@ -1184,6 +1231,33 @@ class ConnectorProxy:
             "reconciled_at_ns": ts,
         }
         with write_uow(writer, tx_lock=self._tx_lock) as db:
+            # Condition settlement on execution_generation and non-live in_flight state
+            # so a concurrent lookup can never clear an active attempt's budget exclusion.
+            cur_row = db.execute(
+                """SELECT status, receipt_json, run_id
+                   FROM external_actions
+                   WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if cur_row is not None:
+                latest_status, latest_raw, latest_run_id = (
+                    str(cur_row[0]),
+                    cur_row[1],
+                    None if cur_row[2] is None else str(cur_row[2]),
+                )
+                if latest_status in ("confirmed", "rejected"):
+                    return _response_from_cached_receipt(latest_status, latest_raw)
+                latest_meta = _parse_receipt_meta(latest_raw)
+                latest_gen_raw = latest_meta.get("execution_generation", 0)
+                latest_gen = int(latest_gen_raw) if type(latest_gen_raw) is int else 0
+                if latest_status in ("prepared", "in_flight") and (
+                    latest_gen != expected_gen
+                    or _origin_run_is_live(db, company_id, latest_run_id, ts)
+                ):
+                    raise ConnectorRefused(
+                        f"External action '{idempotency_key}' advanced to an active execution "
+                        "during reconciliation lookup"
+                    )
             settle_external_action(
                 db,
                 idempotency_key,
