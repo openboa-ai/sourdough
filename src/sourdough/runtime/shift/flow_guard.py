@@ -59,14 +59,19 @@ class ProvenanceIndex:
             return fn(ro_db)
 
     def project_members(
-        self, project_id: str, *, db: sqlite3.Connection | None = None
+        self,
+        project_id: str,
+        *,
+        db: sqlite3.Connection | None = None,
+        refresh: bool = False,
     ) -> set[str] | None:
         if not isinstance(project_id, str) or not project_id.strip():
             return None
         pid = project_id.strip()
-        cached = self._project_members.get(pid)
-        if cached is not None:
-            return set(cached)
+        if not refresh:
+            cached = self._project_members.get(pid)
+            if cached is not None:
+                return set(cached)
 
         def _query(ro_db: sqlite3.Connection) -> set[str] | None:
             row = ro_db.execute(
@@ -74,6 +79,7 @@ class ProvenanceIndex:
                 (self._company_id, pid),
             ).fetchone()
             if row is None:
+                self._project_members.pop(pid, None)
                 return None
             try:
                 parsed = json.loads(str(row[0]))
@@ -572,6 +578,8 @@ class ShiftFlowGuard:
                                     resolved_prior_peer = True
                 else:
                     unresolved_prior_peer = True
+            else:
+                unresolved_prior_peer = True
         if unresolved_prior_peer or not resolved_prior_peer:
             self._narrow_audience({self.agent_id})
 
@@ -613,12 +621,13 @@ class ShiftFlowGuard:
                 "in the same shift after reading private Desk data"
             )
 
-        if outbound and self.allowed_audience is not None and isinstance(args, Mapping):
+        if outbound and self.allowed_audience is not None:
             cur_allowed = self.allowed_audience
+            args_map: Mapping[str, Any] = args if isinstance(args, Mapping) else {}
             if name == "append_message":
-                dest_pid = args.get("project_id")
+                dest_pid = args_map.get("project_id")
                 dest_members = (
-                    self.provenance.project_members(dest_pid)
+                    self.provenance.project_members(dest_pid, refresh=True)
                     if isinstance(dest_pid, str)
                     else None
                 )
@@ -628,7 +637,7 @@ class ShiftFlowGuard:
                         "the audience of previously read peer messages or shared assets"
                     )
             elif name in ("request_peer_response", "offer_handoff"):
-                dest_agent = args.get("recipient_id")
+                dest_agent = args_map.get("recipient_id")
                 if (
                     not isinstance(dest_agent, str)
                     or dest_agent.strip() not in cur_allowed
@@ -645,7 +654,7 @@ class ShiftFlowGuard:
                         "of previously read peer messages or shared assets"
                     )
             elif name == "decline_handoff":
-                raw_oid = args.get("offer_id")
+                raw_oid = args_map.get("offer_id")
                 offerer_id, _ = (
                     self.provenance.handoff_offer_provenance(raw_oid)
                     if isinstance(raw_oid, str)
@@ -656,6 +665,11 @@ class ShiftFlowGuard:
                         "Cannot decline handoff with a message to an offerer outside "
                         "the audience of previously read peer messages or shared assets"
                     )
+            else:
+                raise DutyRefused(
+                    "Cannot invoke custom outbound peer tool while shift is restricted "
+                    "to a narrowed peer audience"
+                )
 
     def record_after_call(self, name: str, args: Any, out: Any) -> Any:
         """Update taint/audience state after tool execution and filter tainted discovery outputs."""
@@ -703,6 +717,8 @@ class ShiftFlowGuard:
                 if pid:
                     self.tainted_projects.add(pid)
                 self._narrow_audience(aud if aud is not None else {self.agent_id})
+            else:
+                self._narrow_audience({self.agent_id})
         elif name == "read_inbox" and isinstance(out, Mapping):
             delivs = out.get("deliveries")
             if isinstance(delivs, list):
@@ -726,12 +742,15 @@ class ShiftFlowGuard:
                             )
                         else:
                             self._narrow_audience({self.agent_id})
+            else:
+                self._narrow_audience({self.agent_id})
         elif name == "discover_handoffs" and isinstance(out, Mapping):
             offers = out.get("offers")
             if isinstance(offers, list):
                 with scoped_reader(self.provenance._store) as ro_db:
                     for o in offers:
                         if not isinstance(o, Mapping):
+                            self._narrow_audience({self.agent_id})
                             continue
                         o_aid = o.get("asset_id")
                         if isinstance(o_aid, str) and o_aid.strip():
@@ -747,6 +766,13 @@ class ShiftFlowGuard:
                             sender = o.get("sender_id")
                             if isinstance(sender, str) and sender.strip():
                                 self._narrow_audience({self.agent_id, sender.strip()})
+                            else:
+                                self._narrow_audience({self.agent_id})
+            else:
+                self._narrow_audience({self.agent_id})
+        else:
+            # Fail closed for custom peer_input tools whose provenance audience is not resolved.
+            self._narrow_audience({self.agent_id})
 
     def filter_discovery_output(self, name: str, out: Any) -> Any:
         if (

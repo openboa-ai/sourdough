@@ -39,9 +39,8 @@ from ..domains import ToolContribution, ToolQueryContext, merge_tool_contributio
 from ..method_tools import build_core_skill_tool_contribution
 from ..registry import DutyContext, RuntimeRefused
 from .policy import (
-    _PEER_INPUT_TOOLS,
     _PRIVATE_DESK_ALL_TOOLS,
-    _PRIVATE_DESK_READ_TOOLS,
+    classify_tool_flow,
     is_external_write_sink,
     is_peer_input,
     is_peer_outbound,
@@ -138,15 +137,36 @@ def hydrate_shift_session(
     )
 
     base_spec_by_name = {spec.name: spec for spec in base_tools}
+    plugin_contribution = (
+        contribute_tools(
+            ToolQueryContext(
+                store=ctx.writer.store,
+                company_id=ctx.company_id,
+                writer=ctx.writer,
+                agent_id=agent_id,
+                duty_kind=ctx.work_item.duty_kind,
+                grant_scope=grant_scope,
+                installed_domains=active_domains,
+            )
+        )
+        if include_plugin_tools
+        else None
+    )
+    all_initial_spec_by_name = dict(base_spec_by_name)
+    all_initial_names = set(base_handlers)
+    if plugin_contribution is not None:
+        for ps in plugin_contribution.specs:
+            all_initial_spec_by_name[ps.name] = ps
+        all_initial_names |= set(plugin_contribution.handlers)
     effective_base_names = (
-        set(base_handlers)
+        all_initial_names
         if allowed_tool_names is None
-        else (set(base_handlers) & allowed_tool_names)
+        else (all_initial_names & allowed_tool_names)
     )
     has_base_external_sinks = any(
-        is_peer_input(name, base_spec_by_name.get(name))
-        or is_peer_outbound(name, base_spec_by_name.get(name))
-        or is_external_write_sink(name, base_spec_by_name.get(name))
+        is_peer_input(name, all_initial_spec_by_name.get(name))
+        or is_peer_outbound(name, all_initial_spec_by_name.get(name))
+        or is_external_write_sink(name, all_initial_spec_by_name.get(name))
         for name in effective_base_names
     )
 
@@ -180,22 +200,74 @@ def hydrate_shift_session(
             (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
         ).fetchall()
 
-        prior_had_peer_input = bool(prior_tool_names & _PEER_INPUT_TOOLS)
+        # Restore persisted declarative flow_class tags from prior runs of this work item.
+        prior_flow_by_call: dict[tuple[str, str], str] = {}
+        prior_persisted_flows: set[str] = set()
+        for f_run_id, f_payload_json in db.execute(
+            """SELECT run_id, payload_json
+               FROM audit_event
+               WHERE company_id = ?
+                 AND entity_type = 'work_item'
+                 AND entity_id = ?
+                 AND event_type = 'work.tool_flow_recorded'
+                 AND (run_id IS NULL OR run_id != ?)""",
+            (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
+        ).fetchall():
+            try:
+                f_obj = json.loads(str(f_payload_json))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(f_obj, Mapping):
+                continue
+            f_cls = f_obj.get("flow_class")
+            f_cid = f_obj.get("call_id")
+            if isinstance(f_cls, str) and f_cls:
+                prior_persisted_flows.add(f_cls)
+                if f_run_id is not None and isinstance(f_cid, str) and f_cid:
+                    prior_flow_by_call[(str(f_run_id), f_cid)] = f_cls
+
+        prior_peer_tool_names = {
+            name
+            for name in prior_tool_names
+            if classify_tool_flow(name, base_spec_by_name.get(name)) == "peer_input"
+        }
+        prior_private_tool_names = {
+            name
+            for name in prior_tool_names
+            if classify_tool_flow(name, base_spec_by_name.get(name))
+            == "private_desk_read"
+        }
+        prior_had_peer_input = bool(prior_peer_tool_names) or (
+            "peer_input" in prior_persisted_flows
+        )
         prior_peer_rows: tuple[tuple[Any, Any, Any], ...] = ()
         if prior_had_peer_input:
-            prior_peer_rows = tuple(
-                db.execute(
-                    """SELECT t.tool_name, t.result_json, t.offloaded_log_path
-                       FROM tool_call_receipt t
-                       JOIN work_runs wr
-                         ON wr.company_id = t.company_id AND wr.run_id = t.run_id
-                       WHERE t.company_id = ?
-                         AND wr.work_item_id = ?
-                         AND t.run_id != ?
-                         AND t.tool_name IN ('read_messages', 'read_inbox', 'discover_handoffs', 'read_shared_asset')""",
-                    (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
-                ).fetchall()
-            )
+            all_prior_receipts = db.execute(
+                """SELECT t.run_id, t.call_id, t.tool_name, t.result_json, t.offloaded_log_path
+                   FROM tool_call_receipt t
+                   JOIN work_runs wr
+                     ON wr.company_id = t.company_id AND wr.run_id = t.run_id
+                   WHERE t.company_id = ?
+                     AND wr.work_item_id = ?
+                     AND t.run_id != ?""",
+                (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
+            ).fetchall()
+            matched_peer_rows: list[tuple[Any, Any, Any]] = []
+            for (
+                pr_run_id,
+                pr_call_id,
+                pr_tname,
+                pr_res_json,
+                pr_off,
+            ) in all_prior_receipts:
+                tname_s = str(pr_tname)
+                restored_flow = prior_flow_by_call.get(
+                    (str(pr_run_id), str(pr_call_id)),
+                    classify_tool_flow(tname_s, base_spec_by_name.get(tname_s)),
+                )
+                if restored_flow == "peer_input":
+                    matched_peer_rows.append((tname_s, pr_res_json, pr_off))
+            prior_peer_rows = tuple(matched_peer_rows)
 
         hydrated_peer_input = any(
             isinstance(r, Mapping)
@@ -207,7 +279,9 @@ def hydrate_shift_session(
             for r in open_receipts
         )
         initial_had_peer_input = prior_had_peer_input or hydrated_peer_input
-        prior_had_private_desk = bool(prior_tool_names & _PRIVATE_DESK_READ_TOOLS)
+        prior_had_private_desk = bool(prior_private_tool_names) or (
+            "private_desk_read" in prior_persisted_flows
+        )
         effective_include_desk_tools = (
             include_core_desk_tools and not initial_had_peer_input
         )
@@ -289,12 +363,21 @@ def hydrate_shift_session(
             "result_digest": str(r_result_digest),
             "recorded_at_ns": int(r_recorded_at_ns),
         }
-        is_private_receipt = is_private_error_tool(tool_name_s)
+        restored_flow = prior_flow_by_call.get(
+            (str(r_run_id), str(r_call_id)),
+            classify_tool_flow(tool_name_s, base_spec_by_name.get(tool_name_s)),
+        )
+        is_private_flow = restored_flow in ("private_desk_read", "private_desk_write")
+        is_private_receipt = is_private_flow or is_private_error_tool(
+            tool_name_s, base_spec_by_name.get(tool_name_s)
+        )
         if r_offloaded_log_path is not None and (
             effective_include_desk_tools or not is_private_receipt
         ):
             receipt_entry["offloaded_log_path"] = str(r_offloaded_log_path)
-            if not is_private_desk_tool(tool_name_s):
+            if not is_private_flow and not is_private_desk_tool(
+                tool_name_s, base_spec_by_name.get(tool_name_s)
+            ):
                 prior_public_offloads.add(str(r_offloaded_log_path))
         if (
             isinstance(r_result_json, str)
@@ -443,20 +526,8 @@ def hydrate_shift_session(
                 tx_lock=ctx.tx_lock,
             )
         )
-    if include_plugin_tools:
-        contributions.append(
-            contribute_tools(
-                ToolQueryContext(
-                    store=ctx.writer.store,
-                    company_id=ctx.company_id,
-                    writer=ctx.writer,
-                    agent_id=agent_id,
-                    duty_kind=ctx.work_item.duty_kind,
-                    grant_scope=grant_scope,
-                    installed_domains=active_domains,
-                )
-            )
-        )
+    if plugin_contribution is not None:
+        contributions.append(plugin_contribution)
 
     tool_specs, merged_handlers, contributed_recoverable = merge_tool_contributions(
         base_tools, base_handlers, contributions

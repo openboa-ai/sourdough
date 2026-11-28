@@ -223,6 +223,7 @@ class ShiftRunner:
             specs_by_name=specs_by_name,
             public_offloaded_paths=hydrated.public_offloaded_paths,
             stable_prefix_sha256=stable_prefix_sha256,
+            work_item_id=ctx.work_item.work_item_id,
             tx_lock=ctx.tx_lock,
         )
 

@@ -85,6 +85,15 @@ _PRIVATE_RECEIPT_ERROR_TOOLS = frozenset(
         "skill_record_invocation",
     }
 )
+_PUBLIC_RESULT_PRIVATE_TOOLS = frozenset(
+    {
+        "desk_publish_selection",
+        "skill_read",
+        "skill_list_active",
+        "skill_draft_candidate",
+        "skill_record_invocation",
+    }
+)
 _SAFE_DESK_RECEIPT_FIELDS = (
     "ok",
     "revision",
@@ -190,12 +199,11 @@ def is_external_write_sink(name: str, spec: ToolSpec | None = None) -> bool:
 
 
 def is_private_receipt_tool(name: str, spec: ToolSpec | None = None) -> bool:
-    return name in _PRIVATE_DESK_RECEIPT_TOOLS or (
-        spec is not None
-        and spec.flow_class in ("private_desk_read", "private_desk_write")
-        and name.startswith(("desk_", "memory_"))
-        and name != "desk_publish_selection"
-    )
+    if name in _PRIVATE_DESK_RECEIPT_TOOLS:
+        return True
+    if name in _PUBLIC_RESULT_PRIVATE_TOOLS:
+        return False
+    return is_private_desk_tool(name, spec)
 
 
 def is_private_error_tool(name: str, spec: ToolSpec | None = None) -> bool:

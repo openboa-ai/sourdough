@@ -18,6 +18,7 @@ from ...harness import (
     offload_large_output,
 )
 from ...storage.db import write_uow
+from ...storage.kernel import append_audit_event
 from ...writer_lease import WriterLease
 from ..desk_tools import (
     _DEFAULT_OFFLOAD_READ_BYTES,
@@ -28,6 +29,7 @@ from ..domains import ToolContribution
 from ..registry import RuntimeRefused
 from .policy import (
     _SAFE_DESK_RECEIPT_FIELDS,
+    classify_tool_flow,
     is_authority_refusal_message,
     is_private_desk_tool,
     is_private_error_tool,
@@ -200,6 +202,7 @@ class ShiftReceiptStore:
         specs_by_name: Mapping[str, ToolSpec],
         public_offloaded_paths: set[str],
         stable_prefix_sha256: str,
+        work_item_id: str = "",
         tx_lock: Any = None,
     ) -> None:
         self._writer = writer
@@ -207,11 +210,14 @@ class ShiftReceiptStore:
         self._specs_by_name = dict(specs_by_name)
         self._public_offloaded_paths = public_offloaded_paths
         self._stable_prefix_sha256 = stable_prefix_sha256
+        self._work_item_id = work_item_id
         self._tx_lock = tx_lock
 
     def record_receipt(self, receipt: dict[str, Any]) -> None:
         tool_name = str(receipt["tool_name"])
         spec = self._specs_by_name.get(tool_name)
+        effective_flow = classify_tool_flow(tool_name, spec)
+        legacy_flow = classify_tool_flow(tool_name, None)
         stored_result_json = _sanitize_receipt_result_json(
             tool_name,
             str(receipt["result_digest"]),
@@ -249,6 +255,26 @@ class ShiftReceiptStore:
                     receipt["recorded_at_ns"],
                 ),
             )
+            if (
+                self._work_item_id
+                and effective_flow != "neutral"
+                and effective_flow != legacy_flow
+            ):
+                append_audit_event(
+                    db,
+                    company_id=str(receipt["company_id"]),
+                    domain="work",
+                    entity_type="work_item",
+                    entity_id=self._work_item_id,
+                    event_type="work.tool_flow_recorded",
+                    actor_id=str(receipt["agent_id"]),
+                    run_id=str(receipt["run_id"]),
+                    payload={
+                        "call_id": str(receipt["call_id"]),
+                        "flow_class": effective_flow,
+                    },
+                    recorded_at_ns=int(receipt["recorded_at_ns"]),
+                )
 
     def record_trace(self, trace_payload: dict[str, Any]) -> None:
         enriched = {

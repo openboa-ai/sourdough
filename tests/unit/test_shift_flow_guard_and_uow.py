@@ -537,6 +537,291 @@ class TestShiftFlowGuardAndUow(unittest.TestCase):
                 any("Episode persistence failed" in msg for msg in logs.output)
             )
 
+    def test_flow_guard_refreshes_destination_project_membership_mid_shift(
+        self,
+    ) -> None:
+        """PR #195 Codex P1: outbound append_message refreshes live project membership."""
+        peer_a, _ = self._hire("peer-p1-a")
+        peer_b, _ = self._hire("peer-p1-b")
+        item, _, claim = self._open_claim()
+
+        with hold_company_writer(self.store, self.company_id) as w:
+            rev_1 = assign_project(
+                w,
+                self.grant_id,
+                "proj-expanding",
+                (self.founder_id, peer_a),
+                publishers=(self.founder_id, peer_a),
+            )
+            msg = append_message(
+                w,
+                claim,
+                claim.purpose,
+                Post(
+                    request_id="msg-exp-1",
+                    project_id="proj-expanding",
+                    project_revision=rev_1,
+                    body="Restricted 2-party note",
+                    asset_id="",
+                ),
+            )
+
+        prov = ProvenanceIndex(
+            self.store, self.company_id, self.founder_id, item.work_item_id
+        )
+        guard = ShiftFlowGuard(
+            agent_id=self.founder_id,
+            provenance=prov,
+            specs_by_name={},
+            public_offloaded_paths=set(),
+        )
+        # Reading caches the initial 2-member project and narrows audience to {founder, peer_a}.
+        guard.record_after_call(
+            "read_messages",
+            {"project_id": "proj-expanding"},
+            {"messages": [{"message_id": msg.message_id}]},
+        )
+        self.assertEqual(guard.allowed_audience, {self.founder_id, peer_a})
+        guard.check_before_call("append_message", {"project_id": "proj-expanding"})
+
+        # Mid-shift enrollment expands proj-expanding to include peer_b!
+        with hold_company_writer(self.store, self.company_id) as w:
+            assign_project(
+                w,
+                self.grant_id,
+                "proj-expanding",
+                (self.founder_id, peer_a, peer_b),
+                publishers=(self.founder_id, peer_a),
+                expected_revision=rev_1,
+            )
+
+        # Outbound authorization MUST refresh membership and refuse posting to the expanded project!
+        with self.assertRaises(DutyRefused):
+            guard.check_before_call("append_message", {"project_id": "proj-expanding"})
+
+    def test_custom_peer_input_narrows_fail_closed_and_blocks_custom_outbound(
+        self,
+    ) -> None:
+        """PR #195 Codex P2: custom peer_input narrows audience to {agent_id} and blocks outbound sinks."""
+        peer_a, _ = self._hire("peer-custom-in-a")
+        with hold_company_writer(self.store, self.company_id) as w:
+            assign_project(
+                w,
+                self.grant_id,
+                "proj-broad",
+                (self.founder_id, peer_a),
+                publishers=(self.founder_id,),
+            )
+
+        custom_in = ToolSpec(
+            name="connector_read_peer_feed",
+            description="Custom peer feed reader",
+            parameters={"type": "object"},
+            flow_class="peer_input",
+        )
+        custom_out = ToolSpec(
+            name="connector_send_peer_note",
+            description="Custom outbound peer sender",
+            parameters={"type": "object"},
+            flow_class="peer_outbound",
+        )
+        prov = ProvenanceIndex(self.store, self.company_id, self.founder_id, "wi-c")
+        guard = ShiftFlowGuard(
+            agent_id=self.founder_id,
+            provenance=prov,
+            specs_by_name={custom_in.name: custom_in, custom_out.name: custom_out},
+            public_offloaded_paths=set(),
+        )
+        guard.record_after_call(custom_in.name, {}, {"items": ["peer-text"]})
+        self.assertTrue(guard.read_peer_input)
+        self.assertEqual(guard.allowed_audience, {self.founder_id})
+        with self.assertRaises(DutyRefused):
+            guard.check_before_call("append_message", {"project_id": "proj-broad"})
+        with self.assertRaises(DutyRefused):
+            guard.check_before_call("request_peer_response", {"recipient_id": peer_a})
+        with self.assertRaises(DutyRefused):
+            guard.check_before_call(custom_out.name, {"body": "leak"})
+
+    def test_custom_private_desk_read_receipt_redacted_regardless_of_name(
+        self,
+    ) -> None:
+        """PR #195 Codex P2: custom private_desk_read tool redacts payload in tool_call_receipt."""
+        import json
+
+        from sourdough.runtime.shift import ShiftReceiptStore
+
+        item, run, claim = self._open_claim()
+        custom_priv = ToolSpec(
+            name="connector_read_private",
+            description="Custom private note reader",
+            parameters={"type": "object"},
+            flow_class="private_desk_read",
+        )
+        with hold_company_writer(self.store, self.company_id) as w:
+            session = create_agent_session(w, claim, claim.purpose)
+            receipt_store = ShiftReceiptStore(
+                writer=w,
+                session=session,
+                specs_by_name={custom_priv.name: custom_priv},
+                public_offloaded_paths=set(),
+                stable_prefix_sha256="prefix-1",
+                work_item_id=item.work_item_id,
+            )
+            receipt_store.record_receipt(
+                {
+                    "company_id": self.company_id,
+                    "run_id": run.run_id,
+                    "agent_id": self.founder_id,
+                    "call_id": "call-priv-1",
+                    "tool_name": custom_priv.name,
+                    "arg_digest": "arg-1",
+                    "status": "ok",
+                    "result_digest": "res-1",
+                    "result_json": json.dumps({"secret": "private-draft-canary"}),
+                    "error_type": None,
+                    "error_message": None,
+                    "offloaded_log_path": None,
+                    "recorded_at_ns": time_ns(),
+                }
+            )
+
+        with scoped_reader(self.store) as db:
+            row = db.execute(
+                "SELECT result_json FROM tool_call_receipt WHERE run_id = ? AND call_id = ?",
+                (run.run_id, "call-priv-1"),
+            ).fetchone()
+            assert row is not None
+            raw = str(row[0])
+            self.assertNotIn("private-draft-canary", raw)
+            parsed = json.loads(raw)
+            self.assertEqual(parsed["redacted"], "private_desk_payload")
+
+    def test_resumed_work_item_restores_custom_peer_input_taint_fail_closed(
+        self,
+    ) -> None:
+        """PR #195 Codex P2: resumed work item restores declarative peer_input taint across runs."""
+        import json
+
+        from sourdough.runtime.shift import (
+            ShiftReceiptStore,
+            hydrate_shift_session,
+        )
+        from sourdough.runtime.domains import ToolContribution
+        from sourdough.runtime.work_kernel import fail_work_run
+
+        item, run1, claim1 = self._open_claim()
+        custom_peer = ToolSpec(
+            name="connector_fetch_external_peer",
+            description="Custom peer input",
+            parameters={"type": "object"},
+            flow_class="peer_input",
+        )
+        custom_sink = ToolSpec(
+            name="connector_dispatch_action",
+            description="Custom write sink",
+            parameters={"type": "object"},
+            flow_class="external_write_sink",
+        )
+        now = time_ns()
+        with hold_company_writer(self.store, self.company_id) as w:
+            session1 = create_agent_session(w, claim1, claim1.purpose)
+            rs = ShiftReceiptStore(
+                writer=w,
+                session=session1,
+                specs_by_name={custom_peer.name: custom_peer},
+                public_offloaded_paths=set(),
+                stable_prefix_sha256="p1",
+                work_item_id=item.work_item_id,
+            )
+            rs.record_receipt(
+                {
+                    "company_id": self.company_id,
+                    "run_id": run1.run_id,
+                    "agent_id": self.founder_id,
+                    "call_id": "call-peer-r1",
+                    "tool_name": custom_peer.name,
+                    "arg_digest": "arg-p1",
+                    "status": "ok",
+                    "result_digest": "res-p1",
+                    "result_json": json.dumps({"note": "untrusted-peer-content"}),
+                    "error_type": None,
+                    "error_message": None,
+                    "offloaded_log_path": None,
+                    "recorded_at_ns": now,
+                }
+            )
+            with write_uow(w) as db:
+                fail_work_run(
+                    db,
+                    run1.run_id,
+                    run1.fencing_token,
+                    error_summary="transient",
+                    return_to_due=True,
+                    now_ns=now + 10,
+                )
+                run2 = claim_work_run(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=item.work_item_id,
+                    lease_owner="unit-worker-2",
+                    lease_ttl_ns=3_600_000_000_000,
+                    now_ns=now + 20,
+                )
+
+            ctx2 = DutyContext(
+                company_id=self.company_id,
+                writer=w,
+                work_item=item,
+                run=run2,
+                _clock=now + 20,
+            )
+            # Resume WITHOUT custom_peer in base_tools — taint must still restore from persisted flow metadata!
+            hydrated = hydrate_shift_session(
+                ctx2,
+                persisted_profile=self.profile.profile_id(),
+                grant_scope="manage-company",
+                profile=self.profile,
+                mandate_summary="Resume.",
+                purpose="manage-company",
+                base_tools=(custom_sink,),
+                base_handlers={custom_sink.name: lambda _a: {"ok": True}},
+                history_notes=(),
+                open_receipts=(),
+                include_core_desk_tools=True,
+                include_core_skill_tools=None,
+                include_plugin_tools=False,
+                extra_recoverable_exceptions=(),
+                pre_resolved_active_methods=((), None),
+                allowed_tool_names=None,
+                contribute_tools=lambda _q: ToolContribution(specs=(), handlers={}),
+                active_methods_provider=lambda *_a: ((), None),
+            )
+            self.assertTrue(hydrated.prior_had_peer_input)
+            self.assertTrue(hydrated.initial_had_peer_input)
+            self.assertFalse(hydrated.effective_include_desk_tools)
+
+            prov2 = ProvenanceIndex(
+                self.store, self.company_id, self.founder_id, item.work_item_id
+            )
+            guard2 = ShiftFlowGuard(
+                agent_id=self.founder_id,
+                provenance=prov2,
+                specs_by_name={s.name: s for s in hydrated.tool_specs},
+                public_offloaded_paths=hydrated.public_offloaded_paths,
+                read_private_desk=hydrated.has_hydrated_private_context,
+                read_peer_input=hydrated.initial_had_peer_input,
+            )
+            guard2.seed_from_shift_context(
+                work_item_source_kind=item.source_kind,
+                work_item_payload_json=item.payload_json,
+                open_receipts=(),
+                prior_had_peer_input=hydrated.prior_had_peer_input,
+                prior_peer_rows=hydrated.prior_peer_rows,
+            )
+            self.assertEqual(guard2.allowed_audience, {self.founder_id})
+            with self.assertRaises(DutyRefused):
+                guard2.check_before_call(custom_sink.name, {})
+
 
 if __name__ == "__main__":
     unittest.main()
