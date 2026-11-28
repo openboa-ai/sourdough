@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import closing
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from sqlite3 import Connection
 from time import time_ns
@@ -12,7 +11,7 @@ from uuid import uuid4
 
 from ..company import _identity
 from ..duty_run import employment_cutoff
-from ..storage.db import open_reader, open_writer, read_tx, write_tx
+from ..storage.db import scoped_reader, write_uow
 from ..storage.kernel import append_audit_event
 from ..storage.schema import is_domain_installed
 from ..writer_lease import WriterLease
@@ -33,6 +32,88 @@ from .domain import (
     _row_to_binding,
 )
 from .risk import require_trading_risk_clear
+
+
+@dataclass(frozen=True)
+class _BookOrderSpec:
+    order_id_prefix: str
+    fill_id_prefix: str
+    conflict_error: str
+    exposure_limit_error: str
+    cash_limit_error: str
+    open_cash_limit_error: str
+    filled_event_type: str
+    opened_event_type: str | None = None
+    valuation_source: str | None = None
+
+
+@dataclass(frozen=True)
+class _OrderRequest:
+    company_id: str
+    actor_id: str
+    action_id: str
+    instrument_id: str
+    side: str
+    quantity: int
+    limit_minor_units: int
+    market_price_minor_units: int
+    quote_observed_at_ns: int
+    run_id: str | None = None
+    decision_id: str | None = None
+    mandate_revision: str | None = None
+    external_order_id: str | None = None
+    external_fill_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _BookOrderExecution:
+    order_id: str
+    binding_id: str
+    action_id: str
+    instrument_id: str
+    side: str
+    quantity: int
+    limit_minor_units: int
+    market_price_minor_units: int
+    status: str
+    filled_quantity: int
+    fill_price_minor_units: int | None
+    fee_minor_units: int
+    fill_id: str | None
+    realized_pnl_minor_units: int
+    replayed: bool
+
+    def to_sandbox_receipt(self, agent_id: str) -> SandboxOrderReceipt:
+        return SandboxOrderReceipt(agent_id=agent_id, **asdict(self))
+
+    def to_paper_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload.pop("limit_minor_units")
+        payload.pop("market_price_minor_units")
+        return payload
+
+
+_SANDBOX_ORDER_SPEC = _BookOrderSpec(
+    order_id_prefix="sbxo",
+    fill_id_prefix="sbxf",
+    conflict_error="Sandbox action_id conflicts with previously submitted order terms",
+    exposure_limit_error="Sandbox order exceeds agent sandbox exposure limit",
+    cash_limit_error="Sandbox order exceeds available virtual cash",
+    open_cash_limit_error="Sandbox limit order exceeds available virtual cash",
+    filled_event_type="agent_sandbox.order_filled",
+    opened_event_type="agent_sandbox.order_opened",
+)
+
+_COMPANY_PAPER_ORDER_SPEC = _BookOrderSpec(
+    order_id_prefix="cpbo",
+    fill_id_prefix="cpbf",
+    conflict_error="action_id already used for a different company paper order",
+    exposure_limit_error="Company paper book order exceeds exposure limit",
+    cash_limit_error="Company paper book order exceeds available virtual cash",
+    open_cash_limit_error="Company paper book limit order exceeds available virtual cash",
+    filled_event_type="company_paper.order_filled",
+    valuation_source="paper_fill",
+)
 
 
 def _assert_active_agent(db: Connection, company_id: str, agent_id: str) -> None:
@@ -109,6 +190,494 @@ def _compute_unified_book_metrics_in_tx(
         "total_fees_minor_units": total_fees,
         "nav_minor_units": nav,
     }
+
+
+def _apply_fill_to_position_in_tx(
+    db: Connection,
+    binding: ExecutionBinding,
+    *,
+    company_id: str,
+    instrument_id: str,
+    side: str,
+    quantity: int,
+    fill_price_minor_units: int,
+    fee_minor_units: int,
+    recorded_at_ns: int,
+    exposure_limit_error: str,
+    cash_limit_error: str,
+    metrics_before: dict[str, int] | None = None,
+) -> int:
+    """Validate risk/cash limits, apply weighted-average fill math, upsert position, and return net realized PnL."""
+    if metrics_before is None:
+        metrics_before = _compute_unified_book_metrics_in_tx(db, binding)
+    cash_available = metrics_before["cash_minor_units"]
+    gross_exposure = metrics_before["gross_exposure_minor_units"]
+
+    pos_row = db.execute(
+        """SELECT quantity, avg_entry_minor_units, mark_price_minor_units,
+                  realized_pnl_minor_units, total_fees_minor_units
+           FROM trading_book_position
+           WHERE binding_id = ? AND environment = ? AND instrument_id = ?""",
+        (binding.binding_id, binding.environment, instrument_id),
+    ).fetchone()
+    cur_qty = int(pos_row[0]) if pos_row else 0
+    cur_avg = int(pos_row[1]) if pos_row else 0
+    cur_mark = int(pos_row[2]) if pos_row and int(pos_row[2]) > 0 else cur_avg
+    cur_realized = int(pos_row[3]) if pos_row else 0
+    cur_fees = int(pos_row[4]) if pos_row else 0
+
+    notional = quantity * fill_price_minor_units
+    delta = quantity if side == "buy" else -quantity
+    new_qty = cur_qty + delta
+    other_exposure = gross_exposure - abs(cur_qty) * cur_mark
+
+    realized_delta = 0
+    if cur_qty == 0 or (cur_qty > 0 and delta > 0) or (cur_qty < 0 and delta < 0):
+        total_cost = abs(cur_qty) * cur_avg + quantity * fill_price_minor_units
+        new_avg = total_cost // abs(new_qty)
+    else:
+        closing_qty = min(abs(cur_qty), quantity)
+        if cur_qty > 0:
+            realized_delta = (fill_price_minor_units - cur_avg) * closing_qty
+        else:
+            realized_delta = (cur_avg - fill_price_minor_units) * closing_qty
+        if new_qty == 0:
+            new_avg = 0
+        elif (cur_qty > 0 and new_qty > 0) or (cur_qty < 0 and new_qty < 0):
+            new_avg = cur_avg
+        else:
+            new_avg = fill_price_minor_units
+
+    projected_exposure = other_exposure + abs(new_qty) * fill_price_minor_units
+    if projected_exposure > binding.exposure_limit_minor_units:
+        raise ExecutionTierRefused(exposure_limit_error)
+    if side == "buy" and notional + fee_minor_units > cash_available:
+        raise ExecutionTierRefused(cash_limit_error)
+
+    realized_net = realized_delta - fee_minor_units
+    db.execute(
+        """INSERT INTO trading_book_position (
+               binding_id, environment, company_id, instrument_id,
+               quantity, avg_entry_minor_units, mark_price_minor_units,
+               realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (binding_id, instrument_id) DO UPDATE SET
+               quantity = excluded.quantity,
+               avg_entry_minor_units = excluded.avg_entry_minor_units,
+               mark_price_minor_units = excluded.mark_price_minor_units,
+               realized_pnl_minor_units = excluded.realized_pnl_minor_units,
+               total_fees_minor_units = excluded.total_fees_minor_units,
+               updated_at_ns = excluded.updated_at_ns""",
+        (
+            binding.binding_id,
+            binding.environment,
+            company_id,
+            instrument_id,
+            new_qty,
+            new_avg,
+            fill_price_minor_units,
+            cur_realized + realized_net,
+            cur_fees + fee_minor_units,
+            recorded_at_ns,
+        ),
+    )
+    return realized_net
+
+
+def _insert_book_order_in_tx(
+    db: Connection,
+    binding: ExecutionBinding,
+    req: _OrderRequest,
+    *,
+    order_id: str,
+    status: str,
+    filled_quantity: int,
+    fill_price_minor_units: int | None,
+    fee_minor_units: int,
+    recorded_at_ns: int,
+) -> None:
+    db.execute(
+        """INSERT INTO trading_book_order (
+               order_id, binding_id, environment, company_id, actor_id,
+               action_id, external_order_id, run_id, decision_id,
+               mandate_revision, instrument_id, side, quantity,
+               limit_minor_units, market_price_minor_units,
+               quote_observed_at_ns, quote_source, fee_bps, slippage_bps,
+               status, filled_quantity, fill_price_minor_units,
+               fee_minor_units, created_at_ns, updated_at_ns
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            order_id,
+            binding.binding_id,
+            binding.environment,
+            req.company_id,
+            req.actor_id,
+            req.action_id,
+            req.external_order_id,
+            req.run_id,
+            req.decision_id,
+            req.mandate_revision,
+            req.instrument_id,
+            req.side,
+            req.quantity,
+            req.limit_minor_units,
+            req.market_price_minor_units,
+            req.quote_observed_at_ns,
+            binding.quote_source,
+            binding.fee_bps,
+            binding.slippage_bps,
+            status,
+            filled_quantity,
+            fill_price_minor_units,
+            fee_minor_units,
+            recorded_at_ns,
+            recorded_at_ns,
+        ),
+    )
+
+
+def _record_filled_book_order_in_tx(
+    db: Connection,
+    binding: ExecutionBinding,
+    req: _OrderRequest,
+    *,
+    order_id: str,
+    fill_id: str,
+    fill_price_minor_units: int,
+    fee_minor_units: int,
+    recorded_at_ns: int,
+    exposure_limit_error: str,
+    cash_limit_error: str,
+    filled_event_type: str,
+    valuation_source: str | None = None,
+    valuation_label: str | None = None,
+    metrics_before: dict[str, int] | None = None,
+) -> int:
+    """Apply fill math to position, persist order/fill/valuation rows, emit audit event, and return net realized PnL."""
+    realized_net = _apply_fill_to_position_in_tx(
+        db,
+        binding,
+        company_id=req.company_id,
+        instrument_id=req.instrument_id,
+        side=req.side,
+        quantity=req.quantity,
+        fill_price_minor_units=fill_price_minor_units,
+        fee_minor_units=fee_minor_units,
+        recorded_at_ns=recorded_at_ns,
+        exposure_limit_error=exposure_limit_error,
+        cash_limit_error=cash_limit_error,
+        metrics_before=metrics_before,
+    )
+    _insert_book_order_in_tx(
+        db,
+        binding,
+        req,
+        order_id=order_id,
+        status="filled",
+        filled_quantity=req.quantity,
+        fill_price_minor_units=fill_price_minor_units,
+        fee_minor_units=fee_minor_units,
+        recorded_at_ns=recorded_at_ns,
+    )
+    db.execute(
+        """INSERT INTO trading_book_fill (
+               fill_id, order_id, binding_id, environment, company_id,
+               actor_id, external_fill_id, instrument_id, side, quantity,
+               price_minor_units, fee_minor_units, realized_pnl_minor_units,
+               filled_at_ns
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            fill_id,
+            order_id,
+            binding.binding_id,
+            binding.environment,
+            req.company_id,
+            req.actor_id,
+            req.external_fill_id,
+            req.instrument_id,
+            req.side,
+            req.quantity,
+            fill_price_minor_units,
+            fee_minor_units,
+            realized_net,
+            recorded_at_ns,
+        ),
+    )
+    if valuation_source is not None:
+        _insert_book_valuation_in_tx(
+            db,
+            binding,
+            label=valuation_label or f"{req.side.upper()} {req.instrument_id}",
+            mark_prices={req.instrument_id: fill_price_minor_units},
+            source=valuation_source,
+            recorded_at_ns=recorded_at_ns,
+        )
+    audit_payload: dict[str, Any] = {
+        "order_id": order_id,
+        "fill_id": fill_id,
+        "binding_id": binding.binding_id,
+        "environment": binding.environment,
+        "instrument_id": req.instrument_id,
+        "side": req.side,
+        "quantity": req.quantity,
+        "price_minor_units": fill_price_minor_units,
+        "fee_minor_units": fee_minor_units,
+    }
+    if req.external_order_id is not None:
+        audit_payload["external_order_id"] = req.external_order_id
+    if req.external_fill_id is not None:
+        audit_payload["external_fill_id"] = req.external_fill_id
+    append_audit_event(
+        db,
+        company_id=req.company_id,
+        domain="trading",
+        entity_type="trading_book_fill",
+        entity_id=fill_id,
+        event_type=filled_event_type,
+        actor_id=req.actor_id,
+        payload=audit_payload,
+        recorded_at_ns=recorded_at_ns,
+    )
+    return realized_net
+
+
+def _validate_simulated_order_inputs(
+    *,
+    action_id: str,
+    instrument_id: str,
+    side: str,
+    quantity: int,
+    limit_minor_units: int,
+    market_price_minor_units: int,
+    fill_mode: str,
+    quote_observed_at_ns: int | None,
+) -> int:
+    _require_safe_id(action_id, "action_id")
+    _require_safe_id(instrument_id, "instrument_id")
+    if side not in ("buy", "sell"):
+        raise ExecutionTierRefused("side must be 'buy' or 'sell'")
+    if fill_mode not in ("immediate", "resting"):
+        raise ExecutionTierRefused("fill_mode must be 'immediate' or 'resting'")
+    _require_positive_int(quantity, "quantity")
+    _require_positive_int(limit_minor_units, "limit_minor_units")
+    _require_positive_int(market_price_minor_units, "market_price_minor_units")
+    observed_ns = time_ns() if quote_observed_at_ns is None else quote_observed_at_ns
+    _require_positive_int(observed_ns, "quote_observed_at_ns")
+    return observed_ns
+
+
+def _execute_book_order_in_tx(
+    db: Connection,
+    binding: ExecutionBinding,
+    req: _OrderRequest,
+    *,
+    spec: _BookOrderSpec,
+    fill_mode: str,
+    valuation_label: str | None = None,
+    now_ns: int | None = None,
+) -> _BookOrderExecution:
+    """Execute or replay a deterministic simulated order inside an open write transaction."""
+    existing = db.execute(
+        """SELECT order_id, instrument_id, side, quantity, limit_minor_units,
+                  market_price_minor_units, status, filled_quantity,
+                  fill_price_minor_units, fee_minor_units
+           FROM trading_book_order
+           WHERE binding_id = ? AND environment = ? AND action_id = ?""",
+        (binding.binding_id, binding.environment, req.action_id),
+    ).fetchone()
+    if existing is not None:
+        if (
+            str(existing[1]),
+            str(existing[2]),
+            int(existing[3]),
+            int(existing[4]),
+        ) != (req.instrument_id, req.side, req.quantity, req.limit_minor_units):
+            raise ExecutionTierRefused(spec.conflict_error)
+        fill_row = db.execute(
+            """SELECT fill_id, realized_pnl_minor_units
+               FROM trading_book_fill
+               WHERE order_id = ? AND environment = ?""",
+            (str(existing[0]), binding.environment),
+        ).fetchone()
+        return _BookOrderExecution(
+            order_id=str(existing[0]),
+            binding_id=binding.binding_id,
+            action_id=req.action_id,
+            instrument_id=req.instrument_id,
+            side=req.side,
+            quantity=req.quantity,
+            limit_minor_units=req.limit_minor_units,
+            market_price_minor_units=int(existing[5]),
+            status=str(existing[6]),
+            filled_quantity=int(existing[7]),
+            fill_price_minor_units=None if existing[8] is None else int(existing[8]),
+            fee_minor_units=int(existing[9]),
+            fill_id=None if fill_row is None else str(fill_row[0]),
+            realized_pnl_minor_units=0 if fill_row is None else int(fill_row[1]),
+            replayed=True,
+        )
+
+    if req.side == "buy":
+        slipped_price = (
+            req.market_price_minor_units
+            + (req.market_price_minor_units * binding.slippage_bps + 9_999) // 10_000
+        )
+        crosses_limit = slipped_price <= req.limit_minor_units
+    else:
+        slipped_price = max(
+            1,
+            req.market_price_minor_units
+            - (req.market_price_minor_units * binding.slippage_bps) // 10_000,
+        )
+        crosses_limit = slipped_price >= req.limit_minor_units
+
+    metrics_before = _compute_unified_book_metrics_in_tx(db, binding)
+    now = time_ns() if now_ns is None else now_ns
+    order_id = f"{spec.order_id_prefix}-{uuid4().hex[:16]}"
+
+    if fill_mode == "immediate" and crosses_limit:
+        fee = (req.quantity * slipped_price * binding.fee_bps + 5_000) // 10_000
+        fill_id: str | None = f"{spec.fill_id_prefix}-{uuid4().hex[:16]}"
+        assert fill_id is not None
+        realized_net = _record_filled_book_order_in_tx(
+            db,
+            binding,
+            req,
+            order_id=order_id,
+            fill_id=fill_id,
+            fill_price_minor_units=slipped_price,
+            fee_minor_units=fee,
+            recorded_at_ns=now,
+            exposure_limit_error=spec.exposure_limit_error,
+            cash_limit_error=spec.cash_limit_error,
+            filled_event_type=spec.filled_event_type,
+            valuation_source=spec.valuation_source,
+            valuation_label=valuation_label,
+            metrics_before=metrics_before,
+        )
+        status, filled_qty, fill_price = "filled", req.quantity, slipped_price
+    else:
+        if (
+            req.side == "buy"
+            and req.quantity * req.limit_minor_units
+            > metrics_before["cash_minor_units"]
+        ):
+            raise ExecutionTierRefused(spec.open_cash_limit_error)
+        _insert_book_order_in_tx(
+            db,
+            binding,
+            req,
+            order_id=order_id,
+            status="open",
+            filled_quantity=0,
+            fill_price_minor_units=None,
+            fee_minor_units=0,
+            recorded_at_ns=now,
+        )
+        if spec.opened_event_type is not None:
+            append_audit_event(
+                db,
+                company_id=req.company_id,
+                domain="trading",
+                entity_type="trading_book_order",
+                entity_id=order_id,
+                event_type=spec.opened_event_type,
+                actor_id=req.actor_id,
+                payload={
+                    "order_id": order_id,
+                    "binding_id": binding.binding_id,
+                    "environment": binding.environment,
+                    "instrument_id": req.instrument_id,
+                    "side": req.side,
+                    "quantity": req.quantity,
+                    "limit_minor_units": req.limit_minor_units,
+                },
+                recorded_at_ns=now,
+            )
+        status, filled_qty, fill_price, fee, fill_id, realized_net = (
+            "open",
+            0,
+            None,
+            0,
+            None,
+            0,
+        )
+
+    return _BookOrderExecution(
+        order_id=order_id,
+        binding_id=binding.binding_id,
+        action_id=req.action_id,
+        instrument_id=req.instrument_id,
+        side=req.side,
+        quantity=req.quantity,
+        limit_minor_units=req.limit_minor_units,
+        market_price_minor_units=req.market_price_minor_units,
+        status=status,
+        filled_quantity=filled_qty,
+        fill_price_minor_units=fill_price,
+        fee_minor_units=fee,
+        fill_id=fill_id,
+        realized_pnl_minor_units=realized_net,
+        replayed=False,
+    )
+
+
+def _read_book_positions_and_orders_in_tx(
+    db: Connection,
+    binding_id: str,
+    environment: str,
+    *,
+    order_limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    positions = [
+        {
+            "instrument_id": str(r[0]),
+            "quantity": int(r[1]),
+            "avg_entry_minor_units": int(r[2]),
+            "realized_pnl_minor_units": int(r[3]),
+            "total_fees_minor_units": int(r[4]),
+            "updated_at_ns": int(r[5]),
+        }
+        for r in db.execute(
+            """SELECT instrument_id, quantity, avg_entry_minor_units,
+                      realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
+               FROM trading_book_position
+               WHERE binding_id = ? AND environment = ?
+               ORDER BY instrument_id ASC""",
+            (binding_id, environment),
+        ).fetchall()
+    ]
+    orders = [
+        {
+            "order_id": str(r[0]),
+            "action_id": str(r[1]),
+            "instrument_id": str(r[2]),
+            "side": str(r[3]),
+            "quantity": int(r[4]),
+            "limit_minor_units": int(r[5]),
+            "status": str(r[6]),
+            "filled_quantity": int(r[7]),
+            "fill_price_minor_units": None if r[8] is None else int(r[8]),
+            "fee_minor_units": int(r[9]),
+            "created_at_ns": int(r[10]),
+        }
+        for r in db.execute(
+            """SELECT order_id, action_id, instrument_id, side, quantity,
+                      limit_minor_units, status, filled_quantity,
+                      fill_price_minor_units, fee_minor_units, created_at_ns
+               FROM trading_book_order
+               WHERE binding_id = ? AND environment = ?
+               ORDER BY created_at_ns DESC LIMIT ?""",
+            (binding_id, environment, order_limit),
+        ).fetchall()
+    ]
+    fill_count = int(
+        db.execute(
+            "SELECT COUNT(*) FROM trading_book_fill WHERE binding_id = ? AND environment = ?",
+            (binding_id, environment),
+        ).fetchone()[0]
+    )
+    return positions, orders, fill_count
 
 
 def _insert_book_valuation_in_tx(
@@ -188,8 +757,7 @@ def record_trading_book_valuation(
             _require_safe_id(inst, "instrument_id")
             _require_positive_int(px, f"mark_price[{inst}]")
 
-    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
-        writer.verify()
+    with write_uow(writer) as db:
         if _identity(db) != writer.company_id:
             raise ExecutionTierRefused("Company identity mismatch")
         if not is_domain_installed(db, "trading"):
@@ -205,7 +773,7 @@ def record_trading_book_valuation(
                 f"Active company trading book '{binding_id}' not found"
             )
         binding = _row_to_binding(row)
-        cut = _insert_book_valuation_in_tx(
+        return _insert_book_valuation_in_tx(
             db,
             binding,
             label=clean_label,
@@ -213,8 +781,6 @@ def record_trading_book_valuation(
             source=clean_source,
             recorded_at_ns=now_ns,
         )
-        writer.verify()
-        return cut
 
 
 def has_company_paper_soak_evidence(db: Connection, company_id: str) -> bool:
@@ -280,20 +846,32 @@ def submit_agent_sandbox_order(
     """Submit a simulated order strictly inside an Agent's isolated Tier 1 sandbox."""
     writer.verify()
     _require_safe_id(agent_id, "agent_id")
-    _require_safe_id(action_id, "action_id")
-    _require_safe_id(instrument_id, "instrument_id")
-    if side not in ("buy", "sell"):
-        raise ExecutionTierRefused("side must be 'buy' or 'sell'")
-    if fill_mode not in ("immediate", "resting"):
-        raise ExecutionTierRefused("fill_mode must be 'immediate' or 'resting'")
-    _require_positive_int(quantity, "quantity")
-    _require_positive_int(limit_minor_units, "limit_minor_units")
-    _require_positive_int(market_price_minor_units, "market_price_minor_units")
-    observed_ns = time_ns() if quote_observed_at_ns is None else quote_observed_at_ns
-    _require_positive_int(observed_ns, "quote_observed_at_ns")
+    observed_ns = _validate_simulated_order_inputs(
+        action_id=action_id,
+        instrument_id=instrument_id,
+        side=side,
+        quantity=quantity,
+        limit_minor_units=limit_minor_units,
+        market_price_minor_units=market_price_minor_units,
+        fill_mode=fill_mode,
+        quote_observed_at_ns=quote_observed_at_ns,
+    )
+    req = _OrderRequest(
+        company_id=writer.company_id,
+        actor_id=agent_id,
+        action_id=action_id,
+        instrument_id=instrument_id,
+        side=side,
+        quantity=quantity,
+        limit_minor_units=limit_minor_units,
+        market_price_minor_units=market_price_minor_units,
+        quote_observed_at_ns=observed_ns,
+        run_id=run_id,
+        decision_id=decision_id,
+        mandate_revision=mandate_revision,
+    )
 
-    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
-        writer.verify()
+    with write_uow(writer) as db:
         if _identity(db) != writer.company_id:
             raise ExecutionTierRefused("Company identity mismatch")
         if not is_domain_installed(db, "trading"):
@@ -310,322 +888,14 @@ def submit_agent_sandbox_order(
             raise ExecutionTierRefused("Agent has no active sandbox account")
         binding = _row_to_binding(binding_row)
 
-        existing = db.execute(
-            """SELECT order_id, instrument_id, side, quantity, limit_minor_units,
-                      market_price_minor_units, status, filled_quantity,
-                      fill_price_minor_units, fee_minor_units
-               FROM trading_book_order
-               WHERE binding_id = ? AND environment = 'agent_sandbox' AND action_id = ?""",
-            (binding.binding_id, action_id),
-        ).fetchone()
-        if existing is not None:
-            if (
-                str(existing[1]),
-                str(existing[2]),
-                int(existing[3]),
-                int(existing[4]),
-            ) != (instrument_id, side, quantity, limit_minor_units):
-                raise ExecutionTierRefused(
-                    "Sandbox action_id conflicts with previously submitted order terms"
-                )
-            fill_row = db.execute(
-                """SELECT fill_id, realized_pnl_minor_units
-                   FROM trading_book_fill
-                   WHERE order_id = ? AND environment = 'agent_sandbox'""",
-                (str(existing[0]),),
-            ).fetchone()
-            return SandboxOrderReceipt(
-                order_id=str(existing[0]),
-                binding_id=binding.binding_id,
-                agent_id=agent_id,
-                action_id=action_id,
-                instrument_id=instrument_id,
-                side=side,
-                quantity=quantity,
-                limit_minor_units=limit_minor_units,
-                market_price_minor_units=int(existing[5]),
-                status=str(existing[6]),
-                filled_quantity=int(existing[7]),
-                fill_price_minor_units=None
-                if existing[8] is None
-                else int(existing[8]),
-                fee_minor_units=int(existing[9]),
-                fill_id=None if fill_row is None else str(fill_row[0]),
-                realized_pnl_minor_units=0 if fill_row is None else int(fill_row[1]),
-                replayed=True,
-            )
-
-        if side == "buy":
-            slipped_price = (
-                market_price_minor_units
-                + (market_price_minor_units * binding.slippage_bps + 9_999) // 10_000
-            )
-            crosses_limit = slipped_price <= limit_minor_units
-        else:
-            slipped_price = max(
-                1,
-                market_price_minor_units
-                - (market_price_minor_units * binding.slippage_bps) // 10_000,
-            )
-            crosses_limit = slipped_price >= limit_minor_units
-
-        metrics_before = _compute_unified_book_metrics_in_tx(db, binding)
-        cash_available = metrics_before["cash_minor_units"]
-        gross_exposure = metrics_before["gross_exposure_minor_units"]
-
-        pos_row = db.execute(
-            """SELECT quantity, avg_entry_minor_units, mark_price_minor_units,
-                      realized_pnl_minor_units, total_fees_minor_units
-               FROM trading_book_position
-               WHERE binding_id = ? AND environment = 'agent_sandbox' AND instrument_id = ?""",
-            (binding.binding_id, instrument_id),
-        ).fetchone()
-        cur_qty = int(pos_row[0]) if pos_row else 0
-        cur_avg = int(pos_row[1]) if pos_row else 0
-        cur_mark = int(pos_row[2]) if pos_row and int(pos_row[2]) > 0 else cur_avg
-        cur_realized = int(pos_row[3]) if pos_row else 0
-        cur_fees = int(pos_row[4]) if pos_row else 0
-
-        now = time_ns()
-        order_id = f"sbxo-{uuid4().hex[:16]}"
-        should_fill = fill_mode == "immediate" and crosses_limit
-
-        if should_fill:
-            notional = quantity * slipped_price
-            fee = (notional * binding.fee_bps + 5_000) // 10_000
-            delta = quantity if side == "buy" else -quantity
-            new_qty = cur_qty + delta
-            other_exposure = gross_exposure - abs(cur_qty) * cur_mark
-
-            realized_delta = 0
-            if (
-                cur_qty == 0
-                or (cur_qty > 0 and delta > 0)
-                or (cur_qty < 0 and delta < 0)
-            ):
-                total_cost = abs(cur_qty) * cur_avg + quantity * slipped_price
-                new_avg = total_cost // abs(new_qty)
-            else:
-                closing_qty = min(abs(cur_qty), quantity)
-                if cur_qty > 0:
-                    realized_delta = (slipped_price - cur_avg) * closing_qty
-                else:
-                    realized_delta = (cur_avg - slipped_price) * closing_qty
-                if new_qty == 0:
-                    new_avg = 0
-                elif (cur_qty > 0 and new_qty > 0) or (cur_qty < 0 and new_qty < 0):
-                    new_avg = cur_avg
-                else:
-                    new_avg = slipped_price
-
-            projected_exposure = other_exposure + abs(new_qty) * slipped_price
-            if projected_exposure > binding.exposure_limit_minor_units:
-                raise ExecutionTierRefused(
-                    "Sandbox order exceeds agent sandbox exposure limit"
-                )
-            if side == "buy" and notional + fee > cash_available:
-                raise ExecutionTierRefused(
-                    "Sandbox order exceeds available virtual cash"
-                )
-            realized_net = realized_delta - fee
-            fill_id = f"sbxf-{uuid4().hex[:16]}"
-            db.execute(
-                """INSERT INTO trading_book_order (
-                       order_id, binding_id, environment, company_id, actor_id,
-                       action_id, external_order_id, run_id, decision_id,
-                       mandate_revision, instrument_id, side, quantity,
-                       limit_minor_units, market_price_minor_units,
-                       quote_observed_at_ns, quote_source, fee_bps, slippage_bps,
-                       status, filled_quantity, fill_price_minor_units,
-                       fee_minor_units, created_at_ns, updated_at_ns
-                   ) VALUES (?, ?, 'agent_sandbox', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'filled', ?, ?, ?, ?, ?)""",
-                (
-                    order_id,
-                    binding.binding_id,
-                    writer.company_id,
-                    agent_id,
-                    action_id,
-                    run_id,
-                    decision_id,
-                    mandate_revision,
-                    instrument_id,
-                    side,
-                    quantity,
-                    limit_minor_units,
-                    market_price_minor_units,
-                    observed_ns,
-                    binding.quote_source,
-                    binding.fee_bps,
-                    binding.slippage_bps,
-                    quantity,
-                    slipped_price,
-                    fee,
-                    now,
-                    now,
-                ),
-            )
-            db.execute(
-                """INSERT INTO trading_book_fill (
-                       fill_id, order_id, binding_id, environment, company_id,
-                       actor_id, external_fill_id, instrument_id, side, quantity,
-                       price_minor_units, fee_minor_units, realized_pnl_minor_units,
-                       filled_at_ns
-                   ) VALUES (?, ?, ?, 'agent_sandbox', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    fill_id,
-                    order_id,
-                    binding.binding_id,
-                    writer.company_id,
-                    agent_id,
-                    instrument_id,
-                    side,
-                    quantity,
-                    slipped_price,
-                    fee,
-                    realized_net,
-                    now,
-                ),
-            )
-            db.execute(
-                """INSERT INTO trading_book_position (
-                       binding_id, environment, company_id, instrument_id,
-                       quantity, avg_entry_minor_units, mark_price_minor_units,
-                       realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
-                   ) VALUES (?, 'agent_sandbox', ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT (binding_id, instrument_id) DO UPDATE SET
-                       quantity = excluded.quantity,
-                       avg_entry_minor_units = excluded.avg_entry_minor_units,
-                       mark_price_minor_units = excluded.mark_price_minor_units,
-                       realized_pnl_minor_units = excluded.realized_pnl_minor_units,
-                       total_fees_minor_units = excluded.total_fees_minor_units,
-                       updated_at_ns = excluded.updated_at_ns""",
-                (
-                    binding.binding_id,
-                    writer.company_id,
-                    instrument_id,
-                    new_qty,
-                    new_avg,
-                    slipped_price,
-                    cur_realized + realized_net,
-                    cur_fees + fee,
-                    now,
-                ),
-            )
-            append_audit_event(
-                db,
-                company_id=writer.company_id,
-                domain="trading",
-                entity_type="trading_book_fill",
-                entity_id=fill_id,
-                event_type="agent_sandbox.order_filled",
-                actor_id=agent_id,
-                payload={
-                    "order_id": order_id,
-                    "fill_id": fill_id,
-                    "binding_id": binding.binding_id,
-                    "environment": ENV_AGENT_SANDBOX,
-                    "instrument_id": instrument_id,
-                    "side": side,
-                    "quantity": quantity,
-                    "price_minor_units": slipped_price,
-                    "fee_minor_units": fee,
-                },
-                recorded_at_ns=now,
-            )
-            writer.verify()
-            return SandboxOrderReceipt(
-                order_id=order_id,
-                binding_id=binding.binding_id,
-                agent_id=agent_id,
-                action_id=action_id,
-                instrument_id=instrument_id,
-                side=side,
-                quantity=quantity,
-                limit_minor_units=limit_minor_units,
-                market_price_minor_units=market_price_minor_units,
-                status="filled",
-                filled_quantity=quantity,
-                fill_price_minor_units=slipped_price,
-                fee_minor_units=fee,
-                fill_id=fill_id,
-                realized_pnl_minor_units=realized_net,
-                replayed=False,
-            )
-
-        if side == "buy" and quantity * limit_minor_units > cash_available:
-            raise ExecutionTierRefused(
-                "Sandbox limit order exceeds available virtual cash"
-            )
-        db.execute(
-            """INSERT INTO trading_book_order (
-                   order_id, binding_id, environment, company_id, actor_id,
-                   action_id, external_order_id, run_id, decision_id,
-                   mandate_revision, instrument_id, side, quantity,
-                   limit_minor_units, market_price_minor_units,
-                   quote_observed_at_ns, quote_source, fee_bps, slippage_bps,
-                   status, filled_quantity, fill_price_minor_units,
-                   fee_minor_units, created_at_ns, updated_at_ns
-               ) VALUES (?, ?, 'agent_sandbox', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', 0, NULL, 0, ?, ?)""",
-            (
-                order_id,
-                binding.binding_id,
-                writer.company_id,
-                agent_id,
-                action_id,
-                run_id,
-                decision_id,
-                mandate_revision,
-                instrument_id,
-                side,
-                quantity,
-                limit_minor_units,
-                market_price_minor_units,
-                observed_ns,
-                binding.quote_source,
-                binding.fee_bps,
-                binding.slippage_bps,
-                now,
-                now,
-            ),
-        )
-        append_audit_event(
+        execution = _execute_book_order_in_tx(
             db,
-            company_id=writer.company_id,
-            domain="trading",
-            entity_type="trading_book_order",
-            entity_id=order_id,
-            event_type="agent_sandbox.order_opened",
-            actor_id=agent_id,
-            payload={
-                "order_id": order_id,
-                "binding_id": binding.binding_id,
-                "environment": ENV_AGENT_SANDBOX,
-                "instrument_id": instrument_id,
-                "side": side,
-                "quantity": quantity,
-                "limit_minor_units": limit_minor_units,
-            },
-            recorded_at_ns=now,
+            binding,
+            req,
+            spec=_SANDBOX_ORDER_SPEC,
+            fill_mode=fill_mode,
         )
-        writer.verify()
-        return SandboxOrderReceipt(
-            order_id=order_id,
-            binding_id=binding.binding_id,
-            agent_id=agent_id,
-            action_id=action_id,
-            instrument_id=instrument_id,
-            side=side,
-            quantity=quantity,
-            limit_minor_units=limit_minor_units,
-            market_price_minor_units=market_price_minor_units,
-            status="open",
-            filled_quantity=0,
-            fill_price_minor_units=None,
-            fee_minor_units=0,
-            fill_id=None,
-            realized_pnl_minor_units=0,
-            replayed=False,
-        )
+        return execution.to_sandbox_receipt(agent_id)
 
 
 def cancel_agent_sandbox_order(
@@ -638,8 +908,7 @@ def cancel_agent_sandbox_order(
     writer.verify()
     _require_safe_id(agent_id, "agent_id")
     _require_safe_id(order_id, "order_id")
-    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
-        writer.verify()
+    with write_uow(writer) as db:
         if _identity(db) != writer.company_id:
             raise ExecutionTierRefused("Company identity mismatch")
         if not is_domain_installed(db, "trading"):
@@ -683,7 +952,6 @@ def cancel_agent_sandbox_order(
             },
             recorded_at_ns=now,
         )
-        writer.verify()
         return {"order_id": order_id, "status": "cancelled", "replayed": False}
 
 
@@ -703,53 +971,8 @@ def read_agent_sandbox_portfolio_from_db(
         return None
     binding = _row_to_binding(row)
     metrics = _compute_unified_book_metrics_in_tx(db, binding)
-    positions = [
-        {
-            "instrument_id": str(r[0]),
-            "quantity": int(r[1]),
-            "avg_entry_minor_units": int(r[2]),
-            "realized_pnl_minor_units": int(r[3]),
-            "total_fees_minor_units": int(r[4]),
-            "updated_at_ns": int(r[5]),
-        }
-        for r in db.execute(
-            """SELECT instrument_id, quantity, avg_entry_minor_units,
-                      realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
-               FROM trading_book_position
-               WHERE binding_id = ? AND environment = 'agent_sandbox'
-               ORDER BY instrument_id ASC""",
-            (binding.binding_id,),
-        ).fetchall()
-    ]
-    orders = [
-        {
-            "order_id": str(r[0]),
-            "action_id": str(r[1]),
-            "instrument_id": str(r[2]),
-            "side": str(r[3]),
-            "quantity": int(r[4]),
-            "limit_minor_units": int(r[5]),
-            "status": str(r[6]),
-            "filled_quantity": int(r[7]),
-            "fill_price_minor_units": None if r[8] is None else int(r[8]),
-            "fee_minor_units": int(r[9]),
-            "created_at_ns": int(r[10]),
-        }
-        for r in db.execute(
-            """SELECT order_id, action_id, instrument_id, side, quantity,
-                      limit_minor_units, status, filled_quantity,
-                      fill_price_minor_units, fee_minor_units, created_at_ns
-               FROM trading_book_order
-               WHERE binding_id = ? AND environment = 'agent_sandbox'
-               ORDER BY created_at_ns DESC LIMIT 50""",
-            (binding.binding_id,),
-        ).fetchall()
-    ]
-    fill_count = int(
-        db.execute(
-            "SELECT COUNT(*) FROM trading_book_fill WHERE binding_id = ? AND environment = 'agent_sandbox'",
-            (binding.binding_id,),
-        ).fetchone()[0]
+    positions, orders, fill_count = _read_book_positions_and_orders_in_tx(
+        db, binding.binding_id, ENV_AGENT_SANDBOX, order_limit=50
     )
     return {
         "binding": asdict(binding),
@@ -768,7 +991,7 @@ def read_agent_sandbox_portfolio(
     store: Path, company_id: str, agent_id: str
 ) -> dict[str, Any] | None:
     """Read an Agent's active Tier 1 sandbox portfolio via open_reader."""
-    with closing(open_reader(store)) as db, read_tx(db):
+    with scoped_reader(store) as db:
         if _identity(db) != company_id:
             raise ExecutionTierRefused("Company identity mismatch")
         return read_agent_sandbox_portfolio_from_db(db, company_id, agent_id)
@@ -802,20 +1025,18 @@ def submit_company_paper_book_order(
     writer.verify()
     _require_safe_id(binding_id, "binding_id")
     _require_safe_id(actor_id, "actor_id")
-    _require_safe_id(action_id, "action_id")
-    _require_safe_id(instrument_id, "instrument_id")
-    if side not in ("buy", "sell"):
-        raise ExecutionTierRefused("side must be 'buy' or 'sell'")
-    _require_positive_int(quantity, "quantity")
-    _require_positive_int(limit_minor_units, "limit_minor_units")
-    _require_positive_int(market_price_minor_units, "market_price_minor_units")
-    if fill_mode not in ("immediate", "resting"):
-        raise ExecutionTierRefused("fill_mode must be 'immediate' or 'resting'")
-    observed_ns = time_ns() if quote_observed_at_ns is None else quote_observed_at_ns
-    _require_positive_int(observed_ns, "quote_observed_at_ns")
+    observed_ns = _validate_simulated_order_inputs(
+        action_id=action_id,
+        instrument_id=instrument_id,
+        side=side,
+        quantity=quantity,
+        limit_minor_units=limit_minor_units,
+        market_price_minor_units=market_price_minor_units,
+        fill_mode=fill_mode,
+        quote_observed_at_ns=quote_observed_at_ns,
+    )
 
-    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
-        writer.verify()
+    with write_uow(writer) as db:
         if _identity(db) != writer.company_id:
             raise ExecutionTierRefused("Company identity mismatch")
         if not is_domain_installed(db, "trading"):
@@ -832,300 +1053,30 @@ def submit_company_paper_book_order(
         binding = _row_to_binding(row)
         require_trading_risk_clear(db, writer.company_id, ENV_PAPER)
 
-        existing = db.execute(
-            """SELECT order_id, instrument_id, side, quantity, limit_minor_units,
-                      market_price_minor_units, status, filled_quantity,
-                      fill_price_minor_units, fee_minor_units
-               FROM trading_book_order
-               WHERE binding_id = ? AND environment = 'paper' AND action_id = ?""",
-            (binding.binding_id, action_id),
-        ).fetchone()
-        if existing is not None:
-            if (
-                str(existing[1]) != instrument_id
-                or str(existing[2]) != side
-                or int(existing[3]) != quantity
-                or int(existing[4]) != limit_minor_units
-            ):
-                raise ExecutionTierRefused(
-                    "action_id already used for a different company paper order"
-                )
-            fill_row = db.execute(
-                """SELECT fill_id, realized_pnl_minor_units
-                   FROM trading_book_fill WHERE order_id = ?""",
-                (str(existing[0]),),
-            ).fetchone()
-            return {
-                "order_id": str(existing[0]),
-                "binding_id": binding.binding_id,
-                "action_id": action_id,
-                "instrument_id": instrument_id,
-                "side": side,
-                "quantity": quantity,
-                "status": str(existing[6]),
-                "filled_quantity": int(existing[7]),
-                "fill_price_minor_units": None
-                if existing[8] is None
-                else int(existing[8]),
-                "fee_minor_units": int(existing[9]),
-                "fill_id": None if fill_row is None else str(fill_row[0]),
-                "realized_pnl_minor_units": 0 if fill_row is None else int(fill_row[1]),
-                "replayed": True,
-            }
-
-        if side == "buy":
-            slipped_price = (
-                market_price_minor_units
-                + (market_price_minor_units * binding.slippage_bps + 9_999) // 10_000
-            )
-            crosses_limit = slipped_price <= limit_minor_units
-        else:
-            slipped_price = max(
-                1,
-                market_price_minor_units
-                - (market_price_minor_units * binding.slippage_bps) // 10_000,
-            )
-            crosses_limit = slipped_price >= limit_minor_units
-
-        metrics_before = _compute_unified_book_metrics_in_tx(db, binding)
-        cash_available = metrics_before["cash_minor_units"]
-        gross_exposure = metrics_before["gross_exposure_minor_units"]
-
-        pos_row = db.execute(
-            """SELECT quantity, avg_entry_minor_units, mark_price_minor_units,
-                      realized_pnl_minor_units, total_fees_minor_units
-               FROM trading_book_position
-               WHERE binding_id = ? AND environment = 'paper' AND instrument_id = ?""",
-            (binding.binding_id, instrument_id),
-        ).fetchone()
-        cur_qty = int(pos_row[0]) if pos_row else 0
-        cur_avg = int(pos_row[1]) if pos_row else 0
-        cur_mark = int(pos_row[2]) if pos_row and int(pos_row[2]) > 0 else cur_avg
-        cur_realized = int(pos_row[3]) if pos_row else 0
-        cur_fees = int(pos_row[4]) if pos_row else 0
-
-        now = time_ns() if now_ns is None else now_ns
-        order_id = f"cpbo-{uuid4().hex[:16]}"
-        should_fill = fill_mode == "immediate" and crosses_limit
-
-        if should_fill:
-            notional = quantity * slipped_price
-            fee = (notional * binding.fee_bps + 5_000) // 10_000
-            delta = quantity if side == "buy" else -quantity
-            new_qty = cur_qty + delta
-            other_exposure = gross_exposure - abs(cur_qty) * cur_mark
-
-            realized_delta = 0
-            if (
-                cur_qty == 0
-                or (cur_qty > 0 and delta > 0)
-                or (cur_qty < 0 and delta < 0)
-            ):
-                total_cost = abs(cur_qty) * cur_avg + quantity * slipped_price
-                new_avg = total_cost // abs(new_qty)
-            else:
-                closing_qty = min(abs(cur_qty), quantity)
-                if cur_qty > 0:
-                    realized_delta = (slipped_price - cur_avg) * closing_qty
-                else:
-                    realized_delta = (cur_avg - slipped_price) * closing_qty
-                if new_qty == 0:
-                    new_avg = 0
-                elif (cur_qty > 0 and new_qty > 0) or (cur_qty < 0 and new_qty < 0):
-                    new_avg = cur_avg
-                else:
-                    new_avg = slipped_price
-
-            projected_exposure = other_exposure + abs(new_qty) * slipped_price
-            if projected_exposure > binding.exposure_limit_minor_units:
-                raise ExecutionTierRefused(
-                    "Company paper book order exceeds exposure limit"
-                )
-            if side == "buy" and notional + fee > cash_available:
-                raise ExecutionTierRefused(
-                    "Company paper book order exceeds available virtual cash"
-                )
-            realized_net = realized_delta - fee
-            fill_id = f"cpbf-{uuid4().hex[:16]}"
-            db.execute(
-                """INSERT INTO trading_book_order (
-                       order_id, binding_id, environment, company_id, actor_id,
-                       action_id, external_order_id, run_id, decision_id,
-                       mandate_revision, instrument_id, side, quantity,
-                       limit_minor_units, market_price_minor_units,
-                       quote_observed_at_ns, quote_source, fee_bps, slippage_bps,
-                       status, filled_quantity, fill_price_minor_units,
-                       fee_minor_units, created_at_ns, updated_at_ns
-                   ) VALUES (?, ?, 'paper', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'filled', ?, ?, ?, ?, ?)""",
-                (
-                    order_id,
-                    binding.binding_id,
-                    writer.company_id,
-                    actor_id,
-                    action_id,
-                    run_id,
-                    decision_id,
-                    mandate_revision or binding.binding_revision,
-                    instrument_id,
-                    side,
-                    quantity,
-                    limit_minor_units,
-                    market_price_minor_units,
-                    observed_ns,
-                    binding.quote_source,
-                    binding.fee_bps,
-                    binding.slippage_bps,
-                    quantity,
-                    slipped_price,
-                    fee,
-                    now,
-                    now,
-                ),
-            )
-            db.execute(
-                """INSERT INTO trading_book_fill (
-                       fill_id, order_id, binding_id, environment, company_id,
-                       actor_id, external_fill_id, instrument_id, side, quantity,
-                       price_minor_units, fee_minor_units, realized_pnl_minor_units, filled_at_ns
-                   ) VALUES (?, ?, ?, 'paper', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    fill_id,
-                    order_id,
-                    binding.binding_id,
-                    writer.company_id,
-                    actor_id,
-                    instrument_id,
-                    side,
-                    quantity,
-                    slipped_price,
-                    fee,
-                    realized_net,
-                    now,
-                ),
-            )
-            db.execute(
-                """INSERT INTO trading_book_position (
-                       binding_id, environment, company_id, instrument_id,
-                       quantity, avg_entry_minor_units, mark_price_minor_units,
-                       realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
-                   ) VALUES (?, 'paper', ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT (binding_id, instrument_id) DO UPDATE SET
-                       quantity = excluded.quantity,
-                       avg_entry_minor_units = excluded.avg_entry_minor_units,
-                       mark_price_minor_units = excluded.mark_price_minor_units,
-                       realized_pnl_minor_units = excluded.realized_pnl_minor_units,
-                       total_fees_minor_units = excluded.total_fees_minor_units,
-                       updated_at_ns = excluded.updated_at_ns""",
-                (
-                    binding.binding_id,
-                    writer.company_id,
-                    instrument_id,
-                    new_qty,
-                    new_avg,
-                    slipped_price,
-                    cur_realized + realized_net,
-                    cur_fees + fee,
-                    now,
-                ),
-            )
-            _insert_book_valuation_in_tx(
-                db,
-                binding,
-                label=valuation_label or f"{side.upper()} {instrument_id}",
-                mark_prices={instrument_id: slipped_price},
-                source="paper_fill",
-                recorded_at_ns=now,
-            )
-            append_audit_event(
-                db,
-                company_id=writer.company_id,
-                domain="trading",
-                entity_type="trading_book_fill",
-                entity_id=fill_id,
-                event_type="company_paper.order_filled",
-                actor_id=actor_id,
-                payload={
-                    "order_id": order_id,
-                    "fill_id": fill_id,
-                    "binding_id": binding.binding_id,
-                    "environment": ENV_PAPER,
-                    "instrument_id": instrument_id,
-                    "side": side,
-                    "quantity": quantity,
-                    "price_minor_units": slipped_price,
-                    "fee_minor_units": fee,
-                },
-                recorded_at_ns=now,
-            )
-            writer.verify()
-            return {
-                "order_id": order_id,
-                "binding_id": binding.binding_id,
-                "action_id": action_id,
-                "instrument_id": instrument_id,
-                "side": side,
-                "quantity": quantity,
-                "status": "filled",
-                "filled_quantity": quantity,
-                "fill_price_minor_units": slipped_price,
-                "fee_minor_units": fee,
-                "fill_id": fill_id,
-                "realized_pnl_minor_units": realized_net,
-                "replayed": False,
-            }
-
-        if side == "buy" and quantity * limit_minor_units > cash_available:
-            raise ExecutionTierRefused(
-                "Company paper book limit order exceeds available virtual cash"
-            )
-        db.execute(
-            """INSERT INTO trading_book_order (
-                   order_id, binding_id, environment, company_id, actor_id,
-                   action_id, external_order_id, run_id, decision_id,
-                   mandate_revision, instrument_id, side, quantity,
-                   limit_minor_units, market_price_minor_units,
-                   quote_observed_at_ns, quote_source, fee_bps, slippage_bps,
-                   status, filled_quantity, fill_price_minor_units,
-                   fee_minor_units, created_at_ns, updated_at_ns
-               ) VALUES (?, ?, 'paper', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', 0, NULL, 0, ?, ?)""",
-            (
-                order_id,
-                binding.binding_id,
-                writer.company_id,
-                actor_id,
-                action_id,
-                run_id,
-                decision_id,
-                mandate_revision or binding.binding_revision,
-                instrument_id,
-                side,
-                quantity,
-                limit_minor_units,
-                market_price_minor_units,
-                observed_ns,
-                binding.quote_source,
-                binding.fee_bps,
-                binding.slippage_bps,
-                now,
-                now,
-            ),
+        req = _OrderRequest(
+            company_id=writer.company_id,
+            actor_id=actor_id,
+            action_id=action_id,
+            instrument_id=instrument_id,
+            side=side,
+            quantity=quantity,
+            limit_minor_units=limit_minor_units,
+            market_price_minor_units=market_price_minor_units,
+            quote_observed_at_ns=observed_ns,
+            run_id=run_id,
+            decision_id=decision_id,
+            mandate_revision=mandate_revision or binding.binding_revision,
         )
-        writer.verify()
-        return {
-            "order_id": order_id,
-            "binding_id": binding.binding_id,
-            "action_id": action_id,
-            "instrument_id": instrument_id,
-            "side": side,
-            "quantity": quantity,
-            "status": "open",
-            "filled_quantity": 0,
-            "fill_price_minor_units": None,
-            "fee_minor_units": 0,
-            "fill_id": None,
-            "realized_pnl_minor_units": 0,
-            "replayed": False,
-        }
+        execution = _execute_book_order_in_tx(
+            db,
+            binding,
+            req,
+            spec=_COMPANY_PAPER_ORDER_SPEC,
+            fill_mode=fill_mode,
+            valuation_label=valuation_label,
+            now_ns=now_ns,
+        )
+        return execution.to_paper_dict()
 
 
 def cancel_company_paper_book_order(
@@ -1147,8 +1098,7 @@ def cancel_company_paper_book_order(
     clean_reason = reason.strip()
     now = time_ns() if now_ns is None else now_ns
 
-    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
-        writer.verify()
+    with write_uow(writer) as db:
         if _identity(db) != writer.company_id:
             raise ExecutionTierRefused("Company identity mismatch")
         if not is_domain_installed(db, "trading"):
@@ -1199,7 +1149,6 @@ def cancel_company_paper_book_order(
             },
             recorded_at_ns=now,
         )
-        writer.verify()
         return {
             "order_id": order_id,
             "binding_id": binding_id,
@@ -1259,53 +1208,8 @@ def read_company_paper_book_portfolio_from_db(
             nominated_question_id = None
 
     metrics = _compute_unified_book_metrics_in_tx(db, binding)
-    positions = [
-        {
-            "instrument_id": str(r[0]),
-            "quantity": int(r[1]),
-            "avg_entry_minor_units": int(r[2]),
-            "realized_pnl_minor_units": int(r[3]),
-            "total_fees_minor_units": int(r[4]),
-            "updated_at_ns": int(r[5]),
-        }
-        for r in db.execute(
-            """SELECT instrument_id, quantity, avg_entry_minor_units,
-                      realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
-               FROM trading_book_position
-               WHERE binding_id = ? AND environment = 'paper'
-               ORDER BY instrument_id ASC""",
-            (binding.binding_id,),
-        ).fetchall()
-    ]
-    orders = [
-        {
-            "order_id": str(r[0]),
-            "action_id": str(r[1]),
-            "instrument_id": str(r[2]),
-            "side": str(r[3]),
-            "quantity": int(r[4]),
-            "limit_minor_units": int(r[5]),
-            "status": str(r[6]),
-            "filled_quantity": int(r[7]),
-            "fill_price_minor_units": None if r[8] is None else int(r[8]),
-            "fee_minor_units": int(r[9]),
-            "created_at_ns": int(r[10]),
-        }
-        for r in db.execute(
-            """SELECT order_id, action_id, instrument_id, side, quantity,
-                      limit_minor_units, status, filled_quantity,
-                      fill_price_minor_units, fee_minor_units, created_at_ns
-               FROM trading_book_order
-               WHERE binding_id = ? AND environment = 'paper'
-               ORDER BY created_at_ns DESC LIMIT 30""",
-            (binding.binding_id,),
-        ).fetchall()
-    ]
-    fill_count = int(
-        db.execute(
-            "SELECT COUNT(*) FROM trading_book_fill WHERE binding_id = ? AND environment = 'paper'",
-            (binding.binding_id,),
-        ).fetchone()[0]
+    positions, orders, fill_count = _read_book_positions_and_orders_in_tx(
+        db, binding.binding_id, ENV_PAPER, order_limit=30
     )
     open_orders_count = int(
         db.execute(
@@ -1392,8 +1296,7 @@ def record_live_book_order_fill(
     _require_positive_int(eff_limit, "limit_minor_units")
     now = time_ns() if now_ns is None else now_ns
 
-    with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
-        writer.verify()
+    with write_uow(writer) as db:
         if _identity(db) != writer.company_id:
             raise ExecutionTierRefused("Company identity mismatch")
         if not is_domain_installed(db, "trading"):
@@ -1454,171 +1357,39 @@ def record_live_book_order_fill(
                 "replayed": True,
             }
 
-        metrics_before = _compute_unified_book_metrics_in_tx(db, binding)
-        cash_available = metrics_before["cash_minor_units"]
-        gross_exposure = metrics_before["gross_exposure_minor_units"]
-
-        pos_row = db.execute(
-            """SELECT quantity, avg_entry_minor_units, mark_price_minor_units,
-                      realized_pnl_minor_units, total_fees_minor_units
-               FROM trading_book_position
-               WHERE binding_id = ? AND environment = 'live' AND instrument_id = ?""",
-            (binding.binding_id, instrument_id),
-        ).fetchone()
-        cur_qty = int(pos_row[0]) if pos_row else 0
-        cur_avg = int(pos_row[1]) if pos_row else 0
-        cur_mark = int(pos_row[2]) if pos_row and int(pos_row[2]) > 0 else cur_avg
-        cur_realized = int(pos_row[3]) if pos_row else 0
-        cur_fees = int(pos_row[4]) if pos_row else 0
-
-        notional = quantity * fill_price_minor_units
-        delta = quantity if side == "buy" else -quantity
-        new_qty = cur_qty + delta
-        other_exposure = gross_exposure - abs(cur_qty) * cur_mark
-
-        realized_delta = 0
-        if cur_qty == 0 or (cur_qty > 0 and delta > 0) or (cur_qty < 0 and delta < 0):
-            total_cost = abs(cur_qty) * cur_avg + quantity * fill_price_minor_units
-            new_avg = total_cost // abs(new_qty)
-        else:
-            closing_qty = min(abs(cur_qty), quantity)
-            if cur_qty > 0:
-                realized_delta = (fill_price_minor_units - cur_avg) * closing_qty
-            else:
-                realized_delta = (cur_avg - fill_price_minor_units) * closing_qty
-            if new_qty == 0:
-                new_avg = 0
-            elif (cur_qty > 0 and new_qty > 0) or (cur_qty < 0 and new_qty < 0):
-                new_avg = cur_avg
-            else:
-                new_avg = fill_price_minor_units
-
-        projected_exposure = other_exposure + abs(new_qty) * fill_price_minor_units
-        if projected_exposure > binding.exposure_limit_minor_units:
-            raise ExecutionTierRefused(
-                "Live book order exceeds live binding exposure limit"
-            )
-        if side == "buy" and notional + fee_minor_units > cash_available:
-            raise ExecutionTierRefused("Live book order exceeds available live cash")
-
-        realized_net = realized_delta - fee_minor_units
+        req = _OrderRequest(
+            company_id=writer.company_id,
+            actor_id=actor_id,
+            action_id=action_id,
+            instrument_id=instrument_id,
+            side=side,
+            quantity=quantity,
+            limit_minor_units=eff_limit,
+            market_price_minor_units=fill_price_minor_units,
+            quote_observed_at_ns=now,
+            run_id=run_id,
+            decision_id=decision_id,
+            mandate_revision=mandate_revision or binding.binding_revision,
+            external_order_id=external_order_id,
+            external_fill_id=external_fill_id,
+        )
         order_id = f"livo-{uuid4().hex[:16]}"
         fill_id = f"livf-{uuid4().hex[:16]}"
-        db.execute(
-            """INSERT INTO trading_book_order (
-                   order_id, binding_id, environment, company_id, actor_id,
-                   action_id, external_order_id, run_id, decision_id,
-                   mandate_revision, instrument_id, side, quantity,
-                   limit_minor_units, market_price_minor_units,
-                   quote_observed_at_ns, quote_source, fee_bps, slippage_bps,
-                   status, filled_quantity, fill_price_minor_units,
-                   fee_minor_units, created_at_ns, updated_at_ns
-               ) VALUES (?, ?, 'live', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'filled', ?, ?, ?, ?, ?)""",
-            (
-                order_id,
-                binding.binding_id,
-                writer.company_id,
-                actor_id,
-                action_id,
-                external_order_id,
-                run_id,
-                decision_id,
-                mandate_revision or binding.binding_revision,
-                instrument_id,
-                side,
-                quantity,
-                eff_limit,
-                fill_price_minor_units,
-                now,
-                binding.quote_source,
-                binding.fee_bps,
-                binding.slippage_bps,
-                quantity,
-                fill_price_minor_units,
-                fee_minor_units,
-                now,
-                now,
-            ),
-        )
-        db.execute(
-            """INSERT INTO trading_book_fill (
-                   fill_id, order_id, binding_id, environment, company_id,
-                   actor_id, external_fill_id, instrument_id, side, quantity,
-                   price_minor_units, fee_minor_units, realized_pnl_minor_units, filled_at_ns
-               ) VALUES (?, ?, ?, 'live', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                fill_id,
-                order_id,
-                binding.binding_id,
-                writer.company_id,
-                actor_id,
-                external_fill_id,
-                instrument_id,
-                side,
-                quantity,
-                fill_price_minor_units,
-                fee_minor_units,
-                realized_net,
-                now,
-            ),
-        )
-        db.execute(
-            """INSERT INTO trading_book_position (
-                   binding_id, environment, company_id, instrument_id,
-                   quantity, avg_entry_minor_units, mark_price_minor_units,
-                   realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
-               ) VALUES (?, 'live', ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT (binding_id, instrument_id) DO UPDATE SET
-                   quantity = excluded.quantity,
-                   avg_entry_minor_units = excluded.avg_entry_minor_units,
-                   mark_price_minor_units = excluded.mark_price_minor_units,
-                   realized_pnl_minor_units = excluded.realized_pnl_minor_units,
-                   total_fees_minor_units = excluded.total_fees_minor_units,
-                   updated_at_ns = excluded.updated_at_ns""",
-            (
-                binding.binding_id,
-                writer.company_id,
-                instrument_id,
-                new_qty,
-                new_avg,
-                fill_price_minor_units,
-                cur_realized + realized_net,
-                cur_fees + fee_minor_units,
-                now,
-            ),
-        )
-        _insert_book_valuation_in_tx(
+        realized_net = _record_filled_book_order_in_tx(
             db,
             binding,
-            label=valuation_label or f"Live {side.upper()} {instrument_id}",
-            mark_prices={instrument_id: fill_price_minor_units},
-            source="live_fill",
+            req,
+            order_id=order_id,
+            fill_id=fill_id,
+            fill_price_minor_units=fill_price_minor_units,
+            fee_minor_units=fee_minor_units,
             recorded_at_ns=now,
+            exposure_limit_error="Live book order exceeds live binding exposure limit",
+            cash_limit_error="Live book order exceeds available live cash",
+            filled_event_type="company_live.order_filled",
+            valuation_source="live_fill",
+            valuation_label=valuation_label or f"Live {side.upper()} {instrument_id}",
         )
-        append_audit_event(
-            db,
-            company_id=writer.company_id,
-            domain="trading",
-            entity_type="trading_book_fill",
-            entity_id=fill_id,
-            event_type="company_live.order_filled",
-            actor_id=actor_id,
-            payload={
-                "order_id": order_id,
-                "fill_id": fill_id,
-                "external_order_id": external_order_id,
-                "external_fill_id": external_fill_id,
-                "binding_id": binding.binding_id,
-                "environment": ENV_LIVE,
-                "instrument_id": instrument_id,
-                "side": side,
-                "quantity": quantity,
-                "price_minor_units": fill_price_minor_units,
-                "fee_minor_units": fee_minor_units,
-            },
-            recorded_at_ns=now,
-        )
-        writer.verify()
         return {
             "order_id": order_id,
             "binding_id": binding.binding_id,

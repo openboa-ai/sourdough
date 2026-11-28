@@ -16,9 +16,8 @@ from uuid import uuid4
 
 from .company import _connect, _identity
 from .duty_run import (
-    DutyClaim,
     DutyRefused,
-    WorkRunClaim,
+    ExecutionClaim,
     employment_cutoff,
     resolve_run,
 )
@@ -507,9 +506,7 @@ def ensure_private_desk(
     )
 
 
-def require_desk(
-    database: Connection, claim: DutyClaim | WorkRunClaim, purpose: str
-) -> str:
+def require_desk(database: Connection, claim: ExecutionClaim, purpose: str) -> str:
     authority = resolve_run(database, claim)
     authority.require_current(purpose)
     if authority.duty_state != "running":
@@ -548,7 +545,7 @@ def draft_at_revision(
 
 def resolve_desk(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     *,
     include_drafts: bool = False,
@@ -580,7 +577,7 @@ def resolve_desk(
 
 def save_draft(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     *,
     name: str,
@@ -654,7 +651,7 @@ def save_draft(
 
 def delete_draft(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     *,
     name: str,

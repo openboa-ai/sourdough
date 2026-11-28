@@ -7,7 +7,7 @@ from sqlite3 import Connection
 
 from .agent_desk import require_desk
 from .company import _connect
-from .duty_run import DutyClaim, DutyRefused, WorkRunClaim
+from .duty_run import DutyRefused, ExecutionClaim
 from .writer_lease import WriterLease
 
 
@@ -68,7 +68,7 @@ def _check_reference(value: str) -> None:
 
 def read_inbox(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     after: str,
     *,
@@ -123,7 +123,7 @@ def read_inbox(
 
 def acknowledge_delivery(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     delivery_id: str,
     *,

@@ -15,6 +15,7 @@ from .company_assets import enroll_project_participant
 from .duty_run import (
     DutyClaim,
     DutyRefused,
+    ExecutionClaim,
     has_turn_capacity,
     resolve_run,
     start_run,
@@ -330,7 +331,7 @@ def claim_hired_first(
         )
 
 
-def _desk(connection: Connection, claim: DutyClaim) -> dict:
+def _desk(connection: Connection, claim: ExecutionClaim) -> dict:
     authority = resolve_run(connection, claim)
     row = connection.execute(
         """SELECT o.purpose, desk.manifest_revision, c.charter_revision,
@@ -360,7 +361,7 @@ def _desk(connection: Connection, claim: DutyClaim) -> dict:
     return snapshot | {"revision": revision}
 
 
-def read_first_duty(writer: WriterLease, claim: DutyClaim) -> dict:
+def read_first_duty(writer: WriterLease, claim: ExecutionClaim) -> dict:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -373,7 +374,7 @@ def read_first_duty(writer: WriterLease, claim: DutyClaim) -> dict:
 
 
 def accept_first_duty(
-    writer: WriterLease, claim: DutyClaim, revision: str, rationale: str
+    writer: WriterLease, claim: ExecutionClaim, revision: str, rationale: str
 ) -> str:
     if not isinstance(rationale, str) or not 0 < len(rationale.strip()) <= 2000:
         raise DutyRefused("First duty acceptance requires a reason")
@@ -411,7 +412,7 @@ def accept_first_duty(
     return claim.duty_id
 
 
-def first_duty_accepted(writer: WriterLease, claim: DutyClaim) -> bool:
+def first_duty_accepted(writer: WriterLease, claim: ExecutionClaim) -> bool:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as connection:
         connection.execute("BEGIN")
@@ -419,7 +420,7 @@ def first_duty_accepted(writer: WriterLease, claim: DutyClaim) -> bool:
         return has_hired_acceptance(connection, claim)
 
 
-def is_hired_first_duty(connection: Connection, claim: DutyClaim) -> bool:
+def is_hired_first_duty(connection: Connection, claim: ExecutionClaim) -> bool:
     if not connection.execute(
         "SELECT 1 FROM sqlite_schema WHERE name = 'hire_onboarding' AND type = 'table'"
     ).fetchone():
@@ -433,7 +434,7 @@ def is_hired_first_duty(connection: Connection, claim: DutyClaim) -> bool:
     )
 
 
-def has_hired_acceptance(connection: Connection, claim: DutyClaim) -> bool:
+def has_hired_acceptance(connection: Connection, claim: ExecutionClaim) -> bool:
     return is_hired_first_duty(connection, claim) and (
         connection.execute(
             """SELECT 1 FROM onboarding_acceptance accepted
@@ -450,7 +451,7 @@ def has_hired_acceptance(connection: Connection, claim: DutyClaim) -> bool:
 
 
 def invoke_onboarding(
-    writer: WriterLease, claim: DutyClaim, name: str, arguments: dict
+    writer: WriterLease, claim: ExecutionClaim, name: str, arguments: dict
 ) -> dict:
     if name == "read_first_duty" and arguments == {}:
         return read_first_duty(writer, claim)

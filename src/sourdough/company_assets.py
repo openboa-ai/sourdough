@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from .agent_desk import draft_at_revision, require_desk
 from .company import _connect
-from .duty_run import ASSESSMENT_REVIEW, DutyClaim, DutyRefused, WorkRunClaim
+from .duty_run import ASSESSMENT_REVIEW, DutyRefused, ExecutionClaim
 from .runtime.work_kernel import (
     has_project_peer_policy,
     list_project_peer_responders,
@@ -360,7 +360,7 @@ def seal_project_review(
 
 
 def project_review_instruction(
-    writer: WriterLease, claim: DutyClaim | WorkRunClaim
+    writer: WriterLease, claim: ExecutionClaim
 ) -> str | None:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
@@ -451,7 +451,7 @@ class PublicationReceipt:
 
 def discover_project_references(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     after: str,
 ) -> tuple[tuple[SharedAssetReference, ...], tuple[PublicationReceipt, ...], str]:
@@ -499,7 +499,7 @@ def discover_project_references(
 
 def project_access(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
 ) -> tuple[ProjectAccess, ...]:
     writer.verify_for(writer.store, claim.company_id)
@@ -526,7 +526,7 @@ def project_access(
 
 def publish_selection(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     selection: Selection,
 ) -> SharedAsset:
@@ -615,7 +615,7 @@ def publish_selection(
 
 def read_shared_asset(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     asset_id: str,
 ) -> SharedAsset:

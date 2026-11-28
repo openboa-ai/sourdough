@@ -2,7 +2,7 @@
 
 from dataclasses import asdict, dataclass
 
-from .duty_run import DutyClaim, DutyRefused
+from .duty_run import DutyRefused, ExecutionClaim
 from .staffing import (
     HireCommitment,
     HireRequest,
@@ -18,7 +18,7 @@ from .writer_lease import WriterLease
 @dataclass(frozen=True)
 class StaffingTools:
     writer: WriterLease
-    claim: DutyClaim
+    claim: ExecutionClaim
 
     def invoke(self, name: str, arguments: dict) -> dict:
         if not isinstance(arguments, dict):

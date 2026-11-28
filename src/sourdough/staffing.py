@@ -14,6 +14,7 @@ from .runtime.work_kernel import sync_duty_terminal
 from .duty_run import (
     DutyClaim,
     DutyRefused,
+    ExecutionClaim,
     RunAuthority,
     has_turn_capacity,
     resolve_run,
@@ -209,7 +210,7 @@ def claim_staffing(
 
 
 def _staffing_run(
-    connection: Connection, claim: DutyClaim
+    connection: Connection, claim: ExecutionClaim
 ) -> tuple[str, str, RunAuthority]:
     grant = resolve_run(connection, claim)
     row = connection.execute(
@@ -228,7 +229,7 @@ def _staffing_run(
     return body, revision, grant
 
 
-def _assignment(connection: Connection, claim: DutyClaim) -> tuple[str, str]:
+def _assignment(connection: Connection, claim: ExecutionClaim) -> tuple[str, str]:
     body, revision, grant = _staffing_run(connection, claim)
     grant.require_current(STAFFING_REVIEW)
     if grant.duty_state != "running":
@@ -236,7 +237,7 @@ def _assignment(connection: Connection, claim: DutyClaim) -> tuple[str, str]:
     return body, revision
 
 
-def read_need(writer: WriterLease, claim: DutyClaim) -> dict:
+def read_need(writer: WriterLease, claim: ExecutionClaim) -> dict:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -301,7 +302,9 @@ class StaffingChoice:
             raise DutyRefused("Invalid staffing choice or review condition")
 
 
-def record_choice(writer: WriterLease, claim: DutyClaim, choice: StaffingChoice) -> str:
+def record_choice(
+    writer: WriterLease, claim: ExecutionClaim, choice: StaffingChoice
+) -> str:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -309,7 +312,7 @@ def record_choice(writer: WriterLease, claim: DutyClaim, choice: StaffingChoice)
 
 
 def _record_choice(
-    connection: Connection, claim: DutyClaim, choice: StaffingChoice
+    connection: Connection, claim: ExecutionClaim, choice: StaffingChoice
 ) -> str:
     evidence, _, authority = _staffing_run(connection, claim)
     observed = connection.execute(
@@ -344,7 +347,7 @@ def _record_choice(
 
 
 def _schedule_staffing_review(
-    connection: Connection, claim: DutyClaim, evidence: str, due_at: int
+    connection: Connection, claim: ExecutionClaim, evidence: str, due_at: int
 ) -> None:
     successor = uuid4().hex
     carried = _canonical(json.loads(evidence) | {"duty_id": successor})
@@ -424,7 +427,7 @@ class StaffingOutcome:
 
 
 def read_staffing_outcome(
-    writer: WriterLease, claim: DutyClaim
+    writer: WriterLease, claim: ExecutionClaim
 ) -> StaffingOutcome | None:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as connection:
@@ -451,7 +454,7 @@ def read_staffing_outcome(
 
 
 def admit_hire(
-    writer: WriterLease, claim: DutyClaim, request: HireRequest
+    writer: WriterLease, claim: ExecutionClaim, request: HireRequest
 ) -> HireReceipt:
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as connection, connection:
@@ -460,7 +463,7 @@ def admit_hire(
 
 
 def _admit_hire(
-    connection: Connection, claim: DutyClaim, request: HireRequest
+    connection: Connection, claim: ExecutionClaim, request: HireRequest
 ) -> HireReceipt:
     _staffing_run(connection, claim)
     choice = connection.execute(
@@ -541,7 +544,7 @@ class HireCommitment:
 
 def submit_staffing_decision(
     writer: WriterLease,
-    claim: DutyClaim,
+    claim: ExecutionClaim,
     choice: StaffingChoice,
     commitment: HireCommitment | None,
 ) -> tuple[str, HireReceipt | None]:

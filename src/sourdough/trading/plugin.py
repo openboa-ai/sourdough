@@ -60,7 +60,7 @@ from .company_tools import (
     read_trading_books_summary,
 )
 from .domain import ENV_EXTERNAL_TEST, ENV_LIVE, ENV_PAPER, ExecutionTierRefused
-from .duty import TRADING_WORK_POLICY, has_trading_committed_result
+from .policy import TRADING_WORK_POLICY, has_trading_committed_result
 from .external_venue import ExternalVenueAdapter
 from .migration import execute_paper_to_live_migration, read_execution_tiers_snapshot
 from .projections import (
