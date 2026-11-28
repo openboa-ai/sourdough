@@ -1,0 +1,103 @@
+import type { AuditEventItem, RestrictionItem } from "./common";
+
+export interface SystemSafetyProjection {
+  projection: string;
+  company_id: string;
+  charter_revision: string;
+  as_of_ns: number;
+  event_seq: number;
+  checkpoints: Array<{
+    archive_name: string;
+    size_bytes: number;
+    modified_ns: number;
+  }>;
+  restore_receipts: Array<{
+    request_revision: string;
+    checkpoint_sha256: string;
+    watermark: Record<string, unknown>;
+    restored_at_ns: number;
+  }>;
+  store_retired: {
+    request_revision: string;
+    replacement_sha256: string;
+    retired_at_ns: number;
+  } | null;
+  safe_custody_hold: Array<{
+    id: string;
+    label: string;
+    status: "done" | "active" | "pending";
+  }>;
+  active_restrictions: RestrictionItem[];
+}
+
+export interface SystemEvalsProjection {
+  projection: string;
+  company_id: string;
+  as_of_ns: number;
+  event_seq: number;
+  qualifications: Array<{
+    receipt_id: string;
+    candidate_asset_id: string;
+    baseline_asset_id: string | null;
+    parent_asset_id: string | null;
+    passed: boolean;
+    trial_count: number;
+    recorded_at_ns: number;
+  }>;
+  activations: Array<{
+    request_id: string;
+    operation: string;
+    candidate_id: string;
+    qualification_id: string;
+    parent_asset_id: string | null;
+    revision: number;
+    quarantined: boolean;
+    quarantine_reason: string | null;
+    recorded_at_ns: number;
+    blast_radius_descendants: string[];
+    fallback_candidate_id: string | null;
+  }>;
+  offline_evaluator: {
+    connected: boolean;
+    isolated_notice: string;
+    suites: Array<{
+      revision: string;
+      sealed_at_ns: number;
+      observation_count: number;
+      grade_count: number;
+      pairwise_grade_count: number;
+    }>;
+  };
+}
+
+export interface SystemAuditProjection {
+  projection: string;
+  company_id: string;
+  as_of_ns: number;
+  event_seq: number;
+  events: AuditEventItem[];
+  conditions: Array<{
+    condition_id: string;
+    owner_agent_id: string;
+    trigger_kind: string;
+    due_at_ns: number | null;
+    source_identity: string | null;
+    status: string;
+  }>;
+  active_fences: Array<{
+    run_id: string;
+    agent_id: string;
+    duty_kind: string;
+    status: string;
+    fencing_token: number;
+    lease_owner: string | null;
+    lease_expires_at_ns: number | null;
+  }>;
+  board_bindings: Array<{
+    principal_id: string;
+    role_name: string;
+    scope_ref: string;
+    binding_revision: number;
+    active: boolean;
+  }>;
+}

@@ -28,13 +28,6 @@ import {
   type Tone,
 } from "@openboa/yogurt";
 import { normalizeAvatarVariant } from "../api/avatar";
-import {
-  fetchProjection,
-  formatMinorCurrency,
-  formatNsClock,
-  formatRelativeNs,
-  newCommandId,
-} from "../api/client";
 import type {
   AgentsGraphProjection,
   ApprovalsProjection,
@@ -47,7 +40,19 @@ import type {
   StrategiesProjection,
   SystemAuditProjection,
 } from "../api/types";
-import { useApp } from "../state/store";
+import { useProjection } from "../api/useProjection";
+import {
+  formatMinorCurrency,
+  formatNsClock,
+  formatRelativeNs,
+  newCommandId,
+} from "../lib/format";
+import {
+  useControlPlane,
+  useOutbox,
+  usePreferences,
+  useRouter,
+} from "../state/store";
 
 interface ContextResolution {
   statusLabel: string;
@@ -55,6 +60,13 @@ interface ContextResolution {
   detail: string;
   resolvedAgentId?: string | null;
 }
+
+const DEFAULT_CONTEXT_RESOLUTION: ContextResolution = {
+  statusLabel: "Advisory ref",
+  statusTone: "neutral",
+  detail: "Advisory context only · No actions execute from chat",
+  resolvedAgentId: null,
+};
 
 function formatMessageCount(count: number): string {
   return `${count} ${count === 1 ? "message" : "messages"}`;
@@ -134,23 +146,45 @@ function statusToneForApproval(state: string): Tone {
   return "brand";
 }
 
-async function resolveLiveContextState(
+function contextProjectionPathFor(ctx: ContextRef | null): string | null {
+  if (!ctx || ctx.kind === "company") return null;
+  switch (ctx.kind) {
+    case "trading_order":
+      return `orders/${encodeURIComponent(ctx.id)}`;
+    case "agent":
+      return "agents-graph";
+    case "decision_question":
+      return "approvals";
+    case "shared_publication":
+      return "org";
+    case "strategy_release":
+    case "challenger_trial":
+    case "strategy_trial":
+      return "strategies";
+    case "restriction":
+    case "restriction_cause":
+      return "restrictions";
+    case "work_run":
+    case "audit_event":
+      return "system-audit";
+    case "account_balance":
+      return "finance";
+    default:
+      return null;
+  }
+}
+
+function resolveContextFromProjection(
   ctx: ContextRef,
-  signal?: AbortSignal
-): Promise<ContextResolution> {
-  const fallback: ContextResolution = {
-    statusLabel: "Advisory ref",
-    statusTone: "neutral",
-    detail: "Advisory context only · No actions execute from chat",
-  };
+  projectionData: unknown
+): ContextResolution {
+  if (!projectionData || typeof projectionData !== "object") {
+    return DEFAULT_CONTEXT_RESOLUTION;
+  }
 
   if (ctx.kind === "trading_order") {
-    const res = await fetchProjection<OrderTraceProjection>(
-      `orders/${encodeURIComponent(ctx.id)}`,
-      { signal }
-    );
-    const order = res.data?.order;
-    if (!order) return fallback;
+    const order = (projectionData as Partial<OrderTraceProjection>).order;
+    if (!order) return DEFAULT_CONTEXT_RESOLUTION;
     return {
       statusLabel: order.status,
       statusTone: statusToneForOrder(order.status),
@@ -159,9 +193,10 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "agent") {
-    const res = await fetchProjection<AgentsGraphProjection>("agents-graph", { signal });
-    const node = res.data?.nodes.find((n) => n.agent_id === ctx.id);
-    if (!node) return fallback;
+    const node = (projectionData as Partial<AgentsGraphProjection>).nodes?.find(
+      (n) => n.agent_id === ctx.id
+    );
+    if (!node) return DEFAULT_CONTEXT_RESOLUTION;
     const tone: Tone = node.archived
       ? "neutral"
       : node.live_status === "working" || node.live_status === "running"
@@ -175,11 +210,11 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "decision_question") {
-    const res = await fetchProjection<ApprovalsProjection>("approvals", { signal });
+    const proj = projectionData as Partial<ApprovalsProjection>;
     const item =
-      res.data?.pending.find((q) => q.question_id === ctx.id) ??
-      res.data?.history.find((q) => q.question_id === ctx.id);
-    if (!item) return fallback;
+      proj.pending?.find((q) => q.question_id === ctx.id) ??
+      proj.history?.find((q) => q.question_id === ctx.id);
+    if (!item) return DEFAULT_CONTEXT_RESOLUTION;
     return {
       statusLabel: item.state,
       statusTone: statusToneForApproval(item.state),
@@ -188,9 +223,10 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "shared_publication") {
-    const res = await fetchProjection<OrgProjection>("org", { signal });
-    const pub = res.data?.publications.find((p) => p.asset_id === ctx.id);
-    if (!pub) return fallback;
+    const pub = (projectionData as Partial<OrgProjection>).publications?.find(
+      (p) => p.asset_id === ctx.id
+    );
+    if (!pub) return DEFAULT_CONTEXT_RESOLUTION;
     return {
       statusLabel: "Published",
       statusTone: "success",
@@ -199,10 +235,10 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "strategy_release") {
-    const res = await fetchProjection<StrategiesProjection>("strategies", { signal });
-    const rel = res.data?.releases.find((r) => r.release_id === ctx.id);
-    if (!rel) return fallback;
-    const isActive = res.data?.active_deployment?.release_id === ctx.id;
+    const proj = projectionData as Partial<StrategiesProjection>;
+    const rel = proj.releases?.find((r) => r.release_id === ctx.id);
+    if (!rel) return DEFAULT_CONTEXT_RESOLUTION;
+    const isActive = proj.active_deployment?.release_id === ctx.id;
     return {
       statusLabel: isActive ? "Active" : "Registered",
       statusTone: isActive ? "brand" : "neutral",
@@ -211,9 +247,10 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "challenger_trial" || ctx.kind === "strategy_trial") {
-    const res = await fetchProjection<StrategiesProjection>("strategies", { signal });
-    const trial = res.data?.trials.find((t) => t.comparison_id === ctx.id);
-    if (!trial) return fallback;
+    const trial = (projectionData as Partial<StrategiesProjection>).trials?.find(
+      (t) => t.comparison_id === ctx.id
+    );
+    if (!trial) return DEFAULT_CONTEXT_RESOLUTION;
     const label = trial.verdict ?? trial.status;
     const tone: Tone =
       trial.verdict === "PROMOTE"
@@ -229,11 +266,11 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "restriction" || ctx.kind === "restriction_cause") {
-    const res = await fetchProjection<RestrictionsProjection>("restrictions", { signal });
+    const proj = projectionData as Partial<RestrictionsProjection>;
     const item =
-      res.data?.active_causes.find((r) => r.restriction_id === ctx.id) ??
-      res.data?.history.find((r) => r.restriction_id === ctx.id);
-    if (!item) return fallback;
+      proj.active_causes?.find((r) => r.restriction_id === ctx.id) ??
+      proj.history?.find((r) => r.restriction_id === ctx.id);
+    if (!item) return DEFAULT_CONTEXT_RESOLUTION;
     return {
       statusLabel: item.active ? "Active" : "Cleared",
       statusTone: item.active ? "warning" : "success",
@@ -242,9 +279,10 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "work_run") {
-    const res = await fetchProjection<SystemAuditProjection>("system-audit", { signal });
-    const fence = res.data?.active_fences.find((f) => f.run_id === ctx.id);
-    if (!fence) return fallback;
+    const fence = (projectionData as Partial<SystemAuditProjection>).active_fences?.find(
+      (f) => f.run_id === ctx.id
+    );
+    if (!fence) return DEFAULT_CONTEXT_RESOLUTION;
     return {
       statusLabel: fence.status,
       statusTone: fence.status === "running" ? "brand" : "neutral",
@@ -254,9 +292,10 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "account_balance") {
-    const res = await fetchProjection<FinanceProjection>("finance", { signal });
-    const bal = res.data?.account_balances.find((a) => a.account === ctx.id);
-    if (!bal) return fallback;
+    const bal = (projectionData as Partial<FinanceProjection>).account_balances?.find(
+      (a) => a.account === ctx.id
+    );
+    if (!bal) return DEFAULT_CONTEXT_RESOLUTION;
     return {
       statusLabel: "Tracked",
       statusTone: "neutral",
@@ -265,11 +304,10 @@ async function resolveLiveContextState(
   }
 
   if (ctx.kind === "audit_event") {
-    const res = await fetchProjection<SystemAuditProjection>("system-audit", { signal });
-    const ev = res.data?.events.find(
+    const ev = (projectionData as Partial<SystemAuditProjection>).events?.find(
       (e) => String(e.event_seq) === ctx.id || e.entity_id === ctx.id
     );
-    if (!ev) return fallback;
+    if (!ev) return DEFAULT_CONTEXT_RESOLUTION;
     return {
       statusLabel: ev.event_type,
       statusTone: "neutral",
@@ -277,7 +315,7 @@ async function resolveLiveContextState(
     };
   }
 
-  return fallback;
+  return DEFAULT_CONTEXT_RESOLUTION;
 }
 
 export function MessagesView() {
@@ -285,25 +323,26 @@ export function MessagesView() {
     routePathname,
     routeSearchParams,
     navigate,
-    refreshSeq,
-    meta,
-    linkState,
-    hostLocked,
-    canWrite,
-    outbox,
     pendingAskContext,
     setPendingAskContext,
     askCeo,
-    unreadCeoReply,
-    markMessagesVisited,
-    dispatchCommand,
-    reportApiError,
-  } = useApp();
+  } = useRouter();
+  const { meta, linkState, unreadCeoReply, markMessagesVisited } = useControlPlane();
+  const { hostLocked } = usePreferences();
+  const { canWrite, outbox, dispatchCommand } = useOutbox();
 
-  const [data, setData] = useState<MessagesProjection | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [retrySeq, setRetrySeq] = useState(0);
+  const { data, loading, error, refetch } = useProjection<MessagesProjection>("messages");
+
+  const contextProjectionPath = useMemo(
+    () => contextProjectionPathFor(pendingAskContext),
+    [pendingAskContext]
+  );
+  const {
+    data: ctxProjectionData,
+    loading: ctxLoading,
+    error: ctxError,
+  } = useProjection<unknown>(contextProjectionPath);
+
   const [selectedChannel, setSelectedChannel] = useState<string>(
     () => routeSearchParams.get("channel") || "ceo-direct"
   );
@@ -312,11 +351,6 @@ export function MessagesView() {
   const [unreadChannelIds, setUnreadChannelIds] = useState<Set<string>>(() => new Set());
   const [liveChannelActivityNs, setLiveChannelActivityNs] = useState<Record<string, number>>({});
   const [freshMessageIds, setFreshMessageIds] = useState<Set<string>>(() => new Set());
-  const [ctxState, setCtxState] = useState<ContextResolution>({
-    statusLabel: "Advisory ref",
-    statusTone: "neutral",
-    detail: "Advisory context only · No actions execute from chat",
-  });
 
   const selectedChannelRef = useRef(selectedChannel);
   selectedChannelRef.current = selectedChannel;
@@ -355,92 +389,71 @@ export function MessagesView() {
   }, []);
 
   useEffect(() => {
-    const controller = new AbortController();
-    let active = true;
-    void (async () => {
-      try {
-        const res = await fetchProjection<MessagesProjection>("messages", {
-          signal: controller.signal,
-        });
-        if (!active || controller.signal.aborted) return;
-        if (res.data) {
-          const nextData = res.data;
-          setData(nextData);
+    if (!data) {
+      prevChannelCountsRef.current = null;
+      seenMessageIdsRef.current = null;
+      return;
+    }
 
-          const nextCounts = new Map<string, number>();
-          const bumpedChannels: string[] = [];
-          for (const ch of nextData.internal_channels) {
-            nextCounts.set(ch.channel_id, ch.message_count);
-            if (prevChannelCountsRef.current !== null) {
-              const prevCount = prevChannelCountsRef.current.get(ch.channel_id) ?? 0;
-              if (ch.message_count > prevCount) {
-                bumpedChannels.push(ch.channel_id);
-              }
-            }
-          }
-          if (bumpedChannels.length > 0) {
-            setLiveChannelActivityNs((prev) => {
-              const updated = { ...prev };
-              for (const id of bumpedChannels) {
-                updated[id] = nextData.as_of_ns;
-              }
-              return updated;
-            });
-            setUnreadChannelIds((prev) => {
-              const next = new Set(prev);
-              for (const id of bumpedChannels) {
-                if (id !== selectedChannelRef.current) {
-                  next.add(id);
-                }
-              }
-              return next;
-            });
-          }
-          prevChannelCountsRef.current = nextCounts;
-
-          const allMsgKeys = new Set<string>();
-          for (const m of nextData.ceo_thread.messages) {
-            allMsgKeys.add(`ceo:${m.message_id}`);
-          }
-          for (const ch of nextData.internal_channels) {
-            for (const m of ch.messages) {
-              allMsgKeys.add(`${ch.channel_id}:${m.message_id}`);
-            }
-          }
-          if (seenMessageIdsRef.current !== null) {
-            const newlyArrived = new Set<string>();
-            for (const key of allMsgKeys) {
-              if (!seenMessageIdsRef.current.has(key)) {
-                newlyArrived.add(key);
-              }
-            }
-            if (newlyArrived.size > 0) {
-              setFreshMessageIds(newlyArrived);
-              if (freshTimerRef.current !== null) {
-                window.clearTimeout(freshTimerRef.current);
-              }
-              freshTimerRef.current = window.setTimeout(() => {
-                setFreshMessageIds(new Set());
-              }, 380);
-            }
-          }
-          seenMessageIdsRef.current = allMsgKeys;
+    const nextCounts = new Map<string, number>();
+    const bumpedChannels: string[] = [];
+    for (const ch of data.internal_channels) {
+      nextCounts.set(ch.channel_id, ch.message_count);
+      if (prevChannelCountsRef.current !== null) {
+        const prevCount = prevChannelCountsRef.current.get(ch.channel_id) ?? 0;
+        if (ch.message_count > prevCount) {
+          bumpedChannels.push(ch.channel_id);
         }
-        setError(null);
-      } catch (err) {
-        if (!active || controller.signal.aborted) return;
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        reportApiError(err);
-        setError(err instanceof Error ? err.message : "Could not load message channels.");
-      } finally {
-        if (active && !controller.signal.aborted) setLoading(false);
       }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [refreshSeq, retrySeq, reportApiError]);
+    }
+    if (bumpedChannels.length > 0) {
+      setLiveChannelActivityNs((prev) => {
+        const updated = { ...prev };
+        for (const id of bumpedChannels) {
+          updated[id] = data.as_of_ns;
+        }
+        return updated;
+      });
+      setUnreadChannelIds((prev) => {
+        const next = new Set(prev);
+        for (const id of bumpedChannels) {
+          if (id !== selectedChannelRef.current) {
+            next.add(id);
+          }
+        }
+        return next;
+      });
+    }
+    prevChannelCountsRef.current = nextCounts;
+
+    const allMsgKeys = new Set<string>();
+    for (const m of data.ceo_thread.messages) {
+      allMsgKeys.add(`ceo:${m.message_id}`);
+    }
+    for (const ch of data.internal_channels) {
+      for (const m of ch.messages) {
+        allMsgKeys.add(`${ch.channel_id}:${m.message_id}`);
+      }
+    }
+    if (seenMessageIdsRef.current !== null) {
+      const newlyArrived = new Set<string>();
+      for (const key of allMsgKeys) {
+        if (!seenMessageIdsRef.current.has(key)) {
+          newlyArrived.add(key);
+        }
+      }
+      if (newlyArrived.size > 0) {
+        setFreshMessageIds(newlyArrived);
+        if (freshTimerRef.current !== null) {
+          window.clearTimeout(freshTimerRef.current);
+        }
+        freshTimerRef.current = window.setTimeout(() => {
+          setFreshMessageIds(new Set());
+        }, 380);
+      }
+    }
+    seenMessageIdsRef.current = allMsgKeys;
+  }, [data]);
 
   const activeInternal = useMemo(
     () => data?.internal_channels.find((ch) => ch.channel_id === selectedChannel),
@@ -454,58 +467,36 @@ export function MessagesView() {
     }
   }, [data, isCeoThread, markMessagesVisited]);
 
-  useEffect(() => {
-    if (!pendingAskContext || pendingAskContext.kind !== "company") return;
-    if (!meta) {
-      setCtxState({
+  const ctxState = useMemo<ContextResolution>(() => {
+    if (!pendingAskContext) return DEFAULT_CONTEXT_RESOLUTION;
+    if (pendingAskContext.kind === "company") {
+      if (!meta) return DEFAULT_CONTEXT_RESOLUTION;
+      return {
+        statusLabel: meta.active_restrictions_count > 0 ? "Restricted" : "Operational",
+        statusTone: meta.active_restrictions_count > 0 ? "warning" : "success",
+        detail: `Company ${meta.company_id} · Charter ${meta.charter_revision} · ${meta.pending_approvals_count} pending approvals`,
+        resolvedAgentId: null,
+      };
+    }
+    if (!contextProjectionPath) return DEFAULT_CONTEXT_RESOLUTION;
+    if (ctxError) {
+      return {
         statusLabel: "Advisory ref",
+        statusTone: "neutral",
+        detail: "Live status unavailable; advisory reference preserved.",
+        resolvedAgentId: null,
+      };
+    }
+    if (ctxLoading && !ctxProjectionData) {
+      return {
+        statusLabel: "Checking",
         statusTone: "neutral",
         detail: "Advisory context only · No actions execute from chat",
         resolvedAgentId: null,
-      });
-      return;
+      };
     }
-    setCtxState({
-      statusLabel: meta.active_restrictions_count > 0 ? "Restricted" : "Operational",
-      statusTone: meta.active_restrictions_count > 0 ? "warning" : "success",
-      detail: `Company ${meta.company_id} · Charter ${meta.charter_revision} · ${meta.pending_approvals_count} pending approvals`,
-      resolvedAgentId: null,
-    });
-  }, [pendingAskContext, meta]);
-
-  useEffect(() => {
-    if (!pendingAskContext || pendingAskContext.kind === "company") return;
-    const controller = new AbortController();
-    let active = true;
-    setCtxState({
-      statusLabel: "Checking",
-      statusTone: "neutral",
-      detail: "Advisory context only · No actions execute from chat",
-      resolvedAgentId: null,
-    });
-    void (async () => {
-      try {
-        const resolved = await resolveLiveContextState(pendingAskContext, controller.signal);
-        if (active && !controller.signal.aborted) {
-          setCtxState(resolved);
-        }
-      } catch (err) {
-        if (!active || controller.signal.aborted) return;
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        reportApiError(err);
-        setCtxState({
-          statusLabel: "Advisory ref",
-          statusTone: "neutral",
-          detail: "Live status unavailable; advisory reference preserved.",
-          resolvedAgentId: null,
-        });
-      }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [pendingAskContext, refreshSeq, reportApiError]);
+    return resolveContextFromProjection(pendingAskContext, ctxProjectionData);
+  }, [pendingAskContext, meta, contextProjectionPath, ctxError, ctxLoading, ctxProjectionData]);
 
   const selectChannel = useCallback(
     (channelId: string) => {
@@ -559,15 +550,7 @@ export function MessagesView() {
       <Result
         title="Company Messages unavailable"
         action={
-          <Button
-            emphasis="soft"
-            shape="pill"
-            onClick={() => {
-              setLoading(true);
-              setError(null);
-              setRetrySeq((n) => n + 1);
-            }}
-          >
+          <Button emphasis="soft" shape="pill" onClick={refetch}>
             Retry
           </Button>
         }
@@ -828,7 +811,10 @@ export function MessagesView() {
               </div>
 
               {sendingCeo ? (
-                <ThinkingIndicator active label={`Delivering advisory message to ${ceoDisplayName}`} />
+                <ThinkingIndicator
+                  active
+                  label={`Delivering advisory message to ${ceoDisplayName}`}
+                />
               ) : null}
 
               {pendingAskContext ? (

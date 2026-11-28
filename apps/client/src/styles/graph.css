@@ -347,51 +347,6 @@
     margin: 0;
   }
 
-  .sd-agent-talks,
-  .sd-agent-talks .yg-transcript,
-  .sd-agent-talks .yg-scroll {
-    min-inline-size: 0;
-    inline-size: 100%;
-    max-inline-size: 100%;
-  }
-
-  .sd-agent-talks .yg-scroll {
-    max-block-size: min(560px, 52dvh);
-    padding-inline-end: var(--boa-space-4);
-  }
-
-  .sd-agent-talks .yg-message[data-variant="sent"] .yg-message-body {
-    inline-size: 100%;
-    max-inline-size: 100%;
-    min-inline-size: 0;
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .sd-agent-talks .yg-message[data-variant="sent"] .yg-message-content {
-    max-inline-size: 100%;
-    min-inline-size: 0;
-    overflow-wrap: anywhere;
-  }
-
-  .sd-agent-talks .yg-message-content .yg-stack,
-  .sd-agent-talks .yg-message-content .yg-inline,
-  .sd-agent-talks .yg-message-content .yg-button {
-    max-inline-size: 100%;
-    min-inline-size: 0;
-  }
-
-  .sd-agent-talks .yg-message .yg-badge {
-    display: block;
-    width: fit-content;
-    max-inline-size: 100%;
-    text-align: start;
-    line-height: 18px;
-  }
-
-  .sd-agent-talks .yg-message-content p {
-    margin-block: 0;
-  }
-
   @container sd-graph (width < 1020px) {
     .sd-graph-row,
     .sd-graph-row[data-cluster-cols="2"],
