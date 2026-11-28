@@ -511,6 +511,40 @@ class ShiftRunner:
             limits=PRODUCTION_DESK_LIMITS,
         )
 
+        with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
+            prior_tool_names = {
+                str(r[0])
+                for r in db.execute(
+                    """SELECT DISTINCT t.tool_name
+                       FROM tool_call_receipt t
+                       JOIN work_runs wr
+                         ON wr.company_id = t.company_id AND wr.run_id = t.run_id
+                       WHERE t.company_id = ?
+                         AND wr.work_item_id = ?
+                         AND t.run_id != ?""",
+                    (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
+                ).fetchall()
+            }
+            prior_receipt_rows = db.execute(
+                """SELECT t.run_id, t.call_id, t.tool_name, t.arg_digest,
+                          t.status, t.result_digest, t.result_json,
+                          t.offloaded_log_path, t.recorded_at_ns
+                   FROM tool_call_receipt t
+                   JOIN work_runs wr
+                     ON wr.company_id = t.company_id AND wr.run_id = t.run_id
+                   WHERE t.company_id = ?
+                     AND wr.work_item_id = ?
+                     AND t.run_id != ?
+                   ORDER BY t.recorded_at_ns DESC, t.call_id DESC
+                   LIMIT 32""",
+                (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
+            ).fetchall()
+
+        prior_had_peer_input = bool(prior_tool_names & _PEER_INPUT_TOOLS)
+        prior_had_private_desk = bool(prior_tool_names & _PRIVATE_DESK_READ_TOOLS)
+        effective_include_desk_tools = (
+            include_core_desk_tools and not prior_had_peer_input
+        )
         effective_base_names = (
             set(base_handlers)
             if allowed_tool_names is None
@@ -519,7 +553,7 @@ class ShiftRunner:
         has_peer_collab_tools = bool(
             effective_base_names & (_PEER_INPUT_TOOLS | _PEER_OUTBOUND_SINKS)
         )
-        desk_tools_permitted = include_core_desk_tools and (
+        desk_tools_permitted = effective_include_desk_tools and (
             allowed_tool_names is None
             or bool(allowed_tool_names & _PRIVATE_DESK_ALL_TOOLS)
         )
@@ -551,21 +585,8 @@ class ShiftRunner:
                 if hydrate_passive_private_context
                 else ()
             )
-            prior_receipt_rows = db.execute(
-                """SELECT t.run_id, t.call_id, t.tool_name, t.arg_digest,
-                          t.status, t.result_digest, t.result_json,
-                          t.offloaded_log_path, t.recorded_at_ns
-                   FROM tool_call_receipt t
-                   JOIN work_runs wr
-                     ON wr.company_id = t.company_id AND wr.run_id = t.run_id
-                   WHERE t.company_id = ?
-                     AND wr.work_item_id = ?
-                     AND t.run_id != ?
-                   ORDER BY t.recorded_at_ns DESC, t.call_id DESC
-                   LIMIT 32""",
-                (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
-            ).fetchall()
         prior_tool_receipts: list[dict[str, Any]] = []
+        prior_public_offloads: set[str] = set()
         for (
             r_run_id,
             r_call_id,
@@ -591,13 +612,15 @@ class ShiftRunner:
                 r_tool_name
             ) in _PRIVATE_RECEIPT_ERROR_TOOLS or str(r_tool_name).startswith("desk_")
             if r_offloaded_log_path is not None and (
-                include_core_desk_tools or not is_private_receipt
+                effective_include_desk_tools or not is_private_receipt
             ):
                 receipt_entry["offloaded_log_path"] = str(r_offloaded_log_path)
+                if str(r_tool_name) not in _PRIVATE_DESK_ALL_TOOLS:
+                    prior_public_offloads.add(str(r_offloaded_log_path))
             if (
                 isinstance(r_result_json, str)
                 and len(r_result_json) <= 1024
-                and (include_core_desk_tools or not is_private_receipt)
+                and (effective_include_desk_tools or not is_private_receipt)
             ):
                 try:
                     receipt_entry["result"] = json.loads(r_result_json)
@@ -635,7 +658,7 @@ class ShiftRunner:
                 ctx.work_item.duty_kind,
             )
         active_methods = _normalize_method_dicts(raw_active_methods)
-        if not include_core_desk_tools:
+        if not effective_include_desk_tools:
             active_methods = tuple(
                 m for m in active_methods if m.get("audience_scope") != "one_agent"
             )
@@ -673,7 +696,7 @@ class ShiftRunner:
         available_method_ids: list[str] = [
             m.method_id
             for m in all_agent_methods
-            if include_core_desk_tools or m.audience_scope != "one_agent"
+            if effective_include_desk_tools or m.audience_scope != "one_agent"
         ]
         for m in active_methods:
             mid = m.get("method_id")
@@ -709,13 +732,13 @@ class ShiftRunner:
         )
 
         eff_skill_tools = (
-            include_core_desk_tools
+            effective_include_desk_tools
             if include_core_skill_tools is None
-            else include_core_skill_tools
+            else (include_core_skill_tools and not prior_had_peer_input)
         )
-        public_offloaded_paths: set[str] = set()
+        public_offloaded_paths: set[str] = set(prior_public_offloads)
         contributions: list[ToolContribution] = []
-        if include_core_desk_tools:
+        if effective_include_desk_tools:
             contributions.append(
                 build_core_desk_tool_contribution(
                     writer=ctx.writer,
@@ -833,14 +856,11 @@ class ShiftRunner:
             bool(desk_manifest)
             or bool(recent_episodes)
             or any(m.get("audience_scope") == "one_agent" for m in active_methods)
-            or any(
-                str(r.get("tool_name")) in _PRIVATE_DESK_READ_TOOLS
-                for r in prior_tool_receipts
-            )
+            or prior_had_private_desk
         )
         flow_state = {
             "read_private_desk": has_hydrated_private_context,
-            "read_peer_input": False,
+            "read_peer_input": prior_had_peer_input,
         }
 
         def _wrap_handler(name: str, fn: ToolHandler, *, use_lock: bool) -> ToolHandler:
@@ -962,7 +982,11 @@ class ShiftRunner:
             budget_ceiling_minor_units=budget_ceiling,
             max_tool_calls=max_tool_calls,
             timeout_seconds=eff_timeout_seconds,
-            desk_path=desk if include_core_desk_tools else None,
+            desk_path=(
+                desk
+                if (effective_include_desk_tools and not has_peer_collab_tools)
+                else None
+            ),
             store_path=ctx.writer.store,
         )
         stable_prefix_sha256 = compute_stable_prefix_sha256(shift_req)

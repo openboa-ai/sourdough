@@ -35,6 +35,19 @@ from .protocol import (
 _SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 _ISOLATION_PROFILE = "sourdough-agent"
 _VALID_PROTOCOL_MODES = frozenset({"auto", "codex_mcp", "shim"})
+_PEER_COLLAB_TOOL_NAMES = frozenset(
+    {
+        "read_messages",
+        "read_inbox",
+        "discover_handoffs",
+        "read_shared_asset",
+        "append_message",
+        "request_peer_response",
+        "respond_peer_request",
+        "offer_handoff",
+        "decline_handoff",
+    }
+)
 
 
 def confinement_arguments() -> list[str]:
@@ -44,7 +57,7 @@ def confinement_arguments() -> list[str]:
         "-c",
         f"default_permissions={json.dumps(profile)}",
         "-c",
-        f'permissions.{profile}.filesystem={{":root"="deny",":minimal"="read",":workspace_roots"={{"."="read"}}}}',
+        f'permissions.{profile}.filesystem={{":root"="deny",":minimal"="read",":workspace_roots"={{"."="read",".desk"="deny"}}}}',
         "-c",
         f"permissions.{profile}.network.enabled=false",
         "-c",
@@ -288,7 +301,10 @@ class CodexCliAdapter:
             py_path = os.environ.get("PYTHONPATH", "").strip()
             if py_path:
                 env["PYTHONPATH"] = py_path
-            if request.desk_path is not None:
+            has_peer_collab_tools = any(
+                spec.name in _PEER_COLLAB_TOOL_NAMES for spec in request.tools
+            )
+            if request.desk_path is not None and not has_peer_collab_tools:
                 request.desk_path.mkdir(parents=True, exist_ok=True)
                 os.chmod(request.desk_path, 0o700)
                 cwd = str(request.desk_path)
@@ -396,18 +412,25 @@ class CodexCliAdapter:
                         raise AgentRuntimeRefused(
                             "local-macos sandbox backend is unavailable"
                         )
-                    if request.desk_path is None or request.store_path is None:
+                    if request.store_path is None:
                         raise AgentRuntimeRefused(
-                            "desk_path and store_path are required when use_macos_sandbox=True"
+                            "store_path is required when use_macos_sandbox=True"
                         )
                     from ..harness import build_desk_sandbox_profile
 
+                    sandbox_desk = (
+                        request.desk_path
+                        if (request.desk_path is not None and not has_peer_collab_tools)
+                        else None
+                    )
                     sbpl = build_desk_sandbox_profile(
                         request.store_path,
-                        request.desk_path,
+                        sandbox_desk,
                         broker_socket=sock_path,
+                        scratch_dir=sock_dir if sandbox_desk is None else None,
                         extra_read_paths=self._extra_read_paths,
                         extra_read_files=self._extra_read_files,
+                        allow_dotdesk_read=False,
                     )
                     command = [str(_SANDBOX_EXEC), "-p", sbpl, *command]
 

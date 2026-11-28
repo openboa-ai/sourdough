@@ -259,26 +259,31 @@ def _sbpl_quote(path: Path) -> str:
 
 def build_desk_sandbox_profile(
     store: Path,
-    desk_path: Path,
+    desk_path: Path | None,
     *,
     broker_socket: Path | None = None,
     scratch_dir: Path | None = None,
     extra_read_paths: tuple[Path, ...] = (),
     extra_read_files: tuple[Path, ...] = (),
     allow_process_fork: bool = True,
+    allow_dotdesk_read: bool = True,
 ) -> str:
-    """Generate a macOS Seatbelt (SBPL) profile isolating an Agent to its own Desk."""
+    """Generate a macOS Seatbelt (SBPL) profile isolating an Agent to its own Desk or scratch."""
     resolved_store = store.resolve(strict=False)
     resolved_parent = resolved_store.parent
-    resolved_desk = desk_path.resolve(strict=False)
     resolved_desks = desks_root(resolved_store).resolve(strict=False)
     resolved_traces = traces_root(resolved_store).resolve(strict=False)
-    try:
-        resolved_desk.relative_to(resolved_desks)
-    except ValueError as error:
-        raise DutyRefused(
-            "Agent Desk must reside under the company desks root"
-        ) from error
+    resolved_desk: Path | None = None
+    if desk_path is not None:
+        resolved_desk = desk_path.resolve(strict=False)
+        try:
+            resolved_desk.relative_to(resolved_desks)
+        except ValueError as error:
+            raise DutyRefused(
+                "Agent Desk must reside under the company desks root"
+            ) from error
+    elif scratch_dir is None:
+        raise DutyRefused("Sandbox profile requires either desk_path or scratch_dir")
 
     py_roots = sorted(
         {
@@ -290,7 +295,9 @@ def build_desk_sandbox_profile(
         }
     )
     read_subpaths = "\n".join(f"    (subpath {_sbpl_quote(Path(r))})" for r in py_roots)
-    rw_entries = [f"    (subpath {_sbpl_quote(resolved_desk)})"]
+    rw_entries: list[str] = []
+    if resolved_desk is not None:
+        rw_entries.append(f"    (subpath {_sbpl_quote(resolved_desk)})")
     resolved_scratch: Path | None = None
     if scratch_dir is not None:
         resolved_scratch = scratch_dir.resolve(strict=False)
@@ -318,18 +325,41 @@ def build_desk_sandbox_profile(
 
     store_wal = Path(f"{resolved_store}-wal")
     store_shm = Path(f"{resolved_store}-shm")
-    agents_md_path = resolved_desk / "AGENTS.md"
-    skills_dir_path = resolved_desk / "skills"
-    dotdesk_dir_path = resolved_desk / ".desk"
-    dotdesk_scratch_path = dotdesk_dir_path / "scratch"
-    drafts_dir_path = resolved_desk / ".desk" / "drafts"
-    logs_dir_path = resolved_desk / ".desk" / "logs"
+    desk_deny_rules: list[str] = []
     scratch_rules: list[str] = []
-    if resolved_scratch is not None:
+    if resolved_desk is not None:
+        agents_md_path = resolved_desk / "AGENTS.md"
+        skills_dir_path = resolved_desk / "skills"
+        dotdesk_dir_path = resolved_desk / ".desk"
+        dotdesk_scratch_path = dotdesk_dir_path / "scratch"
+        drafts_dir_path = resolved_desk / ".desk" / "drafts"
+        logs_dir_path = resolved_desk / ".desk" / "logs"
+        desk_deny_rules.extend(
+            [
+                "(deny file-write*",
+                f"    (literal {_sbpl_quote(agents_md_path)})",
+                f"    (subpath {_sbpl_quote(skills_dir_path)})",
+                f"    (subpath {_sbpl_quote(dotdesk_dir_path)})",
+                f"    (subpath {_sbpl_quote(drafts_dir_path)})",
+                f"    (subpath {_sbpl_quote(logs_dir_path)}))",
+            ]
+        )
+        if not allow_dotdesk_read:
+            desk_deny_rules.append(
+                f"(deny file-read* (subpath {_sbpl_quote(dotdesk_dir_path)}))"
+            )
+        if resolved_scratch is not None:
+            scratch_rules.extend(
+                [
+                    f"(allow file-write* (subpath {_sbpl_quote(dotdesk_scratch_path)}))",
+                    f"(deny file-write* (literal {_sbpl_quote(dotdesk_scratch_path)}))",
+                    f"(allow file-write* (subpath {_sbpl_quote(resolved_scratch)}))",
+                    f"(deny file-write* (literal {_sbpl_quote(resolved_scratch)}))",
+                ]
+            )
+    elif resolved_scratch is not None:
         scratch_rules.extend(
             [
-                f"(allow file-write* (subpath {_sbpl_quote(dotdesk_scratch_path)}))",
-                f"(deny file-write* (literal {_sbpl_quote(dotdesk_scratch_path)}))",
                 f"(allow file-write* (subpath {_sbpl_quote(resolved_scratch)}))",
                 f"(deny file-write* (literal {_sbpl_quote(resolved_scratch)}))",
             ]
@@ -356,12 +386,7 @@ def build_desk_sandbox_profile(
             "(allow file-read* file-write*",
             rw_block + ")",
             *extra_file_lines,
-            "(deny file-write*",
-            f"    (literal {_sbpl_quote(agents_md_path)})",
-            f"    (subpath {_sbpl_quote(skills_dir_path)})",
-            f"    (subpath {_sbpl_quote(dotdesk_dir_path)})",
-            f"    (subpath {_sbpl_quote(drafts_dir_path)})",
-            f"    (subpath {_sbpl_quote(logs_dir_path)}))",
+            *desk_deny_rules,
             *scratch_rules,
             "(deny file-read* file-write*",
             f"    (literal {_sbpl_quote(resolved_store)})",

@@ -34,7 +34,8 @@ import sys
 from pathlib import Path
 
 args = sys.argv[1:]
-mode = Path("mode.txt").read_text(encoding="utf-8").strip()
+mode_path = Path("mode.txt") if Path("mode.txt").exists() else Path(__file__).with_name("mode.txt")
+mode = mode_path.read_text(encoding="utf-8").strip()
 prompt = sys.stdin.read()
 
 # Extract -c mcp_servers.sourdough.command=... and .args=...
@@ -372,7 +373,7 @@ class CodexCliBridgeTests(unittest.TestCase):
             )
             desk = desk_directory(store, founding.founder_id)
             desk.mkdir(parents=True, exist_ok=True)
-            (desk / "mode.txt").write_text("spoof_usage_exit0", encoding="utf-8")
+            (root / "mode.txt").write_text("spoof_usage_exit0", encoding="utf-8")
 
             with closing(open_writer(store)) as db, write_tx(db):
                 item, _ = create_work_item(
