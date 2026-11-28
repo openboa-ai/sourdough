@@ -46,6 +46,13 @@ _PEER_COLLAB_TOOL_NAMES = frozenset(
         "respond_peer_request",
         "offer_handoff",
         "decline_handoff",
+        "submit_company_paper_order",
+        "cancel_company_paper_order",
+        "submit_company_live_order",
+        "propose_live_migration",
+        "open_agent_sandbox",
+        "submit_agent_sandbox_order",
+        "cancel_agent_sandbox_order",
     }
 )
 

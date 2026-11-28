@@ -123,6 +123,17 @@ _PEER_OUTBOUND_SINKS = frozenset(
         "decline_handoff",
     }
 )
+_TRADING_WRITE_SINKS = frozenset(
+    {
+        "submit_company_paper_order",
+        "cancel_company_paper_order",
+        "submit_company_live_order",
+        "propose_live_migration",
+        "open_agent_sandbox",
+        "submit_agent_sandbox_order",
+        "cancel_agent_sandbox_order",
+    }
+)
 _PRIVATE_DESK_RECEIPT_TOOLS = frozenset(
     {
         "desk_list_drafts",
@@ -553,12 +564,14 @@ class ShiftRunner:
         has_peer_collab_tools = bool(
             effective_base_names & (_PEER_INPUT_TOOLS | _PEER_OUTBOUND_SINKS)
         )
+        has_trading_write_sinks = bool(effective_base_names & _TRADING_WRITE_SINKS)
+        has_external_sinks = has_peer_collab_tools or has_trading_write_sinks
         desk_tools_permitted = effective_include_desk_tools and (
             allowed_tool_names is None
             or bool(allowed_tool_names & _PRIVATE_DESK_ALL_TOOLS)
         )
         hydrate_passive_private_context = (
-            desk_tools_permitted and not has_peer_collab_tools
+            desk_tools_permitted and not has_external_sinks
         )
         if hydrate_passive_private_context:
             _, drafts = resolve_desk(
@@ -871,9 +884,12 @@ class ShiftRunner:
                     and isinstance(args.get("log_path"), str)
                     and args["log_path"] in public_offloaded_paths
                 )
-                if name in _PEER_OUTBOUND_SINKS and flow_state["read_private_desk"]:
+                if (
+                    name in (_PEER_OUTBOUND_SINKS | _TRADING_WRITE_SINKS)
+                    and flow_state["read_private_desk"]
+                ):
                     raise DutyRefused(
-                        "Cannot write free-form peer messages or requests in the same shift "
+                        "Cannot write free-form peer messages, peer requests, or trading actions in the same shift "
                         "after reading private Desk data; publish explicitly via desk_publish_selection"
                     )
                 if (
@@ -984,7 +1000,7 @@ class ShiftRunner:
             timeout_seconds=eff_timeout_seconds,
             desk_path=(
                 desk
-                if (effective_include_desk_tools and not has_peer_collab_tools)
+                if (effective_include_desk_tools and not has_external_sinks)
                 else None
             ),
             store_path=ctx.writer.store,
@@ -1286,6 +1302,26 @@ class ShiftRunner:
                         or retrieved_method_ids
                         or invoked_method_ids
                     ):
+                        from ..method_learning import opaque_one_agent_method_id
+
+                        one_agent_mids = {
+                            str(r[0])
+                            for r in db.execute(
+                                """SELECT DISTINCT method_id FROM method_delta
+                                   WHERE company_id = ? AND audience_scope = 'one_agent'""",
+                                (ctx.company_id,),
+                            ).fetchall()
+                        }
+                        audit_trace = dict(causal_trace_dict)
+                        for key in ("available", "retrieved", "invoked"):
+                            vals = audit_trace.get(key)
+                            if isinstance(vals, list):
+                                audit_trace[key] = [
+                                    opaque_one_agent_method_id(v)
+                                    if isinstance(v, str) and v in one_agent_mids
+                                    else v
+                                    for v in vals
+                                ]
                         append_audit_event(
                             db,
                             company_id=ctx.company_id,
@@ -1295,7 +1331,7 @@ class ShiftRunner:
                             event_type="learning.causal_method_trace",
                             actor_id=agent_id,
                             run_id=ctx.run.run_id,
-                            payload=causal_trace_dict,
+                            payload=audit_trace,
                             recorded_at_ns=ep_ts,
                         )
                 if episode is not None:

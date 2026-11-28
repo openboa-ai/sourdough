@@ -374,6 +374,16 @@ def _opaque_private_ref(kind: str, agent_id: str, draft_stem: str) -> str:
     return f"{kind}:opaque:{digest}"
 
 
+def _opaque_missing_ref(kind: str, company_id: str, agent_id: str, ident: str) -> str:
+    """Return a durable opaque digest for an unverified/missing source_ref so arbitrary text never enters SQLite."""
+    digest = sha256(
+        f"sourdough:missing-ref:v1\x1f{company_id}\x1f{agent_id}\x1f{kind}\x1f{ident}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
+    return f"{kind}:missing:{digest}"
+
+
 def _parse_private_desk_ref(ident: str, *, agent_id: str, ref: str) -> str:
     if "/" in ident:
         owner, draft_name = ident.split("/", 1)
@@ -466,6 +476,7 @@ def _verify_source_refs(
                 (asset_id,),
             ).fetchone()
             if pub_row is None:
+                ref = _opaque_missing_ref(kind, company_id, agent_id, ident)
                 missing.append(ref)
             else:
                 pub_co, pub_proj, aud_json, content = pub_row
@@ -524,6 +535,7 @@ def _verify_source_refs(
                 if rev_parts:
                     expected_rev = sha256(str(content).encode("utf-8")).hexdigest()
                     if rev_parts[0] != expected_rev:
+                        ref = _opaque_missing_ref(kind, company_id, agent_id, ident)
                         missing.append(ref)
 
         elif kind == "work_run":
@@ -532,6 +544,7 @@ def _verify_source_refs(
                 (ident,),
             ).fetchone()
             if run_row is None:
+                ref = _opaque_missing_ref(kind, company_id, agent_id, ident)
                 missing.append(ref)
             elif str(run_row[0]) != company_id or str(run_row[1]) != agent_id:
                 raise MethodRefused(
@@ -544,6 +557,7 @@ def _verify_source_refs(
                 (ident,),
             ).fetchone()
             if dec_row is None:
+                ref = _opaque_missing_ref(kind, company_id, agent_id, ident)
                 missing.append(ref)
             elif str(dec_row[0]) != company_id or str(dec_row[1]) != agent_id:
                 raise MethodRefused(
@@ -565,6 +579,7 @@ def _verify_source_refs(
                     (company_id, ident),
                 ).fetchone()
                 if any_row is None:
+                    ref = _opaque_missing_ref(kind, company_id, agent_id, ident)
                     missing.append(ref)
                 else:
                     raise MethodRefused(
@@ -577,6 +592,7 @@ def _verify_source_refs(
                 (ident,),
             ).fetchone()
             if ep_row is None:
+                ref = _opaque_missing_ref(kind, company_id, agent_id, ident)
                 missing.append(ref)
             elif str(ep_row[0]) != company_id or str(ep_row[1]) != agent_id:
                 raise MethodRefused(
@@ -590,6 +606,7 @@ def _verify_source_refs(
                 (ident,),
             ).fetchone()
             if pr_row is None:
+                ref = _opaque_missing_ref(kind, company_id, agent_id, ident)
                 missing.append(ref)
             elif str(pr_row[0]) != company_id or agent_id not in (
                 str(pr_row[1]),
@@ -913,6 +930,11 @@ def _all_lineage_edges(
 
     remaining_snaps = needed_snaps - set(snapshot_members.keys())
     if remaining_snaps:
+        opaque_to_nodes: dict[str, list[tuple[str, str]]] = {}
+        for mid_key, node_list in nodes_by_method.items():
+            opaque_to_nodes.setdefault(opaque_one_agent_method_id(mid_key), []).extend(
+                node_list
+            )
         for (raw_payload,) in db.execute(
             """SELECT payload_json FROM audit_event
                WHERE company_id = ? AND domain = 'learning'
@@ -930,12 +952,14 @@ def _all_lineage_edges(
                 avail = payload.get("available")
                 if isinstance(avail, list):
                     for mid in avail:
-                        if (
-                            isinstance(mid, str)
-                            and len(nodes_by_method.get(mid, ())) == 1
-                        ):
+                        if not isinstance(mid, str):
+                            continue
+                        matched_nodes = nodes_by_method.get(mid) or opaque_to_nodes.get(
+                            mid
+                        )
+                        if matched_nodes and len(matched_nodes) == 1:
                             snapshot_members.setdefault(snap_val, set()).add(
-                                nodes_by_method[mid][0]
+                                matched_nodes[0]
                             )
 
     for mid, rev, raw_parents, raw_snap, raw_sup, *_ in delta_rows:

@@ -127,12 +127,18 @@ class ConnectedFlow(unittest.TestCase):
                 )
                 for sid, cid, fid, cb, ctxb, arm, cp in slot_specs
             )
+            plan_doc = {"min_pairs": 2, "min_families": 2}
+            plan_digest = _sha(
+                json.dumps(plan_doc, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
             suite = TrialSuite(
                 suite_id="flow-13-rsi-transfer",
                 purpose="recursive",
                 rubric_digest=_sha(b"rubric-v1"),
                 evaluator_digest=_sha(b"evaluator-v1"),
-                analysis_plan_digest=_sha(b"plan-v1"),
+                analysis_plan_digest=plan_digest,
                 slots=slots,
             )
 
@@ -140,10 +146,10 @@ class ConnectedFlow(unittest.TestCase):
             with self.assertRaisesRegex(
                 TrialRefused, "not an offline evaluator registry"
             ):
-                seal_trial_suite(operating_store, suite)
+                seal_trial_suite(operating_store, suite, analysis_plan=plan_doc)
             self.assertEqual(operating_store.read_bytes(), operating_before)
 
-            revision = seal_trial_suite(offline_store, suite)
+            revision = seal_trial_suite(offline_store, suite, analysis_plan=plan_doc)
             self.assertEqual(offline_store.stat().st_mode & 0o077, 0)
 
             # 3. Run all 4 slots via CompanyRuntimeOfflineAdapter (fresh CompanyRuntime + Desk).

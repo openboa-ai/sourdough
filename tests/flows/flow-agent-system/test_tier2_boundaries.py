@@ -3683,6 +3683,10 @@ class TestF43OfflineTrialsRsiTier2(unittest.TestCase):
     def _suite(
         self, families: tuple[str, ...], *, purpose: str = "recursive"
     ) -> TrialSuite:
+        plan_doc = {"min_pairs": len(families)}
+        plan_digest = sha256_hex(
+            json.dumps(plan_doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
         limits = TrialCeiling(2, 10, 1000)
         slots = []
         for idx, fam in enumerate(families, start=1):
@@ -3710,7 +3714,7 @@ class TestF43OfflineTrialsRsiTier2(unittest.TestCase):
             purpose,
             sha256_hex(b"r"),
             sha256_hex(b"e"),
-            sha256_hex(b"p"),
+            plan_digest,
             tuple(slots),
         )
 
@@ -3739,7 +3743,9 @@ class TestF43OfflineTrialsRsiTier2(unittest.TestCase):
         with CoreCompanyHarness() as h:
             h.found_company()
             suite = self._suite(("f1", "f2"))
-            rev = seal_trial_suite(h.evaluator_store, suite)
+            rev = seal_trial_suite(
+                h.evaluator_store, suite, analysis_plan={"min_pairs": 2}
+            )
             for idx, slot in enumerate(suite.slots, start=1):
                 rid = f"r-{idx}"
                 reserve_trial_launch(
@@ -3790,7 +3796,9 @@ class TestF43OfflineTrialsRsiTier2(unittest.TestCase):
         with CoreCompanyHarness() as h:
             h.found_company()
             suite = self._suite(("f1", "f2"))
-            rev = seal_trial_suite(h.evaluator_store, suite)
+            rev = seal_trial_suite(
+                h.evaluator_store, suite, analysis_plan={"min_pairs": 2}
+            )
             for idx, slot in enumerate(suite.slots, start=1):
                 rid = f"r-{idx}"
                 reserve_trial_launch(
@@ -3847,7 +3855,9 @@ class TestF43OfflineTrialsRsiTier2(unittest.TestCase):
         with CoreCompanyHarness() as h:
             h.found_company()
             suite = self._suite(("only-fam", "only-fam", "only-fam"))
-            rev = seal_trial_suite(h.evaluator_store, suite)
+            rev = seal_trial_suite(
+                h.evaluator_store, suite, analysis_plan={"min_pairs": 3}
+            )
             cand_ids = set()
             for idx, slot in enumerate(suite.slots, start=1):
                 rid = f"r-{idx}"
@@ -3962,7 +3972,9 @@ class TestF43OfflineTrialsRsiTier2(unittest.TestCase):
         with CoreCompanyHarness() as h:
             h.found_company()
             suite = self._suite(("f1", "f2"))
-            rev = seal_trial_suite(h.evaluator_store, suite)
+            rev = seal_trial_suite(
+                h.evaluator_store, suite, analysis_plan={"min_pairs": 2}
+            )
             slot0 = suite.slots[0]
             reserve_trial_launch(
                 h.evaluator_store,
@@ -4020,7 +4032,9 @@ class TestF43OfflineTrialsRsiTier2(unittest.TestCase):
         with CoreCompanyHarness() as h:
             h.found_company()
             suite = self._suite(("f1", "f2"))
-            rev = seal_trial_suite(h.evaluator_store, suite)
+            rev = seal_trial_suite(
+                h.evaluator_store, suite, analysis_plan={"min_pairs": 2}
+            )
             for idx, slot in enumerate(suite.slots, start=1):
                 rid = f"r-{idx}"
                 reserve_trial_launch(

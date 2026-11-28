@@ -3504,15 +3504,23 @@ class TestF43OfflineTrialsRsiTier1(unittest.TestCase):
                     )
                 )
             specs.append((s_inc, s_cand, fam, cid))
+        plan_doc = {
+            "min_pairs": len(families),
+            "min_net_wins": max(1, len(families) - 2),
+            "min_families": min(3, len(families)),
+        }
+        plan_digest = sha256_hex(
+            json.dumps(plan_doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
         suite = TrialSuite(
             suite_id="rsi-suite-t1",
             purpose="recursive",
             rubric_digest=sha256_hex(b"rubric"),
             evaluator_digest=sha256_hex(b"eval"),
-            analysis_plan_digest=sha256_hex(b"plan"),
+            analysis_plan_digest=plan_digest,
             slots=tuple(slots),
         )
-        rev = seal_trial_suite(offline_store, suite)
+        rev = seal_trial_suite(offline_store, suite, analysis_plan=plan_doc)
         return rev, suite, specs
 
     def test_f4_3_t1_01_sealed_suite_in_isolated_evaluator_sqlite_and_clone_desk(
@@ -3606,7 +3614,16 @@ class TestF43OfflineTrialsRsiTier1(unittest.TestCase):
                 pkt = blind_trial_packet(
                     h.evaluator_store, revision=rev, result_id=rec.result_id
                 )
-                grade = tr.grade_trial_observation(pkt)
+                grade = tr.grade_trial_observation(
+                    pkt,
+                    decision={
+                        "grounded": True,
+                        "relevant_constraints": True,
+                        "feasible_next_action": True,
+                    },
+                    tool_trace={"calls": [], "violations": 0},
+                    service_effects={"service_correct": True},
+                )
                 commit_blind_grade(
                     h.evaluator_store, revision=rev, packet=pkt, grade=grade
                 )

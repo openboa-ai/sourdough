@@ -499,15 +499,19 @@ print(json.dumps(asdict(TrialGrade(True, True, True, 1, True))))
             arm="candidate",
             counterpart_id="p2-inc",
         )
+        plan_doc = {"min_pairs": 2, "min_families": 1}
+        plan_digest = sha256(
+            json.dumps(plan_doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         suite = TrialSuite(
             "rsi-transfer-1",
             "recursive",
             "e" * 64,
             "f" * 64,
-            "0" * 64,
+            plan_digest,
             (pair1_inc, pair1_cand, pair2_inc, pair2_cand),
         )
-        revision = seal_trial_suite(self.store, suite)
+        revision = seal_trial_suite(self.store, suite, analysis_plan=plan_doc)
         with closing(sqlite3.connect(self.store)) as db:
             self.assertEqual(
                 db.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal"
@@ -693,16 +697,20 @@ print(json.dumps(asdict(TrialGrade(True, True, True, 1, True))))
                 counterpart_id="p2-inc",
             ),
         )
+        plan_doc = {"min_pairs": 2, "min_net_wins": 1}
+        plan_digest = sha256(
+            json.dumps(plan_doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         suite = TrialSuite(
             "rsi-adversarial",
             "recursive",
             "e" * 64,
             "f" * 64,
-            "0" * 64,
+            plan_digest,
             slots,
         )
         store = self.root / f"adv-{os.urandom(4).hex()}.sqlite"
-        rev = seal_trial_suite(store, suite)
+        rev = seal_trial_suite(store, suite, analysis_plan=plan_doc)
         return suite, (store, rev)
 
     def _run_and_grade_suite(

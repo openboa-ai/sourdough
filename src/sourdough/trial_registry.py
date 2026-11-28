@@ -1447,74 +1447,142 @@ def summarize_rsi_transfer(
     path: Path,
     *,
     revision: str,
-    min_pairs: int = 2,
-    min_net_wins: int = 1,
-    min_families: int = 1,
-    alpha: float = 0.05,
-    min_worthwhile_margin: float = 0.0,
-    bootstrap_resamples: int = 2000,
+    min_pairs: int | None = None,
+    min_net_wins: int | None = None,
+    min_families: int | None = None,
+    alpha: float | None = None,
+    min_worthwhile_margin: float | None = None,
+    bootstrap_resamples: int | None = None,
     analysis_plan: Mapping[str, Any] | None = None,
 ) -> RsiTransferSummary:
     """Reconcile paired rubric grades and position-swapped pairwise outcomes into
     an explicit SUPPORTED | UNSUPPORTED | INCONCLUSIVE verdict for recursive suites.
     """
-    eff_min_pairs = min_pairs
-    eff_min_net_wins = min_net_wins
-    eff_min_families = min_families
-    eff_alpha = alpha
-    eff_margin = min_worthwhile_margin
-    eff_resamples = bootstrap_resamples
 
-    plan_dict: dict[str, Any] | None = None
+    def _validate_params(
+        v_min_pairs: Any,
+        v_min_net_wins: Any,
+        v_min_families: Any,
+        v_alpha: Any,
+        v_margin: Any,
+        v_resamples: Any,
+    ) -> tuple[float, float]:
+        if (
+            not _digest(revision)
+            or type(v_min_pairs) is not int
+            or v_min_pairs < 1
+            or type(v_min_net_wins) is not int
+            or v_min_net_wins < 1
+            or type(v_min_families) is not int
+            or v_min_families < 1
+            or isinstance(v_alpha, bool)
+            or not isinstance(v_alpha, (int, float))
+            or not math.isfinite(float(v_alpha))
+            or not (0.0 < float(v_alpha) < 0.5)
+            or isinstance(v_margin, bool)
+            or not isinstance(v_margin, (int, float))
+            or not math.isfinite(float(v_margin))
+            or not (0.0 <= float(v_margin) <= 1.0)
+            or type(v_resamples) is not int
+            or not (100 <= v_resamples <= 50_000)
+        ):
+            raise TrialRefused("Invalid RSI transfer summary parameters")
+        return float(v_alpha), float(v_margin)
+
+    _validate_params(
+        2 if min_pairs is None else min_pairs,
+        1 if min_net_wins is None else min_net_wins,
+        1 if min_families is None else min_families,
+        0.05 if alpha is None else alpha,
+        0.0 if min_worthwhile_margin is None else min_worthwhile_margin,
+        2000 if bootstrap_resamples is None else bootstrap_resamples,
+    )
+
+    caller_plan: dict[str, Any] | None = None
     if analysis_plan is not None:
         if not isinstance(analysis_plan, Mapping):
             raise TrialRefused("Invalid RSI transfer summary analysis_plan")
-        plan_dict = dict(analysis_plan)
-        if "min_pairs" in plan_dict:
-            eff_min_pairs = plan_dict["min_pairs"]
-        if "min_net_wins" in plan_dict:
-            eff_min_net_wins = plan_dict["min_net_wins"]
-        if "min_families" in plan_dict:
-            eff_min_families = plan_dict["min_families"]
-        if "alpha" in plan_dict:
-            eff_alpha = plan_dict["alpha"]
-        if "min_worthwhile_margin" in plan_dict:
-            eff_margin = plan_dict["min_worthwhile_margin"]
-        if "bootstrap_resamples" in plan_dict:
-            eff_resamples = plan_dict["bootstrap_resamples"]
-
-    if (
-        not _digest(revision)
-        or type(eff_min_pairs) is not int
-        or eff_min_pairs < 1
-        or type(eff_min_net_wins) is not int
-        or eff_min_net_wins < 1
-        or type(eff_min_families) is not int
-        or eff_min_families < 1
-        or isinstance(eff_alpha, bool)
-        or not isinstance(eff_alpha, (int, float))
-        or not math.isfinite(float(eff_alpha))
-        or not (0.0 < float(eff_alpha) < 0.5)
-        or isinstance(eff_margin, bool)
-        or not isinstance(eff_margin, (int, float))
-        or not math.isfinite(float(eff_margin))
-        or not (0.0 <= float(eff_margin) <= 1.0)
-        or type(eff_resamples) is not int
-        or not (100 <= eff_resamples <= 50_000)
-    ):
-        raise TrialRefused("Invalid RSI transfer summary parameters")
-    alpha_f = float(eff_alpha)
-    margin_f = float(eff_margin)
+        caller_plan = dict(analysis_plan)
 
     with closing(_open(path, read_only=True)) as database, _read_tx(database):
         suite = _sealed_suite(database, revision)
         if suite["purpose"] != "recursive":
             raise TrialRefused("RSI transfer verdict requires a recursive trial suite")
-        if plan_dict is not None:
-            if _revision(_canonical_json(plan_dict)) != suite["analysis_plan_digest"]:
+        stored_plan_raw = suite.get("analysis_plan")
+        stored_plan: dict[str, Any] | None = None
+        if stored_plan_raw is not None:
+            if not isinstance(stored_plan_raw, Mapping):
+                raise TrialRefused("Stored analysis plan is malformed")
+            stored_plan = dict(stored_plan_raw)
+            if _revision(_canonical_json(stored_plan)) != suite["analysis_plan_digest"]:
+                raise TrialRefused(
+                    "Stored analysis plan does not match sealed analysis_plan_digest"
+                )
+        if caller_plan is not None:
+            if _revision(_canonical_json(caller_plan)) != suite["analysis_plan_digest"]:
                 raise TrialRefused(
                     "Analysis plan does not match sealed analysis_plan_digest"
                 )
+            plan_dict = caller_plan
+        elif stored_plan is not None:
+            plan_dict = stored_plan
+        else:
+            raise TrialRefused(
+                "Sealed analysis plan is unavailable; supply analysis_plan matching analysis_plan_digest"
+            )
+
+        explicit_overrides = (
+            ("min_pairs", min_pairs),
+            ("min_net_wins", min_net_wins),
+            ("min_families", min_families),
+            ("alpha", alpha),
+            ("min_worthwhile_margin", min_worthwhile_margin),
+            ("bootstrap_resamples", bootstrap_resamples),
+        )
+        for key, val in explicit_overrides:
+            if val is not None and key in plan_dict and val != plan_dict[key]:
+                raise TrialRefused(
+                    f"Caller parameter '{key}' conflicts with sealed analysis plan"
+                )
+
+        eff_min_pairs = (
+            plan_dict["min_pairs"]
+            if "min_pairs" in plan_dict
+            else (2 if min_pairs is None else min_pairs)
+        )
+        eff_min_net_wins = (
+            plan_dict["min_net_wins"]
+            if "min_net_wins" in plan_dict
+            else (1 if min_net_wins is None else min_net_wins)
+        )
+        eff_min_families = (
+            plan_dict["min_families"]
+            if "min_families" in plan_dict
+            else (1 if min_families is None else min_families)
+        )
+        eff_alpha = (
+            plan_dict["alpha"]
+            if "alpha" in plan_dict
+            else (0.05 if alpha is None else alpha)
+        )
+        eff_margin = (
+            plan_dict["min_worthwhile_margin"]
+            if "min_worthwhile_margin" in plan_dict
+            else (0.0 if min_worthwhile_margin is None else min_worthwhile_margin)
+        )
+        eff_resamples = (
+            plan_dict["bootstrap_resamples"]
+            if "bootstrap_resamples" in plan_dict
+            else (2000 if bootstrap_resamples is None else bootstrap_resamples)
+        )
+        alpha_f, margin_f = _validate_params(
+            eff_min_pairs,
+            eff_min_net_wins,
+            eff_min_families,
+            eff_alpha,
+            eff_margin,
+            eff_resamples,
+        )
         slots = suite["slots"]
         planned_pairs = len(slots) // 2
         distinct_families = len({slot["family_id"] for slot in slots})
@@ -1638,9 +1706,9 @@ def summarize_rsi_transfer(
                 if grade.judgment_passed(packet.outcome):
                     inc_passes += 1
 
-        # Enforce exact permutation alpha when an explicit plan, custom alpha, or >=3 families apply.
+        # Enforce exact permutation alpha when the sealed plan sets alpha, custom alpha, or >=3 families apply.
         enforce_perm = (
-            plan_dict is not None
+            "alpha" in plan_dict
             or alpha_f != 0.05
             or eff_min_families >= 3
             or distinct_families >= 5

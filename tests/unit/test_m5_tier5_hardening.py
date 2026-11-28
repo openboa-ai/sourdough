@@ -11621,6 +11621,519 @@ class TestM5Tier5Hardening(unittest.TestCase):
         self.assertTrue(seen["refused_desk_read_draft"])
         self.assertTrue(seen["refused_desk_publish_selection"])
 
+    def test_pr191_r26_security_and_code_review_hardening(self) -> None:
+        """PR #191 R26: trading action_id opaque mapping + Desk flow guard, unavailable evidence grading, sealed analysis plan enforcement."""
+        from sourdough.agent_desk import save_draft
+        from sourdough.agent_runtime.codex_cli import CodexCliAdapter
+        from sourdough.agent_runtime.protocol import (
+            AgentProfileBinding,
+            AgentRuntimeAdapter,
+            AdapterManifest,
+            OuterToolBroker,
+            PROVIDER_CODEX_CLI,
+            PROVIDER_OPENAI,
+            ShiftRequest,
+            ShiftResult,
+            TokenUsage,
+            ToolSpec,
+            hydrate_shift_context,
+        )
+        from sourdough.agent_runtime.registry import AgentAdapterRegistry
+        from sourdough.trading.projections import read_trading_desk_projection
+        from sourdough.runtime.engine import CompanyRuntime
+        from sourdough.runtime.handlers import build_production_duty_registry
+        from sourdough.runtime.work_kernel import complete_work_run, create_work_item
+        from sourdough.storage.schema import enable_domain_v1
+        from sourdough.trading.accounts import open_company_paper_book
+        from sourdough.trading.company_tools import (
+            CompanyTradingTools,
+            opaque_trading_action_id,
+        )
+        from sourdough.trading.domain import ExecutionTierRefused
+        from sourdough.trading.plugin import (
+            DUTY_QUANT_PAPER_DECISION,
+            TradingDomainPlugin,
+        )
+        from sourdough.trading.quotes import MarketQuote, StaticQuoteProvider
+        from sourdough.trial_registry import (
+            BlindedTrial,
+            PairwiseJudgment,
+            TrialCeiling,
+            TrialGrade,
+            TrialInputs,
+            TrialRefused,
+            TrialSlot,
+            TrialSuite,
+            TrialTerminalEvidence,
+            blind_pairwise_packets,
+            blind_trial_packet,
+            commit_blind_grade,
+            commit_position_swapped_pairwise_grade,
+            commit_trial_observation,
+            reserve_trial_launch,
+            seal_trial_suite,
+            summarize_rsi_transfer,
+        )
+        from sourdough.trial_runner import grade_trial_observation
+
+        now_ns = time_ns()
+        draft_marker = "private-desk-alpha-8842"
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                enable_domain_v1(db, "trading")
+            book = open_company_paper_book(
+                w,
+                account_id="r26-paper-acct",
+                book_name="R26 Paper Book",
+                starting_minor_units=50_000_000,
+                exposure_limit_minor_units=30_000_000,
+            )
+            trader, trader_grant = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="trader-r26",
+                profile_id=self.profile.profile_id(),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, claim_seed = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=trader,
+                    grant_id=trader_grant,
+                    grant_scope="assessment",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                )
+            save_draft(
+                w,
+                claim_seed,
+                claim_seed.purpose,
+                name="private-alpha",
+                content=f"Private desk note: {draft_marker}",
+                expected_revision=None,
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                complete_work_run(
+                    db,
+                    claim_seed.run_id,
+                    claim_seed.fencing_token,
+                    outcome={"done": True},
+                    now_ns=now_ns + 5,
+                )
+
+        # Part A (Security #24):
+        # 1. Direct CompanyTradingTools opaque-maps action_id and enforces closed cancel reasons.
+        quotes = StaticQuoteProvider(
+            {"BTC-USDT": MarketQuote("BTC-USDT", 6_500_000, now_ns, "feed")}
+        )
+        with hold_company_writer(self.store, self.company_id) as w:
+            ctools = CompanyTradingTools(
+                writer=w,
+                agent_id=trader,
+                run_id=None,
+                quote_provider=quotes,
+                clock=lambda: now_ns + 10,
+            )
+            ord_res = ctools.invoke(
+                "submit_company_paper_order",
+                {
+                    "binding_id": book.binding_id,
+                    "action_id": f"leak-{draft_marker}",
+                    "instrument_id": "BTC-USDT",
+                    "side": "buy",
+                    "quantity": 1,
+                    "limit_minor_units": 6_600_000,
+                },
+            )
+            expected_opaque = opaque_trading_action_id(
+                self.company_id, book.binding_id, f"leak-{draft_marker}"
+            )
+            self.assertEqual(ord_res["action_id"], expected_opaque)
+            self.assertNotIn(draft_marker, json.dumps(ord_res))
+
+            # Free-form cancel reason is refused fail-closed.
+            with self.assertRaises(ExecutionTierRefused):
+                ctools.invoke(
+                    "cancel_company_paper_order",
+                    {
+                        "binding_id": book.binding_id,
+                        "order_id": ord_res["order_id"],
+                        "reason": draft_marker,
+                    },
+                )
+
+        # Board projection & trading_book_order never contain the raw private desk marker.
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            raw_actions = [
+                str(r[0])
+                for r in ro.execute(
+                    "SELECT action_id FROM trading_book_order WHERE company_id = ?",
+                    (self.company_id,),
+                ).fetchall()
+            ]
+        self.assertTrue(all(a.startswith("ordact:") for a in raw_actions))
+        self.assertNotIn(draft_marker, " ".join(raw_actions))
+        board_view, _ = read_trading_desk_projection(
+            self.store, self.company_id, environment="paper"
+        )
+        self.assertNotIn(draft_marker, json.dumps(board_view))
+
+        # 2. ShiftRunner blocks submit_company_paper_order & propose_live_migration after desk_read_draft
+        #    and sets desk_path=None on trading shifts.
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item_trade, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=trader,
+                    duty_kind=DUTY_QUANT_PAPER_DECISION,
+                    source_kind="manual",
+                    source_id="r26-trade-shift",
+                    now_ns=now_ns + 20,
+                )
+
+        trade_obs: dict[str, Any] = {}
+
+        class _TradingFlowAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                trade_obs["desk_path"] = request.desk_path
+                trade_obs["manifest"] = request.context.desk_manifest
+                draft_res = broker.invoke(
+                    "r26-read-draft",
+                    "desk_read_draft",
+                    {"name": "private-alpha"},
+                )
+                trade_obs["draft_ok"] = draft_marker in str(draft_res)
+                order_err = broker.invoke(
+                    "r26-try-order",
+                    "submit_company_paper_order",
+                    {
+                        "binding_id": book.binding_id,
+                        "action_id": f"post-read-{draft_marker}",
+                        "instrument_id": "BTC-USDT",
+                        "side": "buy",
+                        "quantity": 1,
+                        "limit_minor_units": 6_600_000,
+                    },
+                )
+                trade_obs["order_blocked"] = not order_err.get("ok", True)
+                return ShiftResult(
+                    output_text="Checked private draft; order sink blocked as expected.",
+                    usage=TokenUsage(input_tokens=20, output_tokens=10),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg_t = AgentAdapterRegistry()
+        areg_t.register(_TradingFlowAdapter())
+        tplugin = TradingDomainPlugin(quote_provider=quotes)
+        dreg_t = build_production_duty_registry(
+            adapter_registry=areg_t,
+            profile_bindings={self.founder_id: self.profile, trader: self.profile},
+            domain_plugins=(tplugin,),
+        )
+        rt_t = CompanyRuntime(
+            self.store,
+            self.company_id,
+            dreg_t,
+            clock=lambda: now_ns + 30,
+        )
+        rt_t.step(
+            max_dispatches=1,
+            now_ns=now_ns + 30,
+            target_work_item_id=item_trade.work_item_id,
+        )
+        self.assertIsNone(trade_obs["desk_path"])
+        self.assertEqual(trade_obs["manifest"], ())
+        self.assertTrue(trade_obs["draft_ok"])
+        self.assertTrue(trade_obs["order_blocked"])
+
+        # CodexCliAdapter also refuses Desk cwd when trading write sinks are present.
+        shim = self.root / "r26_codex_shim.py"
+        shim.write_text(
+            "import json, os\n"
+            "print(json.dumps({'type': 'terminal', 'output_text': json.dumps({'cwd': os.getcwd()})}))\n",
+            encoding="utf-8",
+        )
+        t_desk = desk_directory(self.store, trader)
+        c_adapter = CodexCliAdapter(
+            executable=(sys.executable, str(shim)),
+            use_macos_sandbox=False,
+            protocol_mode="shim",
+        )
+        c_broker = OuterToolBroker(
+            company_id=self.company_id,
+            agent_id=trader,
+            run_id="r26-codex-trade",
+            fencing_token=1,
+            handlers={"submit_company_paper_order": lambda _a: {"ok": True}},
+        )
+        c_res = c_adapter.run_shift(
+            AgentProfileBinding(
+                provider=PROVIDER_CODEX_CLI, model="gpt-6-luna", revision="v1"
+            ),
+            ShiftRequest(
+                company_id=self.company_id,
+                agent_id=trader,
+                run_id="r26-codex-trade",
+                turn_id="t1",
+                fencing_token=1,
+                instruction="Trade.",
+                context=hydrate_shift_context(
+                    company_id=self.company_id,
+                    agent_id=trader,
+                    run_id="r26-codex-trade",
+                    fencing_token=1,
+                    grant_scope="trading",
+                    mandate_summary="Test.",
+                ),
+                tools=(
+                    ToolSpec(
+                        name="submit_company_paper_order",
+                        description="Submit order.",
+                        parameters={"type": "object", "properties": {}, "required": []},
+                    ),
+                ),
+                budget_ceiling_minor_units=100_000,
+                desk_path=t_desk,
+                store_path=self.store,
+            ),
+            c_broker,
+        )
+        self.assertNotEqual(
+            Path(json.loads(c_res.output_text)["cwd"]).resolve(),
+            t_desk.resolve(),
+        )
+
+        # Part B (Code Review #1): grade_trial_observation refuses passing defaults when evidence is omitted.
+        failing_dec = {
+            "grounded": False,
+            "relevant_constraints": False,
+            "feasible_next_action": False,
+        }
+        failing_trace = {"calls": [], "violations": 1}
+        failing_fx = {"service_correct": False}
+
+        def _cjson(d: Any) -> str:
+            return json.dumps(d, sort_keys=True, separators=(",", ":"))
+
+        pkt_fail = BlindedTrial(
+            result_id="f" * 32,
+            rubric_digest=sha256(b"r").hexdigest(),
+            evaluator_digest=sha256(b"e").hexdigest(),
+            outcome="completed",
+            decision_digest=sha256(_cjson(failing_dec).encode()).hexdigest(),
+            tool_trace_digest=sha256(_cjson(failing_trace).encode()).hexdigest(),
+            service_effects_digest=sha256(_cjson(failing_fx).encode()).hexdigest(),
+        )
+        g_full = grade_trial_observation(
+            pkt_fail,
+            decision=failing_dec,
+            tool_trace=failing_trace,
+            service_effects=failing_fx,
+        )
+        self.assertFalse(g_full.judgment_passed(pkt_fail.outcome))
+        self.assertEqual(g_full.authority_violations, 1)
+        self.assertFalse(g_full.service_correct)
+
+        g_omitted = grade_trial_observation(pkt_fail)
+        self.assertEqual(g_omitted.criteria, (None, None, None))
+        self.assertIsNone(g_omitted.authority_violations)
+        self.assertIsNone(g_omitted.service_correct)
+        self.assertFalse(g_omitted.judgment_passed(pkt_fail.outcome))
+
+        # Part C (Code Review #2): summarize_rsi_transfer applies sealed plan when omitted and refuses unrecoverable plans.
+        eval_dir = self.root / "r26-evals"
+        eval_dir.mkdir(mode=0o700)
+        strict_plan = {
+            "min_pairs": 6,
+            "min_net_wins": 4,
+            "min_families": 6,
+            "alpha": 0.01,
+            "min_worthwhile_margin": 0.0,
+            "bootstrap_resamples": 1000,
+        }
+        strict_digest = sha256(_cjson(strict_plan).encode()).hexdigest()
+        slots_6 = []
+        limits = TrialCeiling(2, 30, 1000)
+        for idx in range(1, 7):
+            s_i, s_c = f"p{idx}-inc", f"p{idx}-cand"
+            for sid, arm, cp in ((s_i, "incumbent", s_c), (s_c, "candidate", s_i)):
+                slots_6.append(
+                    TrialSlot(
+                        sid,
+                        f"case-{idx}",
+                        f"fam-{idx}",
+                        TrialInputs(
+                            sha256(b"fix").hexdigest(),
+                            sha256(f"case-{idx}".encode()).hexdigest(),
+                            sha256(arm.encode()).hexdigest(),
+                            sha256(b"tools").hexdigest(),
+                            "offline-v1",
+                        ),
+                        limits,
+                        arm=arm,
+                        counterpart_id=cp,
+                    )
+                )
+        suite_strict = TrialSuite(
+            "r26-strict-alpha",
+            "recursive",
+            sha256(b"r").hexdigest(),
+            sha256(b"e").hexdigest(),
+            strict_digest,
+            tuple(slots_6),
+        )
+        eval_strict = eval_dir / "strict.sqlite"
+        rev_strict = seal_trial_suite(
+            eval_strict, suite_strict, analysis_plan=strict_plan
+        )
+        cand_ids: set[str] = set()
+        for idx, sl in enumerate(suite_strict.slots, start=1):
+            rid = f"r26-run-{idx}"
+            reserve_trial_launch(
+                eval_strict,
+                revision=rev_strict,
+                slot_id=sl.slot_id,
+                run_id=rid,
+                inputs=sl.inputs,
+                limits=sl.limits,
+            )
+            rec = commit_trial_observation(
+                eval_strict,
+                revision=rev_strict,
+                slot_id=sl.slot_id,
+                run_id=rid,
+                evidence=TrialTerminalEvidence(
+                    "completed",
+                    sha256(f"o-{idx}".encode()).hexdigest(),
+                    sha256(f"d-{idx}".encode()).hexdigest(),
+                    sha256(f"t-{idx}".encode()).hexdigest(),
+                    sha256(f"s-{idx}".encode()).hexdigest(),
+                    sha256(b"{}").hexdigest(),
+                ),
+            )
+            if sl.arm == "candidate":
+                cand_ids.add(rec.result_id)
+            bp = blind_trial_packet(
+                eval_strict, revision=rev_strict, result_id=rec.result_id
+            )
+            commit_blind_grade(
+                eval_strict,
+                revision=rev_strict,
+                packet=bp,
+                grade=TrialGrade(True, True, True, 0, True),
+            )
+        for ab, ba in blind_pairwise_packets(eval_strict, revision=rev_strict):
+            p1 = "first" if ab.first.result_id in cand_ids else "second"
+            p2 = "second" if p1 == "first" else "first"
+            commit_position_swapped_pairwise_grade(
+                eval_strict,
+                revision=rev_strict,
+                ab_packet=ab,
+                ab_judgment=PairwiseJudgment("Better.", p1),
+                ba_packet=ba,
+                ba_judgment=PairwiseJudgment("Confirmed.", p2),
+            )
+
+        # With 6 families, perm_p = 1/64 = 0.015625 > sealed alpha=0.01 -> INCONCLUSIVE both with AND without analysis_plan arg!
+        sum_explicit = summarize_rsi_transfer(
+            eval_strict, revision=rev_strict, analysis_plan=strict_plan
+        )
+        sum_omitted = summarize_rsi_transfer(eval_strict, revision=rev_strict)
+        self.assertEqual(sum_explicit.verdict, "INCONCLUSIVE")
+        self.assertEqual(sum_omitted.verdict, "INCONCLUSIVE")
+        self.assertIn("permutation-p-above-alpha", sum_omitted.reasons)
+        self.assertAlmostEqual(sum_omitted.alpha, 0.01)
+
+        # Conflicting caller override of sealed alpha is refused fail-closed!
+        with self.assertRaisesRegex(
+            TrialRefused, "conflicts with sealed analysis plan"
+        ):
+            summarize_rsi_transfer(eval_strict, revision=rev_strict, alpha=0.05)
+
+        # Suite sealed WITHOUT stored analysis_plan refuses summarize_rsi_transfer when argument is omitted.
+        eval_unrecoverable = eval_dir / "unrecoverable.sqlite"
+        rev_unrec = seal_trial_suite(eval_unrecoverable, suite_strict)
+        with self.assertRaisesRegex(
+            TrialRefused, "Sealed analysis plan is unavailable"
+        ):
+            summarize_rsi_transfer(eval_unrecoverable, revision=rev_unrec)
+
+        # Part D (Security #25): Missing/unverified source_refs are opaque-mapped before persisting
+        # into method_delta.source_refs_json, uncertainty_note, and audit_event.payload_json.
+        from sourdough.method_learning import distill_method_delta
+
+        missing_label = "acquisition-memo-7731"
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, m_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=trader,
+                    grant_id=trader_grant,
+                    grant_scope="assessment",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                )
+            disputed = distill_method_delta(
+                w,
+                m_claim,
+                delta_kind="ADD",
+                item_kind="work_method",
+                method_id="m-r26-missing-ref",
+                trigger_spec={"duty_kind": "work.assessment_review"},
+                body="Check order risk before execution.",
+                audience_scope="one_agent",
+                source_refs=[
+                    f"work_run:{missing_label}",
+                    f"work_decision:{missing_label}-dec",
+                    f"shared_publication:pub-missing@{missing_label}-rev",
+                    f"tool_call_receipt:{missing_label}-rcpt",
+                    f"agent_episode:{missing_label}-ep",
+                    f"peer_request:{missing_label}-pr",
+                ],
+                now_ns=now_ns + 50,
+            )
+            self.assertEqual(disputed.status, "disputed")
+            self.assertTrue(
+                all(":missing:" in ref for ref in disputed.source_refs),
+                disputed.source_refs,
+            )
+            self.assertNotIn(missing_label, json.dumps(list(disputed.source_refs)))
+            self.assertNotIn(missing_label, disputed.uncertainty_note)
+
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            md_dump = json.dumps(
+                ro.execute(
+                    """SELECT source_refs_json, uncertainty_note FROM method_delta
+                       WHERE company_id = ? AND method_id = 'm-r26-missing-ref'""",
+                    (self.company_id,),
+                ).fetchall()
+            )
+            ae_dump = json.dumps(
+                ro.execute(
+                    """SELECT payload_json FROM audit_event
+                       WHERE company_id = ? AND event_type = 'learning.method_delta_disputed'""",
+                    (self.company_id,),
+                ).fetchall()
+            )
+        self.assertNotIn(missing_label, md_dump)
+        self.assertNotIn(missing_label, ae_dump)
+
 
 if __name__ == "__main__":
     unittest.main()

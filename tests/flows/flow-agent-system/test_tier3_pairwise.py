@@ -1654,12 +1654,18 @@ class TestFullStackPairwise(unittest.TestCase):
                     source_refs=["work_decision:missing-id"],
                 )
                 self.assertEqual(disp.status, "disputed")
+            plan_doc = {"min_pairs": 1, "min_net_wins": 1}
+            plan_digest = sha256_hex(
+                json.dumps(plan_doc, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
             suite = TrialSuite(
                 "s-inv",
                 "recursive",
                 sha256_hex(b"r"),
                 sha256_hex(b"e"),
-                sha256_hex(b"p"),
+                plan_digest,
                 slots=(
                     TrialSlot(
                         "s1",
@@ -1693,7 +1699,7 @@ class TestFullStackPairwise(unittest.TestCase):
                     ),
                 ),
             )
-            rev = seal_trial_suite(h.evaluator_store, suite)
+            rev = seal_trial_suite(h.evaluator_store, suite, analysis_plan=plan_doc)
             invalidate_trial_slot(
                 h.evaluator_store,
                 revision=rev,

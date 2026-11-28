@@ -248,8 +248,11 @@ class M4StatisticalGateTests(unittest.TestCase):
 
             # 2. Mixed 6 families (4 cand, 2 inc) -> mean=0.33, bootstrap LCB crosses 0 -> INCONCLUSIVE
             e2 = root / "e2.sqlite"
-            s2 = _build_recursive_suite(("f1", "f2", "f3", "f4", "f5", "f6"))
-            r2 = seal_trial_suite(e2, s2)
+            plan2 = {"min_pairs": 6, "min_net_wins": 1, "min_families": 3}
+            s2 = _build_recursive_suite(
+                ("f1", "f2", "f3", "f4", "f5", "f6"), analysis_plan=plan2
+            )
+            r2 = seal_trial_suite(e2, s2, analysis_plan=plan2)
             _commit_complete_suite_observations(
                 e2, s2, r2, pair_outcomes={5: "inc", 6: "inc"}
             )
@@ -270,7 +273,7 @@ class M4StatisticalGateTests(unittest.TestCase):
             }
             e3 = root / "e3.sqlite"
             s3 = _build_recursive_suite(("f1", "f2", "f3", "f4"), analysis_plan=plan4)
-            r3 = seal_trial_suite(e3, s3)
+            r3 = seal_trial_suite(e3, s3, analysis_plan=plan4)
             _commit_complete_suite_observations(e3, s3, r3, pair_outcomes={})
             res3 = summarize_rsi_transfer(e3, revision=r3, analysis_plan=plan4)
             self.assertEqual(res3.verdict, "INCONCLUSIVE")
@@ -279,8 +282,11 @@ class M4StatisticalGateTests(unittest.TestCase):
 
             # 4. Futility / incumbent stronger across 6 families -> UNSUPPORTED
             e4 = root / "e4.sqlite"
-            s4 = _build_recursive_suite(("f1", "f2", "f3", "f4", "f5", "f6"))
-            r4 = seal_trial_suite(e4, s4)
+            plan4_fut = {"min_pairs": 6, "min_net_wins": 2, "min_families": 3}
+            s4 = _build_recursive_suite(
+                ("f1", "f2", "f3", "f4", "f5", "f6"), analysis_plan=plan4_fut
+            )
+            r4 = seal_trial_suite(e4, s4, analysis_plan=plan4_fut)
             _commit_complete_suite_observations(
                 e4,
                 s4,
@@ -295,8 +301,11 @@ class M4StatisticalGateTests(unittest.TestCase):
 
             # 5. Pseudoreplication: 6 pairs across only 2 families -> INCONCLUSIVE
             e5 = root / "e5.sqlite"
-            s5 = _build_recursive_suite(("f1", "f1", "f1", "f2", "f2", "f2"))
-            r5 = seal_trial_suite(e5, s5)
+            plan5 = {"min_pairs": 6, "min_net_wins": 2, "min_families": 3}
+            s5 = _build_recursive_suite(
+                ("f1", "f1", "f1", "f2", "f2", "f2"), analysis_plan=plan5
+            )
+            r5 = seal_trial_suite(e5, s5, analysis_plan=plan5)
             _commit_complete_suite_observations(e5, s5, r5, pair_outcomes={})
             res5 = summarize_rsi_transfer(
                 e5, revision=r5, min_pairs=6, min_net_wins=2, min_families=3
@@ -382,7 +391,16 @@ class M4TrialRunnerTests(unittest.TestCase):
                 evidence=ev,
             )
             pkt = blind_trial_packet(eval_store, revision=rev, result_id=rec.result_id)
-            grade = grade_trial_observation(pkt)
+            grade = grade_trial_observation(
+                pkt,
+                decision={
+                    "grounded": True,
+                    "relevant_constraints": True,
+                    "feasible_next_action": True,
+                },
+                tool_trace={"calls": [], "violations": 0},
+                service_effects={"service_correct": True},
+            )
             self.assertTrue(grade.judgment_passed(pkt.outcome))
             commit_blind_grade(eval_store, revision=rev, packet=pkt, grade=grade)
 
