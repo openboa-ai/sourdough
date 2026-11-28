@@ -197,6 +197,8 @@ def _verify_venue_binding(
 class TradingVenueConnectorAdapter:
     """Bridge ExternalVenueAdapter into Sourdough's shared ConnectorProxy boundary."""
 
+    max_cost_per_call_minor_units: int = 0
+
     def __init__(
         self,
         venue_resolver: Callable[
@@ -337,11 +339,16 @@ class TradingVenueConnectorAdapter:
             )
         venue = self._resolve_venue(request, secret)
         symbol = str(request.payload.get("symbol") or "")
-        coid = str(
-            request.payload.get("client_order_id")
-            or request.payload.get("action_id")
-            or request.request_id
-        )
+        if request.operation == "submit_order":
+            action_id = str(request.payload.get("action_id") or request.request_id)
+            mapper = getattr(venue, "client_order_id_for", None)
+            coid = str(mapper(action_id)) if callable(mapper) else action_id
+        else:
+            coid = str(
+                request.payload.get("client_order_id")
+                or request.payload.get("action_id")
+                or request.request_id
+            )
         try:
             status = venue.query_order(symbol=symbol, client_order_id=coid)
         except ExternalOrderReplyUnknown as error:

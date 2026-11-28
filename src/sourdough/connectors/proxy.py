@@ -167,6 +167,33 @@ def _resolve_secret_for_binding(
         raise ConnectorEnvironmentMismatch(str(error)) from error
 
 
+def _estimate_request_reservation_minor_units(
+    adapter: ConnectorAdapter,
+    operation: str,
+    payload: Mapping[str, Any],
+    *,
+    budget_enforced: bool,
+) -> int:
+    """Return a conservative upper-bound minor-unit cost reservation before dispatch."""
+    estimator = getattr(adapter, "estimate_max_cost_minor_units", None)
+    if callable(estimator):
+        est = estimator(operation, dict(payload))
+        if type(est) is not int or est < 0:
+            raise ConnectorRefused(
+                "Connector adapter cost estimator returned an invalid value"
+            )
+        return est
+    static_cap = getattr(adapter, "max_cost_per_call_minor_units", None)
+    if type(static_cap) is int and static_cap >= 0:
+        return static_cap
+    if budget_enforced:
+        raise ConnectorBudgetExceeded(
+            f"Connector adapter '{adapter.manifest.connector_kind}' does not declare "
+            "a pre-dispatch cost cap required for budgeted bindings/grants"
+        )
+    return 0
+
+
 def _scrub_response(
     response: ConnectorResponse, raw_secrets: tuple[str, ...]
 ) -> ConnectorResponse:
@@ -602,6 +629,16 @@ class ConnectorProxy:
                     )
 
                 prefix = f"{binding.binding_id}:r"
+                budget_enforced = (
+                    binding.budget_ceiling_minor_units > 0
+                    or grant.max_cost_minor_units > 0
+                )
+                reserved_cost = _estimate_request_reservation_minor_units(
+                    adapter,
+                    op_spec.name,
+                    payload,
+                    budget_enforced=budget_enforced,
+                )
                 if binding.budget_ceiling_minor_units > 0:
                     in_flight_binding = db.execute(
                         """SELECT 1 FROM external_actions
@@ -620,19 +657,30 @@ class ConnectorProxy:
                     spent_binding = int(
                         db.execute(
                             """SELECT COALESCE(SUM(
-                                   CAST(json_extract(receipt_json, '$.cost_minor_units') AS INTEGER)
+                                   CASE
+                                       WHEN status = 'confirmed'
+                                           THEN CAST(COALESCE(json_extract(receipt_json, '$.cost_minor_units'), 0) AS INTEGER)
+                                       WHEN status = 'unknown' AND idempotency_key != ?
+                                           THEN CAST(COALESCE(json_extract(receipt_json, '$.reserved_cost_minor_units'), 0) AS INTEGER)
+                                       ELSE 0
+                                   END
                                ), 0)
                                FROM external_actions
                                WHERE company_id = ?
-                                 AND status = 'confirmed'
+                                 AND status IN ('confirmed', 'unknown')
                                  AND substr(connector, 1, ?) = ?""",
-                            (company_id, len(prefix), prefix),
+                            (idempotency_key, company_id, len(prefix), prefix),
                         ).fetchone()[0]
                     )
-                    if spent_binding >= binding.budget_ceiling_minor_units:
+                    if (
+                        spent_binding >= binding.budget_ceiling_minor_units
+                        or spent_binding + reserved_cost
+                        > binding.budget_ceiling_minor_units
+                    ):
                         raise ConnectorBudgetExceeded(
                             f"Connector binding '{binding.binding_id}' budget ceiling "
-                            f"({binding.budget_ceiling_minor_units}) exhausted"
+                            f"({binding.budget_ceiling_minor_units}) would be exceeded "
+                            f"(spent={spent_binding}, reserved={reserved_cost})"
                         )
                 if grant.max_cost_minor_units > 0:
                     in_flight_grant = db.execute(
@@ -652,19 +700,29 @@ class ConnectorProxy:
                     spent_grant = int(
                         db.execute(
                             """SELECT COALESCE(SUM(
-                                   CAST(json_extract(receipt_json, '$.cost_minor_units') AS INTEGER)
+                                   CASE
+                                       WHEN status = 'confirmed'
+                                           THEN CAST(COALESCE(json_extract(receipt_json, '$.cost_minor_units'), 0) AS INTEGER)
+                                       WHEN status = 'unknown' AND idempotency_key != ?
+                                           THEN CAST(COALESCE(json_extract(receipt_json, '$.reserved_cost_minor_units'), 0) AS INTEGER)
+                                       ELSE 0
+                                   END
                                ), 0)
                                FROM external_actions
                                WHERE company_id = ?
-                                 AND status = 'confirmed'
+                                 AND status IN ('confirmed', 'unknown')
                                  AND json_extract(receipt_json, '$.grant_binding_id') = ?""",
-                            (company_id, grant.grant_binding_id),
+                            (idempotency_key, company_id, grant.grant_binding_id),
                         ).fetchone()[0]
                     )
-                    if spent_grant >= grant.max_cost_minor_units:
+                    if (
+                        spent_grant >= grant.max_cost_minor_units
+                        or spent_grant + reserved_cost > grant.max_cost_minor_units
+                    ):
                         raise ConnectorBudgetExceeded(
                             f"Connector grant '{grant.grant_binding_id}' cost ceiling "
-                            f"({grant.max_cost_minor_units}) exhausted"
+                            f"({grant.max_cost_minor_units}) would be exceeded "
+                            f"(spent={spent_grant}, reserved={reserved_cost})"
                         )
 
                 lookup_context = _extract_lookup_context(payload, request_id.strip())
@@ -683,6 +741,7 @@ class ConnectorProxy:
                         "admission_id": clean_admission,
                         "request_sha256": req_sha256,
                         "execution_generation": exec_gen,
+                        "reserved_cost_minor_units": reserved_cost,
                         "lookup_context": lookup_context,
                     },
                     now_ns=ts,
@@ -918,6 +977,9 @@ class ConnectorProxy:
             "admission_id": clean_admission,
             "request_sha256": req_sha256,
             "execution_generation": exec_gen,
+            "reserved_cost_minor_units": (
+                reserved_cost if ext_status == "unknown" else 0
+            ),
             "lookup_context": lookup_context,
             "source_ref": clean_response.source_ref,
             "cost_minor_units": clean_response.cost_minor_units,

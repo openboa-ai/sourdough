@@ -56,6 +56,8 @@ from sourdough.writer_lease import hold_company_writer
 
 
 class _FakeAdapter:
+    max_cost_per_call_minor_units: int = 25
+
     def __init__(self) -> None:
         self.execute_calls: list[ConnectorRequest] = []
         self.lookup_calls: list[ConnectorRequest] = []
@@ -289,7 +291,7 @@ class ConnectorSubsystemTests(unittest.TestCase):
                     actor_id="board-1",
                     max_requests_per_window=2,
                     window_seconds=60,
-                    budget_ceiling_minor_units=30,
+                    budget_ceiling_minor_units=60,
                     allow_loopback=True,
                     now_ns=now,
                 )
@@ -315,7 +317,7 @@ class ConnectorSubsystemTests(unittest.TestCase):
                     binding_revision=binding.revision,
                     allowed_operations=("fetch_doc", "submit_write"),
                     granted_by_actor_id="board-1",
-                    max_cost_minor_units=30,
+                    max_cost_minor_units=60,
                     now_ns=now + 20,
                 )
 
@@ -466,7 +468,7 @@ class ConnectorSubsystemTests(unittest.TestCase):
                         now_ns=now + 55,
                     )
 
-                # 6. Second unique call succeeds (total spent becomes 50 >= 30 ceiling)
+                # 6. Second unique call succeeds (total spent becomes 50 <= 60 ceiling)
                 proxy.invoke(
                     w,
                     claim,
@@ -487,7 +489,7 @@ class ConnectorSubsystemTests(unittest.TestCase):
                         payload={"doc": "c"},
                         now_ns=now + 70,
                     )
-                # After window passes, budget ceiling (30) blocks new calls!
+                # After window passes, pre-dispatch reservation (50 + 25 = 75 > 60) blocks BEFORE dispatch!
                 with self.assertRaises(ConnectorBudgetExceeded):
                     proxy.invoke(
                         w,
@@ -498,6 +500,7 @@ class ConnectorSubsystemTests(unittest.TestCase):
                         payload={"doc": "c"},
                         now_ns=now + 120_000_000_000,
                     )
+                self.assertEqual(len(adapter.execute_calls), 2)
 
             # Verify zero raw secret bytes anywhere in company.sqlite
             self.assertNotIn(secret_raw.encode("utf-8"), store.read_bytes())
@@ -1486,6 +1489,434 @@ class ConnectorSubsystemTests(unittest.TestCase):
             target_srv.server_close()
             t1.join(timeout=5.0)
             t2.join(timeout=5.0)
+
+    def test_pre_dispatch_budget_reservation_blocks_oversized_calls_and_unknown_reservations(
+        self,
+    ) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import json
+        import threading
+        from sourdough.connectors import (
+            CONNECTOR_KIND_LLM_INFERENCE,
+            LLM_COMPLETE_OP,
+            ScopedLlmInferenceConnector,
+        )
+
+        with TemporaryDirectory(prefix="sd-c-res-") as tmp:
+            store, leases, founding, claim, now = _setup_company_and_claim(Path(tmp))
+            adapter = _FakeAdapter()
+            llm_adapter = ScopedLlmInferenceConnector()
+
+            received_bodies: list[dict[str, Any]] = []
+
+            class _LlmHandler(BaseHTTPRequestHandler):
+                def log_message(self, fmt: str, *args: object) -> None:
+                    del fmt, args
+
+                def do_POST(self) -> None:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                    received_bodies.append(body)
+                    payload = json.dumps(
+                        {
+                            "id": "resp-res-1",
+                            "model": body["model"],
+                            "output_text": "ok",
+                            "usage": {"input_tokens": 10, "output_tokens": 10},
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+            srv = HTTPServer(("127.0.0.1", 0), _LlmHandler)
+            port = int(srv.server_address[1])
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                proxy = ConnectorProxy(
+                    ConnectorAdapterRegistry([adapter, llm_adapter]),
+                    InMemorySecretVault(
+                        {
+                            "envref:FAKE_TEST_KEY": "test-res-key-1111",
+                            "envref:OPENAI_TEST_KEY": "test-llm-res-key-2222",
+                        }
+                    ),
+                    loopback_only=True,
+                )
+                with hold_company_writer(
+                    store, founding.company_id, lease_directory=leases
+                ) as w:
+                    # 1. Ceiling 10 with 25-unit adapter blocks even the FIRST call before dispatch
+                    b_tiny = register_connector_binding(
+                        w,
+                        company_id=founding.company_id,
+                        binding_id="svc-tiny",
+                        connector_kind="fake_service",
+                        environment="external_test",
+                        endpoint_url="http://127.0.0.1:9020",
+                        allowed_hosts=("127.0.0.1",),
+                        operations=adapter.manifest.operations,
+                        credential_handle_ref="envref:FAKE_TEST_KEY",
+                        actor_id="board-1",
+                        budget_ceiling_minor_units=10,
+                        allow_loopback=True,
+                        now_ns=now,
+                    )
+                    grant_connector_access(
+                        w,
+                        company_id=founding.company_id,
+                        agent_id=founding.founder_id,
+                        standing_grant_id=founding.grant_id,
+                        binding_id=b_tiny.binding_id,
+                        binding_revision=b_tiny.revision,
+                        allowed_operations=("fetch_doc",),
+                        granted_by_actor_id="board-1",
+                        max_cost_minor_units=10,
+                        now_ns=now + 1,
+                    )
+                    with self.assertRaises(ConnectorBudgetExceeded):
+                        proxy.invoke(
+                            w,
+                            claim,
+                            binding_id=b_tiny.binding_id,
+                            operation="fetch_doc",
+                            request_id="tiny-1",
+                            payload={"doc": "a"},
+                            now_ns=now + 2,
+                        )
+                    self.assertEqual(len(adapter.execute_calls), 0)
+
+                    # 2. Ceiling 30 allows 1st call (25 <= 30) and blocks 2nd (25 + 25 = 50 > 30) before dispatch
+                    b_med = register_connector_binding(
+                        w,
+                        company_id=founding.company_id,
+                        binding_id="svc-med",
+                        connector_kind="fake_service",
+                        environment="external_test",
+                        endpoint_url="http://127.0.0.1:9021",
+                        allowed_hosts=("127.0.0.1",),
+                        operations=adapter.manifest.operations,
+                        credential_handle_ref="envref:FAKE_TEST_KEY",
+                        actor_id="board-1",
+                        budget_ceiling_minor_units=30,
+                        allow_loopback=True,
+                        now_ns=now + 5,
+                    )
+                    grant_connector_access(
+                        w,
+                        company_id=founding.company_id,
+                        agent_id=founding.founder_id,
+                        standing_grant_id=founding.grant_id,
+                        binding_id=b_med.binding_id,
+                        binding_revision=b_med.revision,
+                        allowed_operations=("fetch_doc",),
+                        granted_by_actor_id="board-1",
+                        max_cost_minor_units=30,
+                        now_ns=now + 6,
+                    )
+                    first = proxy.invoke(
+                        w,
+                        claim,
+                        binding_id=b_med.binding_id,
+                        operation="fetch_doc",
+                        request_id="med-1",
+                        payload={"doc": "a"},
+                        now_ns=now + 7,
+                    )
+                    self.assertEqual(first.status, "observed")
+                    self.assertEqual(len(adapter.execute_calls), 1)
+                    with self.assertRaises(ConnectorBudgetExceeded):
+                        proxy.invoke(
+                            w,
+                            claim,
+                            binding_id=b_med.binding_id,
+                            operation="fetch_doc",
+                            request_id="med-2",
+                            payload={"doc": "b"},
+                            now_ns=now + 8,
+                        )
+                    self.assertEqual(len(adapter.execute_calls), 1)
+
+                    # 3. Indeterminate ('unknown') call keeps its reserved_cost_minor_units held
+                    b_unk = register_connector_binding(
+                        w,
+                        company_id=founding.company_id,
+                        binding_id="svc-unk",
+                        connector_kind="fake_service",
+                        environment="external_test",
+                        endpoint_url="http://127.0.0.1:9022",
+                        allowed_hosts=("127.0.0.1",),
+                        operations=adapter.manifest.operations,
+                        credential_handle_ref="envref:FAKE_TEST_KEY",
+                        actor_id="board-1",
+                        budget_ceiling_minor_units=30,
+                        allow_loopback=True,
+                        now_ns=now + 10,
+                    )
+                    grant_connector_access(
+                        w,
+                        company_id=founding.company_id,
+                        agent_id=founding.founder_id,
+                        standing_grant_id=founding.grant_id,
+                        binding_id=b_unk.binding_id,
+                        binding_revision=b_unk.revision,
+                        allowed_operations=("fetch_doc",),
+                        granted_by_actor_id="board-1",
+                        max_cost_minor_units=30,
+                        now_ns=now + 11,
+                    )
+                    adapter.next_execute = lambda _r, _s: (_ for _ in ()).throw(
+                        ConnectorIndeterminate("timeout")
+                    )
+                    unk = proxy.invoke(
+                        w,
+                        claim,
+                        binding_id=b_unk.binding_id,
+                        operation="fetch_doc",
+                        request_id="unk-1",
+                        payload={"doc": "a"},
+                        now_ns=now + 12,
+                    )
+                    self.assertEqual(unk.status, "unknown")
+                    adapter.next_execute = None
+                    with self.assertRaises(ConnectorBudgetExceeded):
+                        proxy.invoke(
+                            w,
+                            claim,
+                            binding_id=b_unk.binding_id,
+                            operation="fetch_doc",
+                            request_id="unk-2",
+                            payload={"doc": "b"},
+                            now_ns=now + 13,
+                        )
+                    self.assertEqual(len(adapter.execute_calls), 2)
+
+                    # 4. ScopedLlmInferenceConnector reserves upper-bound cost & enforces cap
+                    b_llm = register_connector_binding(
+                        w,
+                        company_id=founding.company_id,
+                        binding_id="llm-tight",
+                        connector_kind=CONNECTOR_KIND_LLM_INFERENCE,
+                        environment="external_test",
+                        endpoint_url=f"http://127.0.0.1:{port}",
+                        allowed_hosts=("127.0.0.1",),
+                        operations=(LLM_COMPLETE_OP,),
+                        credential_handle_ref="envref:OPENAI_TEST_KEY",
+                        actor_id="board-1",
+                        budget_ceiling_minor_units=5,
+                        allow_loopback=True,
+                        now_ns=now + 20,
+                    )
+                    grant_connector_access(
+                        w,
+                        company_id=founding.company_id,
+                        agent_id=founding.founder_id,
+                        standing_grant_id=founding.grant_id,
+                        binding_id=b_llm.binding_id,
+                        binding_revision=b_llm.revision,
+                        allowed_operations=("complete",),
+                        granted_by_actor_id="board-1",
+                        max_cost_minor_units=5,
+                        now_ns=now + 21,
+                    )
+                    # Omitted max_output_tokens reserves 16,384 output tokens (> 5 minor units) -> blocked!
+                    with self.assertRaises(ConnectorBudgetExceeded):
+                        proxy.invoke(
+                            w,
+                            claim,
+                            binding_id=b_llm.binding_id,
+                            operation="complete",
+                            request_id="llm-uncapped",
+                            payload={"model": "gpt-6-luna", "input": "hello"},
+                            now_ns=now + 22,
+                        )
+                    self.assertEqual(received_bodies, [])
+                    # Explicitly bounded max_output_tokens=100 fits within ceiling 5 -> succeeds!
+                    llm_ok = proxy.invoke(
+                        w,
+                        claim,
+                        binding_id=b_llm.binding_id,
+                        operation="complete",
+                        request_id="llm-bounded",
+                        payload={
+                            "model": "gpt-6-luna",
+                            "input": "hello",
+                            "max_output_tokens": 100,
+                        },
+                        now_ns=now + 23,
+                    )
+                    self.assertEqual(llm_ok.status, "observed")
+                    self.assertEqual(len(received_bodies), 1)
+                    self.assertEqual(received_bodies[0]["max_output_tokens"], 100)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                thread.join(timeout=5.0)
+
+    def test_trading_venue_connector_reconciles_binance_mapped_client_order_id(
+        self,
+    ) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import json
+        import threading
+        from urllib.parse import parse_qs, urlparse
+
+        submitted_coids: list[str] = []
+        queried_coids: list[str] = []
+
+        class _BinanceMockHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                del fmt, args
+
+            def do_POST(self) -> None:
+                parsed = urlparse(self.path)
+                params = parse_qs(parsed.query)
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 0:
+                    body_params = parse_qs(self.rfile.read(length).decode("utf-8"))
+                    params.update(body_params)
+                coid = (params.get("newClientOrderId") or [""])[0]
+                submitted_coids.append(coid)
+                # Simulate HTTP 500 ambiguous execution reply so ConnectorProxy records 'unknown'
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b'{"code":-1001,"msg":"internal error"}')
+
+            def do_GET(self) -> None:
+                parsed = urlparse(self.path)
+                params = parse_qs(parsed.query)
+                coid = (params.get("origClientOrderId") or [""])[0]
+                queried_coids.append(coid)
+                if coid in submitted_coids:
+                    body = json.dumps(
+                        {
+                            "orderId": 98765,
+                            "clientOrderId": coid,
+                            "symbol": "BTCUSDT",
+                            "side": "BUY",
+                            "status": "FILLED",
+                            "origQty": "0.01",
+                            "executedQty": "0.01",
+                            "cummulativeQuoteQty": "500.00",
+                            "updateTime": 1700000001000,
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"code":-2013,"msg":"Order does not exist."}')
+
+        srv = HTTPServer(("127.0.0.1", 0), _BinanceMockHandler)
+        port = int(srv.server_address[1])
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory(prefix="sd-c-bmap-") as tmp:
+                store, leases, founding, claim, now = _setup_company_and_claim(
+                    Path(tmp)
+                )
+                adapter = TradingVenueConnectorAdapter(
+                    venue_resolver=build_bound_binance_venue
+                )
+                proxy = ConnectorProxy(
+                    ConnectorAdapterRegistry([adapter]),
+                    InMemorySecretVault(
+                        {
+                            "envref:BINANCE_TESTNET": {
+                                "api_key": "test-bmap-key-1111",
+                                "api_secret": "test-bmap-sec-2222",
+                            }
+                        }
+                    ),
+                    loopback_only=True,
+                )
+                with hold_company_writer(
+                    store, founding.company_id, lease_directory=leases
+                ) as w:
+                    binding = register_connector_binding(
+                        w,
+                        company_id=founding.company_id,
+                        binding_id="binance-spot-test",
+                        connector_kind=CONNECTOR_KIND_TRADING_VENUE,
+                        environment="external_test",
+                        endpoint_url=f"http://127.0.0.1:{port}",
+                        allowed_hosts=("127.0.0.1",),
+                        operations=adapter.manifest.operations,
+                        credential_handle_ref="envref:BINANCE_TESTNET",
+                        actor_id="board-1",
+                        allow_loopback=True,
+                        now_ns=now,
+                    )
+                    grant_connector_access(
+                        w,
+                        company_id=founding.company_id,
+                        agent_id=founding.founder_id,
+                        standing_grant_id=founding.grant_id,
+                        binding_id=binding.binding_id,
+                        binding_revision=binding.revision,
+                        allowed_operations=("submit_order", "query_order"),
+                        granted_by_actor_id="board-1",
+                        now_ns=now + 5,
+                    )
+                    action_id = "order-binance-map-1"
+                    payload = {
+                        "action_id": action_id,
+                        "symbol": "BTCUSDT",
+                        "side": "BUY",
+                        "time_in_force": "GTC",
+                        "quantity": "0.01",
+                        "limit_price": "50000",
+                    }
+                    adm = issue_connector_admission(
+                        w,
+                        company_id=founding.company_id,
+                        binding_id=binding.binding_id,
+                        binding_revision=binding.revision,
+                        operation="submit_order",
+                        request_id=action_id,
+                        payload=payload,
+                        issued_by_service="trading.execution_service",
+                        actor_id=founding.founder_id,
+                        now_ns=now + 8,
+                    )
+                    resp = proxy.invoke(
+                        w,
+                        claim,
+                        binding_id=binding.binding_id,
+                        operation="submit_order",
+                        request_id=action_id,
+                        payload=payload,
+                        admission_id=adm.admission_id,
+                        now_ns=now + 10,
+                    )
+                    self.assertEqual(resp.status, "unknown")
+                    idem_key = resp.payload["idempotency_key"]
+
+                    reconciled = proxy.reconcile_unknown_action(
+                        w, claim, idempotency_key=idem_key, now_ns=now + 20
+                    )
+                    self.assertEqual(len(submitted_coids), 1)
+                    expected_coid = submitted_coids[0]
+                    self.assertTrue(expected_coid.startswith("sd_"))
+                    self.assertEqual(queried_coids, [expected_coid])
+                    self.assertNotEqual(expected_coid, action_id)
+                    self.assertEqual(reconciled.status, "observed")
+                    self.assertEqual(reconciled.payload["order_status"], "filled")
+                    self.assertEqual(
+                        reconciled.payload["client_order_id"], expected_coid
+                    )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5.0)
 
 
 if __name__ == "__main__":

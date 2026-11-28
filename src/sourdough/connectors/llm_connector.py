@@ -207,6 +207,9 @@ def _extract_output_text(parsed: dict[str, Any]) -> str:
     return ""
 
 
+DEFAULT_MAX_OUTPUT_TOKENS = 16_384
+
+
 class ScopedLlmInferenceConnector:
     """Credential-proxied external LLM connector metered through company GL & policy gates."""
 
@@ -233,6 +236,35 @@ class ScopedLlmInferenceConnector:
     @property
     def manifest(self) -> ConnectorManifest:
         return self._manifest
+
+    def estimate_max_cost_minor_units(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+    ) -> int:
+        """Compute a conservative upper-bound integer cost for pre-dispatch budget reservation."""
+        raw_input = str(payload.get("input") or "")
+        raw_instructions = str(payload.get("instructions") or "")
+        # Conservative upper bound: at most 1 token per UTF-8 byte + framing overhead.
+        in_tokens_upper = (
+            len(raw_input.encode("utf-8")) + len(raw_instructions.encode("utf-8")) + 256
+        )
+        if operation == "complete":
+            max_tok = payload.get("max_output_tokens")
+            # If max_output_tokens is omitted, enforce & reserve the default cap.
+            out_tokens_upper = (
+                int(max_tok)
+                if type(max_tok) is int and max_tok > 0
+                else DEFAULT_MAX_OUTPUT_TOKENS
+            )
+            return compute_usage_cost_minor_units(
+                TokenUsage(in_tokens_upper, out_tokens_upper), self._pricing
+            )
+        if operation == "embed":
+            return compute_usage_cost_minor_units(
+                TokenUsage(in_tokens_upper, 0), self._pricing
+            )
+        return 0
 
     def execute(
         self,
@@ -263,6 +295,9 @@ class ScopedLlmInferenceConnector:
                         "max_output_tokens must be a positive integer"
                     )
                 max_tok = max_tok_raw
+            effective_max_tok = (
+                max_tok if max_tok is not None else DEFAULT_MAX_OUTPUT_TOKENS
+            )
             api_style = str(request.payload.get("api_style") or "responses")
             if api_style == "chat_completions":
                 url = f"{base}/v1/chat/completions"
@@ -271,17 +306,21 @@ class ScopedLlmInferenceConnector:
                 if isinstance(instructions, str) and instructions.strip():
                     messages.append({"role": "system", "content": instructions})
                 messages.append({"role": "user", "content": prompt_input})
-                body: dict[str, Any] = {"model": model.strip(), "messages": messages}
-                if max_tok is not None:
-                    body["max_tokens"] = max_tok
+                body: dict[str, Any] = {
+                    "model": model.strip(),
+                    "messages": messages,
+                    "max_tokens": effective_max_tok,
+                }
             elif api_style == "responses":
                 url = f"{base}/v1/responses"
-                body = {"model": model.strip(), "input": prompt_input}
+                body = {
+                    "model": model.strip(),
+                    "input": prompt_input,
+                    "max_output_tokens": effective_max_tok,
+                }
                 instructions = request.payload.get("instructions")
                 if isinstance(instructions, str) and instructions.strip():
                     body["instructions"] = instructions
-                if max_tok is not None:
-                    body["max_output_tokens"] = max_tok
             else:
                 raise ConnectorRefused(
                     f"Unsupported llm_inference api_style: {api_style}"
