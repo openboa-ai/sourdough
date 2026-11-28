@@ -12676,6 +12676,540 @@ class TestM5Tier5Hardening(unittest.TestCase):
             )
         self.assertNotIn(project_a_marker, b_msgs)
 
+    def test_pr191_r29_security_and_code_review_hardening(self) -> None:
+        """PR #191 R29: Historical message audience taint, hydrated peer_outcome audience guard, and Gen-2 sealed toolset."""
+        from collections.abc import Mapping
+
+        from sourdough.agent_runtime.protocol import (
+            AdapterManifest,
+            AgentRuntimeAdapter,
+            PROVIDER_OPENAI,
+            ShiftResult,
+            TokenUsage,
+        )
+        from sourdough.agent_runtime.registry import AgentAdapterRegistry
+        from sourdough.company_assets import assign_project
+        from sourdough.conversations import Post, append_message
+        from sourdough.runtime.engine import CompanyRuntime
+        from sourdough.runtime.handlers import build_production_duty_registry
+        from sourdough.runtime.work_kernel import complete_work_run, create_work_item
+        from sourdough.trial_runner import (
+            _GEN2_TRANSFER_TOOL_MANIFEST,
+            run_recursive_learning_cycle,
+        )
+
+        now_ns = time_ns()
+        pre_enroll_marker = "pre-enroll-alpha-7120"
+        peer_answer_marker = "peer-a2-note-5519"
+
+        # ------------------------------------------------------------------
+        # 1. Security #27: Historical message audience preserved after newcomer joins
+        # ------------------------------------------------------------------
+        with hold_company_writer(self.store, self.company_id) as w:
+            victim, _ = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="victim-r29",
+                profile_id=self.profile.profile_id(),
+            )
+            alice, alice_grant = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="alice-r29",
+                profile_id=self.profile.profile_id(),
+            )
+            mallory, _ = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="mallory-r29",
+                profile_id=self.profile.profile_id(),
+            )
+            proj_a_rev1 = assign_project(
+                w,
+                self.grant_id,
+                "proj-a-r29",
+                (victim, alice),
+                publishers=(victim, alice),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, alice_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=alice,
+                    grant_id=alice_grant,
+                    grant_scope="assessment",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                )
+            append_message(
+                w,
+                alice_claim,
+                alice_claim.purpose,
+                Post(
+                    "proj-a-r29",
+                    proj_a_rev1,
+                    "pre-enroll-msg-1",
+                    f"Pre-enrollment restricted thread note: {pre_enroll_marker}",
+                    "",
+                ),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                complete_work_run(
+                    db,
+                    alice_claim.run_id,
+                    alice_claim.fencing_token,
+                    outcome={"ok": True},
+                    now_ns=now_ns + 5,
+                )
+            # Later add Mallory to Project A (historical message audience remains {victim, alice}!)
+            proj_a_rev2 = assign_project(
+                w,
+                self.grant_id,
+                "proj-a-r29",
+                (victim, alice, mallory),
+                publishers=(victim, alice, mallory),
+                expected_revision=proj_a_rev1,
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item_hist, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=victim,
+                    duty_kind="work.assessment_review",
+                    source_kind="manual",
+                    source_id="r29-hist-aud",
+                    now_ns=now_ns + 10,
+                )
+
+        hist_obs: dict[str, Any] = {}
+
+        class _HistoricalAudAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "r29-hist-v1", "https_json", True, True, True
+                )
+
+            def run_shift(self, profile, request, broker) -> ShiftResult:
+                msgs = broker.invoke(
+                    "r29-read-a",
+                    "read_messages",
+                    {"project_id": "proj-a-r29"},
+                )
+                hist_obs["read_count"] = len(msgs.get("messages") or [])
+                repost = broker.invoke(
+                    "r29-repost-a",
+                    "append_message",
+                    {
+                        "project_id": "proj-a-r29",
+                        "project_revision": proj_a_rev2,
+                        "request_id": "r29-repost-leak",
+                        "body": f"Reposted: {pre_enroll_marker}",
+                    },
+                )
+                hist_obs["repost_blocked"] = not repost.get("ok", True)
+                req_mal = broker.invoke(
+                    "r29-req-mal",
+                    "request_peer_response",
+                    {
+                        "request_key": "r29-req-mal-1",
+                        "recipient_id": mallory,
+                        "question": f"Saw {pre_enroll_marker}",
+                        "expected_response": "ack",
+                        "expires_at": int(time_ns() // 1_000_000_000) + 3600,
+                    },
+                )
+                hist_obs["req_mallory_blocked"] = not req_mal.get("ok", True)
+                return ShiftResult(
+                    output_text="Historical audience checked.",
+                    usage=TokenUsage(input_tokens=15, output_tokens=8),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg_hist = AgentAdapterRegistry()
+        areg_hist.register(_HistoricalAudAdapter())
+        dreg_hist = build_production_duty_registry(
+            adapter_registry=areg_hist,
+            profile_bindings={
+                self.founder_id: self.profile,
+                victim: self.profile,
+                alice: self.profile,
+                mallory: self.profile,
+            },
+        )
+        rt_hist = CompanyRuntime(
+            self.store, self.company_id, dreg_hist, clock=lambda: now_ns + 20
+        )
+        rt_hist.step(
+            max_dispatches=1,
+            now_ns=now_ns + 20,
+            target_work_item_id=item_hist.work_item_id,
+        )
+        self.assertEqual(hist_obs.get("read_count"), 1)
+        self.assertTrue(hist_obs.get("repost_blocked"))
+        self.assertTrue(hist_obs.get("req_mallory_blocked"))
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            a_repost_cnt = int(
+                ro.execute(
+                    """SELECT COUNT(*) FROM project_message
+                       WHERE company_id = ? AND project_id = 'proj-a-r29'
+                         AND request_id = 'r29-repost-leak'""",
+                    (self.company_id,),
+                ).fetchone()[0]
+            )
+        self.assertEqual(a_repost_cnt, 0)
+
+        # ------------------------------------------------------------------
+        # 2. Code Review #1: Hydrated peer_outcome narrows outbound audience guard
+        # ------------------------------------------------------------------
+        with hold_company_writer(self.store, self.company_id) as w:
+            proj_a2_rev = assign_project(
+                w,
+                self.grant_id,
+                "proj-a2-r29",
+                (victim, alice),
+                publishers=(victim, alice),
+                peer_responders=(alice,),
+            )
+            proj_b2_rev = assign_project(
+                w,
+                self.grant_id,
+                "proj-b2-r29",
+                (victim, mallory),
+                publishers=(victim, mallory),
+                peer_responders=(mallory,),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                item_peer, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=victim,
+                    duty_kind="work.assessment_review",
+                    source_kind="manual",
+                    source_id="r29-peer-outcome-guard",
+                    now_ns=now_ns + 30,
+                )
+
+        peer_obs: dict[str, Any] = {}
+
+        class _PeerOutcomeGuardAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "r29-peer-v1", "https_json", True, True, True
+                )
+
+            def run_shift(self, profile, request, broker) -> ShiftResult:
+                tool_names = {t.name for t in request.tools}
+                if "respond_peer_request" in tool_names:
+                    broker.invoke(
+                        f"ans-{request.run_id}",
+                        "respond_peer_request",
+                        {"outcome": "answered", "answer": peer_answer_marker},
+                    )
+                    return ShiftResult(
+                        output_text="Answered.",
+                        usage=TokenUsage(input_tokens=15, output_tokens=8),
+                        provider=profile.provider,
+                        model=profile.model,
+                        run_id=request.run_id,
+                        turn_id=request.turn_id,
+                        tool_calls_executed=broker.call_count,
+                        events=(),
+                    )
+                outcome_rec = next(
+                    (
+                        r
+                        for r in request.context.open_receipts
+                        if isinstance(r, Mapping) and r.get("kind") == "peer_outcome"
+                    ),
+                    None,
+                )
+                if outcome_rec is None:
+                    broker.invoke(
+                        f"ask-{request.run_id}",
+                        "request_peer_response",
+                        {
+                            "request_key": "r29-ask-alice",
+                            "recipient_id": alice,
+                            "project_id": "proj-a2-r29",
+                            "question": "Share project A2 note?",
+                            "expected_response": "note",
+                            "expires_at": int(time_ns() // 1_000_000_000) + 3600,
+                        },
+                    )
+                    return ShiftResult(
+                        output_text="Waiting on Alice.",
+                        usage=TokenUsage(input_tokens=15, output_tokens=8),
+                        provider=profile.provider,
+                        model=profile.model,
+                        run_id=request.run_id,
+                        turn_id=request.turn_id,
+                        tool_calls_executed=broker.call_count,
+                        events=(),
+                    )
+                peer_obs["hydrated_project_id"] = outcome_rec.get("project_id")
+                peer_obs["hydrated_answer"] = outcome_rec.get("answer")
+                post_b2 = broker.invoke(
+                    f"leak-b2-{request.run_id}",
+                    "append_message",
+                    {
+                        "project_id": "proj-b2-r29",
+                        "project_revision": proj_b2_rev,
+                        "request_id": "r29-leak-b2",
+                        "body": f"Leaked: {outcome_rec.get('answer')}",
+                    },
+                )
+                peer_obs["post_b2_blocked"] = not post_b2.get("ok", True)
+                req_mal2 = broker.invoke(
+                    f"req-mal2-{request.run_id}",
+                    "request_peer_response",
+                    {
+                        "request_key": "r29-leak-mal",
+                        "recipient_id": mallory,
+                        "question": f"Leaked: {outcome_rec.get('answer')}",
+                        "expected_response": "ack",
+                        "expires_at": int(time_ns() // 1_000_000_000) + 3600,
+                    },
+                )
+                peer_obs["req_mal2_blocked"] = not req_mal2.get("ok", True)
+                post_a2 = broker.invoke(
+                    f"ok-a2-{request.run_id}",
+                    "append_message",
+                    {
+                        "project_id": "proj-a2-r29",
+                        "project_revision": proj_a2_rev,
+                        "request_id": "r29-ok-a2",
+                        "body": f"Confirmed in A2: {outcome_rec.get('answer')}",
+                    },
+                )
+                peer_obs["post_a2_ok"] = bool(post_a2.get("ok"))
+                return ShiftResult(
+                    output_text="Completed resumed review.",
+                    usage=TokenUsage(input_tokens=15, output_tokens=8),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg_peer = AgentAdapterRegistry()
+        areg_peer.register(_PeerOutcomeGuardAdapter())
+        dreg_peer = build_production_duty_registry(
+            adapter_registry=areg_peer,
+            profile_bindings={
+                self.founder_id: self.profile,
+                victim: self.profile,
+                alice: self.profile,
+                mallory: self.profile,
+            },
+        )
+        rt_peer = CompanyRuntime(
+            self.store, self.company_id, dreg_peer, clock=lambda: now_ns + 40
+        )
+        # Step 1: Victim asks Alice and waits
+        rt_peer.step(
+            max_dispatches=1,
+            now_ns=now_ns + 40,
+            target_work_item_id=item_peer.work_item_id,
+        )
+        # Step 2: Alice answers
+        rt_peer.step(max_dispatches=1, now_ns=now_ns + 50)
+        # Step 3: Victim resumes with hydrated peer_outcome -> Project B2/Mallory blocked, Project A2 allowed
+        rt_peer.step(
+            max_dispatches=1,
+            now_ns=now_ns + 60,
+            target_work_item_id=item_peer.work_item_id,
+        )
+        self.assertEqual(peer_obs.get("hydrated_project_id"), "proj-a2-r29")
+        self.assertEqual(peer_obs.get("hydrated_answer"), peer_answer_marker)
+        self.assertTrue(peer_obs.get("post_b2_blocked"))
+        self.assertTrue(peer_obs.get("req_mal2_blocked"))
+        self.assertTrue(peer_obs.get("post_a2_ok"))
+        with closing(open_reader(self.store)) as ro, read_tx(ro):
+            b2_cnt = int(
+                ro.execute(
+                    """SELECT COUNT(*) FROM project_message
+                       WHERE company_id = ? AND project_id = 'proj-b2-r29'""",
+                    (self.company_id,),
+                ).fetchone()[0]
+            )
+        self.assertEqual(b2_cnt, 0)
+
+        # ------------------------------------------------------------------
+        # 3. Code Review #2: Live Gen-2 callbacks enforce sealed toolset
+        # ------------------------------------------------------------------
+        gen2_observed_toolsets: list[frozenset[str]] = []
+        gen2_forbidden_blocked: list[bool] = []
+
+        class _Gen2SealedToolsetAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "r29-gen2-v1", "https_json", True, True, True
+                )
+
+            def run_shift(self, profile, request, broker) -> ShiftResult:
+                tool_names = frozenset(t.name for t in request.tools)
+                case_trig = next(
+                    (
+                        r
+                        for r in request.context.open_receipts
+                        if isinstance(r, Mapping)
+                        and r.get("kind") == "discovery_trigger"
+                        and isinstance(r.get("boundary_counterexample"), Mapping)
+                    ),
+                    None,
+                )
+                if case_trig is not None:
+                    gen2_observed_toolsets.append(tool_names)
+                    # Attempting an unsealed tool MUST be refused by broker
+                    try:
+                        res = broker.invoke(
+                            f"unsealed-{request.run_id}",
+                            "append_message",
+                            {
+                                "project_id": "proj-a-r29",
+                                "project_revision": proj_a_rev2,
+                                "request_id": "unsealed-try",
+                                "body": "should fail",
+                            },
+                        )
+                        gen2_forbidden_blocked.append(not res.get("ok", True))
+                    except Exception:
+                        gen2_forbidden_blocked.append(True)
+
+                cx_proc: str | None = None
+                for entry in request.context.active_methods:
+                    if entry.get("item_kind") != "improvement_procedure":
+                        continue
+                    mid = str(entry["method_id"])
+                    sres = broker.invoke(
+                        f"read-{request.run_id}-{mid}",
+                        "skill_read",
+                        {"method_id": mid},
+                    )
+                    broker.invoke(
+                        f"inv-{request.run_id}-{mid}",
+                        "skill_record_invocation",
+                        {"method_id": mid, "note": "Applied"},
+                    )
+                    meta = (sres.get("skill") or {}).get("procedure_meta") or {}
+                    if meta.get("require_counterexample") is True:
+                        cx_proc = mid
+                if cx_proc is not None and case_trig is not None:
+                    p_sym = str(
+                        (case_trig.get("primary_item") or {}).get("symptom")
+                        or "primary"
+                    )
+                    b_sym = str(
+                        (case_trig.get("boundary_counterexample") or {}).get("symptom")
+                        or "boundary"
+                    )
+                    c_id = str(case_trig.get("case_id") or "case-r29")
+                    broker.invoke(
+                        f"wm-{request.run_id}",
+                        "skill_draft_candidate",
+                        {
+                            "method_id": f"wm-r29-{request.run_id[:16]}",
+                            "delta_kind": "ADD",
+                            "item_kind": "work_method",
+                            "trigger_spec": {
+                                "duty_kind": "work.discovery_review",
+                                "negative_triggers": [b_sym],
+                            },
+                            "body": (
+                                f"Handle {p_sym} on {c_id} while preserving {b_sym} "
+                                "boundary exceptions and preventing false-positive exclusions."
+                            ),
+                            "falsification_criteria": (
+                                f"Reject if {b_sym} on {c_id} is discarded."
+                            ),
+                            "audience_scope": "company",
+                            "source_refs": [f"work_run:{request.run_id}"],
+                        },
+                    )
+                    note_res = broker.invoke(
+                        f"note-{request.run_id}",
+                        "desk_save_draft",
+                        {
+                            "name": f"case-r29-{request.run_id[:8]}",
+                            "content": f"Case {c_id}: handled {p_sym}, preserved {b_sym}.",
+                        },
+                    )
+                    broker.invoke(
+                        f"dec-{request.run_id}",
+                        "record_work_decision",
+                        {
+                            "action_kind": "counterexample_verified",
+                            "rationale": f"Verified {b_sym} on {c_id} via {cx_proc}.",
+                            "evidence": [
+                                {
+                                    "kind": "private_draft",
+                                    "resource_id": note_res["name"],
+                                    "revision": note_res["revision"],
+                                    "available_at_ns": 1,
+                                    "observed_at_ns": 1,
+                                }
+                            ],
+                        },
+                    )
+                else:
+                    broker.invoke(
+                        f"dec-{request.run_id}",
+                        "record_work_decision",
+                        {
+                            "action_kind": "apply_baseline_heuristic",
+                            "rationale": "Baseline.",
+                            "evidence": [],
+                        },
+                    )
+                return ShiftResult(
+                    output_text="Gen-2 shift done.",
+                    usage=TokenUsage(input_tokens=20, output_tokens=10),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg_gen2 = AgentAdapterRegistry()
+        areg_gen2.register(_Gen2SealedToolsetAdapter())
+        eval_dir = self.root / "r29-evals"
+        eval_dir.mkdir(mode=0o700)
+        with hold_company_writer(self.store, self.company_id) as w:
+            cycle = run_recursive_learning_cycle(
+                w,
+                evaluator_store=eval_dir / "evaluator.sqlite",
+                company_id=self.company_id,
+                meta_agent_id=self.founder_id,
+                promotion_actor_id=self.founder_id,
+                promotion_grant_id=self.grant_id,
+                trial_root=self.root / "r29-trials",
+                adapter_registry=areg_gen2,
+                profile_bindings={self.founder_id: self.profile},
+                min_families=6,
+            )
+        self.assertEqual(cycle.transfer_verdict, "SUPPORTED")
+        self.assertEqual(len(gen2_observed_toolsets), 12)
+        expected_sealed = frozenset(_GEN2_TRANSFER_TOOL_MANIFEST)
+        for ts in gen2_observed_toolsets:
+            self.assertEqual(ts, expected_sealed)
+        self.assertEqual(len(gen2_forbidden_blocked), 12)
+        self.assertTrue(all(gen2_forbidden_blocked))
+
 
 if __name__ == "__main__":
     unittest.main()

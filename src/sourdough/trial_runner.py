@@ -1943,6 +1943,19 @@ def _read_offloaded_receipt_payload(
         return parsed
 
 
+_GEN2_TRANSFER_TOOL_MANIFEST: tuple[str, ...] = (
+    "desk_list_drafts",
+    "desk_read_draft",
+    "desk_save_draft",
+    "desk_read_offloaded_log",
+    "skill_list_active",
+    "skill_read",
+    "skill_record_invocation",
+    "skill_draft_candidate",
+    "record_work_decision",
+)
+
+
 def run_recursive_learning_cycle(
     writer_or_store: WriterLease | Path,
     *,
@@ -2434,7 +2447,10 @@ def run_recursive_learning_cycle(
         fixture_bytes, _base_profiles, _base_founder = _compute_source_store_fixture(
             base_arm_store, company_id, agent_ids=(meta_agent_id,)
         )
-        tools_bytes = b'{"tools":["desk_read_draft","record_work_decision"]}'
+        tools_bytes = _canonical_json(
+            {"tools": list(_GEN2_TRANSFER_TOOL_MANIFEST)}
+        ).encode("utf-8")
+        gen2_sealed_tools = _parse_sealed_tool_manifest(tools_bytes)
         inc_ctx_bytes = _canonical_json(
             {"generation": 2, "procedure_revision": inc_proc_delta.revision_sha256}
         ).encode("utf-8")
@@ -2577,6 +2593,10 @@ def run_recursive_learning_cycle(
                             arm_w.store, company_id, meta_agent_id
                         )
                 if use_live_runtime:
+                    if sealed_slot.inputs.tools != sha256(tools_bytes).hexdigest():
+                        raise TrialRefused(
+                            "Sealed Gen-2 tool_manifest digest diverged from live slot allowlist"
+                        )
                     slot_now_ns = max(post_gen1_ns + 500 + _idx, time_ns())
                     with hold_company_writer(
                         slot_store, company_id, lease_directory=slot_leases
@@ -2585,6 +2605,10 @@ def run_recursive_learning_cycle(
                             closing(open_writer(slot_w.store, lease=slot_w)) as sdb,
                             write_tx(sdb),
                         ):
+                            gen2_payload = dict(_case_spec)
+                            gen2_payload["sealed_tool_manifest"] = list(
+                                gen2_sealed_tools
+                            )
                             item_obj, _ = create_work_item(
                                 sdb,
                                 company_id=company_id,
@@ -2592,7 +2616,7 @@ def run_recursive_learning_cycle(
                                 duty_kind="work.discovery_review",
                                 source_kind="recursive_learning",
                                 source_id=f"gen2-{sealed_slot.slot_id}",
-                                payload=dict(_case_spec),
+                                payload=gen2_payload,
                                 dedupe_key=f"rsi-gen2:{sealed_slot.slot_id}:{_idx}",
                                 actor_id=meta_agent_id,
                                 now_ns=slot_now_ns,

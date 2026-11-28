@@ -613,6 +613,7 @@ def build_production_duty_registry(
             company_id=company_id,
             requester_work_item_id=work_item_id,
             actor_id=agent_id,
+            include_provenance=True,
         )
         if peer_outcome is not None:
             receipts.append({"kind": "peer_outcome", **peer_outcome})
@@ -1188,14 +1189,25 @@ def build_production_duty_registry(
             (), {}, (proactive, collab)
         )
         sealed_tool_allowlist: frozenset[str] | None = None
-        if ctx.work_item.source_kind == "offline_trial" and isinstance(
-            payload.get("sealed_tool_manifest"), list
+        if (
+            ctx.work_item.source_kind in ("offline_trial", "recursive_learning")
+            and "sealed_tool_manifest" in payload
         ):
-            sealed_tool_allowlist = frozenset(
-                str(name)
-                for name in payload["sealed_tool_manifest"]
+            raw_manifest = payload.get("sealed_tool_manifest")
+            if not isinstance(raw_manifest, list):
+                raise RuntimeRefused(
+                    "sealed_tool_manifest must be a list of tool names"
+                )
+            parsed_manifest = frozenset(
+                name.strip()
+                for name in raw_manifest
                 if isinstance(name, str) and name.strip()
             )
+            if not parsed_manifest:
+                raise RuntimeRefused(
+                    "sealed_tool_manifest must contain at least one tool name"
+                )
+            sealed_tool_allowlist = parsed_manifest
         run_res = shift_runner.run(
             ctx,
             mandate_summary=(

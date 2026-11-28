@@ -4837,10 +4837,12 @@ def read_peer_request_outcome(
     company_id: str,
     requester_work_item_id: str,
     actor_id: str,
+    include_provenance: bool = False,
 ) -> dict[str, Any] | None:
     """Read the resolved peer outcome for a resumed requester, guarding project removal."""
     row = connection.execute(
-        """SELECT request_key, request_id, state, response_json, project_id
+        """SELECT request_key, request_id, state, response_json, project_id,
+                  requester_agent_id, recipient_agent_id, evidence_refs_json
            FROM work_peer_requests
            WHERE company_id = ? AND requester_work_item_id = ?
              AND resumed_run_id IS NOT NULL
@@ -4849,7 +4851,16 @@ def read_peer_request_outcome(
     ).fetchone()
     if row is None:
         return None
-    request_key, request_id, state, response_json, project_id = row
+    (
+        request_key,
+        request_id,
+        state,
+        response_json,
+        project_id,
+        requester_agent_id,
+        recipient_agent_id,
+        evidence_refs_json,
+    ) = row
     label = str(request_key) if request_key is not None else str(request_id)
     if project_id is not None:
         proj = connection.execute(
@@ -4858,18 +4869,45 @@ def read_peer_request_outcome(
         ).fetchone()
         members = set(json.loads(str(proj[0]))) if proj is not None else set()
         if actor_id not in members:
-            return {
+            unavailable: dict[str, Any] = {
                 "request_key": label,
                 "outcome": "unavailable",
                 "answer": None,
             }
+            if include_provenance:
+                unavailable["request_id"] = str(request_id)
+                unavailable["project_id"] = str(project_id)
+                unavailable["requester_agent_id"] = str(requester_agent_id)
+                unavailable["recipient_agent_id"] = str(recipient_agent_id)
+                unavailable["evidence_refs"] = []
+            return unavailable
     payload = json.loads(str(response_json)) if response_json is not None else {}
     answer = payload.get("answer") if isinstance(payload, dict) else None
-    return {
+    result: dict[str, Any] = {
         "request_key": label,
         "outcome": str(state),
         "answer": answer,
     }
+    if include_provenance:
+        combined_refs: list[str] = []
+        for raw_source in (
+            json.loads(str(evidence_refs_json)) if evidence_refs_json else (),
+            payload.get("evidence_refs") if isinstance(payload, dict) else (),
+        ):
+            if isinstance(raw_source, list):
+                for item in raw_source:
+                    if (
+                        isinstance(item, str)
+                        and item.strip()
+                        and item.strip() not in combined_refs
+                    ):
+                        combined_refs.append(item.strip())
+        result["request_id"] = str(request_id)
+        result["project_id"] = None if project_id is None else str(project_id)
+        result["requester_agent_id"] = str(requester_agent_id)
+        result["recipient_agent_id"] = str(recipient_agent_id)
+        result["evidence_refs"] = combined_refs
+    return result
 
 
 def interrupt_work_run(

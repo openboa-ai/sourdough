@@ -552,9 +552,19 @@ class ShiftRunner:
             ).fetchall()
 
         prior_had_peer_input = bool(prior_tool_names & _PEER_INPUT_TOOLS)
+        hydrated_peer_input = any(
+            isinstance(r, Mapping)
+            and (
+                (r.get("kind") == "peer_outcome" and r.get("outcome") != "unavailable")
+                or r.get("kind") in ("peer_request", "accepted_handoff")
+                or (r.get("kind") == "shared_asset" and r.get("author_id") != agent_id)
+            )
+            for r in open_receipts
+        )
+        initial_had_peer_input = prior_had_peer_input or hydrated_peer_input
         prior_had_private_desk = bool(prior_tool_names & _PRIVATE_DESK_READ_TOOLS)
         effective_include_desk_tools = (
-            include_core_desk_tools and not prior_had_peer_input
+            include_core_desk_tools and not initial_had_peer_input
         )
         effective_base_names = (
             set(base_handlers)
@@ -747,7 +757,7 @@ class ShiftRunner:
         eff_skill_tools = (
             effective_include_desk_tools
             if include_core_skill_tools is None
-            else (include_core_skill_tools and not prior_had_peer_input)
+            else (include_core_skill_tools and not initial_had_peer_input)
         )
         public_offloaded_paths: set[str] = set(prior_public_offloads)
         contributions: list[ToolContribution] = []
@@ -914,6 +924,90 @@ class ShiftRunner:
                 aud_set &= proj_members
             return proj_id, aud_set
 
+        def _message_audience(
+            message_id: str,
+        ) -> tuple[str | None, set[str] | None]:
+            if not isinstance(message_id, str) or not message_id.strip():
+                return None, None
+            with closing(open_reader(ctx.writer.store)) as ro_db, read_tx(ro_db):
+                row = ro_db.execute(
+                    """SELECT project_id, audience, asset_id
+                       FROM project_message
+                       WHERE company_id = ? AND message_id = ?""",
+                    (ctx.company_id, message_id.strip()),
+                ).fetchone()
+            if row is None:
+                return None, None
+            proj_id = str(row[0])
+            try:
+                aud_list = json.loads(str(row[1]))
+            except json.JSONDecodeError:
+                return proj_id, None
+            if not isinstance(aud_list, list):
+                return proj_id, None
+            aud_set = {str(a) for a in aud_list if isinstance(a, str) and a}
+            proj_members = _project_members(proj_id)
+            if proj_members is not None:
+                aud_set &= proj_members
+            msg_asset_id = row[2]
+            if isinstance(msg_asset_id, str) and msg_asset_id.strip():
+                _, asset_aud = _asset_provenance(msg_asset_id.strip())
+                if asset_aud is not None:
+                    aud_set &= asset_aud
+                else:
+                    aud_set &= {agent_id}
+            return proj_id, aud_set
+
+        def _peer_request_provenance(
+            request_id: str | None,
+        ) -> tuple[str | None, str | None, str | None, list[str]] | None:
+            with closing(open_reader(ctx.writer.store)) as ro_db, read_tx(ro_db):
+                if isinstance(request_id, str) and request_id.strip():
+                    row = ro_db.execute(
+                        """SELECT project_id, requester_agent_id, recipient_agent_id,
+                                  evidence_refs_json, response_json
+                           FROM work_peer_requests
+                           WHERE company_id = ? AND request_id = ?""",
+                        (ctx.company_id, request_id.strip()),
+                    ).fetchone()
+                else:
+                    row = ro_db.execute(
+                        """SELECT project_id, requester_agent_id, recipient_agent_id,
+                                  evidence_refs_json, response_json
+                           FROM work_peer_requests
+                           WHERE company_id = ? AND requester_work_item_id = ?
+                             AND resumed_run_id IS NOT NULL
+                           ORDER BY rowid DESC LIMIT 1""",
+                        (ctx.company_id, ctx.work_item.work_item_id),
+                    ).fetchone()
+            if row is None:
+                return None
+            proj_id = None if row[0] is None else str(row[0])
+            req_agent = None if row[1] is None else str(row[1])
+            recip_agent = None if row[2] is None else str(row[2])
+            refs: list[str] = []
+            for raw_json, key in ((row[3], None), (row[4], "evidence_refs")):
+                if not isinstance(raw_json, str) or not raw_json:
+                    continue
+                try:
+                    parsed = json.loads(raw_json)
+                except json.JSONDecodeError:
+                    continue
+                seq = (
+                    parsed.get(key)
+                    if (key is not None and isinstance(parsed, Mapping))
+                    else parsed
+                )
+                if isinstance(seq, list):
+                    for item in seq:
+                        if (
+                            isinstance(item, str)
+                            and item.strip()
+                            and item.strip() not in refs
+                        ):
+                            refs.append(item.strip())
+            return proj_id, req_agent, recip_agent, refs
+
         def _handoff_offer_provenance(
             offer_id: str,
         ) -> tuple[str | None, str | None]:
@@ -962,6 +1056,15 @@ class ShiftRunner:
                     initial_allowed_audience = _intersect_audience(
                         initial_allowed_audience, p_aud
                     )
+            payload_msg_id = item_payload_obj.get("message_id")
+            if isinstance(payload_msg_id, str) and payload_msg_id.strip():
+                m_pid, m_aud = _message_audience(payload_msg_id)
+                if m_pid:
+                    initial_tainted_projects.add(m_pid)
+                initial_allowed_audience = _intersect_audience(
+                    initial_allowed_audience,
+                    m_aud if m_aud is not None else {agent_id},
+                )
             payload_proj_id = item_payload_obj.get("project_id")
             if (
                 isinstance(payload_proj_id, str)
@@ -978,6 +1081,132 @@ class ShiftRunner:
                 if p_members is not None:
                     initial_allowed_audience = _intersect_audience(
                         initial_allowed_audience, p_members
+                    )
+
+        def _narrow_initial_from_asset(aid: str) -> None:
+            nonlocal initial_allowed_audience
+            p_pid, p_aud = _asset_provenance(aid)
+            if p_pid:
+                initial_tainted_projects.add(p_pid)
+            initial_allowed_audience = _intersect_audience(
+                initial_allowed_audience,
+                p_aud if p_aud is not None else {agent_id},
+            )
+
+        def _narrow_initial_from_peer_request(
+            receipt_obj: Mapping[str, Any],
+        ) -> None:
+            nonlocal initial_allowed_audience
+            raw_req_id = receipt_obj.get("request_id")
+            prov = _peer_request_provenance(
+                raw_req_id if isinstance(raw_req_id, str) else None
+            )
+            if prov is not None:
+                pr_proj_id, pr_req_agent, pr_recip_agent, pr_ev_refs = prov
+            else:
+                raw_pid = receipt_obj.get("project_id")
+                pr_proj_id = (
+                    raw_pid.strip()
+                    if isinstance(raw_pid, str) and raw_pid.strip()
+                    else None
+                )
+                raw_req = receipt_obj.get("requester_agent_id")
+                pr_req_agent = (
+                    raw_req.strip()
+                    if isinstance(raw_req, str) and raw_req.strip()
+                    else None
+                )
+                raw_recip = receipt_obj.get("recipient_agent_id")
+                pr_recip_agent = (
+                    raw_recip.strip()
+                    if isinstance(raw_recip, str) and raw_recip.strip()
+                    else None
+                )
+                raw_refs = receipt_obj.get("evidence_refs")
+                pr_ev_refs = (
+                    [
+                        str(x).strip()
+                        for x in raw_refs
+                        if isinstance(x, str) and x.strip()
+                    ]
+                    if isinstance(raw_refs, list)
+                    else []
+                )
+            if pr_proj_id:
+                initial_tainted_projects.add(pr_proj_id)
+                p_members = _project_members(pr_proj_id)
+                initial_allowed_audience = _intersect_audience(
+                    initial_allowed_audience,
+                    p_members if p_members is not None else {agent_id},
+                )
+            else:
+                pair = {
+                    a.strip()
+                    for a in (agent_id, pr_req_agent, pr_recip_agent)
+                    if isinstance(a, str) and a.strip()
+                }
+                initial_allowed_audience = _intersect_audience(
+                    initial_allowed_audience, pair if pair else {agent_id}
+                )
+            for ref in pr_ev_refs:
+                if ref.startswith("shared_publication:"):
+                    ev_aid = (
+                        ref.removeprefix("shared_publication:").split("@", 1)[0].strip()
+                    )
+                    if ev_aid:
+                        _narrow_initial_from_asset(ev_aid)
+
+        for r in open_receipts:
+            if not isinstance(r, Mapping):
+                continue
+            r_kind = r.get("kind")
+            if r_kind == "peer_outcome" and r.get("outcome") != "unavailable":
+                _narrow_initial_from_peer_request(r)
+            elif r_kind == "peer_request":
+                _narrow_initial_from_peer_request(r)
+                raw_ev = r.get("evidence")
+                if isinstance(raw_ev, list):
+                    for ev in raw_ev:
+                        if isinstance(ev, Mapping):
+                            ev_aid = ev.get("asset_id")
+                            if isinstance(ev_aid, str) and ev_aid.strip():
+                                _narrow_initial_from_asset(ev_aid.strip())
+            elif r_kind == "accepted_handoff":
+                h_aid = r.get("asset_id")
+                h_pid = r.get("project_id")
+                h_sender = r.get("sender_id")
+                if isinstance(h_aid, str) and h_aid.strip():
+                    _narrow_initial_from_asset(h_aid.strip())
+                elif isinstance(h_pid, str) and h_pid.strip():
+                    initial_tainted_projects.add(h_pid.strip())
+                    p_members = _project_members(h_pid.strip())
+                    initial_allowed_audience = _intersect_audience(
+                        initial_allowed_audience,
+                        p_members if p_members is not None else {agent_id},
+                    )
+                elif isinstance(h_sender, str) and h_sender.strip():
+                    initial_allowed_audience = _intersect_audience(
+                        initial_allowed_audience, {agent_id, h_sender.strip()}
+                    )
+                else:
+                    initial_allowed_audience = _intersect_audience(
+                        initial_allowed_audience, {agent_id}
+                    )
+            elif r_kind == "shared_asset" and r.get("author_id") != agent_id:
+                s_aid = r.get("asset_id")
+                s_pid = r.get("project_id")
+                if isinstance(s_aid, str) and s_aid.strip():
+                    _narrow_initial_from_asset(s_aid.strip())
+                elif isinstance(s_pid, str) and s_pid.strip():
+                    initial_tainted_projects.add(s_pid.strip())
+                    p_members = _project_members(s_pid.strip())
+                    initial_allowed_audience = _intersect_audience(
+                        initial_allowed_audience,
+                        p_members if p_members is not None else {agent_id},
+                    )
+                else:
+                    initial_allowed_audience = _intersect_audience(
+                        initial_allowed_audience, {agent_id}
                     )
 
         if prior_had_peer_input:
@@ -1028,30 +1257,46 @@ class ShiftRunner:
                     msgs = p_obj.get("messages")
                     if isinstance(msgs, list):
                         for m in msgs:
-                            if isinstance(m, Mapping) and isinstance(
-                                m.get("project_id"), str
-                            ):
-                                pid = str(m["project_id"])
-                                initial_tainted_projects.add(pid)
-                                initial_allowed_audience = _intersect_audience(
-                                    initial_allowed_audience, _project_members(pid)
-                                )
-                                resolved_prior_peer = True
+                            if not isinstance(m, Mapping):
+                                unresolved_prior_peer = True
+                                continue
+                            m_mid = m.get("message_id")
+                            if isinstance(m_mid, str) and m_mid.strip():
+                                pid, aud = _message_audience(m_mid.strip())
+                                if pid:
+                                    initial_tainted_projects.add(pid)
+                                if aud is not None:
+                                    initial_allowed_audience = _intersect_audience(
+                                        initial_allowed_audience, aud
+                                    )
+                                    resolved_prior_peer = True
+                                else:
+                                    unresolved_prior_peer = True
+                            else:
+                                unresolved_prior_peer = True
                     else:
                         unresolved_prior_peer = True
                 elif p_tname == "read_inbox":
                     delivs = p_obj.get("deliveries")
                     if isinstance(delivs, list):
                         for d in delivs:
-                            if isinstance(d, Mapping) and isinstance(
-                                d.get("project_id"), str
-                            ):
-                                pid = str(d["project_id"])
-                                initial_tainted_projects.add(pid)
-                                initial_allowed_audience = _intersect_audience(
-                                    initial_allowed_audience, _project_members(pid)
-                                )
-                                resolved_prior_peer = True
+                            if not isinstance(d, Mapping):
+                                unresolved_prior_peer = True
+                                continue
+                            d_mid = d.get("message_id")
+                            if isinstance(d_mid, str) and d_mid.strip():
+                                pid, aud = _message_audience(d_mid.strip())
+                                if pid:
+                                    initial_tainted_projects.add(pid)
+                                if aud is not None:
+                                    initial_allowed_audience = _intersect_audience(
+                                        initial_allowed_audience, aud
+                                    )
+                                    resolved_prior_peer = True
+                                else:
+                                    unresolved_prior_peer = True
+                            else:
+                                unresolved_prior_peer = True
                     else:
                         unresolved_prior_peer = True
                 elif p_tname == "discover_handoffs":
@@ -1078,7 +1323,7 @@ class ShiftRunner:
 
         flow_state: dict[str, Any] = {
             "read_private_desk": has_hydrated_private_context,
-            "read_peer_input": prior_had_peer_input,
+            "read_peer_input": initial_had_peer_input,
             "allowed_audience": initial_allowed_audience,
             "tainted_projects": initial_tainted_projects,
         }
@@ -1187,7 +1432,30 @@ class ShiftRunner:
                         pid = args.get("project_id")
                         if isinstance(pid, str) and pid.strip():
                             flow_state["tainted_projects"].add(pid.strip())
-                            _narrow_flow_audience(_project_members(pid.strip()))
+                        msgs = out.get("messages") if isinstance(out, Mapping) else None
+                        if isinstance(msgs, list) and msgs:
+                            for m in msgs:
+                                m_mid = (
+                                    m.get("message_id")
+                                    if isinstance(m, Mapping)
+                                    else None
+                                )
+                                if isinstance(m_mid, str) and m_mid.strip():
+                                    m_pid, m_aud = _message_audience(m_mid.strip())
+                                    if m_pid:
+                                        flow_state["tainted_projects"].add(m_pid)
+                                    _narrow_flow_audience(
+                                        m_aud if m_aud is not None else {agent_id}
+                                    )
+                                else:
+                                    _narrow_flow_audience({agent_id})
+                        elif isinstance(pid, str) and pid.strip():
+                            p_members = _project_members(pid.strip())
+                            _narrow_flow_audience(
+                                p_members if p_members is not None else {agent_id}
+                            )
+                        else:
+                            _narrow_flow_audience({agent_id})
                     elif name == "read_shared_asset" and isinstance(args, Mapping):
                         aid = args.get("asset_id")
                         if isinstance(aid, str) and aid.strip():
@@ -1201,13 +1469,22 @@ class ShiftRunner:
                         delivs = out.get("deliveries")
                         if isinstance(delivs, list):
                             for d in delivs:
-                                if isinstance(d, Mapping) and isinstance(
-                                    d.get("project_id"), str
-                                ):
-                                    pid = str(d["project_id"]).strip()
-                                    if pid:
-                                        flow_state["tainted_projects"].add(pid)
-                                        _narrow_flow_audience(_project_members(pid))
+                                if not isinstance(d, Mapping):
+                                    _narrow_flow_audience({agent_id})
+                                    continue
+                                d_pid = d.get("project_id")
+                                if isinstance(d_pid, str) and d_pid.strip():
+                                    flow_state["tainted_projects"].add(d_pid.strip())
+                                d_mid = d.get("message_id")
+                                if isinstance(d_mid, str) and d_mid.strip():
+                                    m_pid, m_aud = _message_audience(d_mid.strip())
+                                    if m_pid:
+                                        flow_state["tainted_projects"].add(m_pid)
+                                    _narrow_flow_audience(
+                                        m_aud if m_aud is not None else {agent_id}
+                                    )
+                                else:
+                                    _narrow_flow_audience({agent_id})
                     elif name == "discover_handoffs" and isinstance(out, Mapping):
                         offers = out.get("offers")
                         if isinstance(offers, list):
