@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -61,13 +62,29 @@ LEGACY_EXTERNAL_ISOLATION_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
+ExecutionPlane = Literal["llm", "code", "decision_model"]
+VALID_EXECUTION_PLANES: frozenset[str] = frozenset({"llm", "code", "decision_model"})
+
 PROVIDER_CODEX_CLI = "codex_cli"
 PROVIDER_OPENAI = "openai"
 PROVIDER_ANTHROPIC = "anthropic"
 PROVIDER_GEMINI = "gemini"
-VALID_PROVIDERS = frozenset(
-    {PROVIDER_CODEX_CLI, PROVIDER_OPENAI, PROVIDER_ANTHROPIC, PROVIDER_GEMINI}
+PROVIDER_CODE_PLANE = "code_plane"
+PROVIDER_DECISION_MODEL = "decision_model"
+REMOTE_CREDENTIAL_PROVIDERS = frozenset(
+    {PROVIDER_OPENAI, PROVIDER_ANTHROPIC, PROVIDER_GEMINI}
 )
+VALID_PROVIDERS = frozenset(
+    {
+        PROVIDER_CODEX_CLI,
+        PROVIDER_OPENAI,
+        PROVIDER_ANTHROPIC,
+        PROVIDER_GEMINI,
+        PROVIDER_CODE_PLANE,
+        PROVIDER_DECISION_MODEL,
+    }
+)
+_PROVIDER_SLUG_RE = re.compile(r"^[a-z][a-z0-9_-]{1,47}$")
 
 _FORBIDDEN_TOOL_ARG_KEYS = frozenset(
     {
@@ -160,10 +177,43 @@ class InMemorySecretResolver:
 class AdapterManifest:
     provider: str
     adapter_revision: str
-    transport: str  # "local_cli_uds" | "https_json"
+    transport: str  # "local_cli_uds" | "https_json" | "in_process" | "local_rpc"
     supports_tool_mediation: bool
     supports_usage_accounting: bool
     supports_sandbox_desk: bool
+    execution_plane: ExecutionPlane = "llm"
+    default_timeout_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.provider, str)
+            or _PROVIDER_SLUG_RE.fullmatch(self.provider) is None
+        ):
+            raise AgentRuntimeRefused(
+                f"Invalid provider slug in AdapterManifest: {self.provider!r}"
+            )
+        if (
+            not isinstance(self.adapter_revision, str)
+            or not self.adapter_revision.strip()
+        ):
+            raise AgentRuntimeRefused(
+                "AdapterManifest requires a nonempty adapter_revision"
+            )
+        if not isinstance(self.transport, str) or not self.transport.strip():
+            raise AgentRuntimeRefused("AdapterManifest requires a nonempty transport")
+        if self.execution_plane not in VALID_EXECUTION_PLANES:
+            raise AgentRuntimeRefused(
+                f"Unsupported execution_plane in AdapterManifest: {self.execution_plane!r}"
+            )
+        if (
+            isinstance(self.default_timeout_seconds, bool)
+            or not isinstance(self.default_timeout_seconds, (int, float))
+            or not math.isfinite(float(self.default_timeout_seconds))
+            or float(self.default_timeout_seconds) <= 0
+        ):
+            raise AgentRuntimeRefused(
+                "AdapterManifest default_timeout_seconds must be a positive finite number"
+            )
 
 
 @dataclass(frozen=True)
@@ -177,7 +227,10 @@ class AgentProfileBinding:
     credential_handle_ref: str | None = None
 
     def __post_init__(self) -> None:
-        if self.provider not in VALID_PROVIDERS:
+        if (
+            not isinstance(self.provider, str)
+            or _PROVIDER_SLUG_RE.fullmatch(self.provider) is None
+        ):
             raise AgentRuntimeRefused(f"Unsupported provider: {self.provider}")
         for value, label in (
             (self.model, "model"),
@@ -186,7 +239,7 @@ class AgentProfileBinding:
         ):
             if not isinstance(value, str) or _SAFE_SEGMENT_RE.fullmatch(value) is None:
                 raise AgentRuntimeRefused(f"Invalid {label} in AgentProfileBinding")
-        if self.provider != PROVIDER_CODEX_CLI:
+        if self.provider in REMOTE_CREDENTIAL_PROVIDERS:
             if self.credential_handle_ref is None:
                 raise AgentRuntimeRefused(
                     f"Provider '{self.provider}' requires an opaque credential_handle_ref"

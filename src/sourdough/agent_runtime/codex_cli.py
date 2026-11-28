@@ -5,17 +5,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
-import threading
 from pathlib import Path
 from time import time_ns
-from typing import Any, Literal
+from typing import Literal
 
 from ._http import render_context_system_prompt
 from ._mcp_bridge import _run_mcp_stdio_bridge
+from .broker_bridge import (
+    UdsToolBrokerServer as _UdsToolBrokerServer,
+    fatal_broker_exceptions as _fatal_broker_exceptions,
+)
 from .protocol import (
     PROVIDER_CODEX_CLI,
     AdapterEvent,
@@ -52,26 +54,6 @@ def confinement_arguments() -> list[str]:
     ]
 
 
-def _fatal_broker_exceptions() -> tuple[type[BaseException], ...]:
-    from ..company import FoundingRefused
-    from ..runtime.registry import RuntimeRefused
-    from ..runtime.work_kernel import RunFenced
-    from ..storage.checkpoint import CheckpointRefused
-    from ..storage.db import StorageRefused
-    from ..writer_lease import WriterRefused
-
-    return (
-        AgentRuntimeRefused,
-        AgentTransportInterrupted,
-        RunFenced,
-        StorageRefused,
-        FoundingRefused,
-        WriterRefused,
-        CheckpointRefused,
-        RuntimeRefused,
-    )
-
-
 def _resolve_cli_path() -> str:
     parts = [
         str(Path(sys.executable).parent),
@@ -93,96 +75,6 @@ def _resolve_codex_home(explicit: Path | None) -> Path:
     if (app_support / "auth.json").is_file():
         return app_support
     return Path.home() / ".codex"
-
-
-class _UdsToolBrokerServer:
-    """Private 0o600 Unix domain socket server forwarding JSON tool calls to OuterToolBroker."""
-
-    def __init__(self, sock_path: Path, broker: OuterToolBroker) -> None:
-        self._sock_path = sock_path
-        self._broker = broker
-        self._stop = threading.Event()
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.bind(str(sock_path))
-        os.chmod(sock_path, 0o600)
-        self._sock.listen(8)
-        self._sock.settimeout(0.1)
-        self.last_refusal: AgentRuntimeRefused | None = None
-        self.last_fatal_error: BaseException | None = None
-        self._thread = threading.Thread(
-            target=self._serve,
-            name="sourdough-cli-broker",
-            daemon=True,
-        )
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=2.0)
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-
-    def _serve(self) -> None:
-        while not self._stop.is_set():
-            try:
-                conn, _ = self._sock.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            with conn:
-                self._handle_connection(conn)
-
-    def _handle_connection(self, conn: socket.socket) -> None:
-        conn.settimeout(5.0)
-        buffer = b""
-        while b"\n" not in buffer and len(buffer) < 262_144:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            buffer += chunk
-        if not buffer:
-            return
-        line = buffer.split(b"\n", 1)[0].decode("utf-8", errors="replace")
-        fatal_types = _fatal_broker_exceptions()
-        try:
-            req = json.loads(line)
-            if not isinstance(req, dict):
-                raise AgentRuntimeRefused("Broker request must be a JSON object")
-            call_id = str(req.get("call_id") or "")
-            tool_name = str(req.get("tool") or "")
-            arguments = req.get("arguments", {})
-            result = self._broker.invoke(call_id, tool_name, arguments)
-            reply: dict[str, Any] = {"ok": True, "result": result}
-        except AgentRuntimeRefused as error:
-            self.last_refusal = error
-            self.last_fatal_error = error
-            reply = {
-                "ok": False,
-                "error_type": type(error).__name__,
-                "error": str(error),
-            }
-        except fatal_types as error:
-            self.last_fatal_error = error
-            reply = {
-                "ok": False,
-                "error_type": type(error).__name__,
-                "error": str(error),
-            }
-        except Exception as error:
-            reply = {
-                "ok": False,
-                "error_type": type(error).__name__,
-                "error": str(error),
-            }
-        encoded = (
-            json.dumps(reply, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode("utf-8")
-        conn.sendall(encoded)
 
 
 class CodexCliAdapter:
@@ -570,6 +462,14 @@ class CodexCliAdapter:
         finally:
             server.stop()
             shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+__all__ = [
+    "CodexCliAdapter",
+    "_UdsToolBrokerServer",
+    "_fatal_broker_exceptions",
+    "confinement_arguments",
+]
 
 
 if __name__ == "__main__":

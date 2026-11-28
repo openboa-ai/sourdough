@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import re
 import sqlite3
@@ -627,6 +628,142 @@ def _row_to_admission(row: tuple[Any, ...]) -> ConnectorAdmission:
     )
 
 
+def issue_connector_admission_in_tx(
+    db: sqlite3.Connection,
+    *,
+    company_id: str,
+    binding_id: str,
+    binding_revision: int,
+    operation: str,
+    request_id: str,
+    payload: Mapping[str, Any],
+    issued_by_service: str,
+    actor_id: str,
+    admission_id: str | None = None,
+    expires_at_ns: int | None = None,
+    now_ns: int | None = None,
+) -> ConnectorAdmission:
+    """Persist a service-issued admission inside an active BEGIN IMMEDIATE transaction."""
+    if not db.in_transaction:
+        raise ConnectorRefused(
+            "issue_connector_admission_in_tx requires an active write transaction"
+        )
+    if not isinstance(issued_by_service, str) or not issued_by_service.strip():
+        raise ConnectorRefused("issued_by_service must be nonempty")
+    if not isinstance(actor_id, str) or not actor_id.strip():
+        raise ConnectorRefused("actor_id must be nonempty")
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ConnectorRefused("request_id must be nonempty")
+    if not isinstance(payload, Mapping):
+        raise ConnectorRefused("payload must be a mapping")
+    timestamp = time_ns() if now_ns is None else now_ns
+    if expires_at_ns is not None and (
+        type(expires_at_ns) is not int or expires_at_ns <= timestamp
+    ):
+        raise ConnectorRefused("expires_at_ns must be in the future")
+    aid = admission_id or f"cadm-{uuid4().hex[:16]}"
+    binding = read_connector_binding(
+        db, company_id=company_id, binding_id=binding_id, revision=binding_revision
+    )
+    if binding is None or binding.status != "active":
+        raise ConnectorRefused(
+            f"Active connector binding '{binding_id}:r{binding_revision}' not found"
+        )
+    op_spec = binding.operation(operation)
+    if op_spec is None:
+        raise ConnectorRefused(
+            f"Operation '{operation}' is not registered on '{binding_id}:r{binding_revision}'"
+        )
+    payload_digest = compute_admission_payload_sha256(
+        binding_id=binding.binding_id,
+        binding_revision=binding.revision,
+        operation=op_spec.name,
+        request_id=request_id.strip(),
+        payload=payload,
+        environment=binding.environment,
+        endpoint_url=binding.endpoint_url,
+    )
+    existing = db.execute(
+        """SELECT admission_id, company_id, binding_id, binding_revision,
+                  operation, request_id, payload_sha256, environment,
+                  endpoint_url, issued_by_service, actor_id, status,
+                  expires_at_ns, created_at_ns, consumed_at_ns
+           FROM connector_admission WHERE admission_id = ?""",
+        (aid,),
+    ).fetchone()
+    if existing is not None:
+        prior = _row_to_admission(existing)
+        if (
+            prior.company_id != company_id
+            or prior.binding_id != binding.binding_id
+            or prior.binding_revision != binding.revision
+            or prior.operation != op_spec.name
+            or prior.request_id != request_id.strip()
+            or not hmac.compare_digest(prior.payload_sha256, payload_digest)
+            or prior.environment != binding.environment
+            or prior.endpoint_url.rstrip("/") != binding.endpoint_url.rstrip("/")
+            or prior.actor_id != actor_id.strip()
+            or prior.issued_by_service != issued_by_service.strip()
+        ):
+            raise ConnectorRefused(
+                f"Connector admission '{aid}' conflicts with previously issued terms"
+            )
+        return prior
+    db.execute(
+        """INSERT INTO connector_admission (
+               admission_id, company_id, binding_id, binding_revision,
+               operation, request_id, payload_sha256, environment,
+               endpoint_url, issued_by_service, actor_id, status,
+               expires_at_ns, created_at_ns, consumed_at_ns
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', ?, ?, NULL)""",
+        (
+            aid,
+            company_id,
+            binding.binding_id,
+            binding.revision,
+            op_spec.name,
+            request_id.strip(),
+            payload_digest,
+            binding.environment,
+            binding.endpoint_url,
+            issued_by_service.strip(),
+            actor_id.strip(),
+            expires_at_ns,
+            timestamp,
+        ),
+    )
+    append_audit_event(
+        db,
+        company_id=company_id,
+        domain="connectors",
+        entity_type="connector_admission",
+        entity_id=aid,
+        event_type="connectors.admission_issued",
+        actor_id=actor_id.strip(),
+        payload={
+            "admission_id": aid,
+            "binding_id": binding.binding_id,
+            "binding_revision": binding.revision,
+            "operation": op_spec.name,
+            "request_id": request_id.strip(),
+            "payload_sha256": payload_digest,
+            "environment": binding.environment,
+            "issued_by_service": issued_by_service.strip(),
+        },
+        recorded_at_ns=timestamp,
+    )
+    row = db.execute(
+        """SELECT admission_id, company_id, binding_id, binding_revision,
+                  operation, request_id, payload_sha256, environment,
+                  endpoint_url, issued_by_service, actor_id, status,
+                  expires_at_ns, created_at_ns, consumed_at_ns
+           FROM connector_admission WHERE admission_id = ?""",
+        (aid,),
+    ).fetchone()
+    assert row is not None
+    return _row_to_admission(row)
+
+
 def issue_connector_admission(
     writer: WriterLease,
     *,
@@ -650,95 +787,21 @@ def issue_connector_admission(
     """
     if writer.company_id != company_id:
         raise ConnectorRefused("Writer company_id mismatch")
-    if not isinstance(issued_by_service, str) or not issued_by_service.strip():
-        raise ConnectorRefused("issued_by_service must be nonempty")
-    if not isinstance(actor_id, str) or not actor_id.strip():
-        raise ConnectorRefused("actor_id must be nonempty")
-    if not isinstance(request_id, str) or not request_id.strip():
-        raise ConnectorRefused("request_id must be nonempty")
-    if not isinstance(payload, Mapping):
-        raise ConnectorRefused("payload must be a mapping")
-    timestamp = time_ns() if now_ns is None else now_ns
-    if expires_at_ns is not None and (
-        type(expires_at_ns) is not int or expires_at_ns <= timestamp
-    ):
-        raise ConnectorRefused("expires_at_ns must be in the future")
-    aid = admission_id or f"cadm-{uuid4().hex[:16]}"
     with write_uow(writer, tx_lock=tx_lock) as db:
-        binding = read_connector_binding(
-            db, company_id=company_id, binding_id=binding_id, revision=binding_revision
-        )
-        if binding is None or binding.status != "active":
-            raise ConnectorRefused(
-                f"Active connector binding '{binding_id}:r{binding_revision}' not found"
-            )
-        op_spec = binding.operation(operation)
-        if op_spec is None:
-            raise ConnectorRefused(
-                f"Operation '{operation}' is not registered on '{binding_id}:r{binding_revision}'"
-            )
-        payload_digest = compute_admission_payload_sha256(
-            binding_id=binding.binding_id,
-            binding_revision=binding.revision,
-            operation=op_spec.name,
-            request_id=request_id.strip(),
-            payload=payload,
-            environment=binding.environment,
-            endpoint_url=binding.endpoint_url,
-        )
-        db.execute(
-            """INSERT INTO connector_admission (
-                   admission_id, company_id, binding_id, binding_revision,
-                   operation, request_id, payload_sha256, environment,
-                   endpoint_url, issued_by_service, actor_id, status,
-                   expires_at_ns, created_at_ns, consumed_at_ns
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', ?, ?, NULL)""",
-            (
-                aid,
-                company_id,
-                binding.binding_id,
-                binding.revision,
-                op_spec.name,
-                request_id.strip(),
-                payload_digest,
-                binding.environment,
-                binding.endpoint_url,
-                issued_by_service.strip(),
-                actor_id.strip(),
-                expires_at_ns,
-                timestamp,
-            ),
-        )
-        append_audit_event(
+        return issue_connector_admission_in_tx(
             db,
             company_id=company_id,
-            domain="connectors",
-            entity_type="connector_admission",
-            entity_id=aid,
-            event_type="connectors.admission_issued",
-            actor_id=actor_id.strip(),
-            payload={
-                "admission_id": aid,
-                "binding_id": binding.binding_id,
-                "binding_revision": binding.revision,
-                "operation": op_spec.name,
-                "request_id": request_id.strip(),
-                "payload_sha256": payload_digest,
-                "environment": binding.environment,
-                "issued_by_service": issued_by_service.strip(),
-            },
-            recorded_at_ns=timestamp,
+            binding_id=binding_id,
+            binding_revision=binding_revision,
+            operation=operation,
+            request_id=request_id,
+            payload=payload,
+            issued_by_service=issued_by_service,
+            actor_id=actor_id,
+            admission_id=admission_id,
+            expires_at_ns=expires_at_ns,
+            now_ns=now_ns,
         )
-        row = db.execute(
-            """SELECT admission_id, company_id, binding_id, binding_revision,
-                      operation, request_id, payload_sha256, environment,
-                      endpoint_url, issued_by_service, actor_id, status,
-                      expires_at_ns, created_at_ns, consumed_at_ns
-               FROM connector_admission WHERE admission_id = ?""",
-            (aid,),
-        ).fetchone()
-        assert row is not None
-        return _row_to_admission(row)
 
 
 def revoke_connector_admission(
@@ -910,6 +973,7 @@ __all__ = [
     "disable_connector_binding",
     "grant_connector_access",
     "issue_connector_admission",
+    "issue_connector_admission_in_tx",
     "list_connector_bindings",
     "read_connector_binding",
     "read_connector_grants",
