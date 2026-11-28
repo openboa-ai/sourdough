@@ -1918,6 +1918,92 @@ class ConnectorSubsystemTests(unittest.TestCase):
             srv.server_close()
             thread.join(timeout=5.0)
 
+    def test_llm_connector_caps_response_bytes_output_text_and_embedding_size(
+        self,
+    ) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import json
+        import threading
+        from sourdough.connectors import ScopedLlmInferenceConnector
+
+        mode = {"kind": "oversize_bytes"}
+
+        class _BigHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                del fmt, args
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                _ = self.rfile.read(length)
+                if mode["kind"] == "oversize_bytes":
+                    raw = b'{"output_text":"' + b"A" * 4096 + b'"}'
+                elif mode["kind"] == "oversize_text":
+                    raw = json.dumps({"id": "r1", "output_text": "B" * 64}).encode(
+                        "utf-8"
+                    )
+                else:
+                    raw = json.dumps(
+                        {"data": [{"embedding": [0.1, 0.2, 0.3, 0.4, 0.5]}]}
+                    ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        srv = HTTPServer(("127.0.0.1", 0), _BigHandler)
+        port = int(srv.server_address[1])
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            adapter = ScopedLlmInferenceConnector(
+                max_response_bytes=512,
+                max_output_text_chars=32,
+                max_embedding_dimensions=3,
+            )
+            secret = MaskedSecret(
+                value="test-cap-key-1111", handle_ref="envref:OPENAI_TEST_KEY"
+            )
+            req_complete = ConnectorRequest(
+                company_id="co-1",
+                binding_id="llm-cap",
+                binding_revision=1,
+                operation="complete",
+                request_id="cap-1",
+                idempotency_key="conn:co-1:llm-cap:r1:complete:cap-1",
+                payload={"model": "gpt-6-luna", "input": "hi"},
+                environment="external_test",
+                endpoint_url=f"http://127.0.0.1:{port}",
+                allowed_hosts=("127.0.0.1",),
+            )
+            mode["kind"] = "oversize_bytes"
+            with self.assertRaises(ConnectorIndeterminate):
+                adapter.execute(req_complete, secret=secret, timeout_seconds=5.0)
+
+            mode["kind"] = "oversize_text"
+            with self.assertRaises(ConnectorIndeterminate):
+                adapter.execute(req_complete, secret=secret, timeout_seconds=5.0)
+
+            req_embed = ConnectorRequest(
+                company_id="co-1",
+                binding_id="llm-cap",
+                binding_revision=1,
+                operation="embed",
+                request_id="cap-2",
+                idempotency_key="conn:co-1:llm-cap:r1:embed:cap-2",
+                payload={"model": "text-embedding-3-small", "input": "hi"},
+                environment="external_test",
+                endpoint_url=f"http://127.0.0.1:{port}",
+                allowed_hosts=("127.0.0.1",),
+            )
+            mode["kind"] = "oversize_embed"
+            with self.assertRaises(ConnectorIndeterminate):
+                adapter.execute(req_embed, secret=secret, timeout_seconds=5.0)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

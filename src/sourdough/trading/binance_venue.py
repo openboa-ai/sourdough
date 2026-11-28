@@ -244,13 +244,18 @@ class BinanceVenueAdapter:
             },
         )
         opener = urllib.request.build_opener(_NoRedirectHandler())
+        max_resp_bytes = 2 * 1024 * 1024
         try:
             with opener.open(req, timeout=self._config.timeout_seconds) as resp:
-                raw = resp.read()
+                raw = resp.read(max_resp_bytes + 1)
+                if len(raw) > max_resp_bytes:
+                    raise ExternalOrderReplyUnknown(
+                        f"Venue response exceeded maximum allowed size ({max_resp_bytes} bytes); outcome unknown"
+                    )
                 return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as error:
             try:
-                body = error.read()
+                body = error.read(65_536)
             finally:
                 error.close()
             code, msg = _extract_binance_error(body)

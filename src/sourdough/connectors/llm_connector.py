@@ -9,6 +9,7 @@ is metered deterministically into integer minor units for company GL settlement.
 from __future__ import annotations
 
 import json
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -104,6 +105,12 @@ def _assert_safe_header_pair(name: str, value: str) -> None:
         )
 
 
+DEFAULT_MAX_OUTPUT_TOKENS = 16_384
+MAX_LLM_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_OUTPUT_TEXT_CHARS = 512_000
+MAX_EMBEDDING_DIMENSIONS = 16_384
+
+
 def _post_pinned_json(
     url: str,
     *,
@@ -112,6 +119,7 @@ def _post_pinned_json(
     body: dict[str, Any],
     timeout_seconds: float,
     secret_values: tuple[str, ...] = (),
+    max_response_bytes: int = MAX_LLM_RESPONSE_BYTES,
 ) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
     hostname = (parsed.hostname or "").lower()
@@ -135,7 +143,7 @@ def _post_pinned_json(
     opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
         with opener.open(req, timeout=timeout_seconds) as resp:
-            response_bytes = resp.read()
+            response_bytes = resp.read(max_response_bytes + 1)
     except urllib.error.HTTPError as error:
         try:
             # Read complete bounded body and scrub secrets BEFORE truncating so
@@ -160,6 +168,11 @@ def _post_pinned_json(
         raise ConnectorIndeterminate(
             f"LLM connector transport interrupted ({type(error).__name__})"
         ) from error
+
+    if len(response_bytes) > max_response_bytes:
+        raise ConnectorIndeterminate(
+            f"LLM connector response exceeded maximum allowed size ({max_response_bytes} bytes)"
+        )
 
     try:
         decoded = json.loads(response_bytes.decode("utf-8"))
@@ -207,9 +220,6 @@ def _extract_output_text(parsed: dict[str, Any]) -> str:
     return ""
 
 
-DEFAULT_MAX_OUTPUT_TOKENS = 16_384
-
-
 class ScopedLlmInferenceConnector:
     """Credential-proxied external LLM connector metered through company GL & policy gates."""
 
@@ -219,10 +229,24 @@ class ScopedLlmInferenceConnector:
         pricing: ModelPricing | None = None,
         auth_header_name: str = "Authorization",
         auth_prefix: str = "Bearer ",
+        max_response_bytes: int = MAX_LLM_RESPONSE_BYTES,
+        max_output_text_chars: int = MAX_OUTPUT_TEXT_CHARS,
+        max_embedding_dimensions: int = MAX_EMBEDDING_DIMENSIONS,
     ) -> None:
+        if type(max_response_bytes) is not int or max_response_bytes <= 0:
+            raise ConnectorRefused("max_response_bytes must be a positive integer")
+        if type(max_output_text_chars) is not int or max_output_text_chars <= 0:
+            raise ConnectorRefused("max_output_text_chars must be a positive integer")
+        if type(max_embedding_dimensions) is not int or max_embedding_dimensions <= 0:
+            raise ConnectorRefused(
+                "max_embedding_dimensions must be a positive integer"
+            )
         self._pricing = pricing or DEFAULT_MODEL_PRICING[PROVIDER_OPENAI]
         self._auth_header_name = auth_header_name
         self._auth_prefix = auth_prefix
+        self._max_response_bytes = max_response_bytes
+        self._max_output_text_chars = max_output_text_chars
+        self._max_embedding_dimensions = max_embedding_dimensions
         self._manifest = ConnectorManifest(
             connector_kind=CONNECTOR_KIND_LLM_INFERENCE,
             adapter_revision="llm-inference-connector-v1",
@@ -333,10 +357,16 @@ class ScopedLlmInferenceConnector:
                 body=body,
                 timeout_seconds=timeout_seconds,
                 secret_values=secret.raw_values(),
+                max_response_bytes=self._max_response_bytes,
             )
             usage = _extract_usage(parsed)
             cost_minor = compute_usage_cost_minor_units(usage, self._pricing)
             response_id = parsed.get("id")
+            output_text = _extract_output_text(parsed)
+            if len(output_text) > self._max_output_text_chars:
+                raise ConnectorIndeterminate(
+                    f"LLM connector output_text exceeded maximum length ({self._max_output_text_chars} chars)"
+                )
             return ConnectorResponse(
                 status="observed",
                 payload={
@@ -344,7 +374,7 @@ class ScopedLlmInferenceConnector:
                     if response_id is not None
                     else None,
                     "model": str(parsed.get("model") or model.strip()),
-                    "output_text": _extract_output_text(parsed),
+                    "output_text": output_text,
                 },
                 source_ref=str(response_id) if response_id is not None else None,
                 indeterminate=False,
@@ -370,6 +400,7 @@ class ScopedLlmInferenceConnector:
                 body={"model": model.strip(), "input": text_input},
                 timeout_seconds=timeout_seconds,
                 secret_values=secret.raw_values(),
+                max_response_bytes=self._max_response_bytes,
             )
             usage = _extract_usage(parsed)
             cost_minor = compute_usage_cost_minor_units(usage, self._pricing)
@@ -378,11 +409,22 @@ class ScopedLlmInferenceConnector:
             if isinstance(data_list, list) and data_list:
                 first = data_list[0]
                 if isinstance(first, dict) and isinstance(first.get("embedding"), list):
-                    vector = [
-                        float(x)
-                        for x in first["embedding"]
-                        if isinstance(x, (int, float))
-                    ]
+                    raw_emb = first["embedding"]
+                    if len(raw_emb) > self._max_embedding_dimensions:
+                        raise ConnectorIndeterminate(
+                            f"LLM connector embedding exceeded maximum dimensions ({self._max_embedding_dimensions})"
+                        )
+                    for x in raw_emb:
+                        if isinstance(x, bool) or not isinstance(x, (int, float)):
+                            raise ConnectorIndeterminate(
+                                "LLM connector embedding contains non-numeric element"
+                            )
+                        fx = float(x)
+                        if not math.isfinite(fx):
+                            raise ConnectorIndeterminate(
+                                "LLM connector embedding contains non-finite float"
+                            )
+                        vector.append(fx)
             return ConnectorResponse(
                 status="observed",
                 payload={
