@@ -162,6 +162,10 @@ def _verify_venue_binding(
         raise ConnectorEnvironmentMismatch(
             f"Resolved venue host '{effective_host}' is not in pinned allowed_hosts"
         )
+    if getattr(venue, "blocks_redirects", False) is not True:
+        raise ConnectorEnvironmentMismatch(
+            "Resolved trading venue adapter must explicitly enforce HTTP redirect blocking"
+        )
 
     # Verify credential identity if venue exposes config or credential provider.
     cfg_handle = getattr(cfg, "credential_handle_ref", None) or getattr(

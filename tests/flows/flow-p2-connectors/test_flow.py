@@ -116,6 +116,7 @@ class _SimulatedIndeterminateVenue:
     def __init__(self, endpoint_url: str, credential_handle_ref: str) -> None:
         self.endpoint_url = endpoint_url
         self.credential_handle_ref = credential_handle_ref
+        self.blocks_redirects = True
         self.submit_calls = 0
         self.query_calls = 0
         self.accepted_orders: dict[str, ExternalOrderRequest] = {}

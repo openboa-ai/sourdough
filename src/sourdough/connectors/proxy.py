@@ -47,6 +47,7 @@ from .protocol import (
     ConnectorResponse,
     ConnectorUnauthorized,
     OperationSpec,
+    validate_payload_against_schema,
 )
 from .registry import (
     ConnectorAdapterRegistry,
@@ -349,6 +350,10 @@ class ConnectorProxy:
                 raise ConnectorRefused(
                     f"Operation '{operation}' mode mismatch between binding and adapter manifest"
                 )
+            # Enforce BOTH the adapter manifest schema and the binding's pinned restrictions
+            # (e.g. model allowlists, token caps, additionalProperties=False) before dispatch.
+            validate_payload_against_schema(payload, manifest_op.request_schema)
+            validate_payload_against_schema(payload, binding_op.request_schema)
             op_spec = manifest_op
 
             # Check explicit active connector_grant bound to this exact standing grant & binding revision.
@@ -508,8 +513,21 @@ class ConnectorProxy:
                             },
                             indeterminate=True,
                         )
+                elif ext_action.status in ("prepared", "in_flight"):
+                    # Do NOT dispatch an overlapping read retry while an attempt is still
+                    # actively in flight on the same action identity and cost receipt.
+                    mode_action = "replay"
+                    replay_response = ConnectorResponse(
+                        status="unknown",
+                        payload={
+                            "idempotency_key": idempotency_key,
+                            "reason": "action_in_flight",
+                        },
+                        indeterminate=True,
+                    )
                 else:
-                    # Unresolved read retry: still subject to rate & budget ceilings below!
+                    # Settled 'unknown' read retry: atomically claims 'in_flight' below
+                    # and still enforces sliding-window rate & budget ceilings!
                     mode_action = "execute"
 
             if mode_action == "execute":

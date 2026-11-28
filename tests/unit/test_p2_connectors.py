@@ -1211,6 +1211,245 @@ class ConnectorSubsystemTests(unittest.TestCase):
             server.server_close()
             t.join(timeout=5.0)
 
+    def test_binding_pinned_request_schema_enforced_before_dispatch(self) -> None:
+        from sourdough.connectors import (
+            CONNECTOR_KIND_LLM_INFERENCE,
+            ScopedLlmInferenceConnector,
+        )
+
+        with TemporaryDirectory(prefix="sd-c10-") as tmp:
+            store, leases, founding, claim, now = _setup_company_and_claim(Path(tmp))
+            proxy = ConnectorProxy(
+                ConnectorAdapterRegistry([ScopedLlmInferenceConnector()]),
+                InMemorySecretVault(
+                    {"envref:OPENAI_DEV_KEY": "test-schema-token-1111"}
+                ),
+                loopback_only=True,
+            )
+            restricted_complete = OperationSpec(
+                name="complete",
+                mode="write",
+                request_schema={
+                    "type": "object",
+                    "properties": {
+                        "model": {"type": "string", "enum": ["approved-model"]},
+                        "input": {"type": "string", "minLength": 1},
+                        "max_output_tokens": {"type": "integer", "maximum": 10},
+                    },
+                    "required": ["model", "input"],
+                    "additionalProperties": False,
+                },
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                binding = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="llm-pinned",
+                    connector_kind=CONNECTOR_KIND_LLM_INFERENCE,
+                    environment="paper",
+                    endpoint_url="http://127.0.0.1:9020",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=(restricted_complete,),
+                    credential_handle_ref="envref:OPENAI_DEV_KEY",
+                    actor_id="board-1",
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("complete",),
+                    granted_by_actor_id="board-1",
+                    now_ns=now + 5,
+                )
+                handler = proxy.build_tool_handler(w, claim)
+                with self.assertRaises(ConnectorRefused):
+                    handler(
+                        {
+                            "binding_id": "llm-pinned",
+                            "operation": "complete",
+                            "request_id": "bad-model-1",
+                            "payload": {
+                                "model": "forbidden-model",
+                                "input": "hi",
+                                "max_output_tokens": 5,
+                            },
+                        }
+                    )
+                with self.assertRaises(ConnectorRefused):
+                    handler(
+                        {
+                            "binding_id": "llm-pinned",
+                            "operation": "complete",
+                            "request_id": "bad-tokens-1",
+                            "payload": {
+                                "model": "approved-model",
+                                "input": "hi",
+                                "max_output_tokens": 1_000_000,
+                            },
+                        }
+                    )
+
+    def test_overlapping_in_flight_read_retry_is_blocked_without_second_dispatch(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-c11-") as tmp:
+            store, leases, founding, claim, now = _setup_company_and_claim(Path(tmp))
+            adapter = _FakeAdapter()
+            proxy = ConnectorProxy(
+                ConnectorAdapterRegistry([adapter]),
+                InMemorySecretVault({"envref:FAKE_TEST_KEY": "test-inflight-1111"}),
+                loopback_only=True,
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                binding = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="svc-overlap",
+                    connector_kind="fake_service",
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9021",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=adapter.manifest.operations,
+                    credential_handle_ref="envref:FAKE_TEST_KEY",
+                    actor_id="board-1",
+                    budget_ceiling_minor_units=25,
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("fetch_doc",),
+                    granted_by_actor_id="board-1",
+                    max_cost_minor_units=25,
+                    now_ns=now + 5,
+                )
+
+                overlapping_result: list[ConnectorResponse] = []
+
+                def _exec_with_overlap(req: ConnectorRequest, _sec: MaskedSecret):
+                    if len(adapter.execute_calls) == 1:
+                        # Simulate overlapping repeat while first attempt is in_flight!
+                        second = proxy.invoke(
+                            w,
+                            claim,
+                            binding_id=binding.binding_id,
+                            operation="fetch_doc",
+                            request_id="overlap-read-1",
+                            payload={"doc": "a"},
+                            now_ns=now + 12,
+                        )
+                        overlapping_result.append(second)
+                    return ConnectorResponse(
+                        status="observed",
+                        payload={"request_id": req.request_id},
+                        cost_minor_units=25,
+                    )
+
+                adapter.next_execute = _exec_with_overlap
+                first = proxy.invoke(
+                    w,
+                    claim,
+                    binding_id=binding.binding_id,
+                    operation="fetch_doc",
+                    request_id="overlap-read-1",
+                    payload={"doc": "a"},
+                    now_ns=now + 10,
+                )
+                self.assertEqual(first.status, "observed")
+                self.assertEqual(len(adapter.execute_calls), 1)
+                self.assertEqual(len(overlapping_result), 1)
+                self.assertEqual(overlapping_result[0].status, "unknown")
+                self.assertEqual(
+                    overlapping_result[0].payload.get("reason"), "action_in_flight"
+                )
+
+    def test_trading_venue_connector_blocks_http_302_redirect_without_leaking_api_key(
+        self,
+    ) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        stolen_headers: list[str] = []
+
+        class _TargetHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                del fmt, args
+
+            def do_GET(self) -> None:
+                stolen_headers.append(self.headers.get("X-MBX-APIKEY", ""))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"orderId":1,"status":"FILLED"}')
+
+        target_srv = HTTPServer(("127.0.0.1", 0), _TargetHandler)
+        target_port = int(target_srv.server_address[1])
+
+        class _RedirectHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                del fmt, args
+
+            def do_GET(self) -> None:
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://localhost:{target_port}/api/v3/order"
+                )
+                self.end_headers()
+
+        redir_srv = HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        redir_port = int(redir_srv.server_address[1])
+        t1 = threading.Thread(target=target_srv.serve_forever, daemon=True)
+        t2 = threading.Thread(target=redir_srv.serve_forever, daemon=True)
+        t1.start()
+        t2.start()
+        try:
+            secret = MaskedSecretBundle(
+                values={
+                    "api_key": "test-venue-redirect-key-1111",
+                    "api_secret": "test-venue-redirect-sec-2222",
+                },
+                handle_ref="envref:BINANCE_TESTNET",
+            )
+            req = ConnectorRequest(
+                company_id="co-1",
+                binding_id="venue-redir",
+                binding_revision=1,
+                operation="query_order",
+                request_id="q-redir-1",
+                idempotency_key="conn:co-1:venue-redir:r1:query_order:q-redir-1",
+                payload={"symbol": "BTCUSDT", "client_order_id": "q-redir-1"},
+                environment="external_test",
+                endpoint_url=f"http://127.0.0.1:{redir_port}",
+                allowed_hosts=("127.0.0.1",),
+            )
+            adapter = TradingVenueConnectorAdapter(
+                venue_resolver=build_bound_binance_venue
+            )
+            with self.assertRaises(ConnectorEnvironmentMismatch):
+                adapter.execute(req, secret=secret, timeout_seconds=5.0)
+            self.assertEqual(stolen_headers, [])
+        finally:
+            redir_srv.shutdown()
+            redir_srv.server_close()
+            target_srv.shutdown()
+            target_srv.server_close()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

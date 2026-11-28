@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import re
 from typing import Any, Literal, Protocol
 
 from ..secret_vault import MaskedSecret, MaskedSecretBundle
@@ -247,6 +248,150 @@ class ConnectorResponse:
             object.__setattr__(self, "indeterminate", True)
 
 
+def _matches_json_type(value: Any, expected_type: str) -> bool:
+    if expected_type == "object":
+        return isinstance(value, Mapping)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "integer":
+        return type(value) is int
+    if expected_type == "number":
+        return type(value) in (int, float)
+    if expected_type == "boolean":
+        return type(value) is bool
+    if expected_type == "null":
+        return value is None
+    return False
+
+
+def validate_payload_against_schema(
+    value: Any,
+    schema: Mapping[str, Any] | None,
+    *,
+    path: str = "payload",
+) -> None:
+    """Validate a connector request payload against a pinned JSON Schema subset."""
+    if not schema:
+        return
+    if not isinstance(schema, Mapping):
+        raise ConnectorRefused(f"Invalid request schema at {path}")
+
+    expected_type = schema.get("type")
+    if isinstance(expected_type, str):
+        if not _matches_json_type(value, expected_type):
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: expected type '{expected_type}'"
+            )
+    elif isinstance(expected_type, list) and expected_type:
+        if not any(
+            isinstance(t, str) and _matches_json_type(value, t) for t in expected_type
+        ):
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: value does not match allowed types"
+            )
+
+    if "const" in schema and value != schema["const"]:
+        raise ConnectorRefused(
+            f"Connector payload validation failed at {path}: value does not match pinned constant"
+        )
+    if "enum" in schema:
+        allowed_enum = schema["enum"]
+        if not isinstance(allowed_enum, list) or value not in allowed_enum:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: value is not in pinned enum"
+            )
+
+    if isinstance(value, str):
+        min_len = schema.get("minLength")
+        if type(min_len) is int and len(value) < min_len:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: shorter than minLength {min_len}"
+            )
+        max_len = schema.get("maxLength")
+        if type(max_len) is int and len(value) > max_len:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: exceeds maxLength {max_len}"
+            )
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str):
+            try:
+                if re.search(pattern, value) is None:
+                    raise ConnectorRefused(
+                        f"Connector payload validation failed at {path}: does not match pinned pattern"
+                    )
+            except re.error as error:
+                raise ConnectorRefused(
+                    f"Invalid regex pattern in schema at {path}"
+                ) from error
+
+    if type(value) in (int, float):
+        minimum = schema.get("minimum")
+        if type(minimum) in (int, float) and value < minimum:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: value below minimum {minimum}"
+            )
+        maximum = schema.get("maximum")
+        if type(maximum) in (int, float) and value > maximum:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: value exceeds maximum {maximum}"
+            )
+        exc_min = schema.get("exclusiveMinimum")
+        if type(exc_min) in (int, float) and value <= exc_min:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: value must be > {exc_min}"
+            )
+        exc_max = schema.get("exclusiveMaximum")
+        if type(exc_max) in (int, float) and value >= exc_max:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: value must be < {exc_max}"
+            )
+
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        if type(min_items) is int and len(value) < min_items:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: fewer than {min_items} items"
+            )
+        max_items = schema.get("maxItems")
+        if type(max_items) is int and len(value) > max_items:
+            raise ConnectorRefused(
+                f"Connector payload validation failed at {path}: exceeds {max_items} items"
+            )
+        item_schema = schema.get("items")
+        if isinstance(item_schema, Mapping):
+            for idx, elem in enumerate(value):
+                validate_payload_against_schema(
+                    elem, item_schema, path=f"{path}[{idx}]"
+                )
+
+    if isinstance(value, Mapping):
+        req_keys = schema.get("required")
+        if isinstance(req_keys, list):
+            for req_key in req_keys:
+                if isinstance(req_key, str) and req_key not in value:
+                    raise ConnectorRefused(
+                        f"Connector payload validation failed at {path}: missing required field '{req_key}'"
+                    )
+        props = schema.get("properties")
+        props_map = props if isinstance(props, Mapping) else {}
+        addl = schema.get("additionalProperties", True)
+        for key, prop_val in value.items():
+            if key in props_map:
+                prop_schema = props_map[key]
+                if isinstance(prop_schema, Mapping):
+                    validate_payload_against_schema(
+                        prop_val, prop_schema, path=f"{path}.{key}"
+                    )
+            elif addl is False:
+                raise ConnectorRefused(
+                    f"Connector payload validation failed at {path}: unexpected property '{key}'"
+                )
+            elif isinstance(addl, Mapping):
+                validate_payload_against_schema(prop_val, addl, path=f"{path}.{key}")
+
+
 class ConnectorAdapter(Protocol):
     """Outer-host adapter executing scoped operations with memory-only secrets."""
 
@@ -291,4 +436,5 @@ __all__ = [
     "VALID_CONNECTOR_ENVIRONMENTS",
     "VALID_OPERATION_MODES",
     "VALID_RESPONSE_STATUSES",
+    "validate_payload_against_schema",
 ]
