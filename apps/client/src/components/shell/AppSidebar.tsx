@@ -46,11 +46,21 @@ export function AppSidebar() {
         ? "neutral"
         : "danger";
 
+  const residentHealth = meta?.resident_health ?? null;
+  const residentSleepLabel =
+    residentHealth?.sleep_state === "awake"
+      ? "Awake"
+      : residentHealth?.sleep_state === "sleeping"
+        ? "Sleeping"
+        : null;
+
   const statusLabel =
     linkState === "live"
       ? isAnyPaused
         ? `Paused · seq #${lastEventSeq}`
-        : `Live · seq #${lastEventSeq}`
+        : residentSleepLabel
+          ? `${residentSleepLabel} · seq #${lastEventSeq}`
+          : `Live · seq #${lastEventSeq}`
       : linkState === "stale"
         ? "Reconnecting"
         : linkState === "unauthorized"

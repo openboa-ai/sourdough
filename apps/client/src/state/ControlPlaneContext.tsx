@@ -73,12 +73,16 @@ function writeStoredSeq(key: string, seq: number): void {
   }
 }
 
+export const IDLE_META_REFRESH_MS = 6000;
+
 export function ControlPlaneProvider({
   children,
   onClearCache,
+  idleMetaRefreshMs = IDLE_META_REFRESH_MS,
 }: {
   children: ReactNode;
   onClearCache?: () => void;
+  idleMetaRefreshMs?: number;
 }) {
   const {
     routePathname,
@@ -109,6 +113,8 @@ export function ControlPlaneProvider({
   const startupMsgCheckedRef = useRef<string | null>(null);
   const prevBootstrapLockedRef = useRef<boolean | undefined>(undefined);
   const clearListenersRef = useRef<Set<() => void>>(new Set());
+  const lastMetaLoadedAtRef = useRef<number>(0);
+  const metaInFlightCountRef = useRef<number>(0);
 
   const subscribeSessionClear = useCallback((listener: () => void) => {
     clearListenersRef.current.add(listener);
@@ -167,6 +173,7 @@ export function ControlPlaneProvider({
       setRecentEventTypes([]);
       setUnreadCeoReply(false);
       startupMsgCheckedRef.current = null;
+      lastMetaLoadedAtRef.current = 0;
       clearPendingAskContextDirect();
       onClearCache?.();
       for (const listener of clearListenersRef.current) {
@@ -187,8 +194,10 @@ export function ControlPlaneProvider({
 
   const loadMeta = useCallback(
     async (signal?: AbortSignal, opts?: { retryTransientNetwork?: boolean }) => {
+      metaInFlightCountRef.current += 1;
       try {
         const nextMeta = await fetchMeta(signal, opts);
+        if (signal?.aborted) return null;
         const nextPrincipal = nextMeta.board_access.principal_id;
         if (
           (companyIdRef.current !== null &&
@@ -210,6 +219,7 @@ export function ControlPlaneProvider({
         principalIdRef.current = nextPrincipal;
         incarnationRef.current = nextMeta.service_incarnation_id;
         lastSeqRef.current = Math.max(lastSeqRef.current, nextMeta.event_seq);
+        lastMetaLoadedAtRef.current = Date.now();
         setLastEventSeq(lastSeqRef.current);
         setMeta(nextMeta);
         setLinkState("live");
@@ -252,6 +262,8 @@ export function ControlPlaneProvider({
         setLinkState((prev) => (prev === "unauthorized" ? "unauthorized" : "stale"));
         setLastError(err instanceof Error ? err.message : "Control plane unreachable");
         return null;
+      } finally {
+        metaInFlightCountRef.current = Math.max(0, metaInFlightCountRef.current - 1);
       }
     },
     [clearData, markMessagesVisited, routeRef]
@@ -355,7 +367,22 @@ export function ControlPlaneProvider({
       }
     };
 
+    const onVisibilityChange = () => {
+      if (
+        !active ||
+        controller.signal.aborted ||
+        document.visibilityState !== "visible" ||
+        metaInFlightCountRef.current > 0
+      ) {
+        return;
+      }
+      if (Date.now() - lastMetaLoadedAtRef.current >= idleMetaRefreshMs) {
+        void loadMeta(controller.signal);
+      }
+    };
+
     window.addEventListener("pagehide", shutdown);
+    document.addEventListener("visibilitychange", onVisibilityChange);
 
     async function loop() {
       let waitMs = 0;
@@ -391,11 +418,17 @@ export function ControlPlaneProvider({
             }
             coalesceTimer = window.setTimeout(() => {
               if (!active) return;
-              void loadMeta();
+              void loadMeta(controller.signal);
               setRefreshSeq((n) => n + 1);
             }, 150);
           } else if (linkStateRef.current === "stale") {
-            void loadMeta();
+            await loadMeta(controller.signal);
+          } else if (
+            (typeof document === "undefined" ||
+              document.visibilityState !== "hidden") &&
+            Date.now() - lastMetaLoadedAtRef.current >= idleMetaRefreshMs
+          ) {
+            await loadMeta(controller.signal);
           }
           if (waitMs === 0) {
             waitMs = 3000;
@@ -412,7 +445,7 @@ export function ControlPlaneProvider({
           setLastError(err instanceof Error ? err.message : "Live event stream disconnected");
           await waitMsDelay(1500);
           if (active) {
-            await loadMeta();
+            await loadMeta(controller.signal);
           }
         }
       }
@@ -421,9 +454,10 @@ export function ControlPlaneProvider({
     void loop();
     return () => {
       window.removeEventListener("pagehide", shutdown);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       shutdown();
     };
-  }, [clearData, loadMeta, markMessagesVisited, metaReady, routeRef]);
+  }, [clearData, idleMetaRefreshMs, loadMeta, markMessagesVisited, metaReady, routeRef]);
 
   const forceRefresh = useCallback(async (): Promise<boolean> => {
     const loaded = await loadMeta();

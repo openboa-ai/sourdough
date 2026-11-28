@@ -10,6 +10,20 @@ export interface BoardAccess {
   bootstrap_challenge?: string;
 }
 
+export interface ResidentHealth {
+  running: boolean;
+  ticks_completed: number;
+  runs_executed: number;
+  triggers_enqueued: number;
+  last_tick_at_ns: number | null;
+  last_error: string | null;
+  sleep_state: "awake" | "sleeping" | string;
+  wake_count: number;
+  last_wake_reason: string | null;
+  last_good_tick_at_ns: number | null;
+  recovered_runs_count: number;
+}
+
 export interface ControlPlaneMeta {
   control_plane_version: string;
   company_id: string;
@@ -26,6 +40,7 @@ export interface ControlPlaneMeta {
   active_restrictions_count: number;
   supported_projections: string[];
   supported_commands: Record<string, string[]>;
+  resident_health?: ResidentHealth | null;
 }
 
 export interface AuditEventItem {

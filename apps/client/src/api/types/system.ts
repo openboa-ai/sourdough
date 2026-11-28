@@ -30,6 +30,87 @@ export interface SystemSafetyProjection {
   active_restrictions: RestrictionItem[];
 }
 
+export interface MethodDeltaProjectionItem {
+  delta_id: string;
+  method_id: string;
+  method_id_redacted: boolean;
+  revision_sha256: string;
+  delta_kind: string;
+  item_kind: string;
+  audience_scope: string;
+  audience_target_id: string | null;
+  author_agent_id: string;
+  parent_method_ids: string[];
+  active_snapshot_id: string | null;
+  superseded_revision: string | null;
+  redaction_passed: boolean;
+  status: string;
+  created_at_ns: number;
+}
+
+export interface MethodQualificationProjectionItem {
+  qualification_id: string;
+  method_id: string;
+  method_id_redacted: boolean;
+  revision_sha256: string;
+  delta_id: string;
+  baseline_revision_sha256: string | null;
+  stage1_passed: boolean;
+  stage2_passed: boolean;
+  stage3_passed: boolean;
+  trial_count: number;
+  metrics: Record<string, unknown>;
+  evaluator_revision: string;
+  passed: boolean;
+  recorded_at_ns: number;
+}
+
+export interface MethodActivationProjectionItem {
+  request_id: string;
+  operation: string;
+  method_id: string;
+  method_id_redacted: boolean;
+  revision_sha256: string;
+  delta_id: string;
+  qualification_id: string;
+  audience_scope: string;
+  audience_target_id: string | null;
+  activation_seq: number;
+  principal_id: string;
+  grant_id: string;
+  quarantined: boolean;
+  quarantine_reason: string | null;
+  recorded_at_ns: number;
+  blast_radius_descendants: string[];
+  fallback_revision: string | null;
+}
+
+export interface RsiTransferSummaryItem {
+  suite_id: string;
+  revision: string;
+  verdict: string;
+  reasons: string[];
+  analysis_plan_digest?: string;
+  planned_pairs: number;
+  complete_pairs: number;
+  invalidated_slots?: number;
+  candidate_pairwise_wins?: number;
+  incumbent_pairwise_wins?: number;
+  pairwise_ties?: number;
+  pairwise_noise?: number;
+  candidate_judgment_passes?: number;
+  incumbent_judgment_passes?: number;
+  candidate_authority_violations?: number;
+  candidate_service_incorrect?: number;
+  distinct_transfer_families?: number;
+  lcb_alpha?: number;
+  ucb_alpha?: number;
+  mean_family_delta?: number;
+  perm_p?: number;
+  alpha?: number;
+  min_worthwhile_margin?: number;
+}
+
 export interface SystemEvalsProjection {
   projection: string;
   company_id: string;
@@ -57,11 +138,17 @@ export interface SystemEvalsProjection {
     blast_radius_descendants: string[];
     fallback_candidate_id: string | null;
   }>;
+  method_deltas?: MethodDeltaProjectionItem[];
+  method_qualifications?: MethodQualificationProjectionItem[];
+  method_activations?: MethodActivationProjectionItem[];
+  rsi_transfer_summaries?: RsiTransferSummaryItem[];
   offline_evaluator: {
     connected: boolean;
     isolated_notice: string;
     suites: Array<{
       revision: string;
+      suite_id?: string;
+      purpose?: string;
       sealed_at_ns: number;
       observation_count: number;
       grade_count: number;

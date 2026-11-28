@@ -21,15 +21,29 @@ export function AgentDeskAuthoritySection({
   data,
   runtimeState,
 }: AgentDeskAuthoritySectionProps) {
-  const { profile, desk_workspace: deskWorkspace, authority_budget: authorityBudget } =
-    data;
+  const {
+    profile,
+    desk_workspace: deskWorkspace,
+    authority_budget: authorityBudget,
+    runtime_binding: topRuntimeBinding,
+    responsibilities,
+    active_snapshot_id: activeSnapshotId,
+  } = data;
+  const runtimeBinding = topRuntimeBinding ?? deskWorkspace.runtime_binding ?? null;
 
   const deskFacts = useMemo<Fact[]>(() => {
     const facts: Fact[] = [
       {
         id: "exec",
-        label: "Execution Sandbox",
+        label: "Execution Profile",
         value: deskWorkspace.execution_profile,
+      },
+      {
+        id: "binding",
+        label: "Runtime Binding",
+        value: runtimeBinding
+          ? `${runtimeBinding.provider} · ${runtimeBinding.model} (${runtimeBinding.sandbox_backend})`
+          : "Profile bound (no runtime record)",
       },
       {
         id: "manifest",
@@ -37,6 +51,15 @@ export function AgentDeskAuthoritySection({
         value: (
           <Text className="sd-mono">
             {deskWorkspace.desk_manifest_revision ?? "Unavailable"}
+          </Text>
+        ),
+      },
+      {
+        id: "snapshot",
+        label: "Active Method Snapshot",
+        value: (
+          <Text className="sd-mono">
+            {activeSnapshotId ? activeSnapshotId.slice(0, 16) : "Base harness"}
           </Text>
         ),
       },
@@ -69,6 +92,16 @@ export function AgentDeskAuthoritySection({
       },
     ];
 
+    if (responsibilities && responsibilities.length > 0) {
+      const activeResp = responsibilities.filter((r) => r.status === "active");
+      const totalWakes = responsibilities.reduce((sum, r) => sum + r.window_wakes, 0);
+      facts.push({
+        id: "responsibilities",
+        label: "Standing Responsibilities",
+        value: `${activeResp.length} active (${totalWakes} window wakes)`,
+      });
+    }
+
     if (profile.onboarding_purpose) {
       facts.push({
         id: "onboarding-purpose",
@@ -86,7 +119,7 @@ export function AgentDeskAuthoritySection({
     }
 
     return facts;
-  }, [deskWorkspace, profile]);
+  }, [activeSnapshotId, deskWorkspace, profile, responsibilities, runtimeBinding]);
 
   const authorityFacts = useMemo<Fact[]>(() => {
     const hiringValue = !authorityBudget.can_hire

@@ -336,6 +336,24 @@ def read_agent_detail_projection(
             "SELECT manifest_revision FROM private_desk WHERE agent_id = ?",
             (agent_id,),
         ).fetchone()
+        runtime_binding_row = db.execute(
+            """SELECT provider, model, revision, sandbox_backend, profile_id, updated_at_ns
+               FROM agent_runtime_binding
+               WHERE company_id = ? AND agent_id = ?""",
+            (company_id, agent_id),
+        ).fetchone()
+        runtime_binding = (
+            {
+                "provider": str(runtime_binding_row[0]),
+                "model": str(runtime_binding_row[1]),
+                "revision": str(runtime_binding_row[2]),
+                "sandbox_backend": str(runtime_binding_row[3]),
+                "profile_id": str(runtime_binding_row[4]),
+                "updated_at_ns": int(runtime_binding_row[5]),
+            }
+            if runtime_binding_row is not None
+            else None
+        )
         staffing_row = (
             db.execute(
                 """SELECT allowed_scope, slots, turns, manager_scope
@@ -345,6 +363,33 @@ def read_agent_detail_projection(
             if info["grant_id"]
             else None
         )
+
+        responsibilities = [
+            {
+                "responsibility_id": str(r[0]),
+                "duty_kind": str(r[1]),
+                "remit": str(r[2]),
+                "status": str(r[3]),
+                "consecutive_noops": int(r[4]) if r[4] is not None else 0,
+                "cooldown_until_ns": int(r[5]) if r[5] is not None else 0,
+                "window_started_ns": int(r[6]) if r[6] is not None else 0,
+                "window_wakes": int(r[7]) if r[7] is not None else 0,
+                "updated_at_ns": int(r[8]),
+            }
+            for r in db.execute(
+                """SELECT r.responsibility_id, r.duty_kind, r.remit, r.status,
+                          d.consecutive_noops, d.cooldown_until_ns,
+                          d.window_started_ns, d.window_wakes, r.updated_at_ns
+                   FROM work_responsibilities r
+                   LEFT JOIN work_discovery_state d
+                     ON d.company_id = r.company_id
+                    AND d.responsibility_id = r.responsibility_id
+                   WHERE r.company_id = ? AND r.owner_agent_id = ?
+                   ORDER BY r.updated_at_ns DESC, r.responsibility_id ASC
+                   LIMIT 20""",
+                (company_id, agent_id),
+            ).fetchall()
+        ]
 
         # Tab 1: Work Activity
         one_agent_deltas, one_agent_mids = load_one_agent_method_sets(db, company_id)
@@ -384,17 +429,68 @@ def read_agent_detail_projection(
                 "payload": _redact_work_item_payload_for_board(
                     db, company_id, str(r[5])
                 ),
-                "updated_at_ns": int(r[6]),
+                "attempt_count": int(r[6]),
+                "next_retry_at_ns": None if r[7] is None else int(r[7]),
+                "updated_at_ns": int(r[8]),
             }
             for r in db.execute(
                 """SELECT work_item_id, duty_kind, state, source_kind, source_id,
-                          payload_json, updated_at_ns
+                          payload_json, attempt_count, next_retry_at_ns, updated_at_ns
                    FROM work_items
                    WHERE company_id = ? AND owner_agent_id = ?
                    ORDER BY updated_at_ns DESC LIMIT 30""",
                 (company_id, agent_id),
             ).fetchall()
         ]
+
+        dreaming_runs = [r for r in work_activity if r["duty_kind"] == "work.dreaming"]
+        dreaming_stats_row = db.execute(
+            """SELECT COUNT(*),
+                      SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN status IN ('failed', 'fenced') THEN 1 ELSE 0 END),
+                      MAX(updated_at_ns)
+               FROM work_runs
+               WHERE company_id = ? AND agent_id = ? AND duty_kind = 'work.dreaming'""",
+            (company_id, agent_id),
+        ).fetchone()
+        dreaming_latest_row = db.execute(
+            """SELECT run_id, status, outcome_json, updated_at_ns
+               FROM work_runs
+               WHERE company_id = ? AND agent_id = ? AND duty_kind = 'work.dreaming'
+               ORDER BY updated_at_ns DESC, run_id ASC
+               LIMIT 1""",
+            (company_id, agent_id),
+        ).fetchone()
+        dreaming_summary = {
+            "total_runs": int(dreaming_stats_row[0]) if dreaming_stats_row else 0,
+            "completed_runs": (
+                int(dreaming_stats_row[1] or 0) if dreaming_stats_row else 0
+            ),
+            "failed_runs": (
+                int(dreaming_stats_row[2] or 0) if dreaming_stats_row else 0
+            ),
+            "last_run_id": (
+                None if dreaming_latest_row is None else str(dreaming_latest_row[0])
+            ),
+            "last_status": (
+                None if dreaming_latest_row is None else str(dreaming_latest_row[1])
+            ),
+            "last_run_at_ns": (
+                None
+                if dreaming_stats_row is None or dreaming_stats_row[3] is None
+                else int(dreaming_stats_row[3])
+            ),
+            "last_outcome": (
+                None
+                if dreaming_latest_row is None
+                else _redact_run_outcome_for_board(
+                    dreaming_latest_row[2],
+                    one_agent_deltas=one_agent_deltas,
+                    one_agent_mids=one_agent_mids,
+                )
+            ),
+            "recent_runs_count": len(dreaming_runs),
+        }
 
         conditions = [
             {
@@ -538,36 +634,45 @@ def read_agent_detail_projection(
         ]
 
         # Tab 4: Peer Requests & Handoffs
-        peer_requests = [
-            {
-                "request_id": str(r[0]),
-                "direction": "outgoing" if str(r[1]) == agent_id else "incoming",
-                "requester_agent_id": str(r[1]),
-                "requester_name": directory.get(str(r[1]), {}).get(
-                    "display_name", str(r[1])
-                ),
-                "recipient_agent_id": str(r[2]),
-                "recipient_name": directory.get(str(r[2]), {}).get(
-                    "display_name", str(r[2])
-                ),
-                "project_id": None if r[3] is None else str(r[3]),
-                "question": str(r[4]),
-                "expected_decision": str(r[5]),
-                "state": str(r[6]),
-                "response": _json_loads_safe(r[7], None),
-                "created_at_ns": int(r[8]),
-            }
-            for r in db.execute(
-                """SELECT request_id, requester_agent_id, recipient_agent_id,
-                          project_id, question, expected_decision, state,
-                          response_json, created_at_ns
-                   FROM work_peer_requests
-                   WHERE company_id = ?
-                     AND (requester_agent_id = ? OR recipient_agent_id = ?)
-                   ORDER BY created_at_ns DESC LIMIT 30""",
-                (company_id, agent_id, agent_id),
-            ).fetchall()
-        ]
+        peer_requests = []
+        for r in db.execute(
+            """SELECT request_id, requester_agent_id, recipient_agent_id,
+                      project_id, question, expected_decision, state,
+                      response_json, created_at_ns, hop_count, chain_depth,
+                      root_work_item_id, delegation_path_json
+               FROM work_peer_requests
+               WHERE company_id = ?
+                 AND (requester_agent_id = ? OR recipient_agent_id = ?)
+               ORDER BY created_at_ns DESC LIMIT 30""",
+            (company_id, agent_id, agent_id),
+        ).fetchall():
+            delegation_path = _json_loads_safe(str(r[12] or "[]"), [])
+            peer_requests.append(
+                {
+                    "request_id": str(r[0]),
+                    "direction": "outgoing" if str(r[1]) == agent_id else "incoming",
+                    "requester_agent_id": str(r[1]),
+                    "requester_name": directory.get(str(r[1]), {}).get(
+                        "display_name", str(r[1])
+                    ),
+                    "recipient_agent_id": str(r[2]),
+                    "recipient_name": directory.get(str(r[2]), {}).get(
+                        "display_name", str(r[2])
+                    ),
+                    "project_id": None if r[3] is None else str(r[3]),
+                    "question": str(r[4]),
+                    "expected_decision": str(r[5]),
+                    "state": str(r[6]),
+                    "response": _json_loads_safe(r[7], None),
+                    "created_at_ns": int(r[8]),
+                    "hop_count": int(r[9]),
+                    "chain_depth": int(r[10]),
+                    "root_work_item_id": None if r[11] is None else str(r[11]),
+                    "delegation_path_length": (
+                        len(delegation_path) if isinstance(delegation_path, list) else 0
+                    ),
+                }
+            )
 
         handoffs = []
         for r in db.execute(
@@ -627,6 +732,7 @@ def read_agent_detail_projection(
             "agent_sandbox": None,
             "desk_workspace": {
                 "execution_profile": info["execution_profile"],
+                "runtime_binding": runtime_binding,
                 "desk_manifest_revision": None
                 if desk_row is None
                 else str(desk_row[0]),
@@ -635,6 +741,9 @@ def read_agent_detail_projection(
                 "published_count": len(published_reports),
                 "work_run_count": len(work_activity),
             },
+            "runtime_binding": runtime_binding,
+            "responsibilities": responsibilities,
+            "dreaming_summary": dreaming_summary,
             "authority_budget": {
                 "grant_id": info["grant_id"],
                 "grant_scope": info["grant_scope"],
@@ -653,6 +762,7 @@ def read_agent_detail_projection(
                 "work_items": work_items,
                 "conditions": conditions,
                 "armed_conditions": armed_conditions,
+                "responsibilities": responsibilities,
                 "work_decisions": work_decisions,
                 "agent_episodes": agent_episodes,
                 "interactions_and_talks": interactions,
