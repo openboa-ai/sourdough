@@ -66,6 +66,7 @@ def _canonical_json(value: Any) -> str:
 
 def _compute_request_sha256(
     *,
+    agent_id: str,
     binding_id: str,
     binding_revision: int,
     operation: str,
@@ -77,6 +78,7 @@ def _compute_request_sha256(
 ) -> str:
     canonical = _canonical_json(
         {
+            "agent_id": agent_id,
             "binding_id": binding_id,
             "binding_revision": binding_revision,
             "operation": operation,
@@ -191,10 +193,17 @@ class ConnectorProxy:
         self._loopback_only = loopback_only
         self._tx_lock = tx_lock
 
-    def _assert_claim_still_current(
-        self, writer: WriterLease, claim: ExecutionClaim
+    def _assert_dispatch_still_authorized(
+        self,
+        writer: WriterLease,
+        claim: ExecutionClaim,
+        *,
+        binding_id: str,
+        binding_revision: int,
+        grant_binding_id: str,
+        operation: str,
     ) -> None:
-        """Re-check sender fencing & active standing grant right before outbound dispatch."""
+        """Re-check sender fencing, standing grant, active binding, and connector grant right before send."""
         with scoped_reader(writer.store) as ro_db:
             try:
                 authority = resolve_run(ro_db, claim)
@@ -203,6 +212,34 @@ class ConnectorProxy:
                 raise ConnectorUnauthorized(str(error)) from error
             if authority.current_scope == "revoked":
                 raise ConnectorUnauthorized("Agent standing grant is revoked")
+            cur_binding = read_connector_binding(
+                ro_db,
+                company_id=writer.company_id,
+                binding_id=binding_id,
+                revision=binding_revision,
+            )
+            if cur_binding is None or cur_binding.status != "active":
+                raise ConnectorUnauthorized(
+                    f"Connector binding '{binding_id}:r{binding_revision}' is no longer active"
+                )
+            g_row = ro_db.execute(
+                """SELECT status, allowed_operations_json
+                   FROM connector_grant
+                   WHERE company_id = ? AND grant_binding_id = ?""",
+                (writer.company_id, grant_binding_id),
+            ).fetchone()
+            if g_row is None or str(g_row[0]) != "active":
+                raise ConnectorUnauthorized(
+                    f"Connector grant '{grant_binding_id}' is no longer active"
+                )
+            try:
+                allowed_ops = json.loads(str(g_row[1]))
+            except json.JSONDecodeError:
+                allowed_ops = []
+            if not isinstance(allowed_ops, list) or operation not in allowed_ops:
+                raise ConnectorUnauthorized(
+                    f"Connector grant '{grant_binding_id}' no longer authorizes '{operation}'"
+                )
 
     def invoke(
         self,
@@ -367,11 +404,20 @@ class ConnectorProxy:
                     "requires an authoritative service-issued admission"
                 )
 
-            idempotency_key = (
-                f"conn:{company_id}:{binding.binding_id}:r{binding.revision}:"
-                f"{op_spec.name}:{request_id.strip()}"
-            )
+            if op_spec.mode == "effectful":
+                idempotency_key = (
+                    f"conn:{company_id}:{binding.binding_id}:r{binding.revision}:"
+                    f"{op_spec.name}:{request_id.strip()}"
+                )
+            else:
+                # Namespace non-effectful read/write actions by Agent so two authorized
+                # Agents using the same request_id execute independently with zero cross-Agent disclosure.
+                idempotency_key = (
+                    f"conn:{company_id}:{agent_id}:{binding.binding_id}:r{binding.revision}:"
+                    f"{op_spec.name}:{request_id.strip()}"
+                )
             req_sha256 = _compute_request_sha256(
+                agent_id=agent_id,
                 binding_id=binding.binding_id,
                 binding_revision=binding.revision,
                 operation=op_spec.name,
@@ -410,11 +456,39 @@ class ConnectorProxy:
                     payload=payload,
                     environment=binding.environment,
                     endpoint_url=clean_url,
+                    actor_id=agent_id,
                     allow_already_consumed=replayed,
                     now_ns=ts,
                 )
 
             if replayed:
+                prior_owner: str | None = None
+                if isinstance(ext_action.receipt_json, str) and ext_action.receipt_json:
+                    try:
+                        p_obj = json.loads(ext_action.receipt_json)
+                        if isinstance(p_obj, dict) and isinstance(
+                            p_obj.get("agent_id"), str
+                        ):
+                            prior_owner = p_obj["agent_id"]
+                    except json.JSONDecodeError:
+                        prior_owner = None
+                is_owner = prior_owner == agent_id
+                is_recovery_owner = (
+                    db.execute(
+                        """SELECT 1 FROM work_items
+                           WHERE company_id = ?
+                             AND source_kind = 'connector_recovery'
+                             AND source_id = ?
+                             AND owner_agent_id = ?
+                           LIMIT 1""",
+                        (company_id, idempotency_key, agent_id),
+                    ).fetchone()
+                    is not None
+                )
+                if not (is_owner or is_recovery_owner):
+                    raise ConnectorUnauthorized(
+                        f"Agent '{agent_id}' cannot replay or inspect another Agent's external action"
+                    )
                 if ext_action.status in ("confirmed", "rejected"):
                     mode_action = "replay"
                     replay_response = _response_from_cached_receipt(
@@ -584,11 +658,19 @@ class ConnectorProxy:
             raise
         raw_secrets = secret.raw_values() if secret is not None else ()
 
-        # Recheck sender fencing immediately before outbound execute so a run
-        # fenced during blocking secret resolution (e.g. Keychain lookup) cannot newly send.
+        # Recheck sender fencing, active binding, and connector grant immediately before
+        # outbound execute so a run fenced or revoked during blocking secret resolution
+        # (e.g. Keychain lookup) cannot newly send.
         if mode_action == "execute":
             try:
-                self._assert_claim_still_current(writer, claim)
+                self._assert_dispatch_still_authorized(
+                    writer,
+                    claim,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    grant_binding_id=grant.grant_binding_id,
+                    operation=op_spec.name,
+                )
             except ConnectorUnauthorized:
                 secret = None
                 del raw_secrets

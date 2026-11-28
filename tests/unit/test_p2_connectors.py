@@ -708,13 +708,40 @@ class ConnectorSubsystemTests(unittest.TestCase):
                 )
                 self.assertEqual(resp.status, "observed")
                 idem_key = (
-                    f"conn:{founding.company_id}:svc-priv:r1:fetch_doc:priv-doc-1"
+                    f"conn:{founding.company_id}:{founding.founder_id}:"
+                    "svc-priv:r1:fetch_doc:priv-doc-1"
                 )
 
                 with self.assertRaises(ConnectorUnauthorized):
                     proxy.reconcile_unknown_action(
                         w, bystander_claim, idempotency_key=idem_key, now_ns=now + 15
                     )
+
+                # Even if peer ALSO gets granted fetch_doc and submits the exact same
+                # request_id and payload, it executes independently and NEVER sees founder's receipt!
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=peer_id,
+                    standing_grant_id="grant-bystander",
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("fetch_doc",),
+                    granted_by_actor_id="board-1",
+                    now_ns=now + 18,
+                )
+                self.assertEqual(len(adapter.execute_calls), 1)
+                peer_resp = proxy.invoke(
+                    w,
+                    bystander_claim,
+                    binding_id=binding.binding_id,
+                    operation="fetch_doc",
+                    request_id="priv-doc-1",
+                    payload={"doc": "sensitive"},
+                    now_ns=now + 20,
+                )
+                self.assertEqual(peer_resp.status, "observed")
+                self.assertEqual(len(adapter.execute_calls), 2)
 
     def test_unresolved_read_retries_consume_rate_and_budget_limits(self) -> None:
         with TemporaryDirectory(prefix="sd-c5-") as tmp:
@@ -1015,6 +1042,174 @@ class ConnectorSubsystemTests(unittest.TestCase):
                 self.assertNotIn(secret_raw, str(resp.payload))
                 self.assertIn("[REDACTED_SECRET]", resp.payload["error"])
             self.assertNotIn(secret_raw.encode("utf-8"), store.read_bytes())
+
+    def test_grant_revocation_during_secret_resolution_blocks_dispatch(self) -> None:
+        with TemporaryDirectory(prefix="sd-c8-") as tmp:
+            store, leases, founding, claim, now = _setup_company_and_claim(Path(tmp))
+            adapter = _FakeAdapter()
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                binding = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="svc-rev",
+                    connector_kind="fake_service",
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9014",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=adapter.manifest.operations,
+                    credential_handle_ref="envref:FAKE_TEST_KEY",
+                    actor_id="board-1",
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant = grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("fetch_doc",),
+                    granted_by_actor_id="board-1",
+                    now_ns=now + 5,
+                )
+
+                class _RevokingDuringResolveVault:
+                    def resolve_secret(
+                        self,
+                        handle_ref: str,
+                        *,
+                        expected_environment: str | None = None,
+                    ) -> MaskedSecret:
+                        del expected_environment
+                        revoke_connector_grant(
+                            w,
+                            company_id=founding.company_id,
+                            grant_binding_id=grant.grant_binding_id,
+                            actor_id="board-1",
+                            now_ns=now + 9,
+                        )
+                        return MaskedSecret(
+                            value="test-revoked-secret-1111", handle_ref=handle_ref
+                        )
+
+                    def resolve_bundle(
+                        self,
+                        handle_ref: str,
+                        fields: Any,
+                        *,
+                        expected_environment: str | None = None,
+                    ) -> MaskedSecretBundle:
+                        raise NotImplementedError
+
+                proxy = ConnectorProxy(
+                    ConnectorAdapterRegistry([adapter]),
+                    _RevokingDuringResolveVault(),
+                    loopback_only=True,
+                )
+                with self.assertRaises(ConnectorUnauthorized):
+                    proxy.invoke(
+                        w,
+                        claim,
+                        binding_id=binding.binding_id,
+                        operation="fetch_doc",
+                        request_id="rev-race-1",
+                        payload={"q": "x"},
+                        now_ns=now + 10,
+                    )
+                self.assertEqual(len(adapter.execute_calls), 0)
+
+    def test_llm_connector_scrubs_http_error_secret_straddling_240_byte_boundary(
+        self,
+    ) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        from sourdough.connectors import (
+            CONNECTOR_KIND_LLM_INFERENCE,
+            LLM_COMPLETE_OP,
+            ScopedLlmInferenceConnector,
+        )
+
+        # Low-entropy test token so gitleaks does not flag it as a real API key,
+        # while still long enough (32 chars) to straddle the 240-byte excerpt boundary.
+        secret_canary = "dummy-boundary-canary-token-0000"
+
+        class _ErrHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                del fmt, args
+
+            def do_POST(self) -> None:
+                auth = self.headers.get("Authorization", "")
+                body = (("x" * 220) + auth + ("y" * 40)).encode("utf-8")
+                self.send_response(401)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = HTTPServer(("127.0.0.1", 0), _ErrHandler)
+        port = int(server.server_address[1])
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            with TemporaryDirectory(prefix="sd-c9-") as tmp:
+                store, leases, founding, claim, now = _setup_company_and_claim(
+                    Path(tmp)
+                )
+                proxy = ConnectorProxy(
+                    ConnectorAdapterRegistry([ScopedLlmInferenceConnector()]),
+                    InMemorySecretVault({"envref:OPENAI_DEV_KEY": secret_canary}),
+                    loopback_only=True,
+                )
+                with hold_company_writer(
+                    store, founding.company_id, lease_directory=leases
+                ) as w:
+                    binding = register_connector_binding(
+                        w,
+                        company_id=founding.company_id,
+                        binding_id="llm-err",
+                        connector_kind=CONNECTOR_KIND_LLM_INFERENCE,
+                        environment="paper",
+                        endpoint_url=f"http://127.0.0.1:{port}",
+                        allowed_hosts=("127.0.0.1",),
+                        operations=(LLM_COMPLETE_OP,),
+                        credential_handle_ref="envref:OPENAI_DEV_KEY",
+                        actor_id="board-1",
+                        allow_loopback=True,
+                        now_ns=now,
+                    )
+                    grant_connector_access(
+                        w,
+                        company_id=founding.company_id,
+                        agent_id=founding.founder_id,
+                        standing_grant_id=founding.grant_id,
+                        binding_id=binding.binding_id,
+                        binding_revision=binding.revision,
+                        allowed_operations=("complete",),
+                        granted_by_actor_id="board-1",
+                        now_ns=now + 5,
+                    )
+                    resp = proxy.invoke(
+                        w,
+                        claim,
+                        binding_id="llm-err",
+                        operation="complete",
+                        request_id="err-boundary-1",
+                        payload={"model": "gpt-6-luna", "input": "hi"},
+                        now_ns=now + 10,
+                    )
+                    self.assertEqual(resp.status, "rejected")
+                    err_text = str(resp.payload.get("error", ""))
+                    self.assertNotIn("dummy-boundary", err_text)
+                    self.assertNotIn("canary-token", err_text)
+                self.assertNotIn(b"dummy-boundary", store.read_bytes())
+        finally:
+            server.shutdown()
+            server.server_close()
+            t.join(timeout=5.0)
 
 
 if __name__ == "__main__":

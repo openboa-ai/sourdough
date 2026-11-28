@@ -790,6 +790,7 @@ def verify_and_consume_connector_admission(
     payload: Mapping[str, Any],
     environment: str,
     endpoint_url: str,
+    actor_id: str | None = None,
     allow_already_consumed: bool,
     now_ns: int,
 ) -> ConnectorAdmission:
@@ -825,9 +826,10 @@ def verify_and_consume_connector_admission(
         or admission.environment != environment
         or admission.endpoint_url.rstrip("/") != endpoint_url.rstrip("/")
         or admission.payload_sha256 != expected_digest
+        or (actor_id is not None and admission.actor_id != actor_id)
     ):
         raise ConnectorUnauthorized(
-            f"Admission '{admission_id}' does not match immutable request payload, binding, or destination"
+            f"Admission '{admission_id}' does not match immutable request payload, actor, binding, or destination"
         )
     if admission.status == "revoked":
         raise ConnectorUnauthorized(f"Admission '{admission_id}' has been revoked")

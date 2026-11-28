@@ -20,7 +20,11 @@ from ..agent_runtime.cost_accounting import (
     compute_usage_cost_minor_units,
 )
 from ..agent_runtime.protocol import PROVIDER_OPENAI, TokenUsage
-from ..secret_vault import MaskedSecret, MaskedSecretBundle
+from ..secret_vault import (
+    MaskedSecret,
+    MaskedSecretBundle,
+    redact_secret_values,
+)
 from .protocol import (
     ConnectorIndeterminate,
     ConnectorManifest,
@@ -107,6 +111,7 @@ def _post_pinned_json(
     headers: dict[str, str],
     body: dict[str, Any],
     timeout_seconds: float,
+    secret_values: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
     hostname = (parsed.hostname or "").lower()
@@ -133,7 +138,11 @@ def _post_pinned_json(
             response_bytes = resp.read()
     except urllib.error.HTTPError as error:
         try:
-            err_excerpt = error.read().decode("utf-8", errors="replace")[:240]
+            # Read complete bounded body and scrub secrets BEFORE truncating so
+            # secrets straddling the excerpt boundary can never leak fragments.
+            full_err = error.read(65_536).decode("utf-8", errors="replace")
+            scrubbed_err = redact_secret_values(full_err, secret_values)
+            err_excerpt = scrubbed_err[:240]
         finally:
             error.close()
         if error.code in (408, 429, 500, 502, 503, 504):
@@ -278,6 +287,7 @@ class ScopedLlmInferenceConnector:
                 headers=headers,
                 body=body,
                 timeout_seconds=timeout_seconds,
+                secret_values=secret.raw_values(),
             )
             usage = _extract_usage(parsed)
             cost_minor = compute_usage_cost_minor_units(usage, self._pricing)
@@ -314,6 +324,7 @@ class ScopedLlmInferenceConnector:
                 headers=headers,
                 body={"model": model.strip(), "input": text_input},
                 timeout_seconds=timeout_seconds,
+                secret_values=secret.raw_values(),
             )
             usage = _extract_usage(parsed)
             cost_minor = compute_usage_cost_minor_units(usage, self._pricing)
