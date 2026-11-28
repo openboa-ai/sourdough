@@ -16,6 +16,7 @@ from ..storage.schema import is_domain_installed
 from ..writer_lease import WriterLease
 from .accounts import record_venue_qualification_receipt
 from .binance_venue import (
+    BINANCE_ADAPTER_REVISION,
     MARKET_SPOT,
     MARKET_USDM_FUTURES,
     BinanceVenueAdapter,
@@ -76,18 +77,80 @@ class CompositeCredentialProvider:
         raise CredentialRefused(f"Unsupported credential scheme: {parsed.scheme}")
 
 
+_BINANCE_SPOT_CONNECTORS = frozenset({"binance-spot-v1", "binance-spot-rest-v1"})
+_BINANCE_USDM_FUTURES_CONNECTORS = frozenset(
+    {
+        "binance-futures-v1",
+        "binance-usdm-v1",
+        "binance-usdm-futures-v1",
+        "binance-fapi-v1",
+    }
+)
+_BINANCE_GENERIC_REST_CONNECTORS = frozenset({BINANCE_ADAPTER_REVISION})
+_UNSUPPORTED_MARKET_TOKENS = (
+    "options",
+    "option",
+    "eapi",
+    "coinm",
+    "coin-m",
+    "dapi",
+    "margin",
+    "portfolio",
+)
+_FUTURES_TOKENS = ("futures", "usdm", "usd-m", "fapi", "perp")
+_SPOT_TOKENS = ("spot",)
+
+_UNRUN_EXECUTION_QUALIFICATION_CASES: tuple[str, ...] = (
+    "normal_submit_and_fill",
+    "over_limit_rejected_zero_fill",
+    "partial_fill_cancel_residual_position",
+    "lost_reply_recovery_no_duplicate",
+)
+
+
 def infer_binance_market_kind(connector_revision: str, destination_id: str) -> str:
-    """Infer Binance Spot vs USD-M Futures market kind from connector and destination identifiers."""
+    """Validate Binance connector revision independently of destination and resolve Spot vs USD-M Futures."""
     conn_low = connector_revision.strip().lower()
     dest_low = destination_id.strip().lower()
-    combined = f"{conn_low} {dest_low}"
-    if "binance" not in combined:
+    if (
+        conn_low not in _BINANCE_SPOT_CONNECTORS
+        and conn_low not in _BINANCE_USDM_FUTURES_CONNECTORS
+        and conn_low not in _BINANCE_GENERIC_REST_CONNECTORS
+    ):
         raise ExecutionTierRefused(
             f"Unsupported live venue connector '{connector_revision}' for destination '{destination_id}'"
         )
-    if any(tok in combined for tok in ("futures", "usdm", "fapi", "perp")):
+    if any(tok in dest_low for tok in _UNSUPPORTED_MARKET_TOKENS):
+        raise ExecutionTierRefused(
+            f"Unsupported Binance market destination '{destination_id}' for connector '{connector_revision}'"
+        )
+    dest_has_futures = any(tok in dest_low for tok in _FUTURES_TOKENS)
+    dest_has_spot = any(tok in dest_low for tok in _SPOT_TOKENS)
+    if dest_has_futures and dest_has_spot:
+        raise ExecutionTierRefused(
+            f"Contradictory Binance market destination '{destination_id}'"
+        )
+    if conn_low in _BINANCE_SPOT_CONNECTORS:
+        if dest_has_futures:
+            raise ExecutionTierRefused(
+                f"Contradictory spot connector '{connector_revision}' with futures destination '{destination_id}'"
+            )
+        return MARKET_SPOT
+    if conn_low in _BINANCE_USDM_FUTURES_CONNECTORS:
+        if dest_has_spot:
+            raise ExecutionTierRefused(
+                f"Contradictory futures connector '{connector_revision}' with spot destination '{destination_id}'"
+            )
         return MARKET_USDM_FUTURES
-    return MARKET_SPOT
+    # Generic Binance REST connector ('binance-rest-v1'): require explicit Spot or USD-M destination.
+    if dest_has_futures:
+        return MARKET_USDM_FUTURES
+    if dest_has_spot:
+        return MARKET_SPOT
+    raise ExecutionTierRefused(
+        f"Ambiguous destination '{destination_id}' for connector '{connector_revision}'; "
+        "specify explicit spot or usdm/futures market identifier"
+    )
 
 
 def build_default_live_venue_resolver(
@@ -98,12 +161,24 @@ def build_default_live_venue_resolver(
     environment: str = ENV_LIVE,
     base_url_override: str | None = None,
     allow_loopback_override: bool = False,
+    allow_recovery_statuses: bool = False,
 ) -> Callable[[str], ExternalVenueAdapter | None]:
-    """Return a fail-closed binding_id -> ExternalVenueAdapter resolver backed by host credentials."""
+    """Return a fail-closed binding_id -> ExternalVenueAdapter resolver backed by host credentials.
+
+    When `allow_recovery_statuses` is False (default, used for new order submission),
+    only `status = 'active'` bindings resolve. When True (used for reconciliation/recovery
+    of existing unresolved obligations), `suspended` and `retired` live bindings also
+    resolve so suspension never blocks external lookup and settlement.
+    """
     if environment not in (ENV_LIVE, ENV_EXTERNAL_TEST):
         raise ExecutionTierRefused(
             f"Unsupported live venue resolver environment '{environment}'"
         )
+    allowed_statuses = (
+        frozenset({"active", "suspended", "retired"})
+        if allow_recovery_statuses
+        else frozenset({"active"})
+    )
     creds = (
         CompositeCredentialProvider()
         if credential_provider is None
@@ -136,7 +211,7 @@ def build_default_live_venue_resolver(
         if (
             str(tier) != TIER_COMPANY_LIVE
             or str(row_env) != ENV_LIVE
-            or str(status) != "active"
+            or str(status) not in allowed_statuses
             or not handle_ref
         ):
             return None
@@ -241,10 +316,18 @@ def run_live_binance_testnet_qualification(
 
     passed_count = sum(1 for c in results if c.passed)
     failed_count = len(results) - passed_count
-    verdict = "PASS" if failed_count == 0 else "FAIL"
+    unrun_count = len(_UNRUN_EXECUTION_QUALIFICATION_CASES)
+    # Read-only Testnet probes never exercise submission, fill, cancellation, or
+    # lost-reply recovery; fail closed with INCOMPLETE so they cannot satisfy live activation.
+    verdict = "FAIL" if failed_count > 0 else "INCOMPLETE"
     evidence_sha = sha256(
         json.dumps(
-            [asdict(c) for c in results], sort_keys=True, separators=(",", ":")
+            {
+                "cases": [asdict(c) for c in results],
+                "unrun_cases": list(_UNRUN_EXECUTION_QUALIFICATION_CASES),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
 
@@ -260,7 +343,7 @@ def run_live_binance_testnet_qualification(
         verdict=verdict,
         cases_passed=passed_count,
         cases_failed=failed_count,
-        cases_unrun=0,
+        cases_unrun=unrun_count,
         evidence_sha256=evidence_sha,
     )
     return QualificationReport(receipt=receipt, cases=tuple(results))

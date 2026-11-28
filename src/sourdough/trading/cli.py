@@ -16,6 +16,7 @@ from ..duty_run import DutyRefused, count_company_runs
 from ..runtime.domains import DomainCliRefused
 from ..runtime.work_kernel import (
     WorkKernelRefused,
+    cancel_condition,
     create_work_item,
     register_responsibility,
     set_condition,
@@ -618,13 +619,31 @@ def _dispatch_trading_command(args: argparse.Namespace) -> int:
                             now_ns=now,
                         )
                         resp_id = resp.responsibility_id
+                    # Cancel any prior armed timer for this responsibility so re-arming updates cleanly.
+                    prior_timers = db.execute(
+                        """SELECT condition_id FROM work_conditions
+                           WHERE company_id = ? AND owner_agent_id = ?
+                             AND responsibility_id = ? AND trigger_kind = 'timer'
+                             AND status = 'armed'""",
+                        (args.company_id, args.agent_id, resp_id),
+                    ).fetchall()
+                    for (old_cid,) in prior_timers:
+                        cancel_condition(
+                            db,
+                            company_id=args.company_id,
+                            condition_id=str(old_cid),
+                            actor_id="operator_cli",
+                            now_ns=now,
+                        )
+                    delay_ns = delay_sec * 1_000_000_000
                     cond = set_condition(
                         db,
                         company_id=args.company_id,
                         owner_agent_id=args.agent_id,
                         responsibility_id=resp_id,
                         trigger_kind="timer",
-                        due_at_ns=now + delay_sec * 1_000_000_000,
+                        due_at_ns=now + delay_ns,
+                        cooldown_ns=delay_ns,
                         now_ns=now,
                     )
                     armed.append(
@@ -633,6 +652,7 @@ def _dispatch_trading_command(args: argparse.Namespace) -> int:
                             "responsibility_id": resp_id,
                             "condition_id": cond.condition_id,
                             "due_at_ns": cond.due_at_ns,
+                            "interval_seconds": delay_sec,
                         }
                     )
                 immediate_work_id: str | None = None

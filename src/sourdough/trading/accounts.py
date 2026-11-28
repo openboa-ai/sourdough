@@ -303,9 +303,10 @@ def reset_agent_sandbox(
     )
 
 
-def register_company_paper_tier(
-    writer: WriterLease,
+def register_company_paper_tier_in_tx(
+    db: Connection,
     *,
+    company_id: str,
     account_id: str,
     destination_id: str,
     connector_revision: str,
@@ -320,9 +321,9 @@ def register_company_paper_tier(
     book_name: str | None = None,
     strategy_release_id: str | None = None,
     binding_revision: str = "1",
+    now_ns: int | None = None,
 ) -> ExecutionBinding:
-    """Register or idempotently verify an active Tier 2 company_paper book binding."""
-    writer.verify()
+    """Register or idempotently verify an active Tier 2 company_paper book inside an open write_tx."""
     _require_safe_id(account_id, "account_id")
     _require_safe_id(destination_id, "destination_id")
     _require_text(connector_revision, "connector_revision", max_len=128)
@@ -351,87 +352,154 @@ def register_company_paper_tier(
         if binding_id is None
         else _require_safe_id(binding_id, "binding_id")
     )
+    if _identity(db) != company_id:
+        raise ExecutionTierRefused("Company identity mismatch")
+    enable_domain_v1(db, "trading", company_id=company_id, actor_id="trading_accounts")
+    existing = db.execute(
+        f"""{_SELECT_BINDING_COLS}
+            WHERE company_id = ? AND tier = ? AND account_id = ? AND status = 'active'""",
+        (company_id, TIER_COMPANY_PAPER, account_id),
+    ).fetchone()
+    now = time_ns() if now_ns is None else now_ns
+    if existing is not None:
+        prior = _row_to_binding(existing)
+        if (
+            prior.account_id == account_id
+            and prior.destination_id == destination_id
+            and prior.connector_revision == connector_revision
+            and prior.instrument_rules_digest == instrument_rules_digest
+            and prior.currency == currency
+            and prior.starting_minor_units == starting_minor_units
+            and prior.exposure_limit_minor_units == exposure_limit_minor_units
+            and prior.fee_bps == fee_bps
+            and prior.slippage_bps == slippage_bps
+        ):
+            if prior.book_name is None or prior.book_role is None:
+                db.execute(
+                    """UPDATE execution_environment_binding
+                       SET book_name = COALESCE(book_name, ?),
+                           strategy_release_id = COALESCE(strategy_release_id, ?),
+                           book_role = COALESCE(book_role, 'active'),
+                           updated_at_ns = ?
+                       WHERE binding_id = ?""",
+                    (resolved_book_name, resolved_strategy, now, prior.binding_id),
+                )
+            return prior
+        raise ExecutionTierRefused(
+            "An active company_paper book binding already exists for this account_id with different terms"
+        )
+    db.execute(
+        """INSERT INTO execution_environment_binding (
+               binding_id, company_id, tier, environment, owner_agent_id,
+               account_id, destination_id, connector_revision,
+               instrument_rules_digest, currency, starting_minor_units,
+               exposure_limit_minor_units, fee_bps, slippage_bps,
+               quote_source, credential_handle_ref, binding_revision,
+               book_name, strategy_release_id, book_role,
+               shadow_of_live_binding_id, nominated_question_id,
+               status, created_at_ns, updated_at_ns
+           ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'active', NULL, NULL, 'active', ?, ?)""",
+        (
+            resolved_id,
+            company_id,
+            TIER_COMPANY_PAPER,
+            ENV_PAPER,
+            account_id,
+            destination_id,
+            connector_revision,
+            instrument_rules_digest,
+            currency,
+            starting_minor_units,
+            exposure_limit_minor_units,
+            fee_bps,
+            slippage_bps,
+            quote_source,
+            resolved_rev,
+            resolved_book_name,
+            resolved_strategy,
+            now,
+            now,
+        ),
+    )
+    new_binding = ExecutionBinding(
+        binding_id=resolved_id,
+        company_id=company_id,
+        tier=TIER_COMPANY_PAPER,
+        environment=ENV_PAPER,
+        owner_agent_id=None,
+        account_id=account_id,
+        destination_id=destination_id,
+        connector_revision=connector_revision,
+        instrument_rules_digest=instrument_rules_digest,
+        currency=currency,
+        starting_minor_units=starting_minor_units,
+        exposure_limit_minor_units=exposure_limit_minor_units,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        quote_source=quote_source,
+        credential_handle_ref=None,
+        status="active",
+        created_at_ns=now,
+        updated_at_ns=now,
+        binding_revision=resolved_rev,
+        book_name=resolved_book_name,
+        strategy_release_id=resolved_strategy,
+        book_role="active",
+    )
+    _insert_book_valuation_in_tx(
+        db,
+        new_binding,
+        label="Start",
+        source="book_open",
+        recorded_at_ns=now,
+    )
+    append_audit_event(
+        db,
+        company_id=company_id,
+        domain="trading",
+        entity_type="execution_environment_binding",
+        entity_id=resolved_id,
+        event_type="execution_tier.company_paper_registered",
+        actor_id="trading_accounts",
+        payload={
+            "binding_id": resolved_id,
+            "account_id": account_id,
+            "book_name": resolved_book_name,
+            "strategy_release_id": resolved_strategy,
+            "destination_id": destination_id,
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+        },
+        recorded_at_ns=now,
+    )
+    return new_binding
 
+
+def register_company_paper_tier(
+    writer: WriterLease,
+    *,
+    account_id: str,
+    destination_id: str,
+    connector_revision: str,
+    instrument_rules_digest: str,
+    currency: str,
+    starting_minor_units: int,
+    exposure_limit_minor_units: int,
+    fee_bps: int = 4,
+    slippage_bps: int = 2,
+    quote_source: str = "live_read_only",
+    binding_id: str | None = None,
+    book_name: str | None = None,
+    strategy_release_id: str | None = None,
+    binding_revision: str = "1",
+) -> ExecutionBinding:
+    """Register or idempotently verify an active Tier 2 company_paper book binding."""
+    writer.verify()
     with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
         writer.verify()
-        if _identity(db) != writer.company_id:
-            raise ExecutionTierRefused("Company identity mismatch")
-        enable_domain_v1(
-            db, "trading", company_id=writer.company_id, actor_id="trading_accounts"
-        )
-        existing = db.execute(
-            f"""{_SELECT_BINDING_COLS}
-                WHERE company_id = ? AND tier = ? AND account_id = ? AND status = 'active'""",
-            (writer.company_id, TIER_COMPANY_PAPER, account_id),
-        ).fetchone()
-        if existing is not None:
-            prior = _row_to_binding(existing)
-            if (
-                prior.account_id == account_id
-                and prior.destination_id == destination_id
-                and prior.connector_revision == connector_revision
-                and prior.instrument_rules_digest == instrument_rules_digest
-                and prior.currency == currency
-                and prior.starting_minor_units == starting_minor_units
-                and prior.exposure_limit_minor_units == exposure_limit_minor_units
-                and prior.fee_bps == fee_bps
-                and prior.slippage_bps == slippage_bps
-            ):
-                if prior.book_name is None or prior.book_role is None:
-                    now = time_ns()
-                    db.execute(
-                        """UPDATE execution_environment_binding
-                           SET book_name = COALESCE(book_name, ?),
-                               strategy_release_id = COALESCE(strategy_release_id, ?),
-                               book_role = COALESCE(book_role, 'active'),
-                               updated_at_ns = ?
-                           WHERE binding_id = ?""",
-                        (resolved_book_name, resolved_strategy, now, prior.binding_id),
-                    )
-                return prior
-            raise ExecutionTierRefused(
-                "An active company_paper book binding already exists for this account_id with different terms"
-            )
-        now = time_ns()
-        db.execute(
-            """INSERT INTO execution_environment_binding (
-                   binding_id, company_id, tier, environment, owner_agent_id,
-                   account_id, destination_id, connector_revision,
-                   instrument_rules_digest, currency, starting_minor_units,
-                   exposure_limit_minor_units, fee_bps, slippage_bps,
-                   quote_source, credential_handle_ref, binding_revision,
-                   book_name, strategy_release_id, book_role,
-                   shadow_of_live_binding_id, nominated_question_id,
-                   status, created_at_ns, updated_at_ns
-               ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'active', NULL, NULL, 'active', ?, ?)""",
-            (
-                resolved_id,
-                writer.company_id,
-                TIER_COMPANY_PAPER,
-                ENV_PAPER,
-                account_id,
-                destination_id,
-                connector_revision,
-                instrument_rules_digest,
-                currency,
-                starting_minor_units,
-                exposure_limit_minor_units,
-                fee_bps,
-                slippage_bps,
-                quote_source,
-                resolved_rev,
-                resolved_book_name,
-                resolved_strategy,
-                now,
-                now,
-            ),
-        )
-        new_binding = ExecutionBinding(
-            binding_id=resolved_id,
+        binding = register_company_paper_tier_in_tx(
+            db,
             company_id=writer.company_id,
-            tier=TIER_COMPANY_PAPER,
-            environment=ENV_PAPER,
-            owner_agent_id=None,
             account_id=account_id,
             destination_id=destination_id,
             connector_revision=connector_revision,
@@ -442,43 +510,13 @@ def register_company_paper_tier(
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
             quote_source=quote_source,
-            credential_handle_ref=None,
-            status="active",
-            created_at_ns=now,
-            updated_at_ns=now,
-            binding_revision=resolved_rev,
-            book_name=resolved_book_name,
-            strategy_release_id=resolved_strategy,
-            book_role="active",
-        )
-        _insert_book_valuation_in_tx(
-            db,
-            new_binding,
-            label="Start",
-            source="book_open",
-            recorded_at_ns=now,
-        )
-        append_audit_event(
-            db,
-            company_id=writer.company_id,
-            domain="trading",
-            entity_type="execution_environment_binding",
-            entity_id=resolved_id,
-            event_type="execution_tier.company_paper_registered",
-            actor_id="trading_accounts",
-            payload={
-                "binding_id": resolved_id,
-                "account_id": account_id,
-                "book_name": resolved_book_name,
-                "strategy_release_id": resolved_strategy,
-                "destination_id": destination_id,
-                "fee_bps": fee_bps,
-                "slippage_bps": slippage_bps,
-            },
-            recorded_at_ns=now,
+            binding_id=binding_id,
+            book_name=book_name,
+            strategy_release_id=strategy_release_id,
+            binding_revision=binding_revision,
         )
         writer.verify()
-        return new_binding
+        return binding
 
 
 def open_company_paper_book(

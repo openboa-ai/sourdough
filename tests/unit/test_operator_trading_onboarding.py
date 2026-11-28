@@ -109,8 +109,20 @@ class TestOperatorTradingOnboarding(unittest.TestCase):
             infer_binance_market_kind("binance-futures-v1", "binance-usdm-prod"),
             MARKET_USDM_FUTURES,
         )
-        with self.assertRaises(ExecutionTierRefused):
-            infer_binance_market_kind("unknown-exchange-v1", "mystery-dest")
+        # Unsupported, contradictory, or ambiguous connectors/destinations MUST fail closed!
+        for bad_conn, bad_dest in (
+            ("unknown-exchange-v1", "mystery-dest"),
+            ("unknown-exchange-v1", "binance-spot-prod"),
+            ("binance-options-v1", "binance-options-prod"),
+            ("binance-options-v1", "binance-spot-prod"),
+            ("binance-spot-v1", "binance-usdm-prod"),
+            ("binance-futures-v1", "binance-spot-prod"),
+            ("binance-rest-v1", "binance-options-prod"),
+            ("binance-rest-v1", "binance-spot-futures-prod"),
+            ("binance-rest-v1", "binance-generic-prod"),
+        ):
+            with self.assertRaises(ExecutionTierRefused, msg=(bad_conn, bad_dest)):
+                infer_binance_market_kind(bad_conn, bad_dest)
 
         with TemporaryDirectory(prefix="sd-resolver-") as tmp:
             root = Path(tmp)
@@ -205,7 +217,8 @@ class TestOperatorTradingOnboarding(unittest.TestCase):
                     self.assertEqual(adapter.config.base_url, "https://api.binance.com")
                     self.assertEqual(adapter.config.account_id, "binance-prod-us01")
 
-                    # Exercise live-testnet qualification runner over loopback HMAC emulator!
+                    # Exercise read-only live-testnet probe over loopback HMAC emulator:
+                    # MUST record INCOMPLETE with 4 unrun execution cases so it cannot satisfy live promotion!
                     tn_adapter = BinanceVenueAdapter(
                         BinanceVenueConfig(
                             environment=ENV_EXTERNAL_TEST,
@@ -226,9 +239,52 @@ class TestOperatorTradingOnboarding(unittest.TestCase):
                         instrument_rules_digest="btc-usdt-spot-v1",
                         receipt_id="qual-live-tn-1",
                     )
-                    self.assertEqual(tn_report.receipt.verdict, "PASS")
+                    self.assertEqual(tn_report.receipt.verdict, "INCOMPLETE")
                     self.assertEqual(tn_report.receipt.cases_passed, 4)
                     self.assertEqual(tn_report.receipt.cases_failed, 0)
+                    self.assertEqual(tn_report.receipt.cases_unrun, 4)
+                    cand_blocked = register_live_candidate_binding(
+                        writer,
+                        binding_id="live-res-2",
+                        account_id="binance-prod-us02",
+                        destination_id="binance-spot-prod",
+                        connector_revision="binance-rest-v1",
+                        instrument_rules_digest="btc-usdt-spot-v1",
+                        currency="USD",
+                        starting_minor_units=20_000_000,
+                        exposure_limit_minor_units=10_000_000,
+                        credential_handle_ref="envref:BINANCE_PROD",
+                    )
+                    with self.assertRaises(ExecutionTierRefused):
+                        execute_paper_to_live_migration(
+                            writer,
+                            source_paper_binding_id=pbook.binding_id,
+                            target_live_binding_id=cand_blocked.binding_id,
+                            qualification_receipt_id="qual-live-tn-1",
+                            reason="Read-only INCOMPLETE receipt must not promote live",
+                        )
+
+                    # Suspending the active live binding disables new-order resolution
+                    # while preserving recovery/reconciliation resolution!
+                    with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                        db.execute(
+                            "UPDATE execution_environment_binding SET status = 'suspended' WHERE binding_id = ?",
+                            (cand.binding_id,),
+                        )
+                    self.assertIsNone(resolver(cand.binding_id))
+                    recovery_resolver = build_default_live_venue_resolver(
+                        store,
+                        cid,
+                        credential_provider=comp,
+                        environment=ENV_LIVE,
+                        allow_recovery_statuses=True,
+                    )
+                    rec_adapter = recovery_resolver(cand.binding_id)
+                    self.assertIsNotNone(rec_adapter)
+                    assert rec_adapter is not None
+                    self.assertEqual(rec_adapter.config.account_id, "binance-prod-us01")
+                    # Dormant 'registered' candidate still MUST NOT resolve even for recovery!
+                    self.assertIsNone(recovery_resolver(cand_blocked.binding_id))
             finally:
                 emulator.stop()
 
@@ -525,6 +581,155 @@ class TestOperatorTradingOnboarding(unittest.TestCase):
                 cmd_types = {c.command_type for c in plugin.contribute_commands()}
                 self.assertIn(OPEN_COMPANY_PAPER_BOOK, cmd_types)
                 self.assertIn(RECONCILE_TRADING_BOOKS, cmd_types)
+
+    def test_open_paper_book_command_atomic_with_receipt_and_recurring_schedule_rearms(
+        self,
+    ) -> None:
+        from unittest import mock
+
+        from sourdough.agent_runtime.registry import AgentAdapterRegistry
+        from sourdough.runtime.engine import CompanyRuntime
+        from sourdough.runtime.handlers import build_production_duty_registry
+        from sourdough.trading import commands as trading_commands
+
+        with TemporaryDirectory(prefix="sd-pr193-fixes-") as tmp:
+            root = Path(tmp)
+            store = root / "c.sqlite"
+            leases = root / "l"
+            found_out = _run_cli(
+                "found",
+                str(store),
+                "--setup-identity",
+                "sd-atomic-sched",
+                "--charter-revision",
+                "charter-s1",
+                "--founder-scope",
+                "paper",
+                "--execution-profile",
+                "profile-v1",
+            )
+            cid = found_out["company_id"]
+            ceo_id = found_out["founder_id"]
+
+            # 1. Atomicity: if admit_command_receipt fails mid-transaction, the paper book MUST roll back!
+            with hold_company_writer(store, cid, lease_directory=leases) as writer:
+                with closing(open_writer(store, lease=writer)) as db, write_tx(db):
+                    enable_domain_v1(db, "trading")
+                bind_board_principal(
+                    writer, principal_id="board-chair", role_name=BOARD_CONTROL_ROLE
+                )
+                with (
+                    mock.patch.object(
+                        trading_commands,
+                        "admit_command_receipt",
+                        side_effect=RuntimeError("simulated crash before commit"),
+                    ),
+                    self.assertRaises(RuntimeError),
+                ):
+                    execute_execution_tier_command(
+                        writer,
+                        command_id="cmd-atomic-rollback",
+                        command_type=OPEN_COMPANY_PAPER_BOOK,
+                        preconditions={"charter_revision": "charter-s1"},
+                        payload={
+                            "account_id": "paper-should-rollback",
+                            "book_name": "Atomic Rollback Book",
+                            "starting_minor_units": 10_000_000,
+                            "exposure_limit_minor_units": 5_000_000,
+                        },
+                        principal_hint="board-chair",
+                    )
+                with closing(open_reader(store)) as db, read_tx(db):
+                    book_cnt = int(
+                        db.execute(
+                            """SELECT COUNT(*) FROM execution_environment_binding
+                               WHERE company_id = ? AND account_id = 'paper-should-rollback'""",
+                            (cid,),
+                        ).fetchone()[0]
+                    )
+                    rcpt_cnt = int(
+                        db.execute(
+                            """SELECT COUNT(*) FROM command_receipt
+                               WHERE company_id = ? AND command_id = 'cmd-atomic-rollback'""",
+                            (cid,),
+                        ).fetchone()[0]
+                    )
+                self.assertEqual(book_cnt, 0)
+                self.assertEqual(rcpt_cnt, 0)
+
+            # 2. Recurring schedule: arm-trading-schedule arms quant.reconcile with interval,
+            #    and after Run 1 settles, a successor armed timer fires Run 2 automatically!
+            arm_out = _run_cli(
+                "arm-trading-schedule",
+                str(store),
+                "--company-id",
+                cid,
+                "--lease-dir",
+                str(leases),
+                "--agent-id",
+                ceo_id,
+                "--decision-delay",
+                "300",
+                "--reconcile-delay",
+                "20",
+            )
+            rec_entry = next(
+                c
+                for c in arm_out["armed_conditions"]
+                if c["duty_kind"] == "quant.reconcile"
+            )
+            self.assertEqual(rec_entry["interval_seconds"], 20)
+            first_due = int(rec_entry["due_at_ns"])
+
+            trading_plugin = TradingDomainPlugin(quote_provider=StaticQuoteProvider({}))
+            dreg = build_production_duty_registry(
+                adapter_registry=AgentAdapterRegistry(),
+                profile_bindings={},
+                domain_plugins=(trading_plugin,),
+            )
+            rt = CompanyRuntime(
+                store,
+                cid,
+                dreg,
+                lease_directory=leases,
+            )
+            # Tick 1 at first_due: fires quant.reconcile Run 1 and atomically rearms successor timer!
+            step1 = rt.step(max_dispatches=1, now_ns=first_due + 1)
+            self.assertEqual(len(step1.executed_runs), 1)
+            with closing(open_reader(store)) as db, read_tx(db):
+                rearmed_row = db.execute(
+                    """SELECT condition_id, due_at_ns, cooldown_ns
+                       FROM work_conditions
+                       WHERE company_id = ? AND responsibility_id = ? AND status = 'armed'""",
+                    (cid, rec_entry["responsibility_id"]),
+                ).fetchone()
+            self.assertIsNotNone(rearmed_row)
+            assert rearmed_row is not None
+            self.assertNotEqual(str(rearmed_row[0]), rec_entry["condition_id"])
+            self.assertEqual(int(rearmed_row[2]), 20 * 1_000_000_000)
+            second_due = int(rearmed_row[1])
+            self.assertGreaterEqual(second_due, first_due + 20 * 1_000_000_000)
+
+            # Tick 2 at second_due: fires quant.reconcile Run 2 and rearms Run 3!
+            step2 = rt.step(max_dispatches=1, now_ns=second_due + 1)
+            self.assertEqual(len(step2.executed_runs), 1)
+            with closing(open_reader(store)) as db, read_tx(db):
+                settled_reconciles = int(
+                    db.execute(
+                        """SELECT COUNT(*) FROM work_items
+                           WHERE company_id = ? AND duty_kind = 'quant.reconcile' AND state = 'settled'""",
+                        (cid,),
+                    ).fetchone()[0]
+                )
+                still_armed = int(
+                    db.execute(
+                        """SELECT COUNT(*) FROM work_conditions
+                           WHERE company_id = ? AND responsibility_id = ? AND status = 'armed'""",
+                        (cid, rec_entry["responsibility_id"]),
+                    ).fetchone()[0]
+                )
+            self.assertEqual(settled_reconciles, 2)
+            self.assertEqual(still_armed, 1)
 
 
 if __name__ == "__main__":

@@ -25,8 +25,8 @@ from ..storage.schema import is_domain_installed
 from ..writer_lease import WriterLease
 from .accounts import (
     demote_live_environment,
-    open_company_paper_book,
     promote_execution_environment,
+    register_company_paper_tier_in_tx,
 )
 from .domain import (
     DEMOTE_LIVE_ENVIRONMENT,
@@ -474,55 +474,174 @@ def execute_execution_tier_command(
                     "payload": norm_payload,
                 }
             )
-            actor_id, early = _check_existing_receipt_and_charter(
-                writer,
-                command_id=cmd_id,
-                command_type=command_type,
-                charter_revision=charter,
-                payload_sha=payload_sha,
-                preconditions=norm_pre,
-                authorize=authorize,
-                principal_hint=principal_hint,
-                peer_pid=peer_pid,
-            )
-            if early is not None:
-                return early
-
-            binding = open_company_paper_book(
-                writer,
-                account_id=account_id,
-                book_name=book_name,
-                strategy_release_id=strategy_release_id,
-                instrument_rules_digest=inst_digest,
-                currency=currency,
-                starting_minor_units=starting_minor,
-                exposure_limit_minor_units=exposure_minor,
-                fee_bps=fee_bps,
-                slippage_bps=slippage_bps,
-            )
-            result = {
-                "binding_id": binding.binding_id,
-                "account_id": binding.account_id,
-                "book_name": binding.book_name,
-                "strategy_release_id": binding.strategy_release_id,
-                "starting_minor_units": binding.starting_minor_units,
-                "exposure_limit_minor_units": binding.exposure_limit_minor_units,
-                "currency": binding.currency,
-                "reason": reason,
-            }
-            return _finalize_applied_board_command(
-                writer,
-                command_id=cmd_id,
-                command_type=command_type,
-                actor_id=actor_id,
-                peer_pid=peer_pid,
-                payload_sha=payload_sha,
-                preconditions=norm_pre,
-                entity_type="execution_environment_binding",
-                entity_id=binding.binding_id,
-                event_type="trading.paper_book_opened_by_board",
-                result=result,
-            )
+            with closing(open_writer(writer.store, lease=writer)) as db, write_tx(db):
+                writer.verify()
+                if _identity(db) != writer.company_id:
+                    raise BoardControlForbidden("Company identity mismatch")
+                actor_id = _authorize_board_trading_command(
+                    db,
+                    writer.company_id,
+                    operation=command_type,
+                    authorize=authorize,
+                    principal_hint=principal_hint,
+                )
+                existing = db.execute(
+                    """SELECT state FROM command_receipt
+                       WHERE company_id = ? AND command_id = ?""",
+                    (writer.company_id, cmd_id),
+                ).fetchone()
+                if existing is not None:
+                    try:
+                        replayed, _ = admit_command_receipt(
+                            db,
+                            company_id=writer.company_id,
+                            command_id=cmd_id,
+                            actor_id=actor_id,
+                            peer_pid=peer_pid,
+                            command_type=command_type,
+                            contract_version=EXECUTION_TIER_COMMAND,
+                            payload_sha256=payload_sha,
+                            preconditions=norm_pre,
+                            state=str(existing[0]),
+                        )
+                    except CommandConflict as error:
+                        raise BoardControlConflict(str(error)) from error
+                    saved_result = (
+                        json.loads(replayed.result_json) if replayed.result_json else {}
+                    )
+                    return BoardCommandOutcome(
+                        command_id=replayed.command_id,
+                        command_type=replayed.command_type,
+                        state=replayed.state,
+                        disposition="applied"
+                        if replayed.state == "applied"
+                        else "denied",
+                        denial_code=replayed.denial_code,
+                        effective_revision=int(replayed.applied_seq or 0),
+                        recorded_at_ns=replayed.created_at_ns,
+                        peer_pid=replayed.peer_pid,
+                        result=saved_result,
+                    )
+                if not is_domain_installed(db, "trading"):
+                    raise BoardControlRefused(
+                        "Trading domain is not installed on this store"
+                    )
+                row = db.execute(
+                    "SELECT charter_revision FROM company WHERE id = ?",
+                    (writer.company_id,),
+                ).fetchone()
+                current_charter = str(row[0]) if row else ""
+                now = time_ns()
+                if charter != current_charter:
+                    denied_result = {
+                        "expected_charter_revision": current_charter,
+                        "provided_charter_revision": charter,
+                    }
+                    seq = append_audit_event(
+                        db,
+                        company_id=writer.company_id,
+                        domain="trading",
+                        entity_type="company",
+                        entity_id=writer.company_id,
+                        event_type=f"trading.{command_type}_denied_conflict",
+                        actor_id=actor_id,
+                        command_id=cmd_id,
+                        payload=denied_result,
+                        recorded_at_ns=now,
+                    )
+                    admit_command_receipt(
+                        db,
+                        company_id=writer.company_id,
+                        command_id=cmd_id,
+                        actor_id=actor_id,
+                        peer_pid=peer_pid,
+                        command_type=command_type,
+                        contract_version=EXECUTION_TIER_COMMAND,
+                        payload_sha256=payload_sha,
+                        preconditions=norm_pre,
+                        state="denied",
+                        denial_code="conflicting_revision",
+                        result=denied_result,
+                        applied_seq=seq,
+                        now_ns=now,
+                    )
+                    writer.verify()
+                    return BoardCommandOutcome(
+                        command_id=cmd_id,
+                        command_type=command_type,
+                        state="denied",
+                        disposition="denied",
+                        denial_code="conflicting_revision",
+                        effective_revision=seq,
+                        recorded_at_ns=now,
+                        peer_pid=peer_pid,
+                        result=denied_result,
+                    )
+                binding = register_company_paper_tier_in_tx(
+                    db,
+                    company_id=writer.company_id,
+                    account_id=account_id,
+                    destination_id="company-paper-sim",
+                    connector_revision="company-paper-sim-v1",
+                    instrument_rules_digest=inst_digest,
+                    currency=currency,
+                    starting_minor_units=starting_minor,
+                    exposure_limit_minor_units=exposure_minor,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    book_name=book_name,
+                    strategy_release_id=strategy_release_id,
+                    now_ns=now,
+                )
+                result = {
+                    "binding_id": binding.binding_id,
+                    "account_id": binding.account_id,
+                    "book_name": binding.book_name,
+                    "strategy_release_id": binding.strategy_release_id,
+                    "starting_minor_units": binding.starting_minor_units,
+                    "exposure_limit_minor_units": binding.exposure_limit_minor_units,
+                    "currency": binding.currency,
+                    "reason": reason,
+                }
+                seq = append_audit_event(
+                    db,
+                    company_id=writer.company_id,
+                    domain="trading",
+                    entity_type="execution_environment_binding",
+                    entity_id=binding.binding_id,
+                    event_type="trading.paper_book_opened_by_board",
+                    actor_id=actor_id,
+                    command_id=cmd_id,
+                    payload=result,
+                    recorded_at_ns=now,
+                )
+                admit_command_receipt(
+                    db,
+                    company_id=writer.company_id,
+                    command_id=cmd_id,
+                    actor_id=actor_id,
+                    peer_pid=peer_pid,
+                    command_type=command_type,
+                    contract_version=EXECUTION_TIER_COMMAND,
+                    payload_sha256=payload_sha,
+                    preconditions=norm_pre,
+                    state="applied",
+                    result=result,
+                    applied_seq=seq,
+                    now_ns=now,
+                )
+                writer.verify()
+                return BoardCommandOutcome(
+                    command_id=cmd_id,
+                    command_type=command_type,
+                    state="applied",
+                    disposition="applied",
+                    denial_code=None,
+                    effective_revision=seq,
+                    recorded_at_ns=now,
+                    peer_pid=peer_pid,
+                    result=result,
+                )
         if command_type == RECONCILE_TRADING_BOOKS:
             cmd_id = _require_text(command_id, "command_id", max_len=128)
             charter = _require_text(

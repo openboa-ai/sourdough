@@ -164,6 +164,47 @@ def _read_tiers(store: Path, company_id: str) -> dict[str, Any]:
         return read_execution_tiers_snapshot(db, company_id)
 
 
+def _recurring_timer_next_condition(
+    store: Path,
+    company_id: str,
+    owner_agent_id: str,
+    payload: Mapping[str, Any],
+    now_ns: int,
+) -> dict[str, Any] | None:
+    """Return a successor timer condition when a scheduled standing trading timer completes."""
+    cond_id = payload.get("condition_id")
+    if not isinstance(cond_id, str) or not cond_id.strip():
+        return None
+    with closing(open_reader(store)) as db, read_tx(db):
+        row = db.execute(
+            """SELECT c.cooldown_ns, c.responsibility_id
+               FROM work_conditions c
+               JOIN work_responsibilities r
+                 ON r.company_id = c.company_id
+                AND r.responsibility_id = c.responsibility_id
+               WHERE c.company_id = ?
+                 AND c.condition_id = ?
+                 AND c.trigger_kind = 'timer'
+                 AND c.cooldown_ns > 0
+                 AND r.owner_agent_id = ?
+                 AND r.status = 'active'
+               LIMIT 1""",
+            (company_id, cond_id.strip(), owner_agent_id),
+        ).fetchone()
+    if row is None:
+        return None
+    interval_ns = int(row[0])
+    resp_id = str(row[1])
+    if interval_ns <= 0:
+        return None
+    return {
+        "trigger_kind": "timer",
+        "responsibility_id": resp_id,
+        "due_at_ns": now_ns + interval_ns,
+        "cooldown_ns": interval_ns,
+    }
+
+
 def _no_trading_risk_restriction(
     conn: sqlite3.Connection, item: WorkItem
 ) -> tuple[bool, str | None]:
@@ -452,13 +493,16 @@ class TradingDomainPlugin(BaseDomainPlugin):
         self._max_quote_age_ns = max_quote_age_ns
 
     def _effective_live_venue_resolver(
-        self, store: Path, company_id: str
+        self, store: Path, company_id: str, *, for_recovery: bool = False
     ) -> Callable[[str], ExternalVenueAdapter | None] | None:
         if self._live_venue_resolver is not None:
             return self._live_venue_resolver
         if self._auto_resolve_live_venues:
             return build_default_live_venue_resolver(
-                store, company_id, environment=self._default_live_env
+                store,
+                company_id,
+                environment=self._default_live_env,
+                allow_recovery_statuses=for_recovery,
             )
         return None
 
@@ -625,6 +669,13 @@ class TradingDomainPlugin(BaseDomainPlugin):
             result = run_res.shift_result
             settlement = run_res.settlement
             sbx_out_bytes = result.output_text.strip().encode("utf-8")
+            next_cond = _recurring_timer_next_condition(
+                ctx.writer.store,
+                ctx.company_id,
+                agent_id,
+                payload if isinstance(payload, Mapping) else {},
+                ctx.now_ns,
+            )
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -637,19 +688,31 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "cost_minor_units": settlement.cost_minor_units,
                     "journal_entry_id": settlement.journal_entry_id,
                 },
+                next_condition=next_cond,
             )
 
         def _run_quant_reconcile(ctx: DutyContext) -> DutyOutcome:
+            try:
+                raw_payload = json.loads(ctx.work_item.payload_json or "{}")
+            except json.JSONDecodeError:
+                raw_payload = {}
             reconcile_summary = reconcile_trading_books(
                 ctx.writer,
                 quote_provider=self._quote_provider,
                 live_venue_resolver=self._effective_live_venue_resolver(
-                    ctx.writer.store, ctx.company_id
+                    ctx.writer.store, ctx.company_id, for_recovery=True
                 ),
                 max_quote_age_ns=self._max_quote_age_ns,
                 now_ns=ctx.now_ns,
             )
             snapshot = _read_tiers(ctx.writer.store, ctx.company_id)
+            next_cond = _recurring_timer_next_condition(
+                ctx.writer.store,
+                ctx.company_id,
+                ctx.work_item.owner_agent_id,
+                raw_payload if isinstance(raw_payload, Mapping) else {},
+                ctx.now_ns,
+            )
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -666,6 +729,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "drift_detected": reconcile_summary["drift_detected"],
                     "restrictions_applied": reconcile_summary["restrictions_applied"],
                 },
+                next_condition=next_cond,
             )
 
         return (
@@ -767,7 +831,9 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 peer_pid=ctx.peer_pid,
                 quote_provider=self._quote_provider,
                 live_venue_resolver=self._effective_live_venue_resolver(
-                    ctx.writer.store, ctx.writer.company_id
+                    ctx.writer.store,
+                    ctx.writer.company_id,
+                    for_recovery=(ctx.command_type == RECONCILE_TRADING_BOOKS),
                 ),
             )
 
