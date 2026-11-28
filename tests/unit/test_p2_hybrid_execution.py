@@ -52,6 +52,7 @@ from sourdough.runtime.hybrid_execution import (
     DecisionModelPlaneExecutor,
     DecisionModelRuntimeAdapter,
     DeterministicControlPlaneGate,
+    EffectAdmissionDecision,
     FeaturePoint,
     FeatureSnapshot,
     HybridAntiLookaheadViolation,
@@ -701,6 +702,7 @@ class HybridExecutionPlaneTests(unittest.TestCase):
             policy_id="policy.liquidity",
             base_revision="rev-1",
             target_revision="rev-2",
+            base_parameters={"max_spread_bps": 25.0},
             parameter_deltas={"max_spread_bps": -5.0},
             rationale="Tighten spread threshold based on offline replay",
             produced_by_run_id="run-meta-1",
@@ -780,6 +782,7 @@ class HybridExecutionPlaneTests(unittest.TestCase):
             policy_id="policy.liquidity",
             base_revision="rev-1",
             target_revision="rev-2",
+            base_parameters={"max_spread_bps": 25.0},
             parameter_deltas={"max_spread_bps": 25.0},
             rationale="Too large delta",
             produced_by_run_id="run-meta-1",
@@ -844,6 +847,17 @@ class HybridExecutionPlaneTests(unittest.TestCase):
             )
             gate = DeterministicControlPlaneGate(
                 connector_proxy=proxy,
+                effect_authorizers={
+                    "hybrid_target": lambda _db, _cid, _aid, _b, _op, payload, _p: (
+                        EffectAdmissionDecision(
+                            issued_by_service="unit.hybrid_target_authorizer",
+                            authoritative_notional_minor_units=int(
+                                payload.get("qty", 0)
+                            )
+                            * 100,
+                        )
+                    )
+                },
                 max_notional_minor_units=5_000,
                 min_llm_eval_samples=20,
                 min_llm_holdout_margin=0.01,
@@ -944,6 +958,7 @@ class HybridExecutionPlaneTests(unittest.TestCase):
                     policy_id="policy.risk",
                     base_revision="v1",
                     target_revision="v2",
+                    base_parameters={"limit": 10.0},
                     parameter_deltas={"limit": 1.0},
                     rationale="Small change",
                     produced_by_run_id=claim.run_id,
@@ -1061,7 +1076,20 @@ class HybridExecutionPlaneTests(unittest.TestCase):
                 InMemorySecretVault({"envref:HYB_TEST_KEY": "test-hyb-rep-1111"}),
                 loopback_only=True,
             )
-            gate = DeterministicControlPlaneGate(connector_proxy=proxy)
+            gate = DeterministicControlPlaneGate(
+                connector_proxy=proxy,
+                effect_authorizers={
+                    "hybrid_target": lambda _db, _cid, _aid, _b, _op, payload, _p: (
+                        EffectAdmissionDecision(
+                            issued_by_service="unit.hybrid_target_authorizer",
+                            authoritative_notional_minor_units=int(
+                                payload.get("qty", 0)
+                            )
+                            * 100,
+                        )
+                    )
+                },
+            )
             with hold_company_writer(
                 store, founding.company_id, lease_directory=leases
             ) as w:
@@ -1186,6 +1214,7 @@ class HybridExecutionPlaneTests(unittest.TestCase):
                     policy_id="policy.risk",
                     base_revision="v1",
                     target_revision="v2",
+                    base_parameters={"limit": 10.0},
                     parameter_deltas={"limit": 1.0},
                     rationale="Small change",
                     produced_by_run_id=claim.run_id,
@@ -1346,6 +1375,338 @@ class HybridExecutionPlaneTests(unittest.TestCase):
             # Custom unknown provider with nonzero tokens still fails closed!
             with self.assertRaises(AgentRuntimeRefused):
                 resolve_model_pricing("custom_unpriced", usage=TokenUsage(100, 50))
+
+    def test_effectful_trading_venue_admission_requires_domain_authorizer_and_honors_authoritative_notional(
+        self,
+    ) -> None:
+        from decimal import Decimal
+        from sourdough.trading.connector import (
+            CONNECTOR_KIND_TRADING_VENUE,
+            TradingVenueConnectorAdapter,
+        )
+        from sourdough.trading.external_venue import (
+            ExternalOrderRequest,
+            ExternalOrderStatus,
+            VenueCapabilities,
+        )
+
+        submitted_orders: list[ExternalOrderRequest] = []
+
+        class _RecordingVenue:
+            endpoint_url = "http://127.0.0.1:9130"
+            credential_handle_ref = "envref:BINANCE_TESTNET"
+            blocks_redirects = True
+            capabilities = VenueCapabilities(
+                adapter_revision="rec-v1",
+                venue_name="rec_venue",
+                market_kind="spot",
+                environment="external_test",
+                supports_spot=True,
+                supports_usdm_futures=False,
+                supports_ioc_limit=True,
+                supports_gtc_limit=True,
+                seals_absent_orders=False,
+                supports_external_reconciliation=True,
+            )
+
+            def submit_order(self, order: ExternalOrderRequest) -> ExternalOrderStatus:
+                submitted_orders.append(order)
+                return ExternalOrderStatus(
+                    venue_order_id=f"vo-{len(submitted_orders)}",
+                    client_order_id=order.action_id,
+                    symbol=order.symbol,
+                    side=order.side,
+                    status="filled",
+                    original_quantity=order.quantity,
+                    filled_quantity=order.quantity,
+                    remaining_quantity=Decimal("0"),
+                    avg_price=order.limit_price,
+                    update_time_ms=1700000000000,
+                )
+
+        with TemporaryDirectory(prefix="sd-hyb-tv-") as tmp:
+            store, leases, founding, claim, evidence, now = _setup_company_and_run(
+                Path(tmp)
+            )
+            tv_adapter = TradingVenueConnectorAdapter(
+                venue_resolver=lambda _r, _s: _RecordingVenue()
+            )
+            proxy = ConnectorProxy(
+                ConnectorAdapterRegistry([tv_adapter]),
+                InMemorySecretVault(
+                    {
+                        "envref:BINANCE_TESTNET": {
+                            "api_key": "test-tv-key-1111",
+                            "api_secret": "test-tv-sec-2222",
+                        }
+                    }
+                ),
+                loopback_only=True,
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                binding = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="tv-spot-1",
+                    connector_kind=CONNECTOR_KIND_TRADING_VENUE,
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9130",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=tv_adapter.manifest.operations,
+                    credential_handle_ref="envref:BINANCE_TESTNET",
+                    actor_id="board-1",
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("submit_order",),
+                    granted_by_actor_id="board-1",
+                    now_ns=now + 1,
+                )
+                huge_order_prop = PlaneExecutionProposal(
+                    proposal_id="p-tv-huge-zero-declared",
+                    plane="code",
+                    engine_id="rule.tv",
+                    engine_revision="v1",
+                    action_kind="proceed",
+                    rationale="Attempt huge order declaring zero notional",
+                    decision_at_ns=now + 5,
+                    evidence=(evidence,),
+                    proposed_notional_minor_units=0,
+                    connector_effect=ConnectorEffectIntent(
+                        binding_id=binding.binding_id,
+                        operation="submit_order",
+                        request_id="tv-ord-1",
+                        payload={
+                            "action_id": "tv-ord-1",
+                            "symbol": "BTCUSDT",
+                            "side": "BUY",
+                            "time_in_force": "GTC",
+                            "quantity": "1000000",
+                            "limit_price": "100000",
+                        },
+                        expected_environment="external_test",
+                    ),
+                )
+
+                # A. WITHOUT an authoritative trading_venue EffectAdmissionAuthorizer -> FAIL CLOSED!
+                gate_no_auth = DeterministicControlPlaneGate(
+                    connector_proxy=proxy, max_notional_minor_units=1
+                )
+                with self.assertRaises(HybridControlGateDenied):
+                    gate_no_auth.commit(w, claim, huge_order_prop, now_ns=now + 5)
+                self.assertEqual(len(submitted_orders), 0)
+
+                # B. WITH an authoritative trading authorizer computing real qty * price ->
+                #    still DENIED because authoritative notional exceeds max_notional_minor_units=1!
+                def _trading_authorizer(
+                    _db: Any,
+                    _cid: str,
+                    _aid: str,
+                    _binding: Any,
+                    _op: str,
+                    payload: Any,
+                    _prop: Any,
+                ) -> EffectAdmissionDecision:
+                    notional = int(
+                        Decimal(str(payload["quantity"]))
+                        * Decimal(str(payload["limit_price"]))
+                    )
+                    return EffectAdmissionDecision(
+                        issued_by_service="trading.risk_authorizer",
+                        authoritative_notional_minor_units=notional,
+                    )
+
+                gate_with_auth = DeterministicControlPlaneGate(
+                    connector_proxy=proxy,
+                    effect_authorizers={
+                        CONNECTOR_KIND_TRADING_VENUE: _trading_authorizer
+                    },
+                    max_notional_minor_units=1,
+                )
+                with self.assertRaises(HybridControlGateDenied):
+                    gate_with_auth.commit(w, claim, huge_order_prop, now_ns=now + 6)
+                self.assertEqual(len(submitted_orders), 0)
+
+                # C. Small order within authoritative notional limit (1 <= 1) succeeds!
+                tiny_order_prop = PlaneExecutionProposal(
+                    proposal_id="p-tv-tiny-ok",
+                    plane="code",
+                    engine_id="rule.tv",
+                    engine_revision="v1",
+                    action_kind="proceed",
+                    rationale="Bounded authorized order",
+                    decision_at_ns=now + 8,
+                    evidence=(evidence,),
+                    proposed_notional_minor_units=1,
+                    connector_effect=ConnectorEffectIntent(
+                        binding_id=binding.binding_id,
+                        operation="submit_order",
+                        request_id="tv-ord-tiny",
+                        payload={
+                            "action_id": "tv-ord-tiny",
+                            "symbol": "BTCUSDT",
+                            "side": "BUY",
+                            "time_in_force": "GTC",
+                            "quantity": "1",
+                            "limit_price": "1",
+                        },
+                        expected_environment="external_test",
+                    ),
+                )
+                out = gate_with_auth.commit(w, claim, tiny_order_prop, now_ns=now + 8)
+                self.assertEqual(len(submitted_orders), 1)
+                self.assertIsNotNone(out.admission_id)
+
+    def test_decision_model_propagates_anti_lookahead_violation_without_fallback(
+        self,
+    ) -> None:
+        now = 1_700_000_000_000_000_000
+        art = b"weights-v1"
+        snap = FeatureSnapshot(
+            snapshot_id="snap-la-prop",
+            schema_version="feat-v1",
+            decision_at_ns=now,
+            features=(
+                FeaturePoint(
+                    name="x",
+                    value=1.0,
+                    observed_at_ns=now - 10,
+                    available_at_ns=now - 5,
+                ),
+            ),
+        )
+        fallback_ran = {"count": 0}
+        fb = CodePlaneExecutor(
+            rule_id="rule.fb",
+            code_revision="v1",
+            rule_fn=lambda _s, _p: (
+                fallback_ran.__setitem__("count", fallback_ran["count"] + 1)
+                or CodeRuleDecision(action_kind="proceed", rationale="must not run")
+            ),
+        )
+        dm = DecisionModelPlaneExecutor(
+            model_id="dm-la-scorer",
+            model_revision="v1",
+            expected_artifact_sha256=sha256(art).hexdigest(),
+            feature_schema_version="feat-v1",
+            artifact_bytes=art,
+            fallback_executor=fb,
+            scorer_fn=lambda _s, _a: (_ for _ in ()).throw(
+                HybridAntiLookaheadViolation("Derived feature leaked future timestamp")
+            ),
+        )
+        with self.assertRaises(HybridAntiLookaheadViolation):
+            dm.evaluate(snap)
+        self.assertEqual(fallback_ran["count"], 0)
+
+        # Fallback raising HybridAntiLookaheadViolation must also propagate!
+        fb_la = CodePlaneExecutor(
+            rule_id="rule.fb.la",
+            code_revision="v1",
+            rule_fn=lambda _s, _p: (_ for _ in ()).throw(
+                HybridAntiLookaheadViolation("Fallback feature leaked future timestamp")
+            ),
+        )
+        dm_bad_art = DecisionModelPlaneExecutor(
+            model_id="dm-la-fb",
+            model_revision="v1",
+            expected_artifact_sha256=sha256(b"other").hexdigest(),
+            feature_schema_version="feat-v1",
+            artifact_bytes=art,
+            fallback_executor=fb_la,
+            scorer_fn=lambda _s, _a: (_ for _ in ()).throw(
+                AssertionError("unreachable")
+            ),
+        )
+        with self.assertRaises(HybridAntiLookaheadViolation):
+            dm_bad_art.evaluate(snap)
+
+    def test_llm_gate_rejects_tampered_updated_parameters_and_enforces_gate_bounds(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-hyb-llm-upd-") as tmp:
+            store, leases, founding, claim, evidence, now = _setup_company_and_run(
+                Path(tmp)
+            )
+            bounds = {
+                "limit": ParameterBound(
+                    min_value=1.0, max_value=20.0, max_abs_delta=2.0
+                )
+            }
+            meta = LlmMetaPlaneExecutor(
+                parameter_bounds=bounds,
+                min_eval_samples=20,
+                min_holdout_margin=0.01,
+            )
+            patch = PolicyPatchProposal(
+                proposal_id="p-upd-tamper",
+                policy_id="policy.risk",
+                base_revision="v1",
+                target_revision="v2",
+                base_parameters={"limit": 10.0},
+                parameter_deltas={"limit": 1.0},
+                rationale="Bounded +1 adjustment",
+                produced_by_run_id=claim.run_id,
+                evidence=(evidence,),
+            )
+            verdict = OfflineEvalVerdict(
+                verdict_id="ev-upd-1",
+                policy_id="policy.risk",
+                target_revision="v2",
+                proposal_digest=patch.canonical_digest(),
+                suite_revision="s1",
+                passed=True,
+                sample_count=50,
+                holdout_margin=0.05,
+                max_drawdown_bps=50,
+                evaluated_at_ns=now + 1,
+                evaluator_id="eval-1",
+            )
+            admitted = meta.admit_policy_patch(
+                patch,
+                current_parameters={"limit": 10.0},
+                verdict=verdict,
+                decision_at_ns=now + 5,
+            )
+            # Tamper ONLY parameters['updated_parameters'] after admit_policy_patch!
+            tampered_params = dict(admitted.parameters)
+            tampered_params["updated_parameters"] = {"limit": 1_000_000.0}
+            tampered_prop = PlaneExecutionProposal(
+                proposal_id=admitted.proposal_id,
+                plane=admitted.plane,
+                engine_id=admitted.engine_id,
+                engine_revision=admitted.engine_revision,
+                action_kind=admitted.action_kind,
+                rationale=admitted.rationale,
+                decision_at_ns=admitted.decision_at_ns,
+                evidence=admitted.evidence,
+                parameters=tampered_params,
+                eval_verdict=admitted.eval_verdict,
+                eval_verdict_digest=admitted.eval_verdict_digest,
+                policy_patch_digest=admitted.policy_patch_digest,
+            )
+            gate = DeterministicControlPlaneGate(
+                llm_parameter_bounds=bounds,
+                min_llm_eval_samples=20,
+                min_llm_holdout_margin=0.01,
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                with self.assertRaises(HybridControlGateDenied):
+                    gate.commit(w, claim, tampered_prop, now_ns=now + 5)
+                # Untampered admitted proposal commits cleanly!
+                out = gate.commit(w, claim, admitted, now_ns=now + 6)
+                self.assertEqual(out.decision.action_kind, "approve")
 
 
 if __name__ == "__main__":

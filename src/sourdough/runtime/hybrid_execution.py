@@ -37,6 +37,7 @@ from ..agent_runtime.protocol import (
     TokenUsage,
 )
 from ..connectors.protocol import (
+    ConnectorBinding,
     ConnectorRefused,
     ConnectorResponse,
     validate_payload_against_schema,
@@ -288,6 +289,7 @@ class PolicyPatchProposal:
     parameter_deltas: Mapping[str, float]
     rationale: str
     produced_by_run_id: str
+    base_parameters: Mapping[str, float]
     evidence: tuple[DecisionEvidence, ...] = ()
     token_usage: TokenUsage = field(default_factory=lambda: TokenUsage(0, 0))
     target_scope_ref: str = "company"
@@ -308,13 +310,33 @@ class PolicyPatchProposal:
             raise HybridExecutionRefused(
                 "PolicyPatchProposal parameter_deltas must be a nonempty mapping"
             )
+        if not isinstance(self.base_parameters, Mapping) or not self.base_parameters:
+            raise HybridExecutionRefused(
+                "PolicyPatchProposal base_parameters must be a nonempty mapping"
+            )
         clean_deltas: dict[str, float] = {}
         for k, v in self.parameter_deltas.items():
             _require_safe_id(str(k), "parameter_deltas key")
             clean_deltas[str(k)] = _require_finite_number(v, f"parameter_deltas[{k}]")
+        clean_base: dict[str, float] = {}
+        for k, v in self.base_parameters.items():
+            _require_safe_id(str(k), "base_parameters key")
+            clean_base[str(k)] = _require_finite_number(v, f"base_parameters[{k}]")
+        if set(clean_base.keys()) != set(clean_deltas.keys()):
+            raise HybridExecutionRefused(
+                "PolicyPatchProposal base_parameters keys must match parameter_deltas keys"
+            )
         object.__setattr__(self, "parameter_deltas", clean_deltas)
+        object.__setattr__(self, "base_parameters", clean_base)
+
+    def resulting_parameters(self) -> dict[str, float]:
+        return {
+            k: float(self.base_parameters[k]) + float(delta)
+            for k, delta in self.parameter_deltas.items()
+        }
 
     def canonical_digest(self) -> str:
+        resulting = self.resulting_parameters()
         return sha256(
             _canonical_json(
                 {
@@ -322,7 +344,9 @@ class PolicyPatchProposal:
                     "policy_id": self.policy_id,
                     "base_revision": self.base_revision,
                     "target_revision": self.target_revision,
+                    "base_parameters": dict(self.base_parameters),
                     "parameter_deltas": dict(self.parameter_deltas),
+                    "updated_parameters": resulting,
                     "rationale": self.rationale,
                 }
             ).encode("utf-8")
@@ -721,6 +745,8 @@ class DecisionModelPlaneExecutor:
                     fallback_used=True,
                     fallback_reason=reason,
                 )
+            except HybridAntiLookaheadViolation:
+                raise
             except HybridExecutionRefused:
                 reason = f"{reason}:fallback_failed"
         pid = proposal_id or f"dmfb-{snapshot.content_digest()[:16]}"
@@ -767,6 +793,8 @@ class DecisionModelPlaneExecutor:
             return None, "model_timeout"
         if "error" in holder:
             err = holder["error"]
+            if isinstance(err, HybridAntiLookaheadViolation):
+                raise err
             return None, f"model_error:{type(err).__name__}"
         return holder.get("result"), None
 
@@ -990,6 +1018,16 @@ class LlmMetaPlaneExecutor:
             base_val = _require_finite_number(
                 current_parameters[key], f"current_parameters[{key}]"
             )
+            if not math.isclose(
+                base_val,
+                float(proposal.base_parameters[key]),
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            ):
+                raise HybridExecutionRefused(
+                    f"Live base parameter '{key}' ({base_val}) drifted from evaluated "
+                    f"base_parameters ({proposal.base_parameters[key]})"
+                )
             if abs(delta) > bound.max_abs_delta:
                 raise HybridExecutionRefused(
                     f"Parameter '{key}' delta ({delta}) exceeds max_abs_delta ({bound.max_abs_delta})"
@@ -1018,6 +1056,7 @@ class LlmMetaPlaneExecutor:
                 "policy_id": proposal.policy_id,
                 "base_revision": proposal.base_revision,
                 "target_revision": proposal.target_revision,
+                "base_parameters": dict(proposal.base_parameters),
                 "parameter_deltas": dict(proposal.parameter_deltas),
                 "updated_parameters": updated_parameters,
                 "produced_by_run_id": proposal.produced_by_run_id,
@@ -1175,11 +1214,53 @@ class DecisionModelRuntimeAdapter:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class EffectAdmissionDecision:
+    """Authoritative domain authorization & exposure valuation for an effectful connector intent."""
+
+    issued_by_service: str
+    authoritative_notional_minor_units: int
+    reservation_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.issued_by_service, str)
+            or not self.issued_by_service.strip()
+        ):
+            raise HybridExecutionRefused(
+                "EffectAdmissionDecision issued_by_service must be nonempty"
+            )
+        if (
+            type(self.authoritative_notional_minor_units) is not int
+            or self.authoritative_notional_minor_units < 0
+        ):
+            raise HybridExecutionRefused(
+                "EffectAdmissionDecision authoritative_notional_minor_units must be nonnegative int"
+            )
+        if self.reservation_ref is not None:
+            _require_safe_id(self.reservation_ref, "reservation_ref")
+
+
+EffectAdmissionAuthorizer = Callable[
+    [
+        Any,
+        str,
+        str,
+        ConnectorBinding,
+        str,
+        Mapping[str, Any],
+        PlaneExecutionProposal,
+    ],
+    EffectAdmissionDecision,
+]
+
+
 class DeterministicControlPlaneGate:
     """Single authoritative pre-commit gate governing proposals from all 3 execution planes.
 
     Enforces live WorkRunClaim fencing, active standing_grant, active restriction_cause
-    blocks, notional ceilings, LLM offline-eval verdict verification, evidence-backed
+    blocks, domain-authorized effectful connector admissions, notional ceilings,
+    LLM offline-eval verdict & resulting-parameter verification, evidence-backed
     work_decision persistence, immutable audit trails, and service-owned ConnectorProxy
     admission/dispatch without holding SQLite write locks during outbound network I/O.
     """
@@ -1188,6 +1269,8 @@ class DeterministicControlPlaneGate:
         self,
         *,
         connector_proxy: ConnectorProxy | None = None,
+        effect_authorizers: Mapping[str, EffectAdmissionAuthorizer] | None = None,
+        llm_parameter_bounds: Mapping[str, ParameterBound] | None = None,
         max_notional_minor_units: int = 0,
         min_llm_eval_samples: int = 1,
         min_llm_holdout_margin: float = 0.0,
@@ -1203,12 +1286,50 @@ class DeterministicControlPlaneGate:
         min_margin = _require_finite_number(
             min_llm_holdout_margin, "min_llm_holdout_margin"
         )
+        clean_authorizers: dict[str, EffectAdmissionAuthorizer] = {}
+        if effect_authorizers is not None:
+            for kind, fn in effect_authorizers.items():
+                _require_safe_id(str(kind), "effect_authorizers key")
+                if not callable(fn):
+                    raise HybridExecutionRefused(
+                        f"effect_authorizers[{kind}] must be callable"
+                    )
+                clean_authorizers[str(kind)] = fn
+        clean_bounds: dict[str, ParameterBound] | None = None
+        if llm_parameter_bounds is not None:
+            clean_bounds = {}
+            for name, bound in llm_parameter_bounds.items():
+                _require_safe_id(str(name), "llm_parameter_bounds key")
+                if not isinstance(bound, ParameterBound):
+                    raise HybridExecutionRefused(
+                        f"llm_parameter_bounds[{name}] must be a ParameterBound"
+                    )
+                clean_bounds[str(name)] = bound
         self._connector_proxy = connector_proxy
+        self._effect_authorizers = clean_authorizers
+        self._llm_parameter_bounds = clean_bounds
         self._max_notional_minor_units = max_notional_minor_units
         self._min_llm_eval_samples = min_llm_eval_samples
         self._min_llm_holdout_margin = min_margin
         self._domain_plugins = tuple(domain_plugins)
         self._tx_lock = tx_lock
+
+    def _resolve_effect_authorizer(
+        self, connector_kind: str
+    ) -> EffectAdmissionAuthorizer | None:
+        explicit = self._effect_authorizers.get(connector_kind)
+        if explicit is not None:
+            return explicit
+        for plugin in self._domain_plugins:
+            fn = getattr(plugin, "authorize_connector_effect", None)
+            if callable(fn):
+                handles = getattr(plugin, "handles_connector_kind", None)
+                if callable(handles):
+                    if handles(connector_kind):
+                        return fn
+                else:
+                    return fn
+        return None
 
     def _verify_llm_eval_gate(self, proposal: PlaneExecutionProposal) -> str | None:
         if proposal.plane != "llm":
@@ -1232,14 +1353,31 @@ class DeterministicControlPlaneGate:
         ):
             return "llm_offline_eval_policy_target_mismatch"
         base_rev = proposal.parameters.get("base_revision")
+        raw_base_params = proposal.parameters.get("base_parameters")
         raw_deltas = proposal.parameters.get("parameter_deltas")
+        raw_updated_params = proposal.parameters.get("updated_parameters")
         if (
             not isinstance(base_rev, str)
             or not base_rev.strip()
+            or not isinstance(raw_base_params, Mapping)
+            or not raw_base_params
             or not isinstance(raw_deltas, Mapping)
             or not raw_deltas
+            or not isinstance(raw_updated_params, Mapping)
+            or not raw_updated_params
         ):
             return "llm_offline_eval_missing_patch_terms"
+        validated_base: dict[str, float] = {}
+        for k, v in raw_base_params.items():
+            if not isinstance(k, str) or _SAFE_ID_RE.fullmatch(k) is None:
+                return "llm_offline_eval_invalid_base_key"
+            if (
+                isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(float(v))
+            ):
+                return "llm_offline_eval_invalid_base_value"
+            validated_base[k] = float(v)
         validated_deltas: dict[str, float] = {}
         for k, v in raw_deltas.items():
             if not isinstance(k, str) or _SAFE_ID_RE.fullmatch(k) is None:
@@ -1251,6 +1389,35 @@ class DeterministicControlPlaneGate:
             ):
                 return "llm_offline_eval_invalid_delta_value"
             validated_deltas[k] = float(v)
+        validated_updated: dict[str, float] = {}
+        for k, v in raw_updated_params.items():
+            if not isinstance(k, str) or _SAFE_ID_RE.fullmatch(k) is None:
+                return "llm_offline_eval_invalid_updated_key"
+            if (
+                isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(float(v))
+            ):
+                return "llm_offline_eval_invalid_updated_value"
+            validated_updated[k] = float(v)
+        if set(validated_base.keys()) != set(validated_deltas.keys()) or set(
+            validated_updated.keys()
+        ) != set(validated_deltas.keys()):
+            return "llm_offline_eval_parameter_key_mismatch"
+        for k, delta in validated_deltas.items():
+            expected_val = validated_base[k] + delta
+            if not math.isclose(
+                validated_updated[k], expected_val, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                return "llm_offline_eval_updated_parameter_mismatch"
+            if self._llm_parameter_bounds is not None:
+                if k not in self._llm_parameter_bounds:
+                    return "llm_offline_eval_parameter_outside_gate_bounds"
+                bound = self._llm_parameter_bounds[k]
+                if abs(delta) > bound.max_abs_delta or not (
+                    bound.min_value <= validated_updated[k] <= bound.max_value
+                ):
+                    return "llm_offline_eval_parameter_bounds_exceeded"
         recomputed_patch_digest = sha256(
             _canonical_json(
                 {
@@ -1258,7 +1425,9 @@ class DeterministicControlPlaneGate:
                     "policy_id": proposal.engine_id,
                     "base_revision": base_rev,
                     "target_revision": proposal.engine_revision,
+                    "base_parameters": validated_base,
                     "parameter_deltas": validated_deltas,
+                    "updated_parameters": validated_updated,
                     "rationale": proposal.rationale,
                 }
             ).encode("utf-8")
@@ -1362,9 +1531,11 @@ class DeterministicControlPlaneGate:
                     rid, sref, _ = blocking[0]
                     denial_reason = f"active_restriction:{rid}:{sref}"
 
-            # 4. Pre-flight connector authorization & taint validation BEFORE persisting decision
+            # 4. Pre-flight connector authorization, domain effect authorizer & taint validation
             binding = None
             binding_op = None
+            effect_auth_decision: EffectAdmissionDecision | None = None
+            effective_notional = proposal.proposed_notional_minor_units
             if denial_reason is None and effect is not None:
                 if self._connector_proxy is None:
                     denial_reason = "connector_proxy_not_configured"
@@ -1453,6 +1624,58 @@ class DeterministicControlPlaneGate:
                             "effectful",
                         ):
                             denial_reason = "shift_flow_guard_peer_input_taint"
+                    # Effectful connector admissions MUST be authorized & valued by an
+                    # authoritative domain/connector EffectAdmissionAuthorizer (never blindly
+                    # trusting self-reported notional or skipping domain risk reservations!).
+                    if (
+                        denial_reason is None
+                        and binding is not None
+                        and binding_op is not None
+                        and binding_op.mode == "effectful"
+                    ):
+                        authorizer = self._resolve_effect_authorizer(
+                            binding.connector_kind
+                        )
+                        if authorizer is None:
+                            denial_reason = (
+                                f"effect_domain_authorizer_missing:"
+                                f"{binding.connector_kind}:{binding_op.name}"
+                            )
+                        else:
+                            db.execute("SAVEPOINT hybrid_effect_auth")
+                            try:
+                                raw_auth = authorizer(
+                                    db,
+                                    company_id,
+                                    agent_id,
+                                    binding,
+                                    binding_op.name,
+                                    effect.payload,
+                                    proposal,
+                                )
+                                if not isinstance(raw_auth, EffectAdmissionDecision):
+                                    raise HybridControlGateDenied(
+                                        "Effect authorizer must return EffectAdmissionDecision"
+                                    )
+                                effective_notional = max(
+                                    proposal.proposed_notional_minor_units,
+                                    raw_auth.authoritative_notional_minor_units,
+                                )
+                                if (
+                                    self._max_notional_minor_units > 0
+                                    and effective_notional
+                                    > self._max_notional_minor_units
+                                ):
+                                    raise HybridControlGateDenied(
+                                        f"authoritative_notional_cap_exceeded:"
+                                        f"{effective_notional}>{self._max_notional_minor_units}"
+                                    )
+                                effect_auth_decision = raw_auth
+                                db.execute("RELEASE SAVEPOINT hybrid_effect_auth")
+                            except HybridExecutionRefused as error:
+                                db.execute("ROLLBACK TO SAVEPOINT hybrid_effect_auth")
+                                db.execute("RELEASE SAVEPOINT hybrid_effect_auth")
+                                denial_reason = f"effect_domain_denied:{error}"
 
             if denial_reason is not None:
                 append_audit_event(
@@ -1485,7 +1708,7 @@ class DeterministicControlPlaneGate:
                             "engine_revision": proposal.engine_revision,
                             "action_kind": proposal.action_kind,
                             "target_scope_ref": proposal.target_scope_ref,
-                            "proposed_notional_minor_units": proposal.proposed_notional_minor_units,
+                            "proposed_notional_minor_units": effective_notional,
                             "parameters": dict(proposal.parameters),
                             "eval_verdict_digest": proposal.eval_verdict_digest,
                             "policy_patch_digest": proposal.policy_patch_digest,
@@ -1555,6 +1778,7 @@ class DeterministicControlPlaneGate:
                     and binding_op is not None
                     and binding_op.mode == "effectful"
                 ):
+                    assert effect_auth_decision is not None
                     det_aid = (
                         "hybadm-"
                         + sha256(
@@ -1570,7 +1794,7 @@ class DeterministicControlPlaneGate:
                             operation=binding_op.name,
                             request_id=effect.request_id,
                             payload=effect.payload,
-                            issued_by_service="core.hybrid_control_gate",
+                            issued_by_service=effect_auth_decision.issued_by_service,
                             actor_id=agent_id,
                             admission_id=det_aid,
                             now_ns=ts,
@@ -1718,6 +1942,8 @@ __all__ = [
     "DecisionModelPlaneExecutor",
     "DecisionModelRuntimeAdapter",
     "DeterministicControlPlaneGate",
+    "EffectAdmissionAuthorizer",
+    "EffectAdmissionDecision",
     "FeaturePoint",
     "FeatureSnapshot",
     "HybridAntiLookaheadViolation",

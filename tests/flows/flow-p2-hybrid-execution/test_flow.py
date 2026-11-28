@@ -51,6 +51,7 @@ from sourdough.runtime.hybrid_execution import (
     DecisionModelPlaneExecutor,
     DecisionModelRuntimeAdapter,
     DeterministicControlPlaneGate,
+    EffectAdmissionDecision,
     FeaturePoint,
     FeatureSnapshot,
     HybridControlGateDenied,
@@ -310,6 +311,17 @@ class ConnectedFlow(unittest.TestCase):
             )
             gate = DeterministicControlPlaneGate(
                 connector_proxy=proxy,
+                effect_authorizers={
+                    "exec_sink": lambda _db, _cid, _aid, _b, _op, payload, _prop: (
+                        EffectAdmissionDecision(
+                            issued_by_service="flow.exec_sink_authorizer",
+                            authoritative_notional_minor_units=int(
+                                payload.get("units", 0)
+                            )
+                            * 100,
+                        )
+                    )
+                },
                 max_notional_minor_units=10_000,
                 min_llm_eval_samples=30,
                 min_llm_holdout_margin=0.01,
@@ -508,6 +520,7 @@ class ConnectedFlow(unittest.TestCase):
                     policy_id="policy.liquidity_dispatch",
                     base_revision="rev-1",
                     target_revision="rev-2",
+                    base_parameters={"min_liquidity_ratio": 0.85},
                     parameter_deltas={"min_liquidity_ratio": 0.03},
                     rationale="Raise liquidity buffer after offline regime study",
                     produced_by_run_id=run.run_id,
