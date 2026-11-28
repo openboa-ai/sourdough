@@ -259,7 +259,7 @@ def _sanitize_receipt_result_json(
         return raw_result_json
     try:
         parsed = json.loads(raw_result_json)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         parsed = None
     if is_private_desk:
         safe_payload: dict[str, Any] = {
@@ -871,10 +871,224 @@ class ShiftRunner:
             or any(m.get("audience_scope") == "one_agent" for m in active_methods)
             or prior_had_private_desk
         )
-        flow_state = {
+
+        def _project_members(project_id: str) -> set[str] | None:
+            if not isinstance(project_id, str) or not project_id.strip():
+                return None
+            with closing(open_reader(ctx.writer.store)) as ro_db, read_tx(ro_db):
+                row = ro_db.execute(
+                    "SELECT members FROM shared_project WHERE company_id = ? AND project_id = ?",
+                    (ctx.company_id, project_id.strip()),
+                ).fetchone()
+            if row is None:
+                return None
+            try:
+                parsed = json.loads(str(row[0]))
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(parsed, list):
+                return None
+            return {str(m) for m in parsed if isinstance(m, str) and m}
+
+        def _asset_provenance(asset_id: str) -> tuple[str | None, set[str] | None]:
+            if not isinstance(asset_id, str) or not asset_id.strip():
+                return None, None
+            with closing(open_reader(ctx.writer.store)) as ro_db, read_tx(ro_db):
+                row = ro_db.execute(
+                    """SELECT project_id, audience FROM shared_publication
+                       WHERE company_id = ? AND asset_id = ?""",
+                    (ctx.company_id, asset_id.strip()),
+                ).fetchone()
+            if row is None:
+                return None, None
+            proj_id = str(row[0])
+            try:
+                aud_list = json.loads(str(row[1]))
+            except json.JSONDecodeError:
+                return proj_id, None
+            if not isinstance(aud_list, list):
+                return proj_id, None
+            aud_set = {str(a) for a in aud_list if isinstance(a, str) and a}
+            proj_members = _project_members(proj_id)
+            if proj_members is not None:
+                aud_set &= proj_members
+            return proj_id, aud_set
+
+        def _handoff_offer_provenance(
+            offer_id: str,
+        ) -> tuple[str | None, str | None]:
+            if not isinstance(offer_id, str) or not offer_id.strip():
+                return None, None
+            with closing(open_reader(ctx.writer.store)) as ro_db, read_tx(ro_db):
+                row = ro_db.execute(
+                    """SELECT sender_id, asset_id FROM work_handoff
+                       WHERE company_id = ? AND offer_id = ?""",
+                    (ctx.company_id, offer_id.strip()),
+                ).fetchone()
+            if row is None:
+                return None, None
+            return str(row[0]), (None if row[1] is None else str(row[1]))
+
+        def _peer_request_requester() -> str | None:
+            with closing(open_reader(ctx.writer.store)) as ro_db, read_tx(ro_db):
+                row = ro_db.execute(
+                    """SELECT requester_agent_id FROM work_peer_requests
+                       WHERE company_id = ? AND response_work_item_id = ?""",
+                    (ctx.company_id, ctx.work_item.work_item_id),
+                ).fetchone()
+            return None if row is None else str(row[0])
+
+        initial_allowed_audience: set[str] | None = None
+        initial_tainted_projects: set[str] = set()
+
+        def _intersect_audience(
+            cur: set[str] | None, aud: set[str] | None
+        ) -> set[str] | None:
+            if aud is None:
+                return cur
+            return set(aud) if cur is None else (cur & aud)
+
+        try:
+            item_payload_obj = json.loads(ctx.work_item.payload_json or "{}")
+        except json.JSONDecodeError:
+            item_payload_obj = {}
+        if isinstance(item_payload_obj, Mapping):
+            payload_asset_id = item_payload_obj.get("asset_id")
+            if isinstance(payload_asset_id, str) and payload_asset_id.strip():
+                p_pid, p_aud = _asset_provenance(payload_asset_id)
+                if p_pid:
+                    initial_tainted_projects.add(p_pid)
+                if p_aud is not None:
+                    initial_allowed_audience = _intersect_audience(
+                        initial_allowed_audience, p_aud
+                    )
+            payload_proj_id = item_payload_obj.get("project_id")
+            if (
+                isinstance(payload_proj_id, str)
+                and payload_proj_id.strip()
+                and (
+                    ctx.work_item.source_kind
+                    in ("project_message", "peer_request", "handoff_offer")
+                    or item_payload_obj.get("trigger_kind")
+                    in ("project_message", "peer_request", "handoff_offer")
+                )
+            ):
+                initial_tainted_projects.add(payload_proj_id.strip())
+                p_members = _project_members(payload_proj_id.strip())
+                if p_members is not None:
+                    initial_allowed_audience = _intersect_audience(
+                        initial_allowed_audience, p_members
+                    )
+
+        if prior_had_peer_input:
+            # Reconstruct audience bounds from prior peer-input receipts, failing closed to {agent_id}
+            # if any prior peer read cannot be resolved cleanly (e.g., offloaded or beyond LIMIT 32).
+            resolved_prior_peer = False
+            unresolved_prior_peer = False
+            with closing(open_reader(ctx.writer.store)) as ro_db, read_tx(ro_db):
+                prior_peer_rows = ro_db.execute(
+                    """SELECT t.tool_name, t.result_json, t.offloaded_log_path
+                       FROM tool_call_receipt t
+                       JOIN work_runs wr
+                         ON wr.company_id = t.company_id AND wr.run_id = t.run_id
+                       WHERE t.company_id = ?
+                         AND wr.work_item_id = ?
+                         AND t.run_id != ?
+                         AND t.tool_name IN ('read_messages', 'read_inbox', 'discover_handoffs', 'read_shared_asset')""",
+                    (ctx.company_id, ctx.work_item.work_item_id, ctx.run.run_id),
+                ).fetchall()
+            for p_tname, p_res_json, p_off in prior_peer_rows:
+                if p_off is not None or not isinstance(p_res_json, str):
+                    unresolved_prior_peer = True
+                    continue
+                try:
+                    p_obj = json.loads(p_res_json)
+                except json.JSONDecodeError:
+                    unresolved_prior_peer = True
+                    continue
+                if not isinstance(p_obj, Mapping):
+                    unresolved_prior_peer = True
+                    continue
+                if p_tname == "read_shared_asset":
+                    p_aid = p_obj.get("asset_id")
+                    if isinstance(p_aid, str) and p_aid.strip():
+                        pid, aud = _asset_provenance(p_aid)
+                        if pid:
+                            initial_tainted_projects.add(pid)
+                        if aud is not None:
+                            initial_allowed_audience = _intersect_audience(
+                                initial_allowed_audience, aud
+                            )
+                            resolved_prior_peer = True
+                        else:
+                            unresolved_prior_peer = True
+                    else:
+                        unresolved_prior_peer = True
+                elif p_tname == "read_messages":
+                    msgs = p_obj.get("messages")
+                    if isinstance(msgs, list):
+                        for m in msgs:
+                            if isinstance(m, Mapping) and isinstance(
+                                m.get("project_id"), str
+                            ):
+                                pid = str(m["project_id"])
+                                initial_tainted_projects.add(pid)
+                                initial_allowed_audience = _intersect_audience(
+                                    initial_allowed_audience, _project_members(pid)
+                                )
+                                resolved_prior_peer = True
+                    else:
+                        unresolved_prior_peer = True
+                elif p_tname == "read_inbox":
+                    delivs = p_obj.get("deliveries")
+                    if isinstance(delivs, list):
+                        for d in delivs:
+                            if isinstance(d, Mapping) and isinstance(
+                                d.get("project_id"), str
+                            ):
+                                pid = str(d["project_id"])
+                                initial_tainted_projects.add(pid)
+                                initial_allowed_audience = _intersect_audience(
+                                    initial_allowed_audience, _project_members(pid)
+                                )
+                                resolved_prior_peer = True
+                    else:
+                        unresolved_prior_peer = True
+                elif p_tname == "discover_handoffs":
+                    offers = p_obj.get("offers")
+                    if isinstance(offers, list):
+                        for o in offers:
+                            if isinstance(o, Mapping):
+                                o_aid = o.get("asset_id")
+                                if isinstance(o_aid, str) and o_aid.strip():
+                                    pid, aud = _asset_provenance(o_aid)
+                                    if pid:
+                                        initial_tainted_projects.add(pid)
+                                    if aud is not None:
+                                        initial_allowed_audience = _intersect_audience(
+                                            initial_allowed_audience, aud
+                                        )
+                                        resolved_prior_peer = True
+                    else:
+                        unresolved_prior_peer = True
+            if unresolved_prior_peer or not resolved_prior_peer:
+                initial_allowed_audience = _intersect_audience(
+                    initial_allowed_audience, {agent_id}
+                )
+
+        flow_state: dict[str, Any] = {
             "read_private_desk": has_hydrated_private_context,
             "read_peer_input": prior_had_peer_input,
+            "allowed_audience": initial_allowed_audience,
+            "tainted_projects": initial_tainted_projects,
         }
+
+        def _narrow_flow_audience(aud: set[str] | None) -> None:
+            if aud is None:
+                return
+            flow_state["allowed_audience"] = _intersect_audience(
+                flow_state["allowed_audience"], aud
+            )
 
         def _wrap_handler(name: str, fn: ToolHandler, *, use_lock: bool) -> ToolHandler:
             def _wrapped(args: dict[str, Any]) -> dict[str, Any]:
@@ -892,6 +1106,11 @@ class ShiftRunner:
                         "Cannot write free-form peer messages, peer requests, or trading actions in the same shift "
                         "after reading private Desk data; publish explicitly via desk_publish_selection"
                     )
+                if name in _TRADING_WRITE_SINKS and flow_state["read_peer_input"]:
+                    raise DutyRefused(
+                        "Cannot execute trading write actions in the same shift "
+                        "after reading peer-authored messages, handoffs, or shared assets"
+                    )
                 if (
                     name in _PRIVATE_DESK_ALL_TOOLS
                     and not is_public_offload_read
@@ -906,6 +1125,55 @@ class ShiftRunner:
                         "Cannot read peer-authored messages, handoffs, or shared assets "
                         "in the same shift after reading private Desk data"
                     )
+                cur_allowed: set[str] | None = flow_state["allowed_audience"]
+                if (
+                    name in _PEER_OUTBOUND_SINKS
+                    and cur_allowed is not None
+                    and isinstance(args, Mapping)
+                ):
+                    if name == "append_message":
+                        dest_pid = args.get("project_id")
+                        dest_members = (
+                            _project_members(dest_pid)
+                            if isinstance(dest_pid, str)
+                            else None
+                        )
+                        if dest_members is None or not dest_members.issubset(
+                            cur_allowed
+                        ):
+                            raise DutyRefused(
+                                "Cannot post message to a project whose members extend beyond "
+                                "the audience of previously read peer messages or shared assets"
+                            )
+                    elif name in ("request_peer_response", "offer_handoff"):
+                        dest_agent = args.get("recipient_id")
+                        if (
+                            not isinstance(dest_agent, str)
+                            or dest_agent.strip() not in cur_allowed
+                        ):
+                            raise DutyRefused(
+                                "Cannot send peer request or handoff to a recipient outside "
+                                "the audience of previously read peer messages or shared assets"
+                            )
+                    elif name == "respond_peer_request":
+                        req_agent = _peer_request_requester()
+                        if req_agent is None or req_agent not in cur_allowed:
+                            raise DutyRefused(
+                                "Cannot respond to a peer requester outside the audience "
+                                "of previously read peer messages or shared assets"
+                            )
+                    elif name == "decline_handoff":
+                        raw_oid = args.get("offer_id")
+                        offerer_id, _ = (
+                            _handoff_offer_provenance(raw_oid)
+                            if isinstance(raw_oid, str)
+                            else (None, None)
+                        )
+                        if offerer_id is None or offerer_id not in cur_allowed:
+                            raise DutyRefused(
+                                "Cannot decline handoff with a message to an offerer outside "
+                                "the audience of previously read peer messages or shared assets"
+                            )
                 if use_lock:
                     with ctx.write_lock_ctx():
                         out = fn(args)
@@ -915,6 +1183,88 @@ class ShiftRunner:
                     flow_state["read_private_desk"] = True
                 if name in _PEER_INPUT_TOOLS:
                     flow_state["read_peer_input"] = True
+                    if name == "read_messages" and isinstance(args, Mapping):
+                        pid = args.get("project_id")
+                        if isinstance(pid, str) and pid.strip():
+                            flow_state["tainted_projects"].add(pid.strip())
+                            _narrow_flow_audience(_project_members(pid.strip()))
+                    elif name == "read_shared_asset" and isinstance(args, Mapping):
+                        aid = args.get("asset_id")
+                        if isinstance(aid, str) and aid.strip():
+                            pid, aud = _asset_provenance(aid.strip())
+                            if pid:
+                                flow_state["tainted_projects"].add(pid)
+                            _narrow_flow_audience(
+                                aud if aud is not None else {agent_id}
+                            )
+                    elif name == "read_inbox" and isinstance(out, Mapping):
+                        delivs = out.get("deliveries")
+                        if isinstance(delivs, list):
+                            for d in delivs:
+                                if isinstance(d, Mapping) and isinstance(
+                                    d.get("project_id"), str
+                                ):
+                                    pid = str(d["project_id"]).strip()
+                                    if pid:
+                                        flow_state["tainted_projects"].add(pid)
+                                        _narrow_flow_audience(_project_members(pid))
+                    elif name == "discover_handoffs" and isinstance(out, Mapping):
+                        offers = out.get("offers")
+                        if isinstance(offers, list):
+                            for o in offers:
+                                if not isinstance(o, Mapping):
+                                    continue
+                                o_aid = o.get("asset_id")
+                                if isinstance(o_aid, str) and o_aid.strip():
+                                    pid, aud = _asset_provenance(o_aid.strip())
+                                    if pid:
+                                        flow_state["tainted_projects"].add(pid)
+                                    _narrow_flow_audience(
+                                        aud if aud is not None else {agent_id}
+                                    )
+                                else:
+                                    sender = o.get("sender_id")
+                                    if isinstance(sender, str) and sender.strip():
+                                        _narrow_flow_audience(
+                                            {agent_id, sender.strip()}
+                                        )
+                if (
+                    name == "discover_project_references"
+                    and flow_state["read_peer_input"]
+                    and isinstance(out, Mapping)
+                ):
+                    allowed_projs: set[str] = set(flow_state["tainted_projects"])
+                    allowed_aud_now: set[str] | None = flow_state["allowed_audience"]
+                    filtered_projects = []
+                    for p_entry in out.get("projects") or ():
+                        if not isinstance(p_entry, Mapping):
+                            continue
+                        p_id = str(p_entry.get("project_id") or "")
+                        p_members_raw = p_entry.get("members") or ()
+                        p_members_set = {
+                            str(m) for m in p_members_raw if isinstance(m, str)
+                        }
+                        if p_id in allowed_projs or (
+                            allowed_aud_now is not None
+                            and p_members_set
+                            and p_members_set.issubset(allowed_aud_now)
+                        ):
+                            filtered_projects.append(p_entry)
+                            allowed_projs.add(p_id)
+                    out = dict(out)
+                    out["projects"] = filtered_projects
+                    out["shared_assets"] = [
+                        a
+                        for a in (out.get("shared_assets") or ())
+                        if isinstance(a, Mapping)
+                        and str(a.get("project_id") or "") in allowed_projs
+                    ]
+                    out["publication_receipts"] = [
+                        r
+                        for r in (out.get("publication_receipts") or ())
+                        if isinstance(r, Mapping)
+                        and str(r.get("project_id") or "") in allowed_projs
+                    ]
                 return out
 
             return _wrapped

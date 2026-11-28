@@ -18,10 +18,12 @@ from uuid import uuid4
 
 from .agent_desk import (
     EMPTY_DESK_DIGEST,
+    PRODUCTION_DESK_LIMITS,
     clone_desk_snapshot,
     compute_agent_desk_digest,
     desk_directory,
     desks_root,
+    draft_at_revision,
 )
 from .agent_runtime.protocol import (
     AgentBudgetExceeded,
@@ -219,6 +221,7 @@ def _verify_case_grounded_evidence(
     slot_store: Path,
     agent_desk_dir: Path,
     company_id: str,
+    agent_id: str,
     case_spec: Mapping[str, Any] | None,
     evidence_refs: Sequence[Any],
     drafted_methods: Sequence[tuple[str, str, str, str, str, str, str, str, str]],
@@ -228,6 +231,46 @@ def _verify_case_grounded_evidence(
     if truth is None or not evidence_refs:
         return False
     drafts_root = (agent_desk_dir / ".desk" / "drafts").resolve(strict=False)
+    draft_name_by_ref: dict[str, str] | None = None
+
+    def _private_draft_ref_index() -> dict[str, str]:
+        nonlocal draft_name_by_ref
+        if draft_name_by_ref is not None:
+            return draft_name_by_ref
+        index: dict[str, str] = {}
+        try:
+            if not drafts_root.is_symlink() and drafts_root.is_dir():
+                for entry in drafts_root.iterdir():
+                    if (
+                        entry.is_symlink()
+                        or not entry.is_file()
+                        or entry.suffix != ".json"
+                    ):
+                        continue
+                    try:
+                        if not entry.resolve(strict=True).is_relative_to(drafts_root):
+                            continue
+                    except OSError:
+                        continue
+                    d_name = entry.stem
+                    for raw_key in (
+                        d_name,
+                        f"{agent_id}/{d_name}",
+                        f"{agent_id}:{d_name}",
+                    ):
+                        index[raw_key] = d_name
+                        opaque_key = (
+                            "private_draft:opaque:"
+                            + sha256(
+                                f"{agent_id}:{raw_key}".encode("utf-8")
+                            ).hexdigest()[:24]
+                        )
+                        index[opaque_key] = d_name
+        except OSError:
+            pass
+        draft_name_by_ref = index
+        return draft_name_by_ref
+
     for ev in evidence_refs:
         if not isinstance(ev, Mapping):
             continue
@@ -237,25 +280,24 @@ def _verify_case_grounded_evidence(
         if not kind or not res_id:
             continue
         if kind == "private_draft":
-            if "/" in res_id or "\\" in res_id or res_id in (".", ".."):
+            if not rev:
                 continue
-            draft_path = drafts_root / f"{res_id}.json"
+            resolved_name = _private_draft_ref_index().get(res_id)
+            if resolved_name is None:
+                continue
             try:
-                if draft_path.is_symlink() or not draft_path.is_file():
-                    continue
-                if not draft_path.resolve(strict=True).is_relative_to(drafts_root):
-                    continue
-                raw_doc = json.loads(draft_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                resolved_draft = draft_at_revision(
+                    slot_store,
+                    agent_id,
+                    resolved_name,
+                    rev,
+                    limits=PRODUCTION_DESK_LIMITS,
+                )
+            except DutyRefused, OSError:
                 continue
-            if not isinstance(raw_doc, Mapping):
-                continue
-            content = str(raw_doc.get("content") or "")
-            if _HEX64.fullmatch(rev):
-                actual_rev = sha256(content.encode("utf-8")).hexdigest()
-                if actual_rev != rev:
-                    continue
-            if _text_covers_case_truth(content, truth):
+            if resolved_draft is not None and _text_covers_case_truth(
+                resolved_draft.content, truth
+            ):
                 return True
         elif kind == "method_delta":
             for (
@@ -1897,7 +1939,7 @@ def _read_offloaded_receipt_payload(
             os.close(fd)
         loaded = json.loads(b"".join(chunks).decode("utf-8"))
         return loaded if isinstance(loaded, Mapping) else parsed
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except OSError, UnicodeDecodeError, json.JSONDecodeError:
         return parsed
 
 
@@ -2841,6 +2883,7 @@ def run_recursive_learning_cycle(
                         slot_store=slot_store,
                         agent_desk_dir=agent_desk_dir,
                         company_id=company_id,
+                        agent_id=meta_agent_id,
                         case_spec=_case_spec,
                         evidence_refs=parsed_ev_list,
                         drafted_methods=drafted_methods,
