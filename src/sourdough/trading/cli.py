@@ -5,17 +5,46 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from contextlib import closing
 from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
 from time import time_ns
+from uuid import uuid4
 
 from ..duty_run import DutyRefused, count_company_runs
 from ..runtime.domains import DomainCliRefused
+from ..runtime.work_kernel import (
+    WorkKernelRefused,
+    cancel_condition,
+    create_work_item,
+    register_responsibility,
+    set_condition,
+)
+from ..storage.db import open_writer, write_tx
+from ..storage.schema import enable_domain_v1
 from ..supervisor import SupervisionRefused, supervise_worker
 from ..writer_lease import hold_company_writer
-from .domain import ExecutionTierRefused
+from .accounts import open_company_paper_book, register_live_candidate_binding
+from .binance_emulator import BinanceWireEmulator
+from .binance_venue import (
+    MARKET_SPOT,
+    MARKET_USDM_FUTURES,
+    BinanceVenueAdapter,
+    BinanceVenueConfig,
+)
+from .credentials import (
+    CredentialRefused,
+    InMemoryTestCredentialProvider,
+)
+from .domain import ENV_EXTERNAL_TEST, ExecutionTierRefused
 from .engine import EngineRefused, prepare_engine
 from .execution import BindingRefused, VenueRefused
+from .external_venue import (
+    ExternalEnvironmentMismatch,
+    ExternalOrderReplyUnknown,
+    ExternalVenueRefused,
+)
 from .fund_returns import ReturnRefused
 from .market_runtime import observe_market
 from .market_worker import MarketRefused
@@ -28,6 +57,12 @@ from .statement_store import (
     retain_paper_statement,
 )
 from .valuation import ValuationRefused
+from .venue_qualification import run_binance_testnet_qualification
+from .venue_resolver import (
+    CompositeCredentialProvider,
+    build_default_live_venue_resolver,
+    run_live_binance_testnet_qualification,
+)
 from .window import WindowPlan, WindowRefused
 from .window_run import run_window
 from .window_sampler import WindowSampler, register_managed_window
@@ -44,6 +79,11 @@ TRADING_CLI_COMMANDS = frozenset(
         "prepare-nautilus-paper",
         "serve-nautilus-paper",
         "reconcile-trading-books",
+        "enable-trading-domain",
+        "open-paper-book",
+        "register-live-candidate",
+        "qualify-live-venue",
+        "arm-trading-schedule",
     }
 )
 
@@ -190,11 +230,96 @@ def register_trading_subcommands(
     )
     rec_cmd.add_argument("store", type=Path)
     rec_cmd.add_argument("--company-id", required=True)
+    rec_cmd.add_argument("--lease-dir", type=Path)
     rec_cmd.add_argument(
         "--quote-source",
         help="Optional read-only quote source: binance-spot, binance-futures, or journal:<path>",
     )
     rec_cmd.add_argument("--max-quote-age-seconds", type=int, default=60)
+    rec_cmd.add_argument(
+        "--live-reconcile",
+        action="store_true",
+        help="Resolve active company_live bindings via host credentials to reconcile external orders and drift",
+    )
+
+    enable_cmd = commands.add_parser(
+        "enable-trading-domain",
+        help="Idempotently install the canonical v1 trading domain schema pack on a Core Company store",
+    )
+    enable_cmd.add_argument("store", type=Path)
+    enable_cmd.add_argument("--company-id", required=True)
+    enable_cmd.add_argument("--lease-dir", type=Path)
+
+    paper_cmd = commands.add_parser(
+        "open-paper-book",
+        help="Open a new isolated Company Paper Book for concurrent strategy soak testing",
+    )
+    paper_cmd.add_argument("store", type=Path)
+    paper_cmd.add_argument("--company-id", required=True)
+    paper_cmd.add_argument("--lease-dir", type=Path)
+    paper_cmd.add_argument("--account-id", required=True)
+    paper_cmd.add_argument("--book-name", required=True)
+    paper_cmd.add_argument("--starting-minor", required=True, type=int)
+    paper_cmd.add_argument("--exposure-limit-minor", required=True, type=int)
+    paper_cmd.add_argument("--currency", default="USD")
+    paper_cmd.add_argument("--strategy-release")
+    paper_cmd.add_argument("--instrument-rules-digest", default="btc-usdt-spot-v1")
+    paper_cmd.add_argument("--fee-bps", type=int, default=4)
+    paper_cmd.add_argument("--slippage-bps", type=int, default=2)
+
+    live_cand_cmd = commands.add_parser(
+        "register-live-candidate",
+        help="Register a dormant Tier 3 company_live candidate binding with an opaque host credential handle",
+    )
+    live_cand_cmd.add_argument("store", type=Path)
+    live_cand_cmd.add_argument("--company-id", required=True)
+    live_cand_cmd.add_argument("--lease-dir", type=Path)
+    live_cand_cmd.add_argument("--binding-id", required=True)
+    live_cand_cmd.add_argument("--account-id", required=True)
+    live_cand_cmd.add_argument("--destination-id", required=True)
+    live_cand_cmd.add_argument("--connector-revision", default="binance-rest-v1")
+    live_cand_cmd.add_argument("--instrument-rules-digest", required=True)
+    live_cand_cmd.add_argument("--starting-minor", required=True, type=int)
+    live_cand_cmd.add_argument("--exposure-limit-minor", required=True, type=int)
+    live_cand_cmd.add_argument("--credential-handle", required=True)
+    live_cand_cmd.add_argument("--currency", default="USD")
+    live_cand_cmd.add_argument("--fee-bps", type=int, default=4)
+
+    qual_cmd = commands.add_parser(
+        "qualify-live-venue",
+        help="Run external_test venue qualification (emulator or live Binance Testnet) and seal a receipt",
+    )
+    qual_cmd.add_argument("store", type=Path)
+    qual_cmd.add_argument("--company-id", required=True)
+    qual_cmd.add_argument("--lease-dir", type=Path)
+    qual_cmd.add_argument("--instrument-rules-digest", required=True)
+    qual_cmd.add_argument(
+        "--mode", choices=("emulator", "binance-testnet"), default="emulator"
+    )
+    qual_cmd.add_argument(
+        "--market", choices=(MARKET_SPOT, MARKET_USDM_FUTURES), default=MARKET_SPOT
+    )
+    qual_cmd.add_argument("--symbol", default="BTCUSDT")
+    qual_cmd.add_argument("--account-id", default="binance-testnet-qual")
+    qual_cmd.add_argument("--destination-id", default="binance-spot-testnet")
+    qual_cmd.add_argument("--credential-handle", default="envref:BINANCE_TESTNET")
+    qual_cmd.add_argument("--receipt-id")
+
+    sched_cmd = commands.add_parser(
+        "arm-trading-schedule",
+        help="Register standing autonomous trading responsibilities and arm initial wake timers",
+    )
+    sched_cmd.add_argument("store", type=Path)
+    sched_cmd.add_argument("--company-id", required=True)
+    sched_cmd.add_argument("--lease-dir", type=Path)
+    sched_cmd.add_argument("--agent-id", required=True)
+    sched_cmd.add_argument("--decision-delay", type=int, default=300)
+    sched_cmd.add_argument("--reconcile-delay", type=int, default=60)
+    sched_cmd.add_argument(
+        "--enqueue-now",
+        action="store_true",
+        help="Also enqueue an immediate due quant.paper_decision shift",
+    )
 
 
 def handle_trading_cli_command(args: argparse.Namespace) -> int | None:
@@ -204,9 +329,13 @@ def handle_trading_cli_command(args: argparse.Namespace) -> int | None:
         return _dispatch_trading_command(args)
     except (
         BindingRefused,
+        CredentialRefused,
         DutyRefused,
         EngineRefused,
         ExecutionTierRefused,
+        ExternalEnvironmentMismatch,
+        ExternalOrderReplyUnknown,
+        ExternalVenueRefused,
         MarketRefused,
         QuoteRefused,
         ReturnRefused,
@@ -214,6 +343,7 @@ def handle_trading_cli_command(args: argparse.Namespace) -> int | None:
         ValuationRefused,
         VenueRefused,
         WindowRefused,
+        WorkKernelRefused,
     ) as error:
         raise DomainCliRefused(str(error)) from error
 
@@ -303,13 +433,252 @@ def _dispatch_trading_command(args: argparse.Namespace) -> int:
             if args.quote_source
             else None
         )
-        with hold_company_writer(args.store, args.company_id) as writer:
+        resolver = (
+            build_default_live_venue_resolver(args.store, args.company_id)
+            if args.live_reconcile
+            else None
+        )
+        with hold_company_writer(
+            args.store, args.company_id, lease_directory=args.lease_dir
+        ) as writer:
             summary = reconcile_trading_books(
                 writer,
                 quote_provider=provider,
+                live_venue_resolver=resolver,
                 max_quote_age_ns=args.max_quote_age_seconds * 10**9,
             )
         print(json.dumps(summary, sort_keys=True))
+        return 0
+    elif args.command == "enable-trading-domain":
+        with hold_company_writer(
+            args.store, args.company_id, lease_directory=args.lease_dir
+        ) as writer:
+            with closing(open_writer(args.store, lease=writer)) as db, write_tx(db):
+                installed_now = enable_domain_v1(
+                    db,
+                    "trading",
+                    company_id=args.company_id,
+                    actor_id="operator_cli",
+                )
+        print(
+            json.dumps(
+                {
+                    "company_id": args.company_id,
+                    "domain": "trading",
+                    "installed_now": installed_now,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    elif args.command == "open-paper-book":
+        with hold_company_writer(
+            args.store, args.company_id, lease_directory=args.lease_dir
+        ) as writer:
+            binding = open_company_paper_book(
+                writer,
+                account_id=args.account_id,
+                book_name=args.book_name,
+                strategy_release_id=args.strategy_release,
+                instrument_rules_digest=args.instrument_rules_digest,
+                currency=args.currency,
+                starting_minor_units=args.starting_minor,
+                exposure_limit_minor_units=args.exposure_limit_minor,
+                fee_bps=args.fee_bps,
+                slippage_bps=args.slippage_bps,
+            )
+        print(json.dumps(asdict(binding), sort_keys=True))
+        return 0
+    elif args.command == "register-live-candidate":
+        with hold_company_writer(
+            args.store, args.company_id, lease_directory=args.lease_dir
+        ) as writer:
+            binding = register_live_candidate_binding(
+                writer,
+                binding_id=args.binding_id,
+                account_id=args.account_id,
+                destination_id=args.destination_id,
+                connector_revision=args.connector_revision,
+                instrument_rules_digest=args.instrument_rules_digest,
+                currency=args.currency,
+                starting_minor_units=args.starting_minor,
+                exposure_limit_minor_units=args.exposure_limit_minor,
+                credential_handle_ref=args.credential_handle,
+                fee_bps=args.fee_bps,
+            )
+        print(json.dumps(asdict(binding), sort_keys=True))
+        return 0
+    elif args.command == "qualify-live-venue":
+        with hold_company_writer(
+            args.store, args.company_id, lease_directory=args.lease_dir
+        ) as writer:
+            if args.mode == "emulator":
+                emu_key = f"qual-key-{uuid4().hex[:8]}"
+                emu_secret = f"qual-sec-{uuid4().hex[:12]}"
+                emu_handle = "envref:BINANCE_TESTNET_EMU"
+                emulator = BinanceWireEmulator(
+                    api_key=emu_key,
+                    api_secret=emu_secret,
+                    starting_usdt=Decimal("500000"),
+                    fee_bps=4,
+                    max_order_notional=Decimal("100000"),
+                )
+                emulator.start()
+                try:
+                    adapter = BinanceVenueAdapter(
+                        BinanceVenueConfig(
+                            environment=ENV_EXTERNAL_TEST,
+                            market_kind=args.market,
+                            account_id=args.account_id,
+                            destination_id=args.destination_id,
+                            credential_handle_ref=emu_handle,
+                            base_url_override=emulator.base_url,
+                            allow_loopback_override=True,
+                        ),
+                        InMemoryTestCredentialProvider(
+                            {emu_handle: (emu_key, emu_secret)}
+                        ),
+                    )
+                    report = run_binance_testnet_qualification(
+                        writer,
+                        adapter=adapter,
+                        emulator=emulator,
+                        instrument_rules_digest=args.instrument_rules_digest,
+                        symbol=args.symbol,
+                        receipt_id=args.receipt_id,
+                    )
+                finally:
+                    emulator.stop()
+            else:
+                adapter = BinanceVenueAdapter(
+                    BinanceVenueConfig(
+                        environment=ENV_EXTERNAL_TEST,
+                        market_kind=args.market,
+                        account_id=args.account_id,
+                        destination_id=args.destination_id,
+                        credential_handle_ref=args.credential_handle,
+                    ),
+                    CompositeCredentialProvider(),
+                )
+                report = run_live_binance_testnet_qualification(
+                    writer,
+                    adapter=adapter,
+                    instrument_rules_digest=args.instrument_rules_digest,
+                    symbol=args.symbol,
+                    receipt_id=args.receipt_id,
+                )
+        payload = {
+            "mode": args.mode,
+            "receipt": asdict(report.receipt),
+            "cases": [asdict(c) for c in report.cases],
+        }
+        print(json.dumps(payload, sort_keys=True))
+        return 0 if report.receipt.verdict == "PASS" else 1
+    elif args.command == "arm-trading-schedule":
+        if not 60 <= args.decision_delay <= 86400:
+            raise ExecutionTierRefused(
+                "--decision-delay must be between 60 and 86400 seconds"
+            )
+        if not 15 <= args.reconcile_delay <= 86400:
+            raise ExecutionTierRefused(
+                "--reconcile-delay must be between 15 and 86400 seconds"
+            )
+        now = time_ns()
+        with hold_company_writer(
+            args.store, args.company_id, lease_directory=args.lease_dir
+        ) as writer:
+            with closing(open_writer(args.store, lease=writer)) as db, write_tx(db):
+                enable_domain_v1(
+                    db,
+                    "trading",
+                    company_id=args.company_id,
+                    actor_id="operator_cli",
+                )
+                armed: list[dict[str, object]] = []
+                for duty_kind, delay_sec in (
+                    ("quant.paper_decision", args.decision_delay),
+                    ("quant.reconcile", args.reconcile_delay),
+                ):
+                    row = db.execute(
+                        """SELECT responsibility_id FROM work_responsibilities
+                           WHERE company_id = ? AND owner_agent_id = ?
+                             AND duty_kind = ? AND status = 'active'
+                           LIMIT 1""",
+                        (args.company_id, args.agent_id, duty_kind),
+                    ).fetchone()
+                    if row is not None:
+                        resp_id = str(row[0])
+                    else:
+                        resp = register_responsibility(
+                            db,
+                            company_id=args.company_id,
+                            owner_agent_id=args.agent_id,
+                            duty_kind=duty_kind,
+                            remit=f"Standing operator trading shift ({duty_kind})",
+                            readable_scope=["trading_books", "market_quotes"],
+                            now_ns=now,
+                        )
+                        resp_id = resp.responsibility_id
+                    # Cancel any prior armed timer for this responsibility so re-arming updates cleanly.
+                    prior_timers = db.execute(
+                        """SELECT condition_id FROM work_conditions
+                           WHERE company_id = ? AND owner_agent_id = ?
+                             AND responsibility_id = ? AND trigger_kind = 'timer'
+                             AND status = 'armed'""",
+                        (args.company_id, args.agent_id, resp_id),
+                    ).fetchall()
+                    for (old_cid,) in prior_timers:
+                        cancel_condition(
+                            db,
+                            company_id=args.company_id,
+                            condition_id=str(old_cid),
+                            actor_id="operator_cli",
+                            now_ns=now,
+                        )
+                    delay_ns = delay_sec * 1_000_000_000
+                    cond = set_condition(
+                        db,
+                        company_id=args.company_id,
+                        owner_agent_id=args.agent_id,
+                        responsibility_id=resp_id,
+                        trigger_kind="timer",
+                        due_at_ns=now + delay_ns,
+                        cooldown_ns=delay_ns,
+                        now_ns=now,
+                    )
+                    armed.append(
+                        {
+                            "duty_kind": duty_kind,
+                            "responsibility_id": resp_id,
+                            "condition_id": cond.condition_id,
+                            "due_at_ns": cond.due_at_ns,
+                            "interval_seconds": delay_sec,
+                        }
+                    )
+                immediate_work_id: str | None = None
+                if args.enqueue_now:
+                    item, _created = create_work_item(
+                        db,
+                        company_id=args.company_id,
+                        owner_agent_id=args.agent_id,
+                        duty_kind="quant.paper_decision",
+                        source_kind="schedule",
+                        source_id="operator-arm-now",
+                        dedupe_key=f"operator-arm-{uuid4().hex[:12]}",
+                        now_ns=now,
+                    )
+                    immediate_work_id = item.work_item_id
+        print(
+            json.dumps(
+                {
+                    "company_id": args.company_id,
+                    "agent_id": args.agent_id,
+                    "armed_conditions": armed,
+                    "immediate_work_item_id": immediate_work_id,
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     else:
         raise DomainCliRefused(f"Unsupported trading CLI command: {args.command}")

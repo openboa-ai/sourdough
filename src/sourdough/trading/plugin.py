@@ -40,8 +40,12 @@ from .commands import (
     DEMOTE_LIVE_ENVIRONMENT,
     DEMOTE_PRECONDITION_KEYS,
     EXECUTION_TIER_COMMAND,
+    OPEN_COMPANY_PAPER_BOOK,
+    OPEN_PAPER_BOOK_PRECONDITION_KEYS,
     PROMOTE_EXECUTION_ENVIRONMENT,
     PROMOTE_PRECONDITION_KEYS,
+    RECONCILE_TRADING_BOOKS,
+    RECONCILE_TRADING_PRECONDITION_KEYS,
     ROLLBACK_PRECONDITION_KEYS,
     ROLLBACK_STRATEGY_DEPLOYMENT,
     STRATEGY_COMMAND,
@@ -55,7 +59,7 @@ from .company_tools import (
     READ_TRADING_BOOKS_SPEC,
     read_trading_books_summary,
 )
-from .domain import ENV_LIVE, ENV_PAPER, ExecutionTierRefused
+from .domain import ENV_EXTERNAL_TEST, ENV_LIVE, ENV_PAPER, ExecutionTierRefused
 from .duty import TRADING_WORK_POLICY, has_trading_committed_result
 from .external_venue import ExternalVenueAdapter
 from .migration import execute_paper_to_live_migration, read_execution_tiers_snapshot
@@ -81,6 +85,7 @@ from .risk import (
     active_trading_risk_restrictions,
 )
 from .sandbox_tools import AgentSandboxTools
+from .venue_resolver import build_default_live_venue_resolver
 
 DUTY_QUANT_AGENT_SANDBOX = "quant.agent_sandbox"
 DUTY_TRADING_AGENT_SANDBOX = "trading.agent_sandbox"
@@ -157,6 +162,47 @@ _SANDBOX_TOOL_SPECS: tuple[ToolSpec, ...] = (
 def _read_tiers(store: Path, company_id: str) -> dict[str, Any]:
     with closing(open_reader(store)) as db, read_tx(db):
         return read_execution_tiers_snapshot(db, company_id)
+
+
+def _recurring_timer_next_condition(
+    store: Path,
+    company_id: str,
+    owner_agent_id: str,
+    payload: Mapping[str, Any],
+    now_ns: int,
+) -> dict[str, Any] | None:
+    """Return a successor timer condition when a scheduled standing trading timer completes."""
+    cond_id = payload.get("condition_id")
+    if not isinstance(cond_id, str) or not cond_id.strip():
+        return None
+    with closing(open_reader(store)) as db, read_tx(db):
+        row = db.execute(
+            """SELECT c.cooldown_ns, c.responsibility_id
+               FROM work_conditions c
+               JOIN work_responsibilities r
+                 ON r.company_id = c.company_id
+                AND r.responsibility_id = c.responsibility_id
+               WHERE c.company_id = ?
+                 AND c.condition_id = ?
+                 AND c.trigger_kind = 'timer'
+                 AND c.cooldown_ns > 0
+                 AND r.owner_agent_id = ?
+                 AND r.status = 'active'
+               LIMIT 1""",
+            (company_id, cond_id.strip(), owner_agent_id),
+        ).fetchone()
+    if row is None:
+        return None
+    interval_ns = int(row[0])
+    resp_id = str(row[1])
+    if interval_ns <= 0:
+        return None
+    return {
+        "trigger_kind": "timer",
+        "responsibility_id": resp_id,
+        "due_at_ns": now_ns + interval_ns,
+        "cooldown_ns": interval_ns,
+    }
 
 
 def _no_trading_risk_restriction(
@@ -423,15 +469,42 @@ class TradingDomainPlugin(BaseDomainPlugin):
         *,
         quote_provider: MarketQuoteProvider | None = None,
         live_venue_resolver: Callable[[str], ExternalVenueAdapter | None] | None = None,
+        auto_resolve_live_venues: bool = False,
+        live_venue_environment: str | None = None,
         max_quote_age_ns: int = 60 * 10**9,
     ) -> None:
         if quote_provider is None:
             env_spec = os.environ.get("SOURDOUGH_TRADING_QUOTE_SOURCE", "").strip()
             if env_spec:
                 quote_provider = build_quote_provider_from_spec(env_spec)
+        env_live = (
+            live_venue_environment
+            if live_venue_environment is not None
+            else os.environ.get("SOURDOUGH_TRADING_LIVE_ENV", "").strip().lower()
+        )
+        if env_live and env_live not in (ENV_LIVE, ENV_EXTERNAL_TEST):
+            raise ExecutionTierRefused(
+                f"SOURDOUGH_TRADING_LIVE_ENV must be '{ENV_LIVE}' or '{ENV_EXTERNAL_TEST}'"
+            )
         self._quote_provider = quote_provider
         self._live_venue_resolver = live_venue_resolver
+        self._auto_resolve_live_venues = auto_resolve_live_venues or bool(env_live)
+        self._default_live_env = env_live or ENV_LIVE
         self._max_quote_age_ns = max_quote_age_ns
+
+    def _effective_live_venue_resolver(
+        self, store: Path, company_id: str, *, for_recovery: bool = False
+    ) -> Callable[[str], ExternalVenueAdapter | None] | None:
+        if self._live_venue_resolver is not None:
+            return self._live_venue_resolver
+        if self._auto_resolve_live_venues:
+            return build_default_live_venue_resolver(
+                store,
+                company_id,
+                environment=self._default_live_env,
+                allow_recovery_statuses=for_recovery,
+            )
+        return None
 
     def work_policy(self) -> WorkDomainPolicy:
         return TRADING_WORK_POLICY
@@ -556,7 +629,9 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 agent_id=agent_id,
                 run_id=ctx.run.run_id,
                 quote_provider=self._quote_provider,
-                live_venue_resolver=self._live_venue_resolver,
+                live_venue_resolver=self._effective_live_venue_resolver(
+                    ctx.writer.store, ctx.company_id
+                ),
                 max_quote_age_ns=self._max_quote_age_ns,
             )
             broker_handlers: dict[str, Any] = {
@@ -594,6 +669,13 @@ class TradingDomainPlugin(BaseDomainPlugin):
             result = run_res.shift_result
             settlement = run_res.settlement
             sbx_out_bytes = result.output_text.strip().encode("utf-8")
+            next_cond = _recurring_timer_next_condition(
+                ctx.writer.store,
+                ctx.company_id,
+                agent_id,
+                payload if isinstance(payload, Mapping) else {},
+                ctx.now_ns,
+            )
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -606,17 +688,31 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "cost_minor_units": settlement.cost_minor_units,
                     "journal_entry_id": settlement.journal_entry_id,
                 },
+                next_condition=next_cond,
             )
 
         def _run_quant_reconcile(ctx: DutyContext) -> DutyOutcome:
+            try:
+                raw_payload = json.loads(ctx.work_item.payload_json or "{}")
+            except json.JSONDecodeError:
+                raw_payload = {}
             reconcile_summary = reconcile_trading_books(
                 ctx.writer,
                 quote_provider=self._quote_provider,
-                live_venue_resolver=self._live_venue_resolver,
+                live_venue_resolver=self._effective_live_venue_resolver(
+                    ctx.writer.store, ctx.company_id, for_recovery=True
+                ),
                 max_quote_age_ns=self._max_quote_age_ns,
                 now_ns=ctx.now_ns,
             )
             snapshot = _read_tiers(ctx.writer.store, ctx.company_id)
+            next_cond = _recurring_timer_next_condition(
+                ctx.writer.store,
+                ctx.company_id,
+                ctx.work_item.owner_agent_id,
+                raw_payload if isinstance(raw_payload, Mapping) else {},
+                ctx.now_ns,
+            )
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -633,6 +729,7 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "drift_detected": reconcile_summary["drift_detected"],
                     "restrictions_applied": reconcile_summary["restrictions_applied"],
                 },
+                next_condition=next_cond,
             )
 
         return (
@@ -732,6 +829,12 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 authorize=ctx.authorize_board,
                 principal_hint=ctx.principal_hint,
                 peer_pid=ctx.peer_pid,
+                quote_provider=self._quote_provider,
+                live_venue_resolver=self._effective_live_venue_resolver(
+                    ctx.writer.store,
+                    ctx.writer.company_id,
+                    for_recovery=(ctx.command_type == RECONCILE_TRADING_BOOKS),
+                ),
             )
 
         return (
@@ -760,6 +863,20 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 contract_version=EXECUTION_TIER_COMMAND,
                 execute=_exec_tier,
                 precondition_keys=DEMOTE_PRECONDITION_KEYS,
+                requires_domain="trading",
+            ),
+            CommandDescriptor(
+                command_type=OPEN_COMPANY_PAPER_BOOK,
+                contract_version=EXECUTION_TIER_COMMAND,
+                execute=_exec_tier,
+                precondition_keys=OPEN_PAPER_BOOK_PRECONDITION_KEYS,
+                requires_domain="trading",
+            ),
+            CommandDescriptor(
+                command_type=RECONCILE_TRADING_BOOKS,
+                contract_version=EXECUTION_TIER_COMMAND,
+                execute=_exec_tier,
+                precondition_keys=RECONCILE_TRADING_PRECONDITION_KEYS,
                 requires_domain="trading",
             ),
         )
