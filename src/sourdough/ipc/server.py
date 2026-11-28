@@ -63,7 +63,9 @@ from ..storage.schema import installed_domains
 from ..work_projection import read_local_board_timeline_with_seq
 from ..writer_lease import WriterLease, WriterRefused, hold_company_writer
 from .projections import (
+    AUDIT_ONE_AGENT_ENTITY_TYPES,
     CORE_CLIENT_PROJECTIONS,
+    load_one_agent_method_sets,
     projection_etag,
     read_agent_detail_projection,
     read_agents_graph_projection,
@@ -75,6 +77,7 @@ from .projections import (
     read_system_audit_projection,
     read_system_evals_projection,
     read_system_safety_projection,
+    redact_audit_entity_id_for_board,
 )
 from .protocol import (
     CONTROL_PLANE_VERSION,
@@ -944,13 +947,24 @@ class CompanyDaemon:
                    LIMIT ?""",
                 (self._company_id, after_seq, limit),
             ).fetchall()
+            if any(str(row[3]) in AUDIT_ONE_AGENT_ENTITY_TYPES for row in rows):
+                one_agent_deltas, one_agent_mids = load_one_agent_method_sets(
+                    db, self._company_id
+                )
+            else:
+                one_agent_deltas, one_agent_mids = set(), set()
         return [
             {
                 "event_seq": int(row[0]),
                 "company_id": row[1],
                 "domain": row[2],
                 "entity_type": row[3],
-                "entity_id": row[4],
+                "entity_id": redact_audit_entity_id_for_board(
+                    str(row[3]),
+                    str(row[4]),
+                    one_agent_deltas=one_agent_deltas,
+                    one_agent_mids=one_agent_mids,
+                ),
                 "event_type": row[5],
                 "recorded_at_ns": int(row[6]),
             }

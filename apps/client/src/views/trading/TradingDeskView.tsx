@@ -1401,7 +1401,9 @@ export function TradingDeskView({ mode }: { mode: "live" | "paper" }) {
                     : "sd-tone-neg"
               }`}
             >
-              {port.return_pct === null ? "0.00%" : formatSignedPct(port.return_pct)}
+              {port.return_pct === null
+                ? "Unavailable"
+                : formatSignedPct(port.return_pct)}
             </Text>
             <Text variant="meta">{port.source}</Text>
           </Inline>

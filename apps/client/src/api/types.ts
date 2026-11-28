@@ -315,7 +315,10 @@ export interface AgentDetailProjection {
       recipient_name: string;
       asset_id: string;
       expected_result: string;
+      state: "offered" | "accepted" | "declined" | "expired" | "withdrawn" | string;
       accepted: boolean;
+      expires_at: number;
+      successor_work_item_id: string | null;
     }>;
   };
 }
