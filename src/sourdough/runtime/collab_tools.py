@@ -4,19 +4,16 @@ from __future__ import annotations
 
 import json
 import threading
-from contextlib import closing, nullcontext
 from hashlib import sha256
-from time import time_ns
 from typing import Any
 from uuid import uuid4
 
-from ..agent_desk import require_desk
-from ..agent_runtime.protocol import ToolHandler, ToolSpec
+from ..agent_runtime.protocol import ToolFlowClass, ToolHandler, ToolSpec
 from ..company_assets import shared_asset_for
 from ..conversation_delivery import acknowledge_delivery, read_inbox
 from ..conversations import Post, append_message, read_messages
 from ..duty_run import DutyRefused, WorkRunClaim
-from ..storage.db import open_reader, open_writer, read_tx, write_tx
+from ..storage.db import scoped_reader
 from ..work_handoff import (
     HandoffOffer,
     accept_handoff,
@@ -26,46 +23,23 @@ from ..work_handoff import (
 )
 from ..writer_lease import WriterLease
 from .domains import ToolContribution
+from .tool_kit import (
+    FencedToolBase,
+    optional_str as _optional_str,
+    require_int as _require_int,
+    require_object as _require_object,
+    require_str as _require_str,
+)
 from .work_kernel import (
     _PEER_REQUEST_COLUMNS,
     PeerRequest,
     WorkKernelRefused,
-    assert_run_fencing,
     open_peer_request,
     resolve_peer_request,
 )
 
 
 _MAX_EXPIRES_AT_SECONDS = (2**63 - 1) // 1_000_000_000
-
-
-def _require_object(
-    args: Any, *, allowed: set[str], required: set[str], label: str
-) -> dict[str, Any]:
-    if not isinstance(args, dict):
-        raise DutyRefused(f"{label} arguments must be a JSON object")
-    keys = set(args.keys())
-    if not required <= keys or not keys <= allowed:
-        raise DutyRefused(f"{label} arguments do not match schema")
-    return args
-
-
-def _require_str(value: Any, label: str, *, max_len: int = 128) -> str:
-    if not isinstance(value, str) or not value.strip() or len(value) > max_len:
-        raise DutyRefused(f"{label} must be a nonempty string")
-    return value
-
-
-def _optional_str(value: Any, label: str, *, max_len: int = 128) -> str | None:
-    if value is None:
-        return None
-    return _require_str(value, label, max_len=max_len)
-
-
-def _require_int(value: Any, label: str, *, minimum: int = 0) -> int:
-    if type(value) is not int or value < minimum or value >= 2**63:
-        raise DutyRefused(f"{label} must be a valid integer")
-    return value
 
 
 def build_core_collab_tool_contribution(
@@ -82,20 +56,11 @@ def build_core_collab_tool_contribution(
     scoped_project_id: str | None = None,
 ) -> ToolContribution:
     """Build Core collaboration OuterToolBroker tools fenced to WorkRunClaim."""
-    lock_ctx = tx_lock if tx_lock is not None else nullcontext()
-
-    def _now_ns() -> int:
-        ts = claim.current_now_ns()
-        return time_ns() if ts is None else int(ts)
-
-    def _now_sec() -> int:
-        return max(0, _now_ns() // 1_000_000_000)
-
-    def _verify_fencing() -> None:
-        with closing(open_reader(writer.store)) as db, read_tx(db):
-            assert_run_fencing(
-                db, claim.run_id, claim.fencing_token, now_ns=claim.current_now_ns()
-            )
+    kit = FencedToolBase(writer=writer, claim=claim, purpose=purpose, tx_lock=tx_lock)
+    lock_ctx = kit.lock_ctx()
+    _now_ns = kit.now_ns
+    _now_sec = kit.now_sec
+    _verify_fencing = kit.verify_fencing
 
     def _append_message(args: dict[str, Any]) -> dict[str, Any]:
         obj = _require_object(
@@ -133,7 +98,7 @@ def build_core_collab_tool_contribution(
             asset_id=raw_asset,
         )
         with lock_ctx:
-            with closing(open_reader(writer.store)) as db, read_tx(db):
+            with scoped_reader(writer.store) as db:
                 exact_prior = db.execute(
                     """SELECT 1 FROM project_message
                        WHERE company_id = ? AND project_id = ?
@@ -250,7 +215,7 @@ def build_core_collab_tool_contribution(
         )
         with lock_ctx:
             if scoped_project_id is not None:
-                with closing(open_reader(writer.store)) as db, read_tx(db):
+                with scoped_reader(writer.store) as db:
                     proj_row = db.execute(
                         """SELECT m.project_id FROM project_delivery d
                            JOIN project_message m ON m.message_id = d.message_id
@@ -329,12 +294,9 @@ def build_core_collab_tool_contribution(
 
         now_ns = _now_ns()
         deadline_ns = expires_at * 1_000_000_000
-        with (
-            lock_ctx,
-            closing(open_writer(writer.store, lease=writer)) as db,
-            write_tx(db),
-        ):
-            require_desk(db, claim, purpose)
+        with kit.fenced_write_uow(
+            verify_desk=True, verify_fencing=False, verify_writer=False
+        ) as db:
             if isinstance(raw_asset_id, str) and raw_asset_id.strip():
                 asset_id = raw_asset_id.strip()
                 asset = shared_asset_for(db, claim.founder_id, asset_id)
@@ -395,12 +357,9 @@ def build_core_collab_tool_contribution(
             refs = list(raw_refs)
 
         now_ns = _now_ns()
-        with (
-            lock_ctx,
-            closing(open_writer(writer.store, lease=writer)) as db,
-            write_tx(db),
-        ):
-            require_desk(db, claim, purpose)
+        with kit.fenced_write_uow(
+            verify_desk=True, verify_fencing=False, verify_writer=False
+        ) as db:
             row = db.execute(
                 f"""SELECT {_PEER_REQUEST_COLUMNS}
                     FROM work_peer_requests
@@ -569,8 +528,7 @@ def build_core_collab_tool_contribution(
         include_archived = obj.get("include_archived", False)
         if type(include_archived) is not bool:
             raise DutyRefused("include_archived must be a boolean")
-        _verify_fencing()
-        with closing(open_reader(writer.store)) as db, read_tx(db):
+        with kit.fenced_reader() as db:
             agent_rows = db.execute(
                 """SELECT a.id,
                           COALESCE(p.display_name, a.id),
@@ -636,6 +594,8 @@ def build_core_collab_tool_contribution(
         properties: dict[str, Any],
         required: list[str],
         handler: ToolHandler,
+        *,
+        flow_class: ToolFlowClass = "neutral",
     ) -> None:
         specs.append(
             ToolSpec(
@@ -647,6 +607,7 @@ def build_core_collab_tool_contribution(
                     "required": required,
                     "additionalProperties": False,
                 },
+                flow_class=flow_class,
             )
         )
         handlers[name] = handler
@@ -665,6 +626,7 @@ def build_core_collab_tool_contribution(
             },
             ["project_id", "project_revision", "request_id", "body"],
             _append_message,
+            flow_class="peer_outbound",
         )
         _add(
             "read_messages",
@@ -676,6 +638,7 @@ def build_core_collab_tool_contribution(
             },
             ["project_id"],
             _read_messages,
+            flow_class="peer_input",
         )
         _add(
             "read_inbox",
@@ -683,6 +646,7 @@ def build_core_collab_tool_contribution(
             {"after": {"type": "string"}},
             [],
             _read_inbox,
+            flow_class="peer_input",
         )
         _add(
             "acknowledge_delivery",
@@ -721,6 +685,7 @@ def build_core_collab_tool_contribution(
                 "expires_at",
             ],
             _request_peer_response,
+            flow_class="peer_outbound",
         )
 
     if include_peer_respond:
@@ -734,6 +699,7 @@ def build_core_collab_tool_contribution(
             },
             ["outcome", "answer"],
             _respond_peer_request,
+            flow_class="peer_outbound",
         )
 
     if include_handoffs:
@@ -758,6 +724,7 @@ def build_core_collab_tool_contribution(
                 "expected_result",
             ],
             _offer_handoff,
+            flow_class="peer_outbound",
         )
         _add(
             "discover_handoffs",
@@ -765,6 +732,7 @@ def build_core_collab_tool_contribution(
             {},
             [],
             _discover_handoffs,
+            flow_class="peer_input",
         )
         _add(
             "accept_handoff",
@@ -785,6 +753,7 @@ def build_core_collab_tool_contribution(
             },
             ["offer_id"],
             _decline_handoff,
+            flow_class="peer_outbound",
         )
 
     if include_roster:

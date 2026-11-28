@@ -13,12 +13,10 @@ import os
 import stat
 import threading
 from collections.abc import Callable
-from contextlib import closing, nullcontext
 from pathlib import PurePosixPath
-from time import time_ns
 from typing import Any
 
-from ..agent_desk import desk_directory, require_desk
+from ..agent_desk import desk_directory
 from ..agent_runtime.protocol import ToolHandler, ToolSpec, assign_skill_slugs
 from ..duty_run import DutyRefused, WorkRunClaim
 from ..method_learning import (
@@ -29,11 +27,15 @@ from ..method_learning import (
     resolve_active_methods,
     skill_precedence_key,
 )
-from ..storage.db import open_reader, read_tx
 from ..writer_lease import WriterLease
-from .collab_tools import _optional_str, _require_object, _require_str
 from .domains import ToolContribution
-from .work_kernel import WorkKernelRefused, assert_run_fencing
+from .tool_kit import (
+    FencedToolBase,
+    optional_str as _optional_str,
+    require_object as _require_object,
+    require_str as _require_str,
+)
+from .work_kernel import WorkKernelRefused
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
@@ -48,17 +50,9 @@ def build_core_skill_tool_contribution(
     tx_lock: threading.RLock | None = None,
 ) -> ToolContribution:
     """Build safe OuterToolBroker tools for reading active Skills and drafting candidates."""
-    lock_ctx = tx_lock if tx_lock is not None else nullcontext()
-
-    def _now_ns() -> int:
-        ts = claim.current_now_ns()
-        return time_ns() if ts is None else int(ts)
-
-    def _verify_fencing_and_desk(db: Any) -> None:
-        assert_run_fencing(
-            db, claim.run_id, claim.fencing_token, now_ns=claim.current_now_ns()
-        )
-        require_desk(db, claim, claim.purpose)
+    kit = FencedToolBase(writer=writer, claim=claim, tx_lock=tx_lock)
+    lock_ctx = kit.lock_ctx()
+    _now_ns = kit.now_ns
 
     def _read_projected_skill_markdown(
         slug: str, method: Any, *, allow_disk: bool = True
@@ -96,9 +90,7 @@ def build_core_skill_tool_contribution(
             label="skill_list_active",
         )
         duty_filter = _optional_str(obj.get("duty_kind"), "duty_kind")
-        writer.verify_for(writer.store, claim.company_id)
-        with closing(open_reader(writer.store)) as db, read_tx(db):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_reader(verify_desk=True, verify_writer=True) as db:
             all_methods = resolve_active_methods(
                 db,
                 claim.company_id,
@@ -157,9 +149,7 @@ def build_core_skill_tool_contribution(
                 )
             slug_filter = posix.parts[1]
 
-        writer.verify_for(writer.store, claim.company_id)
-        with closing(open_reader(writer.store)) as db, read_tx(db):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_reader(verify_desk=True, verify_writer=True) as db:
             methods = resolve_active_methods(
                 db,
                 claim.company_id,
@@ -302,9 +292,7 @@ def build_core_skill_tool_contribution(
         )
         method_id = _require_str(obj["method_id"], "method_id")
         note = _optional_str(obj.get("note"), "note", max_len=1000)
-        writer.verify_for(writer.store, claim.company_id)
-        with closing(open_reader(writer.store)) as db, read_tx(db):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_reader(verify_desk=True, verify_writer=True) as db:
             methods = resolve_active_methods(
                 db,
                 claim.company_id,
@@ -334,6 +322,7 @@ def build_core_skill_tool_contribution(
                 "required": [],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_read",
         ),
         ToolSpec(
             name="skill_read",
@@ -348,6 +337,7 @@ def build_core_skill_tool_contribution(
                 "required": [],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_read",
         ),
         ToolSpec(
             name="skill_draft_candidate",
@@ -403,6 +393,7 @@ def build_core_skill_tool_contribution(
                 ],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_write",
         ),
         ToolSpec(
             name="skill_record_invocation",
@@ -416,6 +407,7 @@ def build_core_skill_tool_contribution(
                 "required": ["method_id"],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_write",
         ),
     )
     handlers: dict[str, ToolHandler] = {

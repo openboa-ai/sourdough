@@ -5,29 +5,26 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Sequence
-from contextlib import closing, nullcontext
-from time import time_ns
 from typing import Any
 
-from ..agent_desk import require_desk
 from ..agent_runtime.protocol import ToolHandler, ToolSpec
 from ..duty_run import DutyRefused, WorkRunClaim
-from ..storage.db import open_reader, open_writer, read_tx, write_tx
 from ..writer_lease import WriterLease
-from .collab_tools import (
-    _optional_str,
-    _require_int,
-    _require_object,
-    _require_str,
-)
 from .domains import DomainPlugin, ToolContribution
+from .tool_kit import (
+    FencedToolBase,
+    optional_int as _optional_int,
+    optional_str as _optional_str,
+    require_int as _require_int,
+    require_object as _require_object,
+    require_str as _require_str,
+)
 from .work_kernel import (
     WORK_DECISION_ACTION_KINDS,
     DecisionEvidence,
     WorkCondition,
     WorkKernelRefused,
     arm_result_continuation,
-    assert_run_fencing,
     cancel_condition,
     list_conditions,
     opaque_decision_action_id,
@@ -36,12 +33,6 @@ from .work_kernel import (
     set_condition,
     validate_next_condition_dict,
 )
-
-
-def _optional_int(value: Any, label: str, *, minimum: int = 0) -> int | None:
-    if value is None:
-        return None
-    return _require_int(value, label, minimum=minimum)
 
 
 def _serialize_condition(cond: WorkCondition) -> dict[str, Any]:
@@ -79,17 +70,8 @@ def build_core_proactive_tool_contribution(
     active_snapshot_id: str | None = None,
 ) -> ToolContribution:
     """Build Core proactive condition-scheduling and decision OuterToolBroker tools."""
-    lock_ctx = tx_lock if tx_lock is not None else nullcontext()
-
-    def _now_ns() -> int:
-        ts = claim.current_now_ns()
-        return time_ns() if ts is None else int(ts)
-
-    def _verify_fencing_and_desk(db: Any) -> None:
-        assert_run_fencing(
-            db, claim.run_id, claim.fencing_token, now_ns=claim.current_now_ns()
-        )
-        require_desk(db, claim, claim.purpose)
+    kit = FencedToolBase(writer=writer, claim=claim, tx_lock=tx_lock)
+    _now_ns = kit.now_ns
 
     def _list_conditions(args: dict[str, Any]) -> dict[str, Any]:
         obj = _require_object(
@@ -99,9 +81,7 @@ def build_core_proactive_tool_contribution(
             label="list_conditions",
         )
         status_filter = _optional_str(obj.get("status"), "status")
-        writer.verify_for(writer.store, claim.company_id)
-        with closing(open_reader(writer.store)) as db, read_tx(db):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_reader(verify_desk=True, verify_writer=True) as db:
             items = list_conditions(db, claim.company_id, claim.founder_id)
         if status_filter is not None:
             items = tuple(c for c in items if c.status == status_filter)
@@ -178,13 +158,7 @@ def build_core_proactive_tool_contribution(
             return None
 
         now = _now_ns()
-        writer.verify_for(writer.store, claim.company_id)
-        with (
-            lock_ctx,
-            closing(open_writer(writer.store, lease=writer)) as db,
-            write_tx(db),
-        ):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_write_uow(verify_desk=True) as db:
             if resp_id is None and item_id is not None and item_id != claim.duty_id:
                 raise WorkKernelRefused(
                     "set_condition may only link the current work item or an active standing responsibility"
@@ -259,13 +233,7 @@ def build_core_proactive_tool_contribution(
             minimum=1,
         )
         now = _now_ns()
-        writer.verify_for(writer.store, claim.company_id)
-        with (
-            lock_ctx,
-            closing(open_writer(writer.store, lease=writer)) as db,
-            write_tx(db),
-        ):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_write_uow(verify_desk=True) as db:
             cond = replace_condition(
                 db,
                 condition_id,
@@ -297,13 +265,7 @@ def build_core_proactive_tool_contribution(
             minimum=1,
         )
         now = _now_ns()
-        writer.verify_for(writer.store, claim.company_id)
-        with (
-            lock_ctx,
-            closing(open_writer(writer.store, lease=writer)) as db,
-            write_tx(db),
-        ):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_write_uow(verify_desk=True) as db:
             cancel_condition(
                 db,
                 condition_id,
@@ -389,13 +351,7 @@ def build_core_proactive_tool_contribution(
                 )
             )
         next_cond = _parse_next_condition_arg(obj.get("next_condition"))
-        writer.verify_for(writer.store, claim.company_id)
-        with (
-            lock_ctx,
-            closing(open_writer(writer.store, lease=writer)) as db,
-            write_tx(db),
-        ):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_write_uow(verify_desk=True) as db:
             dec = record_work_decision(
                 db,
                 company_id=claim.company_id,
@@ -447,13 +403,7 @@ def build_core_proactive_tool_contribution(
             obj.get("expires_at_ns"), "expires_at_ns", minimum=0
         )
         now = _now_ns()
-        writer.verify_for(writer.store, claim.company_id)
-        with (
-            lock_ctx,
-            closing(open_writer(writer.store, lease=writer)) as db,
-            write_tx(db),
-        ):
-            _verify_fencing_and_desk(db)
+        with kit.fenced_write_uow(verify_desk=True) as db:
             if resp_id is None and item_id is not None and item_id != claim.duty_id:
                 raise WorkKernelRefused(
                     "arm_result_continuation may only link the current work item or an active standing responsibility"

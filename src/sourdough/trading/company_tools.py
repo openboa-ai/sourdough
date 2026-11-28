@@ -123,6 +123,7 @@ COMPANY_TRADING_TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "limit_minor_units",
             ],
         },
+        flow_class="external_write_sink",
     ),
     ToolSpec(
         name="cancel_company_paper_order",
@@ -136,6 +137,7 @@ COMPANY_TRADING_TOOL_SPECS: tuple[ToolSpec, ...] = (
             },
             "required": ["binding_id", "order_id"],
         },
+        flow_class="external_write_sink",
     ),
     ToolSpec(
         name="submit_company_live_order",
@@ -160,6 +162,7 @@ COMPANY_TRADING_TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "limit_minor_units",
             ],
         },
+        flow_class="external_write_sink",
     ),
     ToolSpec(
         name="propose_live_migration",
@@ -186,6 +189,7 @@ COMPANY_TRADING_TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "qualification_receipt_id",
             ],
         },
+        flow_class="external_write_sink",
     ),
     ToolSpec(
         name="schedule_next_shift",

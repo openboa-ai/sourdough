@@ -117,6 +117,7 @@ _SANDBOX_TOOL_SPECS: tuple[ToolSpec, ...] = (
             },
             "required": ["account_id"],
         },
+        flow_class="external_write_sink",
     ),
     ToolSpec(
         name="submit_agent_sandbox_order",
@@ -141,6 +142,7 @@ _SANDBOX_TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "market_price_minor_units",
             ],
         },
+        flow_class="external_write_sink",
     ),
     ToolSpec(
         name="cancel_agent_sandbox_order",
@@ -150,6 +152,7 @@ _SANDBOX_TOOL_SPECS: tuple[ToolSpec, ...] = (
             "properties": {"order_id": {"type": "string"}},
             "required": ["order_id"],
         },
+        flow_class="external_write_sink",
     ),
     ToolSpec(
         name="read_agent_sandbox_portfolio",

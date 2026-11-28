@@ -130,7 +130,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "method_qualification": frozenset({"method_learning.py"}),
     "method_activation": frozenset({"method_learning.py"}),
     # Agent runtime tool receipts & episodic memory tables
-    "tool_call_receipt": frozenset({"runtime/shift_runner.py"}),
+    "tool_call_receipt": frozenset({"runtime/shift/receipts.py"}),
     "agent_episode": frozenset({"memory.py"}),
     # Separate derived episode FTS5 search index (outside company store)
     "episodes_fts": frozenset({"episode_index.py"}),

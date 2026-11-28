@@ -35,26 +35,6 @@ from .protocol import (
 _SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 _ISOLATION_PROFILE = "sourdough-agent"
 _VALID_PROTOCOL_MODES = frozenset({"auto", "codex_mcp", "shim"})
-_PEER_COLLAB_TOOL_NAMES = frozenset(
-    {
-        "read_messages",
-        "read_inbox",
-        "discover_handoffs",
-        "read_shared_asset",
-        "append_message",
-        "request_peer_response",
-        "respond_peer_request",
-        "offer_handoff",
-        "decline_handoff",
-        "submit_company_paper_order",
-        "cancel_company_paper_order",
-        "submit_company_live_order",
-        "propose_live_migration",
-        "open_agent_sandbox",
-        "submit_agent_sandbox_order",
-        "cancel_agent_sandbox_order",
-    }
-)
 
 
 def confinement_arguments() -> list[str]:
@@ -308,10 +288,10 @@ class CodexCliAdapter:
             py_path = os.environ.get("PYTHONPATH", "").strip()
             if py_path:
                 env["PYTHONPATH"] = py_path
-            has_peer_collab_tools = any(
-                spec.name in _PEER_COLLAB_TOOL_NAMES for spec in request.tools
+            has_isolated_tools = any(
+                spec.requires_desk_isolation() for spec in request.tools
             )
-            if request.desk_path is not None and not has_peer_collab_tools:
+            if request.desk_path is not None and not has_isolated_tools:
                 request.desk_path.mkdir(parents=True, exist_ok=True)
                 os.chmod(request.desk_path, 0o700)
                 cwd = str(request.desk_path)
@@ -427,7 +407,7 @@ class CodexCliAdapter:
 
                     sandbox_desk = (
                         request.desk_path
-                        if (request.desk_path is not None and not has_peer_collab_tools)
+                        if (request.desk_path is not None and not has_isolated_tools)
                         else None
                     )
                     sbpl = build_desk_sandbox_profile(

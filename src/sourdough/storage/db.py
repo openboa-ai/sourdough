@@ -3,12 +3,12 @@
 import os
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from time import monotonic, sleep
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from ..writer_lease import WriterLease
@@ -171,6 +171,7 @@ def open_writer(
     journal_mode: Literal["WAL", "DELETE", "PRESERVE"] = "WAL",
     allow_retired: bool = False,
     foreign_keys: bool = True,
+    verify_on_open: bool = True,
 ) -> ManagedConnection:
     """Open the company SQLite store for serialized writing."""
     if lease is not None:
@@ -189,9 +190,10 @@ def open_writer(
     try:
         connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA trusted_schema = OFF")
-        with read_tx(connection):
-            _verify_store_schema(connection, allow_empty=initialize)
-            _check_writable_state(connection, allow_retired=allow_retired)
+        if verify_on_open:
+            with read_tx(connection):
+                _verify_store_schema(connection, allow_empty=initialize)
+                _check_writable_state(connection, allow_retired=allow_retired)
         if journal_mode == "WAL":
             _set_journal_mode_with_retry(connection, "WAL")
             connection.execute(
@@ -296,6 +298,52 @@ def read_tx(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     finally:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
+
+
+@contextmanager
+def scoped_reader(
+    store: Path, *, transactional: bool = True
+) -> Iterator[ManagedConnection]:
+    """Open a single short-lived read-only connection (and optional snapshot) for a local read phase.
+
+    Callers must never hold a scoped_reader open across LLM, network, or subprocess I/O.
+    """
+    with closing(open_reader(store)) as db:
+        if transactional:
+            with read_tx(db):
+                yield db
+        else:
+            yield db
+
+
+@contextmanager
+def write_uow(
+    writer: "WriterLease",
+    *,
+    tx_lock: Any = None,
+    journal_mode: Literal["WAL", "DELETE", "PRESERVE"] = "WAL",
+    allow_retired: bool = False,
+    foreign_keys: bool = True,
+) -> Iterator[ManagedConnection]:
+    """Run an atomic serialized write unit-of-work bound to WriterLease without duplicate schema checks."""
+    lock_cm = tx_lock if tx_lock is not None else nullcontext()
+    with lock_cm:
+        writer.verify()
+        with (
+            closing(
+                open_writer(
+                    writer.store,
+                    lease=writer,
+                    journal_mode=journal_mode,
+                    allow_retired=allow_retired,
+                    foreign_keys=foreign_keys,
+                    verify_on_open=False,
+                )
+            ) as db,
+            write_tx(db),
+        ):
+            yield db
+            writer.verify()
 
 
 def wal_checkpoint(
