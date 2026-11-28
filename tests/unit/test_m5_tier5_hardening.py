@@ -1566,6 +1566,26 @@ class TestM5Tier5Hardening(unittest.TestCase):
                             if pmeta.get("require_counterexample") is True:
                                 has_cand_proc = True
                     if has_cand_proc:
+                        case_trig = next(
+                            (
+                                r
+                                for r in request.context.open_receipts
+                                if isinstance(r, dict)
+                                and r.get("kind") == "discovery_trigger"
+                            ),
+                            {},
+                        )
+                        p_sym = str(
+                            (case_trig.get("primary_item") or {}).get("symptom")
+                            or "missed_sla_deadline"
+                        )
+                        b_sym = str(
+                            (case_trig.get("boundary_counterexample") or {}).get(
+                                "symptom"
+                            )
+                            or "standing_evergreen_no_deadline"
+                        )
+                        c_id = str(case_trig.get("case_id") or "case-default")
                         broker.invoke(
                             "c3",
                             "skill_draft_candidate",
@@ -1575,14 +1595,35 @@ class TestM5Tier5Hardening(unittest.TestCase):
                                 "item_kind": "work_method",
                                 "trigger_spec": {
                                     "duty_kind": "work.discovery_review",
-                                    "negative_triggers": ["no_deadline_valid_item"],
+                                    "negative_triggers": [b_sym],
                                 },
-                                "body": "Keep valid no-deadline obligations.",
+                                "body": f"Handle {p_sym} on {c_id} while preserving {b_sym}.",
                                 "audience_scope": "one_agent",
                                 "source_refs": [f"work_run:{request.run_id}"],
-                                "falsification_criteria": "Reject if valid obligation dropped.",
+                                "falsification_criteria": f"Reject if {b_sym} on {c_id} dropped.",
                             },
                         )
+                        note_res = broker.invoke(
+                            "c3b",
+                            "desk_save_draft",
+                            {
+                                "name": f"grec3-{request.run_id[:8]}",
+                                "content": f"Case {c_id}: handled {p_sym}, preserved {b_sym}.",
+                            },
+                        )
+                ev_refs = (
+                    [
+                        {
+                            "kind": "private_draft",
+                            "resource_id": note_res["name"],
+                            "revision": note_res["revision"],
+                            "available_at_ns": 1,
+                            "observed_at_ns": 1,
+                        }
+                    ]
+                    if has_cand_proc
+                    else []
+                )
                 broker.invoke(
                     "c4",
                     "record_work_decision",
@@ -1591,7 +1632,7 @@ class TestM5Tier5Hardening(unittest.TestCase):
                             "counterexample_verified" if has_cand_proc else "hold"
                         ),
                         "rationale": "Checked big skill.",
-                        "evidence": [],
+                        "evidence": ev_refs,
                         "action_id": f"dec-{request.run_id}",
                     },
                 )
@@ -8157,13 +8198,50 @@ class TestM5Tier5Hardening(unittest.TestCase):
                         if meta.get("require_counterexample") is True:
                             cx_proc = mid
                     if cx_proc is not None:
+                        case_trig = next(
+                            (
+                                r
+                                for r in request.context.open_receipts
+                                if isinstance(r, dict)
+                                and r.get("kind") == "discovery_trigger"
+                            ),
+                            {},
+                        )
+                        p_sym = str(
+                            (case_trig.get("primary_item") or {}).get("symptom")
+                            or "missed_sla_deadline"
+                        )
+                        b_sym = str(
+                            (case_trig.get("boundary_counterexample") or {}).get(
+                                "symptom"
+                            )
+                            or "standing_evergreen_no_deadline"
+                        )
+                        c_id = str(case_trig.get("case_id") or "case-default")
+                        broker.invoke(
+                            "c-wm",
+                            "skill_draft_candidate",
+                            {
+                                "method_id": f"wm-r16-{request.run_id[:12]}",
+                                "delta_kind": "ADD",
+                                "item_kind": "work_method",
+                                "trigger_spec": {
+                                    "duty_kind": "work.discovery_review",
+                                    "negative_triggers": [b_sym],
+                                },
+                                "body": f"Handle {p_sym} on {c_id} while preserving {b_sym}.",
+                                "audience_scope": "one_agent",
+                                "source_refs": [f"work_run:{request.run_id}"],
+                                "falsification_criteria": f"Reject if {b_sym} on {c_id} dropped.",
+                            },
+                        )
                         draft_name = f"ce-{request.run_id[:8]}"
                         draft_res = broker.invoke(
                             "c-draft",
                             "desk_save_draft",
                             {
                                 "name": draft_name,
-                                "content": "Verified boundary counterexample.",
+                                "content": f"Case {c_id}: handled {p_sym}, preserved {b_sym}.",
                             },
                         )
                         broker.invoke(
@@ -8171,7 +8249,7 @@ class TestM5Tier5Hardening(unittest.TestCase):
                             "record_work_decision",
                             {
                                 "action_kind": "counterexample_verified",
-                                "rationale": "Verified boundary counterexample.",
+                                "rationale": f"Verified {b_sym} on {c_id}.",
                                 "evidence": [
                                     {
                                         "kind": "private_draft",
@@ -12133,6 +12211,157 @@ class TestM5Tier5Hardening(unittest.TestCase):
             )
         self.assertNotIn(missing_label, md_dump)
         self.assertNotIn(missing_label, ae_dump)
+
+    def test_pr191_r27_transfer_grading_rejects_self_reported_labels_and_generic_notes(
+        self,
+    ) -> None:
+        """PR #191 R27: Live RSI transfer grading rejects self-reported action labels and generic unrelated notes."""
+        from sourdough.agent_runtime.protocol import (
+            AdapterManifest,
+            AgentRuntimeAdapter,
+            PROVIDER_OPENAI,
+            ShiftResult,
+            TokenUsage,
+        )
+        from sourdough.agent_runtime.registry import AgentAdapterRegistry
+        from sourdough.trial_registry import TrialRefused
+        from sourdough.trial_runner import (
+            _score_live_gen2_observables,
+            run_recursive_learning_cycle,
+        )
+
+        sample_case = {
+            "case_id": "transfer-case-budget-variance-audit",
+            "primary_item": {
+                "item_id": "transfer-case-budget-variance-audit-primary",
+                "symptom": "unapproved_budget_overrun",
+            },
+            "boundary_counterexample": {
+                "item_id": "transfer-case-budget-variance-audit-boundary",
+                "symptom": "preauthorized_standing_reserve",
+            },
+        }
+        canned_unrelated_draft = (
+            "m-canned",
+            "r1",
+            "ADD",
+            "work_method",
+            json.dumps({"negative_triggers": ["no_deadline"]}),
+            "Keep no-deadline items.",
+            "",
+            "Reject if no-deadline items are discarded.",
+            "candidate",
+        )
+        obs_canned = _score_live_gen2_observables(
+            shift_ok=True,
+            action_kind="counterexample_verified",
+            evidence_count=1,
+            rcpt_rows=(("skill_read", "ok", "{}"),),
+            drafted_methods=(canned_unrelated_draft,),
+            case_spec=sample_case,
+            case_evidence_verified=False,
+        )
+        self.assertFalse(obs_canned["drafted_counterexample_method"])
+        self.assertFalse(obs_canned["counterexample_checked"])
+        self.assertFalse(obs_canned["false_positive_prevented"])
+
+        # End-to-end live cycle with a label-only gaming adapter (never inspects case_spec,
+        # never drafts a case-specific work_method, attaches only a generic note) MUST NOT reach SUPPORTED!
+        class _LabelOnlyGamingAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "gaming-v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                cx_proc: str | None = None
+                for entry in request.context.active_methods:
+                    if entry.get("item_kind") != "improvement_procedure":
+                        continue
+                    mid = str(entry["method_id"])
+                    res = broker.invoke(
+                        f"read-{request.run_id}-{mid}",
+                        "skill_read",
+                        {"method_id": mid},
+                    )
+                    broker.invoke(
+                        f"inv-{request.run_id}-{mid}",
+                        "skill_record_invocation",
+                        {"method_id": mid, "note": "Used"},
+                    )
+                    meta = (res.get("skill") or {}).get("procedure_meta") or {}
+                    if meta.get("require_counterexample") is True:
+                        cx_proc = mid
+                if cx_proc is not None:
+                    draft_res = broker.invoke(
+                        f"draft-{request.run_id}",
+                        "desk_save_draft",
+                        {
+                            "name": f"generic-note-{request.run_id[:8]}",
+                            "content": "Generic note unrelated to any transfer case.",
+                        },
+                    )
+                    broker.invoke(
+                        f"dec-{request.run_id}",
+                        "record_work_decision",
+                        {
+                            "action_kind": "counterexample_verified",
+                            "rationale": "Self-reported label only.",
+                            "evidence": [
+                                {
+                                    "kind": "private_draft",
+                                    "resource_id": draft_res["name"],
+                                    "revision": draft_res["revision"],
+                                    "available_at_ns": 1,
+                                    "observed_at_ns": 1,
+                                }
+                            ],
+                        },
+                    )
+                else:
+                    broker.invoke(
+                        f"dec-{request.run_id}",
+                        "record_work_decision",
+                        {
+                            "action_kind": "apply_baseline_heuristic",
+                            "rationale": "Baseline.",
+                            "evidence": [],
+                        },
+                    )
+                return ShiftResult(
+                    output_text="Done.",
+                    usage=TokenUsage(input_tokens=20, output_tokens=10),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_LabelOnlyGamingAdapter())
+        eval_dir = self.root / "r27-evals"
+        eval_dir.mkdir(mode=0o700)
+        with hold_company_writer(self.store, self.company_id) as w:
+            with self.assertRaisesRegex(
+                TrialRefused, "Recursive transfer trial did not reach SUPPORTED"
+            ):
+                run_recursive_learning_cycle(
+                    w,
+                    evaluator_store=eval_dir / "evaluator.sqlite",
+                    company_id=self.company_id,
+                    meta_agent_id=self.founder_id,
+                    promotion_actor_id=self.founder_id,
+                    promotion_grant_id=self.grant_id,
+                    trial_root=self.root / "r27-trials",
+                    adapter_registry=areg,
+                    profile_bindings={self.founder_id: self.profile},
+                    min_families=6,
+                )
 
 
 if __name__ == "__main__":

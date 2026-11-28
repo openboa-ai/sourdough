@@ -869,6 +869,26 @@ class M4TrialRunnerTests(unittest.TestCase):
                             counterexample_proc_id = mid
 
                     if counterexample_proc_id is not None:
+                        case_trig = next(
+                            (
+                                r
+                                for r in req.context.open_receipts
+                                if isinstance(r, dict)
+                                and r.get("kind") == "discovery_trigger"
+                            ),
+                            {},
+                        )
+                        p_sym = str(
+                            (case_trig.get("primary_item") or {}).get("symptom")
+                            or "missed_sla_deadline"
+                        )
+                        b_sym = str(
+                            (case_trig.get("boundary_counterexample") or {}).get(
+                                "symptom"
+                            )
+                            or "standing_evergreen_no_deadline"
+                        )
+                        c_id = str(case_trig.get("case_id") or "case-default")
                         draft_id = f"wm-obs-{req.run_id[:20]}"
                         broker.invoke(
                             f"draft-{req.run_id}",
@@ -879,22 +899,28 @@ class M4TrialRunnerTests(unittest.TestCase):
                                 "item_kind": "work_method",
                                 "trigger_spec": {
                                     "duty_kind": "work.discovery_review",
-                                    "negative_triggers": [
-                                        "valid_no_deadline_obligation"
-                                    ],
+                                    "negative_triggers": [b_sym],
                                 },
                                 "body": (
-                                    "Counterexample-verified rule retaining valid no-deadline "
+                                    f"Handle {p_sym} on {c_id} while preserving {b_sym} "
                                     "boundary exceptions and preventing false-positive exclusions."
                                 ),
                                 "falsification_criteria": (
-                                    "Reject if valid no-deadline boundary items are discarded."
+                                    f"Reject if {b_sym} boundary items on {c_id} are discarded."
                                 ),
                                 "audience_scope": "company",
                                 "source_refs": [f"work_run:{req.run_id}"],
                             },
                         )
                         drafted_work_methods.append(draft_id)
+                        note_res = broker.invoke(
+                            f"note-{req.run_id}",
+                            "desk_save_draft",
+                            {
+                                "name": f"case-check-{req.run_id[:8]}",
+                                "content": f"Case {c_id}: handled {p_sym}, preserved {b_sym}.",
+                            },
+                        )
                         broker.invoke(
                             f"dec-{req.run_id}",
                             "record_work_decision",
@@ -902,10 +928,17 @@ class M4TrialRunnerTests(unittest.TestCase):
                                 "action_kind": "counterexample_verified",
                                 "rationale": (
                                     f"Verified boundary counterexample via {counterexample_proc_id}; "
-                                    f"preserved no-deadline exception and prevented false-positive "
-                                    f"exclusion on {req.run_id}."
+                                    f"preserved {b_sym} on {c_id}."
                                 ),
-                                "evidence": [],
+                                "evidence": [
+                                    {
+                                        "kind": "private_draft",
+                                        "resource_id": note_res["name"],
+                                        "revision": note_res["revision"],
+                                        "available_at_ns": 1,
+                                        "observed_at_ns": 1,
+                                    }
+                                ],
                             },
                         )
                     else:
@@ -1225,12 +1258,51 @@ class M4TrialRunnerTests(unittest.TestCase):
                         if meta.get("require_counterexample") is True:
                             cx_proc = mid
                     if cx_proc is not None:
+                        case_trig = next(
+                            (
+                                r
+                                for r in req.context.open_receipts
+                                if isinstance(r, dict)
+                                and r.get("kind") == "discovery_trigger"
+                            ),
+                            {},
+                        )
+                        p_sym = str(
+                            (case_trig.get("primary_item") or {}).get("symptom")
+                            or "missed_sla_deadline"
+                        )
+                        b_sym = str(
+                            (case_trig.get("boundary_counterexample") or {}).get(
+                                "symptom"
+                            )
+                            or "standing_evergreen_no_deadline"
+                        )
+                        c_id = str(case_trig.get("case_id") or "case-default")
+                        broker.invoke(
+                            f"wm-{req.run_id}",
+                            "skill_draft_candidate",
+                            {
+                                "method_id": f"wm-unrel-{req.run_id[:16]}",
+                                "delta_kind": "ADD",
+                                "item_kind": "work_method",
+                                "trigger_spec": {
+                                    "duty_kind": "work.discovery_review",
+                                    "negative_triggers": [b_sym],
+                                },
+                                "body": f"Handle {p_sym} on {c_id} while preserving {b_sym}.",
+                                "falsification_criteria": (
+                                    f"Reject if {b_sym} boundary items on {c_id} are discarded."
+                                ),
+                                "audience_scope": "one_agent",
+                                "source_refs": [f"work_run:{req.run_id}"],
+                            },
+                        )
                         draft_res = broker.invoke(
                             f"draft-{req.run_id}",
                             "desk_save_draft",
                             {
                                 "name": f"cx-check-{req.run_id[:8]}",
-                                "content": f"Verified boundary counterexample via {cx_proc}.",
+                                "content": f"Case {c_id}: handled {p_sym}, preserved {b_sym} via {cx_proc}.",
                             },
                         )
                         broker.invoke(
@@ -1239,8 +1311,7 @@ class M4TrialRunnerTests(unittest.TestCase):
                             {
                                 "action_kind": "counterexample_verified",
                                 "rationale": (
-                                    f"Verified boundary counterexample via {cx_proc} "
-                                    f"and prevented false-positive exclusion."
+                                    f"Verified boundary counterexample {b_sym} on {c_id} via {cx_proc}."
                                 ),
                                 "evidence": [
                                     {
@@ -1562,35 +1633,6 @@ class M4TrialRunnerTests(unittest.TestCase):
             inspect.signature(_score_live_gen2_observables).parameters,
         )
 
-        # Positive allowlist without evidence: counterexample_checked=True, false_positive_prevented=False
-        for pos_action in sorted(POSITIVE_BOUNDARY_ACTION_KINDS):
-            with self.subTest(pos_action=pos_action, evidence=0):
-                obs = _score_live_gen2_observables(
-                    shift_ok=True,
-                    action_kind=pos_action,
-                    evidence_count=0,
-                    rcpt_rows=(),
-                    drafted_methods=(),
-                )
-                self.assertFalse(obs["explicit_constraint_violation"])
-                self.assertTrue(obs["counterexample_checked"])
-                self.assertFalse(obs["false_positive_prevented"])
-
-        # Positive allowlist with evidence_count >= 1: both counterexample_checked & false_positive_prevented
-        for pos_action in sorted(POSITIVE_BOUNDARY_ACTION_KINDS):
-            with self.subTest(pos_action=pos_action, evidence=1):
-                obs = _score_live_gen2_observables(
-                    shift_ok=True,
-                    action_kind=pos_action,
-                    evidence_count=1,
-                    rcpt_rows=(),
-                    drafted_methods=(),
-                )
-                self.assertFalse(obs["explicit_constraint_violation"])
-                self.assertTrue(obs["counterexample_checked"])
-                self.assertTrue(obs["false_positive_prevented"])
-
-        # Violation allowlist vetoes even when valid drafted method is present
         valid_draft = (
             "m1",
             "r1",
@@ -1607,6 +1649,53 @@ class M4TrialRunnerTests(unittest.TestCase):
             "Reject if valid no-deadline boundary items are discarded.",
             "candidate",
         )
+        # Positive allowlist WITHOUT a drafted case-specific work_method never earns credit!
+        for pos_action in sorted(POSITIVE_BOUNDARY_ACTION_KINDS):
+            with self.subTest(pos_action=pos_action, drafted=False):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind=pos_action,
+                    evidence_count=1,
+                    rcpt_rows=(),
+                    drafted_methods=(),
+                    case_evidence_verified=False,
+                )
+                self.assertFalse(obs["explicit_constraint_violation"])
+                self.assertFalse(obs["counterexample_checked"])
+                self.assertFalse(obs["false_positive_prevented"])
+
+        # Positive allowlist WITH verified work_method but without verified case evidence:
+        # counterexample_checked=True, false_positive_prevented=False
+        for pos_action in sorted(POSITIVE_BOUNDARY_ACTION_KINDS):
+            with self.subTest(pos_action=pos_action, evidence=0):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind=pos_action,
+                    evidence_count=0,
+                    rcpt_rows=(),
+                    drafted_methods=(valid_draft,),
+                    case_evidence_verified=False,
+                )
+                self.assertFalse(obs["explicit_constraint_violation"])
+                self.assertTrue(obs["counterexample_checked"])
+                self.assertFalse(obs["false_positive_prevented"])
+
+        # Positive allowlist WITH verified work_method and verified case evidence: both True
+        for pos_action in sorted(POSITIVE_BOUNDARY_ACTION_KINDS):
+            with self.subTest(pos_action=pos_action, evidence=1):
+                obs = _score_live_gen2_observables(
+                    shift_ok=True,
+                    action_kind=pos_action,
+                    evidence_count=1,
+                    rcpt_rows=(),
+                    drafted_methods=(valid_draft,),
+                    case_evidence_verified=True,
+                )
+                self.assertFalse(obs["explicit_constraint_violation"])
+                self.assertTrue(obs["counterexample_checked"])
+                self.assertTrue(obs["false_positive_prevented"])
+
+        # Violation allowlist vetoes even when valid drafted method is present
         for viol_action in sorted(VIOLATION_ACTION_KINDS):
             with self.subTest(viol_action=viol_action):
                 obs = _score_live_gen2_observables(
@@ -1987,6 +2076,26 @@ class M4TrialRunnerTests(unittest.TestCase):
                             if meta.get("require_counterexample") is True:
                                 cx_proc = mid
                         if cx_proc is not None and shift_idx <= 13:
+                            case_trig = next(
+                                (
+                                    r
+                                    for r in req.context.open_receipts
+                                    if isinstance(r, dict)
+                                    and r.get("kind") == "discovery_trigger"
+                                ),
+                                {},
+                            )
+                            p_sym = str(
+                                (case_trig.get("primary_item") or {}).get("symptom")
+                                or "missed_sla_deadline"
+                            )
+                            b_sym = str(
+                                (case_trig.get("boundary_counterexample") or {}).get(
+                                    "symptom"
+                                )
+                                or "standing_evergreen_no_deadline"
+                            )
+                            c_id = str(case_trig.get("case_id") or "case-default")
                             broker.invoke(
                                 f"draft-{req.run_id}",
                                 "skill_draft_candidate",
@@ -1996,16 +2105,22 @@ class M4TrialRunnerTests(unittest.TestCase):
                                     "item_kind": "work_method",
                                     "trigger_spec": {
                                         "duty_kind": "work.discovery_review",
-                                        "negative_triggers": [
-                                            "valid_no_deadline_obligation"
-                                        ],
+                                        "negative_triggers": [b_sym],
                                     },
-                                    "body": "Retain valid no-deadline boundary items.",
+                                    "body": f"Handle {p_sym} on {c_id} while preserving {b_sym}.",
                                     "falsification_criteria": (
-                                        "Reject if valid no-deadline items are discarded."
+                                        f"Reject if {b_sym} items on {c_id} are discarded."
                                     ),
                                     "audience_scope": "company",
                                     "source_refs": [f"work_run:{req.run_id}"],
+                                },
+                            )
+                            note_res = broker.invoke(
+                                f"note-{req.run_id}",
+                                "desk_save_draft",
+                                {
+                                    "name": f"slow-check-{req.run_id[:8]}",
+                                    "content": f"Case {c_id}: handled {p_sym}, preserved {b_sym}.",
                                 },
                             )
                             broker.invoke(
@@ -2013,8 +2128,16 @@ class M4TrialRunnerTests(unittest.TestCase):
                                 "record_work_decision",
                                 {
                                     "action_kind": "counterexample_verified",
-                                    "rationale": f"Verified counterexample via {cx_proc}.",
-                                    "evidence": [],
+                                    "rationale": f"Verified {b_sym} on {c_id} via {cx_proc}.",
+                                    "evidence": [
+                                        {
+                                            "kind": "private_draft",
+                                            "resource_id": note_res["name"],
+                                            "revision": note_res["revision"],
+                                            "available_at_ns": 1,
+                                            "observed_at_ns": 1,
+                                        }
+                                    ],
                                 },
                             )
                         else:

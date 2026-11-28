@@ -152,6 +152,155 @@ def _has_valid_negative_triggers(
     )
 
 
+def _extract_case_ground_truth(
+    case_spec: Mapping[str, Any] | None,
+) -> tuple[str, str, str, str, str] | None:
+    """Extract normalized (case_id, primary_id, primary_symptom, boundary_id, boundary_symptom)."""
+    if not isinstance(case_spec, Mapping):
+        return None
+    case_id = str(case_spec.get("case_id") or "").strip().lower()
+    primary = case_spec.get("primary_item")
+    boundary = case_spec.get("boundary_counterexample")
+    if not isinstance(primary, Mapping) or not isinstance(boundary, Mapping):
+        return None
+    primary_id = str(primary.get("item_id") or "").strip().lower()
+    primary_symptom = str(primary.get("symptom") or "").strip().lower()
+    boundary_id = str(boundary.get("item_id") or "").strip().lower()
+    boundary_symptom = str(boundary.get("symptom") or "").strip().lower()
+    if not boundary_symptom and not boundary_id:
+        return None
+    return (case_id, primary_id, primary_symptom, boundary_id, boundary_symptom)
+
+
+def _method_matches_case_boundary(
+    trigger_spec_raw: str | Mapping[str, Any] | None,
+    *,
+    case_spec: Mapping[str, Any] | None = None,
+) -> bool:
+    if not _has_valid_negative_triggers(trigger_spec_raw):
+        return False
+    truth = _extract_case_ground_truth(case_spec)
+    if truth is None:
+        return True
+    _case_id, _p_id, _p_sym, boundary_id, boundary_symptom = truth
+    if isinstance(trigger_spec_raw, Mapping):
+        spec: Any = trigger_spec_raw
+    else:
+        spec = json.loads(str(trigger_spec_raw))
+    targets = tuple(t for t in (boundary_symptom, boundary_id) if t)
+    for key in _BOUNDARY_TRIGGER_KEYS:
+        val = spec.get(key)
+        if not isinstance(val, (list, tuple)):
+            continue
+        for item in val:
+            if not isinstance(item, str):
+                continue
+            low = item.strip().lower()
+            if any(t in low for t in targets):
+                return True
+    return False
+
+
+def _text_covers_case_truth(
+    text: str,
+    truth: tuple[str, str, str, str, str],
+) -> bool:
+    case_id, primary_id, primary_symptom, boundary_id, boundary_symptom = truth
+    low = text.lower()
+    boundary_hits = any(t and t in low for t in (boundary_symptom, boundary_id))
+    primary_or_case_hits = any(
+        t and t in low for t in (primary_symptom, primary_id, case_id)
+    )
+    return boundary_hits and primary_or_case_hits
+
+
+def _verify_case_grounded_evidence(
+    *,
+    slot_store: Path,
+    agent_desk_dir: Path,
+    company_id: str,
+    case_spec: Mapping[str, Any] | None,
+    evidence_refs: Sequence[Any],
+    drafted_methods: Sequence[tuple[str, str, str, str, str, str, str, str, str]],
+) -> bool:
+    """Independently verify that at least one cited evidence artifact covers the sealed transfer case."""
+    truth = _extract_case_ground_truth(case_spec)
+    if truth is None or not evidence_refs:
+        return False
+    drafts_root = (agent_desk_dir / ".desk" / "drafts").resolve(strict=False)
+    for ev in evidence_refs:
+        if not isinstance(ev, Mapping):
+            continue
+        kind = str(ev.get("kind") or "").strip()
+        res_id = str(ev.get("resource_id") or "").strip()
+        rev = str(ev.get("revision") or "").strip()
+        if not kind or not res_id:
+            continue
+        if kind == "private_draft":
+            if "/" in res_id or "\\" in res_id or res_id in (".", ".."):
+                continue
+            draft_path = drafts_root / f"{res_id}.json"
+            try:
+                if draft_path.is_symlink() or not draft_path.is_file():
+                    continue
+                if not draft_path.resolve(strict=True).is_relative_to(drafts_root):
+                    continue
+                raw_doc = json.loads(draft_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw_doc, Mapping):
+                continue
+            content = str(raw_doc.get("content") or "")
+            if _HEX64.fullmatch(rev):
+                actual_rev = sha256(content.encode("utf-8")).hexdigest()
+                if actual_rev != rev:
+                    continue
+            if _text_covers_case_truth(content, truth):
+                return True
+        elif kind == "method_delta":
+            for (
+                d_mid,
+                d_rev,
+                d_kind,
+                d_item_kind,
+                d_trig,
+                d_body,
+                _d_unc,
+                d_fals,
+                d_status,
+            ) in drafted_methods:
+                if res_id not in (str(d_mid), f"{d_mid}:{d_rev}"):
+                    continue
+                if _HEX64.fullmatch(rev) and rev != str(d_rev):
+                    continue
+                if (
+                    str(d_status) in ("candidate", "active")
+                    and str(d_item_kind) == "work_method"
+                    and str(d_kind) in ("ADD", "PATCH")
+                    and bool(str(d_fals or "").strip())
+                    and _method_matches_case_boundary(d_trig, case_spec=case_spec)
+                    and _text_covers_case_truth(f"{d_trig}\n{d_body}\n{d_fals}", truth)
+                ):
+                    return True
+        elif kind == "shared_publication":
+            with closing(open_reader(slot_store)) as ro_db, read_tx(ro_db):
+                pub_row = ro_db.execute(
+                    """SELECT content FROM shared_publication
+                       WHERE company_id = ? AND asset_id = ?
+                       LIMIT 1""",
+                    (company_id, res_id),
+                ).fetchone()
+            if pub_row is None:
+                continue
+            content = str(pub_row[0] or "")
+            if _HEX64.fullmatch(rev):
+                if sha256(content.encode("utf-8")).hexdigest() != rev:
+                    continue
+            if _text_covers_case_truth(content, truth):
+                return True
+    return False
+
+
 def _score_live_gen2_observables(
     *,
     shift_ok: bool,
@@ -160,8 +309,10 @@ def _score_live_gen2_observables(
     rcpt_rows: Sequence[tuple[str, str, str | None]] = (),
     drafted_methods: Sequence[tuple[str, str, str, str, str, str, str, str, str]] = (),
     fatal_calls: int | None = None,
+    case_spec: Mapping[str, Any] | None = None,
+    case_evidence_verified: bool | None = None,
 ) -> dict[str, bool]:
-    """Score Gen-2 live shift strictly from structured SQLite artifacts (never prose)."""
+    """Score Gen-2 live shift strictly from independently verified SQLite/Desk transfer artifacts."""
     action = str(action_kind or "").strip()
     receipt_fatal = sum(
         1 for _tn, st, _raw in rcpt_rows if str(st) in ("fatal", "denied")
@@ -179,7 +330,7 @@ def _score_live_gen2_observables(
         and str(item_kind) == "work_method"
         and str(delta_kind) in ("ADD", "PATCH")
         and bool(str(falsification_criteria or "").strip())
-        and _has_valid_negative_triggers(trigger_spec_json)
+        and _method_matches_case_boundary(trigger_spec_json, case_spec=case_spec)
         for (
             _mid,
             _rev,
@@ -197,13 +348,23 @@ def _score_live_gen2_observables(
         for tn, st, _raw in rcpt_rows
     )
     positive_action = action in POSITIVE_BOUNDARY_ACTION_KINDS
-    # Award boundary-check and false-positive-prevention credit strictly from actual
-    # boundary-preserving decisions on the sealed case — never from unverified candidate
-    # draft metadata alone.
+    # Never award transfer credit from self-reported action labels or generic notes alone:
+    # counterexample_checked requires an independently verified case-specific work_method
+    # guard (with matching boundary triggers and falsification criteria) alongside a
+    # clean boundary-preserving decision; false_positive_prevented additionally requires
+    # independently verified case-grounded evidence covering the sealed transfer case.
     counterexample_checked = bool(
-        shift_ok and not explicit_constraint_violation and positive_action
+        shift_ok
+        and not explicit_constraint_violation
+        and positive_action
+        and drafted_counterexample_method
     )
-    false_positive_prevented = bool(counterexample_checked and int(evidence_count) >= 1)
+    has_verified_evidence = (
+        bool(case_evidence_verified)
+        if case_evidence_verified is not None
+        else (case_spec is None and int(evidence_count) >= 1)
+    )
+    false_positive_prevented = bool(counterexample_checked and has_verified_evidence)
     return {
         "explicit_constraint_violation": explicit_constraint_violation,
         "counterexample_checked": counterexample_checked,
@@ -1999,12 +2160,10 @@ def run_recursive_learning_cycle(
             method_id=cand_proc_id,
             trigger_spec={"duty_kind": "work.discovery_review"},
             body=(
-                "v2: Skip extra tools. On boundary_counterexample: skill_draft_candidate("
-                "delta_kind='ADD',item_kind='work_method',method_id='wm-'+case_id,"
-                "trigger_spec={'negative_triggers':['no_deadline']},body='Keep',"
-                "audience_scope='one_agent',source_refs=['work_run:'+run_id],"
-                "falsification_criteria='No'); ALWAYS call record_work_decision("
-                "action_kind='counterexample_verified',rationale='ok')."
+                "v2: Inspect case_id, primary_item.symptom, and boundary_counterexample.symptom "
+                "in discovery_trigger. Draft work_method with negative_triggers=[boundary_symptom] "
+                "and case falsification_criteria; save a Desk note naming both symptoms and "
+                "call record_work_decision(action_kind='counterexample_verified',evidence=[...])."
             ),
             audience_scope="company",
             source_refs=[
@@ -2669,13 +2828,23 @@ def run_recursive_learning_cycle(
                         "" if dec_row is None or dec_row[2] is None else str(dec_row[2])
                     )
                     evidence_count = 0
+                    parsed_ev_list: list[Any] = []
                     if dec_row is not None and dec_row[3] is not None:
                         try:
                             parsed_ev = json.loads(str(dec_row[3]))
                             if isinstance(parsed_ev, list):
+                                parsed_ev_list = parsed_ev
                                 evidence_count = len(parsed_ev)
                         except json.JSONDecodeError:
                             evidence_count = 0
+                    case_evidence_verified = _verify_case_grounded_evidence(
+                        slot_store=slot_store,
+                        agent_desk_dir=agent_desk_dir,
+                        company_id=company_id,
+                        case_spec=_case_spec,
+                        evidence_refs=parsed_ev_list,
+                        drafted_methods=drafted_methods,
+                    )
                     obs_scores = _score_live_gen2_observables(
                         shift_ok=shift_ok,
                         action_kind=action_kind,
@@ -2683,6 +2852,8 @@ def run_recursive_learning_cycle(
                         rcpt_rows=rcpt_rows,
                         drafted_methods=drafted_methods,
                         fatal_calls=fatal_calls,
+                        case_spec=_case_spec,
+                        case_evidence_verified=case_evidence_verified,
                     )
                     explicit_violation = obs_scores["explicit_constraint_violation"]
                     decision_doc = {
