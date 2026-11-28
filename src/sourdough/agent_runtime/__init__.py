@@ -10,9 +10,11 @@ from .broker_bridge import (
 from .codex_cli import CodexCliAdapter
 from .cost_accounting import (
     DEFAULT_MODEL_PRICING,
+    ZERO_COST_PRICING,
     ModelPricing,
     TurnCostSettlement,
     compute_usage_cost_minor_units,
+    resolve_model_pricing,
     settle_shift_cost_to_ledger,
 )
 from .gemini_api import GeminiGenerateContentAdapter
@@ -96,9 +98,11 @@ __all__ = [
     "ToolSpec",
     "TurnCostSettlement",
     "UdsToolBrokerServer",
+    "ZERO_COST_PRICING",
     "build_default_adapter_registry",
     "compute_usage_cost_minor_units",
     "fatal_broker_exceptions",
     "hydrate_shift_context",
+    "resolve_model_pricing",
     "settle_shift_cost_to_ledger",
 ]

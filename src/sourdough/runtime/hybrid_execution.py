@@ -15,7 +15,6 @@ import json
 import math
 import re
 import threading
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -564,13 +563,35 @@ class CodePlaneExecutor:
         merged_params = dict(self._default_parameters)
         if parameters is not None:
             merged_params.update(_clone_json_mapping(parameters, label="parameters"))
-        started = time.monotonic()
-        decision = self._rule_fn(snapshot, merged_params)
-        elapsed = time.monotonic() - started
-        if elapsed > self._timeout_seconds:
+        done = threading.Event()
+        holder: dict[str, Any] = {}
+
+        def _worker() -> None:
+            try:
+                holder["result"] = self._rule_fn(snapshot, merged_params)
+            except BaseException as error:
+                holder["error"] = error
+            finally:
+                done.set()
+
+        thread = threading.Thread(
+            target=_worker,
+            name=f"sourdough-code-{self._rule_id}",
+            daemon=True,
+        )
+        thread.start()
+        if not done.wait(timeout=self._timeout_seconds):
             raise HybridExecutionRefused(
                 f"CodePlaneExecutor '{self._rule_id}' exceeded timeout ({self._timeout_seconds}s)"
             )
+        if "error" in holder:
+            err = holder["error"]
+            if isinstance(err, HybridExecutionRefused):
+                raise err
+            raise HybridExecutionRefused(
+                f"CodePlaneExecutor '{self._rule_id}' failed ({type(err).__name__}): {err}"
+            ) from err
+        decision = holder.get("result")
         if not isinstance(decision, CodeRuleDecision):
             raise HybridExecutionRefused(
                 "CodePlaneExecutor rule_fn must return a CodeRuleDecision"
@@ -692,13 +713,16 @@ class DecisionModelPlaneExecutor:
         extra_evidence: Sequence[DecisionEvidence],
     ) -> PlaneExecutionProposal:
         if self._fallback_executor is not None:
-            return self._fallback_executor.evaluate(
-                snapshot,
-                proposal_id=proposal_id,
-                extra_evidence=extra_evidence,
-                fallback_used=True,
-                fallback_reason=reason,
-            )
+            try:
+                return self._fallback_executor.evaluate(
+                    snapshot,
+                    proposal_id=proposal_id,
+                    extra_evidence=extra_evidence,
+                    fallback_used=True,
+                    fallback_reason=reason,
+                )
+            except HybridExecutionRefused:
+                reason = f"{reason}:fallback_failed"
         pid = proposal_id or f"dmfb-{snapshot.content_digest()[:16]}"
         return PlaneExecutionProposal(
             proposal_id=pid,
@@ -1216,6 +1240,17 @@ class DeterministicControlPlaneGate:
             or not raw_deltas
         ):
             return "llm_offline_eval_missing_patch_terms"
+        validated_deltas: dict[str, float] = {}
+        for k, v in raw_deltas.items():
+            if not isinstance(k, str) or _SAFE_ID_RE.fullmatch(k) is None:
+                return "llm_offline_eval_invalid_delta_key"
+            if (
+                isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(float(v))
+            ):
+                return "llm_offline_eval_invalid_delta_value"
+            validated_deltas[k] = float(v)
         recomputed_patch_digest = sha256(
             _canonical_json(
                 {
@@ -1223,13 +1258,7 @@ class DeterministicControlPlaneGate:
                     "policy_id": proposal.engine_id,
                     "base_revision": base_rev,
                     "target_revision": proposal.engine_revision,
-                    "parameter_deltas": {
-                        str(k): float(v)
-                        for k, v in raw_deltas.items()
-                        if not isinstance(v, bool)
-                        and isinstance(v, (int, float))
-                        and math.isfinite(float(v))
-                    },
+                    "parameter_deltas": validated_deltas,
                     "rationale": proposal.rationale,
                 }
             ).encode("utf-8")
@@ -1308,9 +1337,11 @@ class DeterministicControlPlaneGate:
                 proposal.action_kind not in DEFENSIVE_ACTION_KINDS or effect is not None
             ):
                 checked_scopes = {
+                    "company:all",
                     "company",
                     "global",
                     "all",
+                    f"company:{company_id}".lower(),
                     proposal.target_scope_ref.lower(),
                 }
                 if effect is not None:
@@ -1444,7 +1475,34 @@ class DeterministicControlPlaneGate:
                     recorded_at_ns=ts,
                 )
             else:
-                # 5. Persist evidence-backed work_decision atomically
+                # 5. Persist evidence-backed work_decision atomically, binding replay
+                #    to the complete proposal terms including connector intent.
+                terms_digest = sha256(
+                    _canonical_json(
+                        {
+                            "plane": proposal.plane,
+                            "engine_id": proposal.engine_id,
+                            "engine_revision": proposal.engine_revision,
+                            "action_kind": proposal.action_kind,
+                            "target_scope_ref": proposal.target_scope_ref,
+                            "proposed_notional_minor_units": proposal.proposed_notional_minor_units,
+                            "parameters": dict(proposal.parameters),
+                            "eval_verdict_digest": proposal.eval_verdict_digest,
+                            "policy_patch_digest": proposal.policy_patch_digest,
+                            "connector_effect": (
+                                None
+                                if effect is None
+                                else {
+                                    "binding_id": effect.binding_id,
+                                    "operation": effect.operation,
+                                    "request_id": effect.request_id,
+                                    "payload": dict(effect.payload),
+                                    "expected_environment": effect.expected_environment,
+                                }
+                            ),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
                 try:
                     decision = record_work_decision(
                         db,
@@ -1454,7 +1512,10 @@ class DeterministicControlPlaneGate:
                         fencing_token=claim.fencing_token,
                         agent_id=agent_id,
                         action_kind=proposal.action_kind,
-                        rationale=f"[{proposal.plane}:{proposal.engine_id}@{proposal.engine_revision}] {proposal.rationale}",
+                        rationale=(
+                            f"[{proposal.plane}:{proposal.engine_id}@{proposal.engine_revision}"
+                            f"|terms={terms_digest[:16]}] {proposal.rationale}"
+                        ),
                         evidence=proposal.evidence,
                         decision_at_ns=proposal.decision_at_ns,
                         action_id=action_id,
@@ -1486,6 +1547,8 @@ class DeterministicControlPlaneGate:
                     )
 
                 # 6. Atomically issue service-owned connector admission for effectful operations
+                #    keyed strictly to (company_id, agent_id, action_id) so one proposal can
+                #    never mint multiple admissions even across replay attempts.
                 if (
                     effect is not None
                     and binding is not None
@@ -1495,24 +1558,25 @@ class DeterministicControlPlaneGate:
                     det_aid = (
                         "hybadm-"
                         + sha256(
-                            f"{company_id}:{agent_id}:{action_id}:{effect.binding_id}:{effect.request_id}".encode(
-                                "utf-8"
-                            )
+                            f"{company_id}:{agent_id}:{action_id}".encode("utf-8")
                         ).hexdigest()[:24]
                     )
-                    adm = issue_connector_admission_in_tx(
-                        db,
-                        company_id=company_id,
-                        binding_id=binding.binding_id,
-                        binding_revision=binding.revision,
-                        operation=binding_op.name,
-                        request_id=effect.request_id,
-                        payload=effect.payload,
-                        issued_by_service="core.hybrid_control_gate",
-                        actor_id=agent_id,
-                        admission_id=det_aid,
-                        now_ns=ts,
-                    )
+                    try:
+                        adm = issue_connector_admission_in_tx(
+                            db,
+                            company_id=company_id,
+                            binding_id=binding.binding_id,
+                            binding_revision=binding.revision,
+                            operation=binding_op.name,
+                            request_id=effect.request_id,
+                            payload=effect.payload,
+                            issued_by_service="core.hybrid_control_gate",
+                            actor_id=agent_id,
+                            admission_id=det_aid,
+                            now_ns=ts,
+                        )
+                    except ConnectorRefused as error:
+                        raise HybridControlGateDenied(str(error)) from error
                     issued_admission_id = adm.admission_id
 
                 append_audit_event(

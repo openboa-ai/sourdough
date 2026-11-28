@@ -1048,6 +1048,305 @@ class HybridExecutionPlaneTests(unittest.TestCase):
                 ).fetchone()[0]
                 self.assertGreaterEqual(denied_cnt, 4)
 
+    def test_proposal_replay_rejects_mutated_connector_intent_and_never_dispatches_twice(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-hyb-rep-") as tmp:
+            store, leases, founding, claim, evidence, now = _setup_company_and_run(
+                Path(tmp)
+            )
+            stub = _StubEffectConnector()
+            proxy = ConnectorProxy(
+                ConnectorAdapterRegistry([stub]),
+                InMemorySecretVault({"envref:HYB_TEST_KEY": "test-hyb-rep-1111"}),
+                loopback_only=True,
+            )
+            gate = DeterministicControlPlaneGate(connector_proxy=proxy)
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                binding = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="hyb-exec-rep",
+                    connector_kind="hybrid_target",
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9121",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=stub.manifest.operations,
+                    credential_handle_ref="envref:HYB_TEST_KEY",
+                    actor_id="board-1",
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("execute_intent",),
+                    granted_by_actor_id="board-1",
+                    now_ns=now + 1,
+                )
+                p_first = PlaneExecutionProposal(
+                    proposal_id="p-replay-1",
+                    plane="code",
+                    engine_id="rule.exec",
+                    engine_revision="r1",
+                    action_kind="proceed",
+                    rationale="First intent",
+                    decision_at_ns=now + 5,
+                    evidence=(evidence,),
+                    connector_effect=ConnectorEffectIntent(
+                        binding_id=binding.binding_id,
+                        operation="execute_intent",
+                        request_id="req-A",
+                        payload={"action": "rebalance", "qty": 1},
+                        expected_environment="external_test",
+                    ),
+                )
+                gate.commit(w, claim, p_first, now_ns=now + 5)
+                self.assertEqual(len(stub.calls), 1)
+
+                # Repeating the exact same proposal_id with mutated request_id & qty MUST be refused!
+                p_mutated = PlaneExecutionProposal(
+                    proposal_id="p-replay-1",
+                    plane="code",
+                    engine_id="rule.exec",
+                    engine_revision="r1",
+                    action_kind="proceed",
+                    rationale="First intent",
+                    decision_at_ns=now + 5,
+                    evidence=(evidence,),
+                    connector_effect=ConnectorEffectIntent(
+                        binding_id=binding.binding_id,
+                        operation="execute_intent",
+                        request_id="req-B",
+                        payload={"action": "rebalance", "qty": 99},
+                        expected_environment="external_test",
+                    ),
+                )
+                with self.assertRaises(HybridControlGateDenied):
+                    gate.commit(w, claim, p_mutated, now_ns=now + 6)
+                self.assertEqual(len(stub.calls), 1)
+
+    def test_canonical_company_all_restriction_and_extra_nonnumeric_llm_delta_denied(
+        self,
+    ) -> None:
+        from sourdough.board_control import record_system_restriction
+
+        with TemporaryDirectory(prefix="sd-hyb-rest-") as tmp:
+            store, leases, founding, claim, evidence, now = _setup_company_and_run(
+                Path(tmp)
+            )
+            stub = _StubEffectConnector()
+            proxy = ConnectorProxy(
+                ConnectorAdapterRegistry([stub]),
+                InMemorySecretVault({"envref:HYB_TEST_KEY": "test-hyb-rest-1111"}),
+                loopback_only=True,
+            )
+            gate = DeterministicControlPlaneGate(
+                connector_proxy=proxy,
+                min_llm_eval_samples=20,
+                min_llm_holdout_margin=0.01,
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                binding = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="hyb-exec-rest",
+                    connector_kind="hybrid_target",
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9122",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=stub.manifest.operations,
+                    credential_handle_ref="envref:HYB_TEST_KEY",
+                    actor_id="board-1",
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("execute_intent",),
+                    granted_by_actor_id="board-1",
+                    now_ns=now + 1,
+                )
+                # 1. Extra non-numeric delta smuggled under valid verdict MUST be rejected!
+                patch = PolicyPatchProposal(
+                    proposal_id="p-smuggle",
+                    policy_id="policy.risk",
+                    base_revision="v1",
+                    target_revision="v2",
+                    parameter_deltas={"limit": 1.0},
+                    rationale="Small change",
+                    produced_by_run_id=claim.run_id,
+                )
+                verdict = OfflineEvalVerdict(
+                    verdict_id="ev-smuggle",
+                    policy_id="policy.risk",
+                    target_revision="v2",
+                    proposal_digest=patch.canonical_digest(),
+                    suite_revision="s1",
+                    passed=True,
+                    sample_count=50,
+                    holdout_margin=0.05,
+                    max_drawdown_bps=50,
+                    evaluated_at_ns=now + 2,
+                    evaluator_id="eval-1",
+                )
+                smuggled_llm = PlaneExecutionProposal(
+                    proposal_id="p-smuggle",
+                    plane="llm",
+                    engine_id="policy.risk",
+                    engine_revision="v2",
+                    action_kind="approve",
+                    rationale="Small change",
+                    decision_at_ns=now + 5,
+                    evidence=(evidence,),
+                    parameters={
+                        "base_revision": "v1",
+                        "parameter_deltas": {
+                            "limit": 1.0,
+                            "unreviewed": "arbitrary-value",
+                        },
+                    },
+                    eval_verdict=verdict,
+                    eval_verdict_digest=verdict.canonical_digest(),
+                    policy_patch_digest=patch.canonical_digest(),
+                )
+                with self.assertRaises(HybridControlGateDenied):
+                    gate.commit(w, claim, smuggled_llm, now_ns=now + 5)
+
+                # 2. Canonical 'company:all' restriction blocks 'proceed' with default target_scope_ref='company'
+                record_system_restriction(
+                    w,
+                    restriction_id="rest-canon-all",
+                    cause_category="operator_pause",
+                    scope_ref="company:all",
+                    reason="Canonical company-wide pause",
+                    actor_id="board-1",
+                    now_ns=now + 10,
+                )
+                blocked_prop = PlaneExecutionProposal(
+                    proposal_id="p-blocked-all",
+                    plane="code",
+                    engine_id="rule.exec",
+                    engine_revision="r1",
+                    action_kind="proceed",
+                    rationale="Should be blocked by company:all",
+                    decision_at_ns=now + 12,
+                    evidence=(evidence,),
+                    connector_effect=ConnectorEffectIntent(
+                        binding_id=binding.binding_id,
+                        operation="execute_intent",
+                        request_id="req-blocked-all",
+                        payload={"action": "rebalance", "qty": 1},
+                        expected_environment="external_test",
+                    ),
+                )
+                with self.assertRaises(HybridControlGateDenied):
+                    gate.commit(w, claim, blocked_prop, now_ns=now + 12)
+                self.assertEqual(len(stub.calls), 0)
+
+    def test_code_plane_enforces_deadline_during_execution_and_fallback_degrades(
+        self,
+    ) -> None:
+        now = 1_700_000_000_000_000_000
+        snap = FeatureSnapshot(
+            snapshot_id="snap-timeout",
+            schema_version="feat-v1",
+            decision_at_ns=now,
+            features=(
+                FeaturePoint(
+                    name="x",
+                    value=1.0,
+                    observed_at_ns=now - 10,
+                    available_at_ns=now - 5,
+                ),
+            ),
+        )
+        slow_code = CodePlaneExecutor(
+            rule_id="rule.slow",
+            code_revision="v1",
+            timeout_seconds=0.05,
+            rule_fn=lambda _s, _p: (
+                time.sleep(2.0),
+                CodeRuleDecision(action_kind="hold", rationale="late"),
+            )[1],
+        )
+        t0 = time.monotonic()
+        with self.assertRaises(HybridExecutionRefused):
+            slow_code.evaluate(snap)
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+        # Even if a DecisionModelPlaneExecutor's fallback code rule hangs, evaluation
+        # degrades cleanly to deterministic 'hold' within the bounded deadline!
+        art = b"weights-v1"
+        dm = DecisionModelPlaneExecutor(
+            model_id="dm-slow-fb",
+            model_revision="v1",
+            expected_artifact_sha256=sha256(art).hexdigest(),
+            feature_schema_version="feat-v1",
+            artifact_bytes=art,
+            timeout_seconds=0.05,
+            fallback_executor=slow_code,
+            scorer_fn=lambda _s, _a: (time.sleep(2.0), None)[1],  # type: ignore[return-value]
+        )
+        t1 = time.monotonic()
+        fb_prop = dm.evaluate(snap)
+        self.assertLess(time.monotonic() - t1, 0.6)
+        self.assertTrue(fb_prop.fallback_used)
+        self.assertEqual(fb_prop.fallback_reason, "model_timeout:fallback_failed")
+        self.assertEqual(fb_prop.action_kind, "hold")
+
+    def test_non_llm_providers_settle_zero_cost_without_key_error(self) -> None:
+        from sourdough.agent_runtime import (
+            resolve_model_pricing,
+            settle_shift_cost_to_ledger,
+        )
+
+        with TemporaryDirectory(prefix="sd-hyb-cost-") as tmp:
+            store, leases, founding, _, _, _ = _setup_company_and_run(Path(tmp))
+            profiles = (
+                AgentProfileBinding(
+                    provider=PROVIDER_CODE_PLANE, model="rule-1", revision="v1"
+                ),
+                AgentProfileBinding(
+                    provider=PROVIDER_DECISION_MODEL, model="scorer-1", revision="v1"
+                ),
+                AgentProfileBinding(
+                    provider="custom_zero_cost", model="worker-1", revision="v1"
+                ),
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                for idx, prof in enumerate(profiles):
+                    settled = settle_shift_cost_to_ledger(
+                        w,
+                        profile=prof,
+                        run_id=f"run-zero-{idx}",
+                        turn_id="t-1",
+                        usage=TokenUsage(0, 0),
+                        budget_ceiling_minor_units=100,
+                    )
+                    self.assertEqual(settled.cost_minor_units, 0)
+                    self.assertEqual(settled.released_unused_minor_units, 100)
+                    self.assertIsNone(settled.journal_entry_id)
+
+            # Custom unknown provider with nonzero tokens still fails closed!
+            with self.assertRaises(AgentRuntimeRefused):
+                resolve_model_pricing("custom_unpriced", usage=TokenUsage(100, 50))
+
 
 if __name__ == "__main__":
     unittest.main()

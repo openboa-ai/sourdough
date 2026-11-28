@@ -543,12 +543,12 @@ class ConnectedFlow(unittest.TestCase):
                 p3_out = gate.commit(w, claim, p3_prop, now_ns=t_dec + 20)
                 self.assertEqual(p3_out.decision.action_kind, "approve")
 
-                # 6. Active company restriction blocks risk proposals from ALL planes!
+                # 6. Active canonical company:all restriction blocks risk proposals from ALL planes!
                 record_system_restriction(
                     w,
                     restriction_id="rest-hyb-pause-1",
                     cause_category="risk_pause",
-                    scope_ref="company",
+                    scope_ref="company:all",
                     reason="Board risk pause",
                     actor_id="owner-board",
                     now_ns=t_dec + 30,
