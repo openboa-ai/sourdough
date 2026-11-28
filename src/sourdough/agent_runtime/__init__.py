@@ -12,11 +12,13 @@ from .cost_accounting import (
 from .gemini_api import GeminiGenerateContentAdapter
 from .openai_api import OpenAiResponsesAdapter
 from .protocol import (
+    EXTERNAL_ISOLATION_FLOW_CLASSES,
     PROVIDER_ANTHROPIC,
     PROVIDER_CODEX_CLI,
     PROVIDER_GEMINI,
     PROVIDER_OPENAI,
     VALID_PROVIDERS,
+    VALID_TOOL_FLOW_CLASSES,
     AdapterEvent,
     AdapterManifest,
     AgentBudgetExceeded,
@@ -34,17 +36,20 @@ from .protocol import (
     ShiftRequest,
     ShiftResult,
     TokenUsage,
+    ToolFlowClass,
     ToolSpec,
     hydrate_shift_context,
 )
 from .registry import AgentAdapterRegistry, build_default_adapter_registry
 
 __all__ = [
+    "EXTERNAL_ISOLATION_FLOW_CLASSES",
     "PROVIDER_ANTHROPIC",
     "PROVIDER_CODEX_CLI",
     "PROVIDER_GEMINI",
     "PROVIDER_OPENAI",
     "VALID_PROVIDERS",
+    "VALID_TOOL_FLOW_CLASSES",
     "AdapterEvent",
     "AdapterManifest",
     "AgentAdapterRegistry",
@@ -69,6 +74,7 @@ __all__ = [
     "ShiftRequest",
     "ShiftResult",
     "TokenUsage",
+    "ToolFlowClass",
     "ToolSpec",
     "TurnCostSettlement",
     "build_default_adapter_registry",

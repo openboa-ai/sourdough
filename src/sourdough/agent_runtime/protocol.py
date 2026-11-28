@@ -11,7 +11,49 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import time_ns
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+
+ToolFlowClass = Literal[
+    "neutral",
+    "private_desk_read",
+    "private_desk_write",
+    "peer_input",
+    "peer_outbound",
+    "external_write_sink",
+]
+VALID_TOOL_FLOW_CLASSES: frozenset[str] = frozenset(
+    {
+        "neutral",
+        "private_desk_read",
+        "private_desk_write",
+        "peer_input",
+        "peer_outbound",
+        "external_write_sink",
+    }
+)
+EXTERNAL_ISOLATION_FLOW_CLASSES: frozenset[str] = frozenset(
+    {"peer_input", "peer_outbound", "external_write_sink"}
+)
+LEGACY_EXTERNAL_ISOLATION_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "read_messages",
+        "read_inbox",
+        "discover_handoffs",
+        "read_shared_asset",
+        "append_message",
+        "request_peer_response",
+        "respond_peer_request",
+        "offer_handoff",
+        "decline_handoff",
+        "submit_company_paper_order",
+        "cancel_company_paper_order",
+        "submit_company_live_order",
+        "propose_live_migration",
+        "open_agent_sandbox",
+        "submit_agent_sandbox_order",
+        "cancel_agent_sandbox_order",
+    }
+)
 
 PROVIDER_CODEX_CLI = "codex_cli"
 PROVIDER_OPENAI = "openai"
@@ -214,6 +256,20 @@ class ToolSpec:
     name: str
     description: str
     parameters: dict[str, Any]
+    flow_class: ToolFlowClass = "neutral"
+
+    def __post_init__(self) -> None:
+        if self.flow_class not in VALID_TOOL_FLOW_CLASSES:
+            raise AgentRuntimeRefused(
+                f"Unsupported ToolSpec.flow_class '{self.flow_class}' for tool '{self.name}'"
+            )
+
+    def requires_desk_isolation(self) -> bool:
+        """Return True when exposing this tool requires isolating the shift from private Desk files."""
+        return (
+            self.flow_class in EXTERNAL_ISOLATION_FLOW_CLASSES
+            or self.name in LEGACY_EXTERNAL_ISOLATION_TOOL_NAMES
+        )
 
 
 @dataclass(frozen=True)

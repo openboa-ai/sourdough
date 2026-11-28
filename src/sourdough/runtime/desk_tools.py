@@ -7,7 +7,6 @@ import os
 import stat
 import threading
 from collections.abc import Callable
-from contextlib import closing, nullcontext
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -38,30 +37,21 @@ from ..harness import (
     run_desk_command_sandboxed,
 )
 from ..memory import read_episode
-from ..storage.db import open_reader, read_tx
+from ..storage.db import scoped_reader
 from ..writer_lease import WriterLease
 from .domains import ToolContribution
-from .work_kernel import assert_run_fencing
+from .tool_kit import (
+    FencedToolBase,
+    require_object as _require_object,
+    require_str,
+)
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _MAX_OFFLOAD_READ_BYTES = 16_384
 
 
-def _require_object(
-    args: Any, *, allowed: set[str], required: set[str], label: str
-) -> dict[str, Any]:
-    if not isinstance(args, dict):
-        raise DutyRefused(f"{label} arguments must be a JSON object")
-    keys = set(args.keys())
-    if not required <= keys or not keys <= allowed:
-        raise DutyRefused(f"{label} arguments do not match schema")
-    return args
-
-
 def _require_str(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise DutyRefused(f"{label} must be a nonempty string")
-    return value
+    return require_str(value, label, max_len=None, strip_check=False)
 
 
 def _check_regular_no_symlink(path: Path, stop_at: Path) -> None:
@@ -150,13 +140,9 @@ def build_core_desk_tool_contribution(
     """Build Core Desk, Asset, and Memory OuterToolBroker tools fenced to WorkRunClaim."""
     del clock
     eff_cmd_limits = command_limits or DeskCommandLimits()
-    lock_ctx = tx_lock if tx_lock is not None else nullcontext()
-
-    def _verify_fencing() -> None:
-        with closing(open_reader(writer.store)) as db, read_tx(db):
-            assert_run_fencing(
-                db, claim.run_id, claim.fencing_token, now_ns=claim.current_now_ns()
-            )
+    kit = FencedToolBase(writer=writer, claim=claim, purpose=purpose, tx_lock=tx_lock)
+    lock_ctx = kit.lock_ctx()
+    _verify_fencing = kit.verify_fencing
 
     def _desk_list_drafts(args: dict[str, Any]) -> dict[str, Any]:
         _require_object(args, allowed=set(), required=set(), label="desk_list_drafts")
@@ -417,9 +403,8 @@ def build_core_desk_tool_contribution(
             required={"episode_id"},
             label="memory_read_episode",
         )
-        _verify_fencing()
         episode_id = _require_str(obj["episode_id"], "episode_id")
-        with closing(open_reader(writer.store)) as db, read_tx(db):
+        with kit.fenced_reader() as db:
             episode = read_episode(db, claim.company_id, claim.founder_id, episode_id)
         return {"ok": True, "episode": episode.to_dict()}
 
@@ -433,6 +418,7 @@ def build_core_desk_tool_contribution(
                 "required": [],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_read",
         ),
         ToolSpec(
             name="desk_read_draft",
@@ -443,6 +429,7 @@ def build_core_desk_tool_contribution(
                 "required": ["name"],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_read",
         ),
         ToolSpec(
             name="desk_save_draft",
@@ -457,6 +444,7 @@ def build_core_desk_tool_contribution(
                 "required": ["name", "content"],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_write",
         ),
         ToolSpec(
             name="desk_delete_draft",
@@ -470,6 +458,7 @@ def build_core_desk_tool_contribution(
                 "required": ["name"],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_write",
         ),
         ToolSpec(
             name="desk_read_offloaded_log",
@@ -488,6 +477,7 @@ def build_core_desk_tool_contribution(
                 "required": ["log_path"],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_read",
         ),
         ToolSpec(
             name="desk_publish_selection",
@@ -516,6 +506,7 @@ def build_core_desk_tool_contribution(
                 ],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_write",
         ),
         ToolSpec(
             name="discover_project_references",
@@ -536,6 +527,7 @@ def build_core_desk_tool_contribution(
                 "required": ["asset_id"],
                 "additionalProperties": False,
             },
+            flow_class="peer_input",
         ),
         ToolSpec(
             name="memory_search_episodes",
@@ -549,6 +541,7 @@ def build_core_desk_tool_contribution(
                 "required": ["query"],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_read",
         ),
         ToolSpec(
             name="memory_read_episode",
@@ -559,6 +552,7 @@ def build_core_desk_tool_contribution(
                 "required": ["episode_id"],
                 "additionalProperties": False,
             },
+            flow_class="private_desk_read",
         ),
     ]
     handlers: dict[str, ToolHandler] = {
@@ -574,7 +568,7 @@ def build_core_desk_tool_contribution(
         "memory_read_episode": _memory_read_episode,
     }
 
-    with closing(open_reader(writer.store)) as db, read_tx(db):
+    with scoped_reader(writer.store) as db:
         exec_granted = sandbox_backend == "local-macos" and has_desk_exec_grant(
             db, claim.company_id, claim.founder_id
         )
@@ -588,12 +582,12 @@ def build_core_desk_tool_contribution(
                 required={"command"},
                 label="desk_run_command",
             )
-            _verify_fencing()
             if sandbox_backend != "local-macos":
+                _verify_fencing()
                 raise DutyRefused(
                     "desk_run_command requires local-macos sandbox backend"
                 )
-            with closing(open_reader(writer.store)) as db, read_tx(db):
+            with kit.fenced_reader() as db:
                 if not has_desk_exec_grant(db, claim.company_id, claim.founder_id):
                     raise DutyRefused(
                         "desk_run_command requires explicit desk:exec grant"
@@ -661,6 +655,7 @@ def build_core_desk_tool_contribution(
                     "required": ["command"],
                     "additionalProperties": False,
                 },
+                flow_class="private_desk_read",
             )
         )
         handlers["desk_run_command"] = _desk_run_command
