@@ -1,4 +1,4 @@
-"""Typed Core Company OS <-> Domain Module extension contracts (8 seams)."""
+"""Typed Core Company OS <-> Domain Module extension contracts (9 seams)."""
 
 from __future__ import annotations
 
@@ -387,6 +387,8 @@ class DomainPlugin(Protocol):
         evidence: Any,
     ) -> bool | None: ...
 
+    def contribute_connectors(self) -> tuple[Any, ...]: ...
+
 
 class BaseDomainPlugin:
     """Default no-op implementations for optional DomainPlugin hooks."""
@@ -459,6 +461,9 @@ class BaseDomainPlugin:
     ) -> bool:
         return False
 
+    def contribute_connectors(self) -> tuple[Any, ...]:
+        return ()
+
 
 class DomainPluginRegistry:
     """Validated registry of active DomainPlugin instances at a composition root."""
@@ -517,6 +522,13 @@ class DomainPluginRegistry:
             if hook is not None:
                 hooks.append(hook)
         return tuple(hooks)
+
+    def connector_adapters(self) -> tuple[Any, ...]:
+        """Collect Seam #9 domain-contributed ConnectorAdapter instances."""
+        adapters: list[Any] = []
+        for plugin in self._plugins.values():
+            adapters.extend(plugin.contribute_connectors())
+        return tuple(adapters)
 
 
 def load_domain_plugins(

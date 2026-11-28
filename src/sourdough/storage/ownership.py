@@ -155,6 +155,9 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Agent runtime tool receipts & episodic memory tables
     "tool_call_receipt": frozenset({"runtime/shift/receipts.py"}),
     "agent_episode": frozenset({"memory.py"}),
+    # Core scoped connector registry & actor grant tables
+    "connector_binding": frozenset({"connectors/registry.py"}),
+    "connector_grant": frozenset({"connectors/registry.py"}),
     # Separate derived episode FTS5 search index (outside company store)
     "episodes_fts": frozenset({"episode_index.py"}),
     "episodes_fts_meta": frozenset({"episode_index.py"}),

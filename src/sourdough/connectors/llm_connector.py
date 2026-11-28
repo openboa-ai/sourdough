@@ -1,0 +1,350 @@
+"""Built-in scoped external LLM inference connector (connector_kind='llm_inference').
+
+Allows Agent-authored programs or tools to invoke company-approved external LLM
+endpoints by binding_id without ever seeing raw API keys. Secrets are injected
+strictly in memory at dispatch time, HTTP redirects are blocked, and token usage
+is metered deterministically into integer minor units for company GL settlement.
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+from ..agent_runtime.cost_accounting import (
+    DEFAULT_MODEL_PRICING,
+    ModelPricing,
+    compute_usage_cost_minor_units,
+)
+from ..agent_runtime.protocol import PROVIDER_OPENAI, TokenUsage
+from ..secret_vault import MaskedSecret, MaskedSecretBundle
+from .protocol import (
+    ConnectorIndeterminate,
+    ConnectorManifest,
+    ConnectorRefused,
+    ConnectorRequest,
+    ConnectorResponse,
+    OperationSpec,
+)
+
+CONNECTOR_KIND_LLM_INFERENCE = "llm_inference"
+
+LLM_COMPLETE_OP = OperationSpec(
+    name="complete",
+    mode="write",
+    request_schema={
+        "type": "object",
+        "properties": {
+            "model": {"type": "string"},
+            "input": {"type": "string"},
+            "instructions": {"type": "string"},
+            "max_output_tokens": {"type": "integer"},
+            "api_style": {"type": "string", "enum": ["responses", "chat_completions"]},
+        },
+        "required": ["model", "input"],
+    },
+    supports_lookup=False,
+    idempotent=False,
+)
+
+LLM_EMBED_OP = OperationSpec(
+    name="embed",
+    mode="read",
+    request_schema={
+        "type": "object",
+        "properties": {
+            "model": {"type": "string"},
+            "input": {"type": "string"},
+        },
+        "required": ["model", "input"],
+    },
+    supports_lookup=False,
+    idempotent=True,
+)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Block all HTTP 3xx redirects so Bearer credentials can never bounce to unpinned hosts."""
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        raise ConnectorRefused(
+            f"Connector HTTP redirect (status {code}) is prohibited for credential safety"
+        )
+
+
+def _post_pinned_json(
+    url: str,
+    *,
+    allowed_hosts: tuple[str, ...],
+    headers: dict[str, str],
+    body: dict[str, Any],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in allowed_hosts:
+        raise ConnectorRefused(
+            f"Refused outbound LLM connector request to unpinned host '{hostname}'"
+        )
+    raw_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=raw_body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **headers,
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    try:
+        with opener.open(req, timeout=timeout_seconds) as resp:
+            response_bytes = resp.read()
+    except urllib.error.HTTPError as error:
+        try:
+            err_excerpt = error.read().decode("utf-8", errors="replace")[:240]
+        finally:
+            error.close()
+        if error.code in (408, 429, 500, 502, 503, 504):
+            raise ConnectorIndeterminate(
+                f"LLM connector HTTP {error.code} indeterminate transport failure"
+            ) from error
+        raise ConnectorRefused(
+            f"LLM connector rejected request (HTTP {error.code}): {err_excerpt}"
+        ) from error
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise ConnectorIndeterminate(
+            f"LLM connector transport interrupted ({type(error).__name__})"
+        ) from error
+
+    try:
+        decoded = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ConnectorIndeterminate(
+            "LLM connector returned malformed JSON response"
+        ) from error
+    if not isinstance(decoded, dict):
+        raise ConnectorIndeterminate("LLM connector JSON root must be an object")
+    return decoded
+
+
+def _extract_usage(parsed: dict[str, Any]) -> TokenUsage:
+    usage = parsed.get("usage")
+    if not isinstance(usage, dict):
+        return TokenUsage(0, 0)
+    raw_in = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+    raw_out = usage.get("output_tokens", usage.get("completion_tokens", 0))
+    in_tok = int(raw_in) if isinstance(raw_in, int) and raw_in >= 0 else 0
+    out_tok = int(raw_out) if isinstance(raw_out, int) and raw_out >= 0 else 0
+    return TokenUsage(input_tokens=in_tok, output_tokens=out_tok)
+
+
+def _extract_output_text(parsed: dict[str, Any]) -> str:
+    if isinstance(parsed.get("output_text"), str):
+        return str(parsed["output_text"])
+    output_items = parsed.get("output")
+    if isinstance(output_items, list):
+        chunks: list[str] = []
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+            for part in item.get("content") or ():
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chunks.append(part["text"])
+        if chunks:
+            return "\n".join(chunks)
+    choices = parsed.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            msg = first.get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                return msg["content"]
+    return ""
+
+
+class ScopedLlmInferenceConnector:
+    """Credential-proxied external LLM connector metered through company GL & policy gates."""
+
+    def __init__(
+        self,
+        *,
+        pricing: ModelPricing | None = None,
+        auth_header_name: str = "Authorization",
+        auth_prefix: str = "Bearer ",
+    ) -> None:
+        self._pricing = pricing or DEFAULT_MODEL_PRICING[PROVIDER_OPENAI]
+        self._auth_header_name = auth_header_name
+        self._auth_prefix = auth_prefix
+        self._manifest = ConnectorManifest(
+            connector_kind=CONNECTOR_KIND_LLM_INFERENCE,
+            adapter_revision="llm-inference-connector-v1",
+            operations=(LLM_COMPLETE_OP, LLM_EMBED_OP),
+            supports_lookup=False,
+            seals_absent=False,
+            requires_credential=True,
+            credential_fields=(),
+        )
+
+    @property
+    def manifest(self) -> ConnectorManifest:
+        return self._manifest
+
+    def execute(
+        self,
+        request: ConnectorRequest,
+        *,
+        secret: MaskedSecret | MaskedSecretBundle | None,
+        timeout_seconds: float,
+    ) -> ConnectorResponse:
+        if not isinstance(secret, MaskedSecret):
+            raise ConnectorRefused(
+                "llm_inference connector requires a resolved MaskedSecret"
+            )
+        headers = {self._auth_header_name: f"{self._auth_prefix}{secret.value}"}
+        base = request.endpoint_url.rstrip("/")
+
+        if request.operation == "complete":
+            model = request.payload.get("model")
+            prompt_input = request.payload.get("input")
+            if not isinstance(model, str) or not model.strip():
+                raise ConnectorRefused("complete requires a nonempty string 'model'")
+            if not isinstance(prompt_input, str) or not prompt_input.strip():
+                raise ConnectorRefused("complete requires a nonempty string 'input'")
+            api_style = str(request.payload.get("api_style") or "responses")
+            if api_style == "chat_completions":
+                url = f"{base}/v1/chat/completions"
+                messages: list[dict[str, str]] = []
+                instructions = request.payload.get("instructions")
+                if isinstance(instructions, str) and instructions.strip():
+                    messages.append({"role": "system", "content": instructions})
+                messages.append({"role": "user", "content": prompt_input})
+                body: dict[str, Any] = {"model": model.strip(), "messages": messages}
+                max_tok = request.payload.get("max_output_tokens")
+                if type(max_tok) is int and max_tok > 0:
+                    body["max_tokens"] = max_tok
+            elif api_style == "responses":
+                url = f"{base}/v1/responses"
+                body = {"model": model.strip(), "input": prompt_input}
+                instructions = request.payload.get("instructions")
+                if isinstance(instructions, str) and instructions.strip():
+                    body["instructions"] = instructions
+                max_tok = request.payload.get("max_output_tokens")
+                if type(max_tok) is int and max_tok > 0:
+                    body["max_output_tokens"] = max_tok
+            else:
+                raise ConnectorRefused(
+                    f"Unsupported llm_inference api_style: {api_style}"
+                )
+
+            parsed = _post_pinned_json(
+                url,
+                allowed_hosts=request.allowed_hosts,
+                headers=headers,
+                body=body,
+                timeout_seconds=timeout_seconds,
+            )
+            usage = _extract_usage(parsed)
+            cost_minor = compute_usage_cost_minor_units(usage, self._pricing)
+            response_id = parsed.get("id")
+            return ConnectorResponse(
+                status="observed",
+                payload={
+                    "response_id": str(response_id)
+                    if response_id is not None
+                    else None,
+                    "model": str(parsed.get("model") or model.strip()),
+                    "output_text": _extract_output_text(parsed),
+                },
+                source_ref=str(response_id) if response_id is not None else None,
+                indeterminate=False,
+                cost_minor_units=cost_minor,
+                usage={
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                },
+            )
+
+        if request.operation == "embed":
+            model = request.payload.get("model")
+            text_input = request.payload.get("input")
+            if not isinstance(model, str) or not model.strip():
+                raise ConnectorRefused("embed requires a nonempty string 'model'")
+            if not isinstance(text_input, str) or not text_input.strip():
+                raise ConnectorRefused("embed requires a nonempty string 'input'")
+            url = f"{base}/v1/embeddings"
+            parsed = _post_pinned_json(
+                url,
+                allowed_hosts=request.allowed_hosts,
+                headers=headers,
+                body={"model": model.strip(), "input": text_input},
+                timeout_seconds=timeout_seconds,
+            )
+            usage = _extract_usage(parsed)
+            cost_minor = compute_usage_cost_minor_units(usage, self._pricing)
+            data_list = parsed.get("data")
+            vector: list[float] = []
+            if isinstance(data_list, list) and data_list:
+                first = data_list[0]
+                if isinstance(first, dict) and isinstance(first.get("embedding"), list):
+                    vector = [
+                        float(x)
+                        for x in first["embedding"]
+                        if isinstance(x, (int, float))
+                    ]
+            return ConnectorResponse(
+                status="observed",
+                payload={
+                    "model": str(parsed.get("model") or model.strip()),
+                    "embedding": vector,
+                    "dimensions": len(vector),
+                },
+                source_ref=None,
+                indeterminate=False,
+                cost_minor_units=cost_minor,
+                usage={
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                },
+            )
+
+        raise ConnectorRefused(
+            f"Unsupported llm_inference operation: {request.operation}"
+        )
+
+    def lookup(
+        self,
+        request: ConnectorRequest,
+        *,
+        secret: MaskedSecret | MaskedSecretBundle | None,
+        timeout_seconds: float,
+    ) -> ConnectorResponse:
+        del secret, timeout_seconds
+        return ConnectorResponse(
+            status="unknown",
+            payload={
+                "idempotency_key": request.idempotency_key,
+                "reason": "llm_inference_lookup_unsupported",
+            },
+            indeterminate=True,
+        )
+
+
+__all__ = [
+    "CONNECTOR_KIND_LLM_INFERENCE",
+    "LLM_COMPLETE_OP",
+    "LLM_EMBED_OP",
+    "ScopedLlmInferenceConnector",
+]

@@ -981,5 +981,11 @@ class TradingDomainPlugin(BaseDomainPlugin):
 
         return handle_trading_cli_command(args)
 
+    def contribute_connectors(self) -> tuple[Any, ...]:
+        """Seam #9: expose trading external venue adapter through Core ConnectorProxy."""
+        from .connector import TradingVenueConnectorAdapter
+
+        return (TradingVenueConnectorAdapter(),)
+
 
 create_domain_plugin = TradingDomainPlugin
