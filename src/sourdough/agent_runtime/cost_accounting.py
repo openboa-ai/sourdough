@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from hashlib import sha256
+import threading
 
 from ..general_ledger import JournalEntry, JournalLine, post_journal
 from ..writer_lease import WriterLease
@@ -81,14 +83,11 @@ def settle_shift_cost_to_ledger(
     budget_ceiling_minor_units: int,
     pricing: ModelPricing | None = None,
     effective_date: date | None = None,
+    tx_lock: threading.RLock | None = None,
 ) -> TurnCostSettlement:
-    """Settle shift token usage into General Ledger idempotently and verify budget ceiling."""
+    """Settle shift token usage into General Ledger idempotently before enforcing budget ceiling."""
     resolved_pricing = pricing or DEFAULT_MODEL_PRICING[profile.provider]
     cost_minor = compute_usage_cost_minor_units(usage, resolved_pricing)
-    if budget_ceiling_minor_units > 0 and cost_minor > budget_ceiling_minor_units:
-        raise AgentBudgetExceeded(
-            f"Shift compute cost ({cost_minor}) exceeded authorized ceiling ({budget_ceiling_minor_units})"
-        )
     released = max(0, budget_ceiling_minor_units - cost_minor)
     if cost_minor == 0:
         return TurnCostSettlement(
@@ -121,7 +120,13 @@ def settle_shift_cost_to_ledger(
             JournalLine("liability:accounts_payable", -cost_minor),
         ),
     )
-    journal_id = post_journal(writer, entry)
+    lock_ctx = tx_lock if tx_lock is not None else nullcontext()
+    with lock_ctx:
+        journal_id = post_journal(writer, entry)
+    if budget_ceiling_minor_units > 0 and cost_minor > budget_ceiling_minor_units:
+        raise AgentBudgetExceeded(
+            f"Shift compute cost ({cost_minor}) exceeded authorized ceiling ({budget_ceiling_minor_units})"
+        )
     return TurnCostSettlement(
         run_id=run_id,
         turn_id=turn_id,

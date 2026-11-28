@@ -8,7 +8,7 @@ from typing import Any
 
 from ._http import (
     post_json_request,
-    render_context_system_prompt,
+    render_context_system_blocks,
     resolve_endpoint_base,
 )
 from .protocol import (
@@ -84,7 +84,18 @@ class AnthropicMessagesAdapter:
                 payload={"provider": PROVIDER_ANTHROPIC, "model": profile.model},
             )
         ]
-        system_prompt = render_context_system_prompt(request)
+        stable_prefix, dynamic_suffix = render_context_system_blocks(request)
+        system_blocks: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": stable_prefix,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {
+                "type": "text",
+                "text": dynamic_suffix,
+            },
+        ]
         tool_defs = [
             {
                 "name": spec.name,
@@ -109,7 +120,7 @@ class AnthropicMessagesAdapter:
             payload: dict[str, Any] = {
                 "model": profile.model,
                 "max_tokens": self._max_tokens,
-                "system": system_prompt,
+                "system": system_blocks,
                 "messages": messages,
             }
             if tool_defs:
@@ -126,16 +137,17 @@ class AnthropicMessagesAdapter:
             usage_obj = response.get("usage")
             if isinstance(usage_obj, dict):
                 input_count = (
-                    int(usage_obj.get("input_tokens", 0))
-                    + int(usage_obj.get("cache_creation_input_tokens", 0))
-                    + int(usage_obj.get("cache_read_input_tokens", 0))
+                    int(usage_obj.get("input_tokens") or 0)
+                    + int(usage_obj.get("cache_creation_input_tokens") or 0)
+                    + int(usage_obj.get("cache_read_input_tokens") or 0)
                 )
-                output_count = int(usage_obj.get("output_tokens", 0))
+                output_count = int(usage_obj.get("output_tokens") or 0)
                 round_usage = TokenUsage(
                     input_tokens=input_count,
                     output_tokens=output_count,
                 )
                 total_usage = total_usage + round_usage
+                broker.record_usage(round_usage)
                 events.append(
                     AdapterEvent(
                         kind="usage",
@@ -167,13 +179,14 @@ class AnthropicMessagesAdapter:
                             f"Anthropic tool_use '{tool_name}' input must be a JSON object"
                         )
                     result = broker.invoke(call_id, tool_name, tool_input)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": call_id,
-                            "content": json.dumps(result, sort_keys=True),
-                        }
-                    )
+                    tool_result_block: dict[str, Any] = {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": json.dumps(result, sort_keys=True),
+                    }
+                    if result.get("ok") is False:
+                        tool_result_block["is_error"] = True
+                    tool_results.append(tool_result_block)
                 elif block_type == "text":
                     text = block.get("text")
                     if isinstance(text, str):

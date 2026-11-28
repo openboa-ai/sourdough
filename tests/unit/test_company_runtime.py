@@ -774,3 +774,248 @@ class UnifiedCompanyRuntime(unittest.TestCase):
         )
         self.assertEqual(good_guard.checked, [self.store.absolute()])
         self.assertTrue(executed)
+
+    def test_wake_priority_ordering_and_duplicate_signal_coalescing(self):
+        from sourdough.runtime.work_kernel import (
+            arm_result_continuation,
+            complete_work_run,
+            evaluate_conditions,
+            record_work_decision,
+        )
+        from sourdough.storage.kernel import append_audit_event
+        from sourdough.writer_lease import hold_company_writer
+
+        execution_order: list[tuple[str, str]] = []
+        with hold_company_writer(
+            self.store, self.company_id, lease_directory=self.leases
+        ) as writer:
+            with closing(open_writer(self.store, lease=writer)) as db, write_tx(db):
+                db.execute(
+                    "INSERT INTO agent VALUES (?, ?, ?)",
+                    ("peer-p", self.company_id, "profile-v1"),
+                )
+                db.execute(
+                    "INSERT INTO standing_grant VALUES (?, ?, ?)",
+                    ("grant-peer-p", "peer-p", "manage"),
+                )
+                db.execute(
+                    "INSERT INTO private_desk VALUES (?, ?)",
+                    ("peer-p", "desk-peer-p"),
+                )
+                # Earlier discretionary dreaming (t=100) and discovery_review (t=150)
+                dream_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.dreaming",
+                    source_kind="manual",
+                    source_id="prio-dream",
+                    now_ns=100,
+                )
+                disc_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="prio-disc",
+                    now_ns=150,
+                )
+                # Later mandatory assessment_review (t=200) and result_dep continuation (t=210)
+                assess_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.assessment_review",
+                    source_kind="manual",
+                    source_id="prio-assess",
+                    now_ns=200,
+                )
+                dep_parent, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    source_kind="manual",
+                    source_id="prio-dep-parent",
+                    now_ns=50,
+                )
+                dep_run = claim_work_run(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=dep_parent.work_item_id,
+                    lease_owner="seed",
+                    lease_ttl_ns=60_000_000_000,
+                    now_ns=60,
+                )
+                record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    work_item_id=dep_parent.work_item_id,
+                    run_id=dep_run.run_id,
+                    fencing_token=dep_run.fencing_token,
+                    action_kind="noop",
+                    rationale="Prerequisite committed",
+                    evidence=(),
+                    action_id="act-prio-dep",
+                    decision_at_ns=70,
+                )
+                complete_work_run(
+                    db,
+                    dep_run.run_id,
+                    dep_run.fencing_token,
+                    outcome={"ok": True},
+                    now_ns=80,
+                )
+                append_audit_event(
+                    db,
+                    company_id=self.company_id,
+                    domain="work",
+                    entity_type="shared_publication",
+                    entity_id="asset-dep-1",
+                    event_type="asset.published",
+                    actor_id="peer-p",
+                    payload={"asset_id": "asset-dep-1", "revision": "r1"},
+                    recorded_at_ns=85,
+                )
+                cont_cond = arm_result_continuation(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    dependency_asset_id="asset-dep-1",
+                    due_at_ns=210,
+                    now_ns=90,
+                    work_item_id=dep_parent.work_item_id,
+                )
+                # Later peer_response (t=220) and Board directives (t=230, t=240)
+                peer_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.peer_response",
+                    source_kind="manual",
+                    source_id="prio-peer",
+                    now_ns=220,
+                )
+                board_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="board.apply_decision",
+                    source_kind="board",
+                    source_id="prio-board",
+                    now_ns=230,
+                )
+                ceo_item, _ = create_work_item(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="ceo.respond_message",
+                    source_kind="board",
+                    source_id="prio-ceo",
+                    now_ns=240,
+                )
+                admitted = evaluate_conditions(db, self.company_id, now_ns=250)
+                self.assertEqual(len(admitted), 1)
+                self.assertEqual(admitted[0].source_id, cont_cond.condition_id)
+                cont_item = admitted[0]
+
+        def _rec(ctx: DutyContext) -> DutyOutcome:
+            execution_order.append(
+                (ctx.work_item.duty_kind, ctx.work_item.work_item_id)
+            )
+            return DutyOutcome("completed")
+
+        registry = build_default_registry(
+            {
+                "ceo.respond_message": _rec,
+                "board.apply_decision": _rec,
+                "work.peer_response": _rec,
+                "work.assessment_review": _rec,
+                "work.discovery_review": _rec,
+                "work.dreaming": _rec,
+            }
+        )
+        runtime = CompanyRuntime(
+            self.store, self.company_id, registry, lease_directory=self.leases
+        )
+        for idx in range(7):
+            runtime.step(max_dispatches=1, now_ns=300 + idx)
+
+        self.assertEqual(
+            [wid for _, wid in execution_order],
+            [
+                board_item.work_item_id,
+                ceo_item.work_item_id,
+                peer_item.work_item_id,
+                assess_item.work_item_id,
+                cont_item.work_item_id,
+                disc_item.work_item_id,
+                dream_item.work_item_id,
+            ],
+        )
+
+        # Duplicate signal coalescing: rapid asset.published events coalesce onto one work item
+        with hold_company_writer(
+            self.store, self.company_id, lease_directory=self.leases
+        ) as writer:
+            with closing(open_writer(self.store, lease=writer)) as db, write_tx(db):
+                resp = register_responsibility(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    duty_kind="work.discovery_review",
+                    remit="Watch proj-prio asset",
+                    readable_scope={"projects": ["proj-prio"]},
+                    now_ns=500,
+                )
+                set_condition(
+                    db,
+                    company_id=self.company_id,
+                    owner_agent_id=self.founder_id,
+                    responsibility_id=resp.responsibility_id,
+                    trigger_kind="shared_asset_revision",
+                    source_identity="asset-coalesce",
+                    cooldown_ns=1,
+                    now_ns=500,
+                )
+                for rev_idx in (1, 2):
+                    append_audit_event(
+                        db,
+                        company_id=self.company_id,
+                        domain="work",
+                        entity_type="shared_publication",
+                        entity_id="asset-coalesce",
+                        event_type="asset.published",
+                        actor_id="peer-p",
+                        payload={
+                            "asset_id": "asset-coalesce",
+                            "revision": f"rev-{rev_idx}",
+                        },
+                        recorded_at_ns=510 + rev_idx,
+                    )
+                items = evaluate_conditions(db, self.company_id, now_ns=530)
+                self.assertEqual(len(items), 1)
+                append_audit_event(
+                    db,
+                    company_id=self.company_id,
+                    domain="work",
+                    entity_type="shared_publication",
+                    entity_id="asset-coalesce",
+                    event_type="asset.published",
+                    actor_id="peer-p",
+                    payload={"asset_id": "asset-coalesce", "revision": "rev-3"},
+                    recorded_at_ns=540,
+                )
+                items2 = evaluate_conditions(db, self.company_id, now_ns=550)
+                self.assertEqual(items2, ())
+                due_disc = db.execute(
+                    """SELECT COUNT(*), payload_json
+                       FROM work_items
+                       WHERE company_id = ? AND owner_agent_id = ?
+                         AND duty_kind = 'work.discovery_review' AND state = 'due'""",
+                    (self.company_id, self.founder_id),
+                ).fetchone()
+                self.assertEqual(due_disc[0], 1)
+                self.assertIn("coalesced_revisions", str(due_disc[1]))

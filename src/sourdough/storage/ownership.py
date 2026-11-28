@@ -32,6 +32,7 @@ SEPARATE_DB_MODULES: frozenset[str] = frozenset(
         "trading/market_worker.py",
         "trading/nautilus_paper.py",
         "trial_registry.py",
+        "episode_index.py",
     }
 )
 
@@ -55,9 +56,15 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "work_conditions": frozenset({"runtime/work_kernel.py"}),
     "work_condition_occurrences": frozenset({"runtime/work_kernel.py"}),
     "work_peer_requests": frozenset({"runtime/work_kernel.py"}),
+    "work_decision": frozenset({"runtime/work_kernel.py"}),
+    "work_event_cursor": frozenset({"runtime/work_kernel.py"}),
+    "work_discovery_state": frozenset({"runtime/work_kernel.py"}),
     # Core company & staffing tables
     "company": frozenset({"company.py", "storage/checkpoint.py"}),
     "agent": frozenset({"company.py", "staffing.py"}),
+    "agent_runtime_binding": frozenset(
+        {"company.py", "staffing.py", "board_control.py"}
+    ),
     "standing_grant": frozenset({"company.py", "staffing.py", "retirement.py"}),
     "founding_receipt": frozenset({"company.py"}),
     "staffing_authority": frozenset({"staffing.py"}),
@@ -116,9 +123,18 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "assessment_source": frozenset({"company_assessment.py"}),
     "assessment_read": frozenset({"company_assessment.py"}),
     "assessment_publication": frozenset({"company_assessment.py"}),
-    # Evidence review qualification and activation tables
+    # Evidence review qualification, activation & method learning tables
     "review_qualification": frozenset({"review_qualification_store.py"}),
     "review_tool_activation": frozenset({"review_tool_activation.py"}),
+    "method_delta": frozenset({"method_learning.py"}),
+    "method_qualification": frozenset({"method_learning.py"}),
+    "method_activation": frozenset({"method_learning.py"}),
+    # Agent runtime tool receipts & episodic memory tables
+    "tool_call_receipt": frozenset({"runtime/shift_runner.py"}),
+    "agent_episode": frozenset({"memory.py"}),
+    # Separate derived episode FTS5 search index (outside company store)
+    "episodes_fts": frozenset({"episode_index.py"}),
+    "episodes_fts_meta": frozenset({"episode_index.py"}),
     # Core general ledger and accounting close tables
     "journal_entry": frozenset({"general_ledger.py"}),
     "journal_line": frozenset({"general_ledger.py"}),

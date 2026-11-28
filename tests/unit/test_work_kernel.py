@@ -1343,3 +1343,133 @@ class WorkKernel(unittest.TestCase):
                 ),
                 {"request_key": "key-1", "outcome": "unavailable", "answer": None},
             )
+
+    def test_open_peer_request_without_explicit_project_id_persists_resolved_project(
+        self,
+    ):
+        peer_impl = "colleague-implicit"
+        with closing(open_writer(self.store)) as conn, write_tx(conn):
+            conn.execute(
+                "INSERT INTO agent VALUES (?, ?, ?)",
+                (peer_impl, self.company_id, "profile-v3"),
+            )
+            conn.execute(
+                "INSERT INTO standing_grant VALUES ('grant-peer-impl', ?, 'manage')",
+                (peer_impl,),
+            )
+            conn.execute(
+                "INSERT INTO shared_project VALUES (?, ?, ?, ?, ?)",
+                (
+                    "proj-implicit",
+                    self.company_id,
+                    "rev-1",
+                    json.dumps([self.founder_id, peer_impl]),
+                    json.dumps([self.founder_id]),
+                ),
+            )
+            upsert_project_peer_responsibility(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=peer_impl,
+                project_id="proj-implicit",
+                allowed_requesters=[self.founder_id],
+                now_ns=1_000,
+            )
+            item, _ = create_work_item(
+                conn,
+                company_id=self.company_id,
+                owner_agent_id=self.founder_id,
+                duty_kind="work.assessment_review",
+                source_kind="unit",
+                source_id="implicit-proj-1",
+                now_ns=1_000,
+            )
+            run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=item.work_item_id,
+                lease_owner="worker-1",
+                lease_ttl_ns=60_000,
+                now_ns=1_100,
+            )
+            req, created = open_peer_request(
+                conn,
+                company_id=self.company_id,
+                requester_work_item_id=item.work_item_id,
+                requester_run_id=run.run_id,
+                fencing_token=run.fencing_token,
+                recipient_agent_id=peer_impl,
+                question="Confirm?",
+                expected_decision="yes/no",
+                evidence_refs=[],
+                deadline_ns=10_000,
+                request_id="req-implicit-1",
+                request_key="key-implicit",
+                project_id=None,
+                now_ns=1_200,
+            )
+            self.assertFalse(created)
+            stored_proj = conn.execute(
+                "SELECT project_id FROM work_peer_requests WHERE request_id = ?",
+                (req.request_id,),
+            ).fetchone()
+            self.assertEqual(stored_proj, ("proj-implicit",))
+            resp_run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=req.response_work_item_id,
+                lease_owner="peer-w",
+                lease_ttl_ns=60_000,
+                now_ns=1_300,
+            )
+            record_peer_request_read(
+                conn,
+                company_id=self.company_id,
+                request_id=req.request_id,
+                actor_id=peer_impl,
+                response_run_id=resp_run.run_id,
+                response_fencing_token=resp_run.fencing_token,
+                now_ns=1_350,
+            )
+            resolve_peer_request(
+                conn,
+                company_id=self.company_id,
+                request_id=req.request_id,
+                actor_id=peer_impl,
+                resolution_state="answered",
+                response_payload={"answer": "Secret"},
+                response_run_id=resp_run.run_id,
+                response_fencing_token=resp_run.fencing_token,
+                now_ns=1_400,
+            )
+            resumed_run = claim_work_run(
+                conn,
+                company_id=self.company_id,
+                work_item_id=item.work_item_id,
+                lease_owner="worker-2",
+                lease_ttl_ns=60_000,
+                now_ns=1_500,
+            )
+            mark_peer_request_resumed(
+                conn,
+                company_id=self.company_id,
+                request_id=req.request_id,
+                resumed_run_id=resumed_run.run_id,
+            )
+            conn.execute(
+                "UPDATE shared_project SET members = ? WHERE project_id = 'proj-implicit'",
+                (json.dumps([peer_impl]),),
+            )
+            self.assertEqual(
+                read_peer_request_outcome(
+                    conn,
+                    company_id=self.company_id,
+                    requester_work_item_id=item.work_item_id,
+                    actor_id=self.founder_id,
+                ),
+                {
+                    "request_key": "key-implicit",
+                    "outcome": "unavailable",
+                    "answer": None,
+                },
+            )

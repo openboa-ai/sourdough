@@ -13,6 +13,26 @@ CREATE TABLE agent (
     execution_profile TEXT NOT NULL
 ) STRICT;
 
+CREATE TABLE agent_runtime_binding (
+    agent_id TEXT PRIMARY KEY NOT NULL REFERENCES agent(id),
+    company_id TEXT NOT NULL REFERENCES company(id),
+    provider TEXT NOT NULL CHECK (
+        provider IN ('codex_cli', 'openai', 'anthropic', 'gemini')
+    ),
+    model TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    sandbox_backend TEXT NOT NULL,
+    credential_handle_ref TEXT CHECK (
+        credential_handle_ref IS NULL
+        OR credential_handle_ref LIKE 'envref:%'
+        OR credential_handle_ref LIKE 'keychain:%'
+    ),
+    profile_id TEXT NOT NULL,
+    created_at_ns INTEGER NOT NULL CHECK (created_at_ns > 0),
+    updated_at_ns INTEGER NOT NULL CHECK (updated_at_ns > 0),
+    CHECK (provider = 'codex_cli' OR credential_handle_ref IS NOT NULL)
+) STRICT;
+
 CREATE TABLE standing_grant (
     id TEXT PRIMARY KEY NOT NULL,
     agent_id TEXT NOT NULL UNIQUE REFERENCES agent(id),

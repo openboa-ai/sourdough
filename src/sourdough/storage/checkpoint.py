@@ -6,14 +6,18 @@ import shutil
 import sqlite3
 import stat
 from collections.abc import Callable, Iterable
-from contextlib import closing
-from dataclasses import asdict, dataclass
+from contextlib import closing, nullcontext
+from dataclasses import asdict, dataclass, field
 from hashlib import file_digest, sha256
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from time import monotonic, time_ns
+from typing import TYPE_CHECKING
 from uuid import uuid4
 from zipfile import ZIP_STORED, BadZipFile, ZipFile
+
+if TYPE_CHECKING:
+    from ..writer_lease import WriterLease
 
 from .db import (
     RETIRED_SCHEMA_REVISION,
@@ -94,6 +98,7 @@ class CheckpointManifest:
     desk_files: tuple[str, ...] = ()
     desk_digest: str = EMPTY_DESK_DIGEST
     cut_id: str = ""
+    agent_desk_digests: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
@@ -112,6 +117,15 @@ class CheckpointManifest:
             or any(ch not in "0123456789abcdef" for ch in self.desk_digest)
             or not isinstance(self.cut_id, str)
             or not self.cut_id.strip()
+            or not isinstance(self.agent_desk_digests, dict)
+            or any(
+                not isinstance(agent_id, str)
+                or not agent_id.strip()
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in digest)
+                for agent_id, digest in self.agent_desk_digests.items()
+            )
         ):
             raise CheckpointRefused("Invalid checkpoint manifest")
 
@@ -360,6 +374,12 @@ def _stage_pinned_desk(
             if stat.S_ISLNK(info.st_mode):
                 raise CheckpointRefused(f"Symlink prohibited inside Desk: {name}")
             if stat.S_ISDIR(info.st_mode):
+                if (
+                    len(prefix.parts) >= 1
+                    and prefix.parts[-1] == ".desk"
+                    and name in ("scratch", "logs", "mounts")
+                ):
+                    continue
                 try:
                     child_fd = os.open(
                         name,
@@ -393,6 +413,12 @@ def _stage_pinned_desk(
                     raise CheckpointRefused(
                         f"Non-regular file prohibited in Desk: {name}"
                     )
+                if pinned_info.st_nlink != 1:
+                    raise CheckpointRefused(
+                        f"Hard-link alias prohibited inside Desk: {name}"
+                    )
+                if name.startswith(".tmp-") and ".desk" in prefix.parts:
+                    continue
                 target = dest_root.joinpath(*rel_path.parts)
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 ancestor = target.parent
@@ -427,6 +453,66 @@ def _publish_file(candidate: Path, target: Path) -> None:
     _fsync_dir(target.parent)
 
 
+def _discover_agent_desk_ids(desk_root: Path) -> tuple[str, ...]:
+    """Return top-level agent_id directories under desk_root that contain a .desk/ directory."""
+    try:
+        root_fd = os.open(desk_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return ()
+    agents: list[str] = []
+    try:
+        for name in sorted(os.listdir(root_fd)):
+            try:
+                agent_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+            except OSError:
+                continue
+            try:
+                desk_fd = os.open(
+                    ".desk",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=agent_fd,
+                )
+                os.close(desk_fd)
+                agents.append(name)
+            except OSError:
+                continue
+            finally:
+                os.close(agent_fd)
+    finally:
+        os.close(root_fd)
+    return tuple(agents)
+
+
+def _compute_agent_desk_digests(
+    agent_ids: Iterable[str],
+    entries: Iterable[tuple[str, str]],
+) -> dict[str, str]:
+    """Compute per-agent canonical SHA-256 digests over <agent_id>/.desk/drafts/*.json."""
+    entry_list = [(str(rel), str(digest)) for rel, digest in entries]
+    known_agents: set[str] = {str(a) for a in agent_ids}
+    per_agent: dict[str, list[tuple[str, str]]] = {a: [] for a in known_agents}
+    for rel, digest in entry_list:
+        parts = PurePosixPath(rel).parts
+        if len(parts) >= 2 and parts[1] == ".desk":
+            agent_id = parts[0]
+            known_agents.add(agent_id)
+            if (
+                len(parts) == 4
+                and parts[2] == "drafts"
+                and parts[3].endswith(".json")
+                and not parts[3].startswith(".")
+            ):
+                per_agent.setdefault(agent_id, []).append((parts[3], digest))
+    return {
+        agent_id: _compute_desk_digest(per_agent.get(agent_id, ()))
+        for agent_id in sorted(known_agents)
+    }
+
+
 def checkpoint_store(
     store: Path,
     company_id: str,
@@ -434,14 +520,21 @@ def checkpoint_store(
     *,
     desk_root: Path | None = None,
     lease_directory: Path | None = None,
+    writer: WriterLease | None = None,
 ) -> CheckpointManifest:
     """Capture a verified, DELETE-normalized checkpoint archive under WriterLease."""
     from ..writer_lease import hold_company_writer
 
-    with (
-        hold_company_writer(
+    if writer is not None:
+        writer.verify_for(store, company_id)
+        lease_cm = nullcontext(writer)
+    else:
+        lease_cm = hold_company_writer(
             store, company_id, lease_directory=lease_directory
-        ) as writer,
+        )
+
+    with (
+        lease_cm as active_writer,
         TemporaryDirectory(dir=archive.parent, prefix=".checkpoint-") as directory,
     ):
         if os.path.lexists(archive):
@@ -451,7 +544,7 @@ def checkpoint_store(
         desk_files = (
             _stage_pinned_desk(desk_root, staged_desk) if desk_root is not None else ()
         )
-        desk_digest = _compute_desk_digest(
+        desk_entries = [
             (
                 rel,
                 _hash_file(
@@ -459,15 +552,37 @@ def checkpoint_store(
                 ),
             )
             for rel in desk_files
-        )
+        ]
+        desk_digest = _compute_desk_digest(desk_entries)
+        agent_ids = _discover_agent_desk_ids(desk_root) if desk_root is not None else ()
+        agent_desk_digests = _compute_agent_desk_digests(agent_ids, desk_entries)
         # Bind the Desk digest into the authoritative append-only audit log before snapshotting SQLite.
         cut_id = uuid4().hex
         with (
             closing(
-                open_writer(writer.store, create=False, lease=writer)
+                open_writer(active_writer.store, create=False, lease=active_writer)
             ) as live_writer,
             write_tx(live_writer),
         ):
+            if agent_desk_digests:
+                known_desks = {
+                    str(row[0])
+                    for row in live_writer.execute(
+                        """SELECT d.agent_id
+                           FROM private_desk d
+                           JOIN agent a ON a.id = d.agent_id
+                           WHERE a.company_id = ?""",
+                        (company_id,),
+                    ).fetchall()
+                }
+                unknown = sorted(set(agent_desk_digests) - known_desks)
+                if unknown:
+                    raise CheckpointRefused(
+                        f"Desk directory belongs to unregistered Agent(s): {', '.join(unknown)}"
+                    )
+            desk_files_digest = sha256(
+                json.dumps(list(desk_files), separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
             append_audit_event(
                 live_writer,
                 company_id=company_id,
@@ -478,7 +593,9 @@ def checkpoint_store(
                 actor_id="checkpoint",
                 payload={
                     "desk_digest": desk_digest,
-                    "desk_files": list(desk_files),
+                    "desk_files_digest": desk_files_digest,
+                    "desk_file_count": len(desk_files),
+                    "agent_desk_digests": agent_desk_digests,
                 },
             )
         staged_db = Path(directory) / _STORE_ENTRY
@@ -496,6 +613,7 @@ def checkpoint_store(
             desk_files=desk_files,
             desk_digest=desk_digest,
             cut_id=cut_id,
+            agent_desk_digests=agent_desk_digests,
         )
         candidate = Path(directory) / "checkpoint.zip"
         with candidate.open("xb") as handle:
@@ -510,7 +628,7 @@ def checkpoint_store(
                     output.write(
                         staged_desk.joinpath(*safe.parts), f"{_DESK_PREFIX}{rel}"
                     )
-        writer.verify()
+        active_writer.verify()
         _publish_file(candidate, archive)
     return manifest
 
@@ -548,6 +666,7 @@ def _parse_manifest(raw: bytes) -> CheckpointManifest:
             desk_files=tuple(desk_files),
             desk_digest=payload["desk_digest"],
             cut_id=payload["cut_id"],
+            agent_desk_digests=payload.get("agent_desk_digests", {}),
         )
     except KeyError as error:
         raise CheckpointRefused("Missing checkpoint manifest field") from error
@@ -615,6 +734,13 @@ def _extract_checkpoint(
                         raise CheckpointRefused(
                             "Extracted Desk contents failed SHA-256 verification"
                         )
+                    actual_agent_digests = _compute_agent_desk_digests(
+                        manifest.agent_desk_digests.keys(), desk_hashes
+                    )
+                    if actual_agent_digests != manifest.agent_desk_digests:
+                        raise CheckpointRefused(
+                            "Extracted per-Agent Desk digests failed verification"
+                        )
             except BadZipFile as error:
                 raise CheckpointRefused("Checkpoint archive is corrupt") from error
     except CheckpointRefused:
@@ -662,14 +788,46 @@ def _extract_checkpoint(
                 raise CheckpointRefused(
                     "Malformed checkpoint cut audit event"
                 ) from error
+            expected_files_digest = sha256(
+                json.dumps(list(manifest.desk_files), separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if isinstance(cut_payload, dict) and "desk_files_digest" in cut_payload:
+                files_match = cut_payload.get(
+                    "desk_files_digest"
+                ) == expected_files_digest and cut_payload.get(
+                    "desk_file_count"
+                ) == len(manifest.desk_files)
+            elif isinstance(cut_payload, dict):
+                files_match = cut_payload.get("desk_files") == list(manifest.desk_files)
+            else:
+                files_match = False
             if (
                 not isinstance(cut_payload, dict)
                 or cut_payload.get("desk_digest") != manifest.desk_digest
-                or cut_payload.get("desk_files") != list(manifest.desk_files)
+                or not files_match
+                or cut_payload.get("agent_desk_digests", {})
+                != manifest.agent_desk_digests
             ):
                 raise CheckpointRefused(
                     "Checkpoint Desk contents do not match authoritative audit digest"
                 )
+            if manifest.agent_desk_digests:
+                known_desks = {
+                    str(row[0])
+                    for row in reader.execute(
+                        """SELECT d.agent_id
+                           FROM private_desk d
+                           JOIN agent a ON a.id = d.agent_id
+                           WHERE a.company_id = ?""",
+                        (company_id,),
+                    ).fetchall()
+                }
+                if not set(manifest.agent_desk_digests) <= known_desks:
+                    raise CheckpointRefused(
+                        "Checkpoint Desk references an unregistered Agent"
+                    )
     except StorageRefused as error:
         raise CheckpointRefused(str(error)) from error
     verify_no_wal_sidecars(database)

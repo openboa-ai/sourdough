@@ -1,9 +1,11 @@
 """Resolve historical run identity separately from current duty authority."""
 
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from .company import _identity
@@ -24,6 +26,48 @@ class DutyClaim:
     duty_id: str
     run_id: str
     execution_profile: str
+
+    @property
+    def agent_id(self) -> str:
+        return self.founder_id
+
+    @property
+    def work_item_id(self) -> str:
+        return self.duty_id
+
+
+@dataclass(frozen=True)
+class WorkRunClaim:
+    """Fenced execution claim for a Work Kernel run.
+
+    Retains `founder_id` (semantic `agent_id`) and `duty_id` (semantic
+    `work_item_id`) field names for structural compatibility with `DutyClaim`.
+    """
+
+    company_id: str
+    founder_id: str
+    duty_id: str
+    run_id: str
+    fencing_token: int
+    grant_id: str
+    grant_scope: str
+    purpose: str
+    _clock: int | Callable[[], int] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    @property
+    def agent_id(self) -> str:
+        return self.founder_id
+
+    @property
+    def work_item_id(self) -> str:
+        return self.duty_id
+
+    def current_now_ns(self) -> int | None:
+        if self._clock is None:
+            return None
+        return self._clock() if callable(self._clock) else self._clock
 
 
 @dataclass(frozen=True)
@@ -155,7 +199,87 @@ def start_run(
     return claim
 
 
-def resolve_run(connection: sqlite3.Connection, claim: DutyClaim) -> RunAuthority:
+def work_run_claim_from_context(
+    connection: sqlite3.Connection,
+    ctx: Any,
+    *,
+    purpose: str | None = None,
+) -> WorkRunClaim:
+    """Build a fenced WorkRunClaim from a DutyContext and authoritative standing_grant."""
+    company_id = str(ctx.company_id)
+    agent_id = str(ctx.work_item.owner_agent_id)
+    if employment_cutoff(connection, agent_id) is not None:
+        raise DutyRefused("Agent employment is fenced")
+    row = connection.execute(
+        """SELECT g.id, g.scope
+           FROM standing_grant g
+           JOIN agent a ON a.id = g.agent_id
+           WHERE a.company_id = ? AND a.id = ?
+             AND trim(g.scope) != '' AND lower(trim(g.scope)) != 'revoked'""",
+        (company_id, agent_id),
+    ).fetchone()
+    if row is None:
+        raise DutyRefused("Agent has no active standing grant")
+    return WorkRunClaim(
+        company_id=company_id,
+        founder_id=agent_id,
+        duty_id=str(ctx.work_item.work_item_id),
+        run_id=str(ctx.run.run_id),
+        fencing_token=int(ctx.run.fencing_token),
+        grant_id=str(row[0]),
+        grant_scope=str(row[1]),
+        purpose=purpose or str(ctx.work_item.duty_kind),
+        _clock=getattr(ctx, "_clock", None),
+    )
+
+
+def resolve_run(
+    connection: sqlite3.Connection,
+    claim: DutyClaim | WorkRunClaim,
+    *,
+    now_ns: int | None = None,
+) -> RunAuthority:
+    if isinstance(claim, WorkRunClaim):
+        from .runtime.work_kernel import assert_run_fencing
+
+        effective_now = now_ns if now_ns is not None else claim.current_now_ns()
+        run = assert_run_fencing(
+            connection, claim.run_id, claim.fencing_token, now_ns=effective_now
+        )
+        if (
+            run.company_id != claim.company_id
+            or run.work_item_id != claim.duty_id
+            or run.agent_id != claim.founder_id
+        ):
+            raise DutyRefused("Work run claim identity mismatch")
+        item_row = connection.execute(
+            """SELECT state FROM work_items
+               WHERE work_item_id = ? AND company_id = ? AND owner_agent_id = ?""",
+            (claim.duty_id, claim.company_id, claim.founder_id),
+        ).fetchone()
+        if item_row is None or str(item_row[0]) != "running":
+            raise DutyRefused("Work run claim requires a running work item")
+        grant_row = connection.execute(
+            """SELECT g.scope
+               FROM standing_grant g
+               JOIN agent a ON a.id = g.agent_id
+               WHERE g.id = ? AND g.agent_id = ? AND a.company_id = ?""",
+            (claim.grant_id, claim.founder_id, claim.company_id),
+        ).fetchone()
+        if grant_row is None:
+            raise DutyRefused("Work run claim grant is unavailable")
+        current_scope = str(grant_row[0])
+        if not current_scope.strip() or current_scope.strip().lower() == "revoked":
+            raise DutyRefused("Work run claim grant is revoked")
+        issued_scope = claim.grant_scope if claim.grant_scope else current_scope
+        return RunAuthority(
+            purpose=claim.purpose,
+            issued_scope=issued_scope,
+            current_scope=current_scope,
+            duty_state="running",
+            is_current=True,
+        )
+
     row = connection.execute(
         """SELECT r.purpose, r.grant_scope, g.scope, d.state, r.is_current
            FROM duty_run r

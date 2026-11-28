@@ -7,13 +7,13 @@ from sqlite3 import Connection
 
 from .agent_desk import require_desk
 from .company import _connect
-from .duty_run import DutyClaim, DutyRefused
+from .duty_run import DutyClaim, DutyRefused, WorkRunClaim
 from .writer_lease import WriterLease
 
 
 _VISIBLE = """FROM project_delivery d JOIN project_message m ON m.message_id=d.message_id
     JOIN shared_project p ON p.project_id=m.project_id
-    WHERE d.recipient_id=? AND EXISTS
+    WHERE d.company_id=? AND d.recipient_id=? AND EXISTS
        (SELECT 1 FROM json_each(p.members) WHERE value=d.recipient_id)"""
 
 
@@ -61,47 +61,99 @@ def _check_cursor(value: str, *, allow_empty: bool = False) -> None:
         raise DutyRefused("Invalid project delivery reference")
 
 
+def _check_reference(value: str) -> None:
+    if not isinstance(value, str) or not 0 < len(value) <= 128 or not value.strip():
+        raise DutyRefused("Invalid project discussion reference")
+
+
 def read_inbox(
-    writer: WriterLease, claim: DutyClaim, purpose: str, after: str
+    writer: WriterLease,
+    claim: DutyClaim | WorkRunClaim,
+    purpose: str,
+    after: str,
+    *,
+    project_id: str | None = None,
 ) -> tuple[tuple[Delivery, ...], str]:
     _check_cursor(after, allow_empty=True)
+    if project_id is not None:
+        _check_reference(project_id)
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "ro")) as database:
         database.execute("BEGIN")
         require_desk(database, claim, purpose)
+        after_rowid: int | None = None
+        if after != "":
+            cursor_row = database.execute(
+                """SELECT d.rowid
+                   FROM project_delivery d
+                   JOIN project_message m ON m.message_id = d.message_id
+                   JOIN shared_project p ON p.project_id = m.project_id
+                   WHERE d.company_id = ? AND d.recipient_id = ? AND d.delivery_id = ?
+                     AND EXISTS (SELECT 1 FROM json_each(p.members) WHERE value = d.recipient_id)
+                     AND (? IS NULL OR m.project_id = ?)""",
+                (
+                    claim.company_id,
+                    claim.founder_id,
+                    after,
+                    project_id,
+                    project_id,
+                ),
+            ).fetchone()
+            if cursor_row is None:
+                raise DutyRefused("Project delivery cursor is unavailable")
+            after_rowid = int(cursor_row[0])
         rows = database.execute(
             """SELECT d.delivery_id,d.message_id,m.project_id,m.sender_id,d.read_run_id """
             + _VISIBLE
-            + """ AND (?='' OR d.rowid>(
-                SELECT rowid FROM project_delivery WHERE recipient_id=? AND delivery_id=?
-               )) ORDER BY d.rowid LIMIT 17""",
-            (claim.founder_id, after, claim.founder_id, after),
+            + """ AND (? IS NULL OR m.project_id = ?)
+                AND (? IS NULL OR d.rowid > ?)
+                ORDER BY d.rowid LIMIT 17""",
+            (
+                claim.company_id,
+                claim.founder_id,
+                project_id,
+                project_id,
+                after_rowid,
+                after_rowid,
+            ),
         ).fetchall()
         page = tuple(Delivery(*row) for row in rows[:16])
         return page, page[-1].delivery_id if len(rows) > 16 else ""
 
 
 def acknowledge_delivery(
-    writer: WriterLease, claim: DutyClaim, purpose: str, delivery_id: str
+    writer: WriterLease,
+    claim: DutyClaim | WorkRunClaim,
+    purpose: str,
+    delivery_id: str,
+    *,
+    expected_membership_revision: str | None = None,
 ) -> Delivery:
     _check_cursor(delivery_id)
+    if expected_membership_revision is not None:
+        _check_reference(expected_membership_revision)
     writer.verify_for(writer.store, claim.company_id)
     with closing(_connect(writer.store, "rw")) as database, database:
         database.execute("BEGIN IMMEDIATE")
         require_desk(database, claim, purpose)
         row = database.execute(
-            """SELECT d.delivery_id,d.message_id,m.project_id,m.sender_id,d.read_run_id """
+            """SELECT d.delivery_id,d.message_id,m.project_id,m.sender_id,d.read_run_id,p.revision """
             + _VISIBLE
             + " AND d.delivery_id=?",
-            (claim.founder_id, delivery_id),
+            (claim.company_id, claim.founder_id, delivery_id),
         ).fetchone()
         if row is None:
             raise DutyRefused("Project delivery is unavailable")
-        if row[-1] is not None:
-            return Delivery(*row)
+        if (
+            expected_membership_revision is not None
+            and row[5] != expected_membership_revision
+        ):
+            raise DutyRefused("Project discussion membership changed")
+        if row[4] is not None:
+            return Delivery(*row[:5])
         database.execute(
-            "UPDATE project_delivery SET read_run_id=? WHERE delivery_id=?",
-            (claim.run_id, delivery_id),
+            "UPDATE project_delivery SET read_run_id=? WHERE company_id=? AND delivery_id=?",
+            (claim.run_id, claim.company_id, delivery_id),
         )
         writer.verify()
-        return Delivery(*row[:-1], claim.run_id)
+        return Delivery(*row[:4], claim.run_id)

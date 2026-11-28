@@ -1,7 +1,9 @@
 """Typed DutyRegistry mapping duty_kind to handlers without scenario-specific loops."""
 
 import sqlite3
+import threading
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from time import time_ns
 from typing import Any, Literal
@@ -21,10 +23,14 @@ class DutyContext:
     work_item: WorkItem
     run: WorkRun
     _clock: int | Callable[[], int] = field(default=time_ns, repr=False)
+    tx_lock: threading.RLock | None = field(default=None, repr=False)
 
     @property
     def now_ns(self) -> int:
         return self._clock() if callable(self._clock) else self._clock
+
+    def write_lock_ctx(self) -> AbstractContextManager[None]:
+        return self.tx_lock if self.tx_lock is not None else nullcontext()
 
 
 @dataclass(frozen=True)

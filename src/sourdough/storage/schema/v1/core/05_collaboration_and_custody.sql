@@ -81,5 +81,12 @@ CREATE TABLE work_handoff (
     expected_result TEXT NOT NULL,
     successor_work_item_id TEXT REFERENCES work_items(work_item_id),
     accepted_run_id TEXT REFERENCES work_runs(run_id),
+    state TEXT NOT NULL DEFAULT 'offered' CHECK (
+        state IN ('offered', 'accepted', 'declined', 'expired', 'withdrawn')
+    ),
+    state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version >= 1),
     UNIQUE (sender_id, request_id)
 ) STRICT;
+
+CREATE INDEX idx_work_handoff_recipient_state
+    ON work_handoff(company_id, recipient_id, state, expires_at);

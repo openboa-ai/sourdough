@@ -1,22 +1,37 @@
 """Bind a company-owned workflow to a Two-Plane AgentSession, Outer Broker, and private Desk."""
 
 import json
+import math
 import os
 import re
+import resource
+import signal
 import stat
 import subprocess
 import sys
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import time_ns
+from typing import Any
 from uuid import uuid4
 
-from .agent_desk import desk_directory, desks_root, resolve_desk
+from .agent_desk import (
+    LEGACY_DESK_LIMITS,
+    PRODUCTION_DESK_LIMITS,
+    DeskLimits,
+    _dir_usage,
+    _safe_unlink_tree_no_follow,
+    allocate_run_scratch,
+    desk_directory,
+    desks_root,
+    resolve_desk,
+)
 from .company import _connect
-from .duty_run import DutyClaim, DutyRefused
+from .duty_run import DutyClaim, DutyRefused, WorkRunClaim, employment_cutoff
 from .runtime.work_kernel import WorkKernelRefused, assert_run_fencing
 from .writer_lease import WriterLease
 
@@ -158,8 +173,10 @@ def offload_large_output(
     root = store.resolve(strict=False).parent
     logs_dir = session.desk_path / ".desk" / "logs"
     _ensure_private_directory(logs_dir, root)
+    safe_run = re.sub(r"[^A-Za-z0-9_.-]", "_", session.run_id)[:64] or "run"
     safe_tool = re.sub(r"[^a-z0-9_]", "_", tool_name)
-    filename = f"{seq:04d}-{safe_tool}.json"
+    digest_prefix = sha256(encoded).hexdigest()[:12]
+    filename = f"{safe_run}-{seq:04d}-{safe_tool}-{digest_prefix}.json"
     tmp_path = logs_dir / f".tmp-{uuid4().hex}-{filename}"
     fd = os.open(
         tmp_path,
@@ -195,7 +212,7 @@ def offload_large_output(
 
 
 def create_agent_session(
-    writer: WriterLease, claim: DutyClaim, purpose: str
+    writer: WriterLease, claim: DutyClaim | WorkRunClaim, purpose: str
 ) -> AgentSession:
     """Bind a server-side AgentSession from the authoritative Work kernel and grant state."""
     writer.verify_for(writer.store, claim.company_id)
@@ -211,9 +228,14 @@ def create_agent_session(
             "SELECT scope FROM standing_grant WHERE id = ? AND agent_id = ?",
             (claim.grant_id, claim.founder_id),
         ).fetchone()
-    if grant_row is None:
+    if grant_row is None or str(grant_row[0]).strip().lower() == "revoked":
         raise DutyRefused("Standing grant is unavailable for AgentSession")
-    fencing_token = int(run_row[0]) if run_row is not None else 1
+    if isinstance(claim, WorkRunClaim):
+        if run_row is None or int(run_row[0]) != claim.fencing_token:
+            raise DutyRefused("Work run fencing token mismatch for AgentSession")
+        fencing_token = claim.fencing_token
+    else:
+        fencing_token = int(run_row[0]) if run_row is not None else 1
     budget_ceiling = int(run_row[1]) if run_row is not None else 0
     return AgentSession(
         company_id=claim.company_id,
@@ -237,25 +259,31 @@ def _sbpl_quote(path: Path) -> str:
 
 def build_desk_sandbox_profile(
     store: Path,
-    desk_path: Path,
+    desk_path: Path | None,
     *,
     broker_socket: Path | None = None,
     scratch_dir: Path | None = None,
     extra_read_paths: tuple[Path, ...] = (),
     extra_read_files: tuple[Path, ...] = (),
+    allow_process_fork: bool = True,
+    allow_dotdesk_read: bool = True,
 ) -> str:
-    """Generate a macOS Seatbelt (SBPL) profile isolating an Agent to its own Desk."""
+    """Generate a macOS Seatbelt (SBPL) profile isolating an Agent to its own Desk or scratch."""
     resolved_store = store.resolve(strict=False)
     resolved_parent = resolved_store.parent
-    resolved_desk = desk_path.resolve(strict=False)
     resolved_desks = desks_root(resolved_store).resolve(strict=False)
     resolved_traces = traces_root(resolved_store).resolve(strict=False)
-    try:
-        resolved_desk.relative_to(resolved_desks)
-    except ValueError as error:
-        raise DutyRefused(
-            "Agent Desk must reside under the company desks root"
-        ) from error
+    resolved_desk: Path | None = None
+    if desk_path is not None:
+        resolved_desk = desk_path.resolve(strict=False)
+        try:
+            resolved_desk.relative_to(resolved_desks)
+        except ValueError as error:
+            raise DutyRefused(
+                "Agent Desk must reside under the company desks root"
+            ) from error
+    elif scratch_dir is None:
+        raise DutyRefused("Sandbox profile requires either desk_path or scratch_dir")
 
     py_roots = sorted(
         {
@@ -267,7 +295,10 @@ def build_desk_sandbox_profile(
         }
     )
     read_subpaths = "\n".join(f"    (subpath {_sbpl_quote(Path(r))})" for r in py_roots)
-    rw_entries = [f"    (subpath {_sbpl_quote(resolved_desk)})"]
+    rw_entries: list[str] = []
+    if resolved_desk is not None:
+        rw_entries.append(f"    (subpath {_sbpl_quote(resolved_desk)})")
+    resolved_scratch: Path | None = None
     if scratch_dir is not None:
         resolved_scratch = scratch_dir.resolve(strict=False)
         for forbidden in (resolved_parent, resolved_desks, resolved_traces):
@@ -294,12 +325,56 @@ def build_desk_sandbox_profile(
 
     store_wal = Path(f"{resolved_store}-wal")
     store_shm = Path(f"{resolved_store}-shm")
+    desk_deny_rules: list[str] = []
+    scratch_rules: list[str] = []
+    if resolved_desk is not None:
+        agents_md_path = resolved_desk / "AGENTS.md"
+        skills_dir_path = resolved_desk / "skills"
+        dotdesk_dir_path = resolved_desk / ".desk"
+        dotdesk_scratch_path = dotdesk_dir_path / "scratch"
+        drafts_dir_path = resolved_desk / ".desk" / "drafts"
+        logs_dir_path = resolved_desk / ".desk" / "logs"
+        desk_deny_rules.extend(
+            [
+                "(deny file-write*",
+                f"    (literal {_sbpl_quote(agents_md_path)})",
+                f"    (subpath {_sbpl_quote(skills_dir_path)})",
+                f"    (subpath {_sbpl_quote(dotdesk_dir_path)})",
+                f"    (subpath {_sbpl_quote(drafts_dir_path)})",
+                f"    (subpath {_sbpl_quote(logs_dir_path)}))",
+            ]
+        )
+        if not allow_dotdesk_read:
+            desk_deny_rules.append(
+                f"(deny file-read* (subpath {_sbpl_quote(dotdesk_dir_path)}))"
+            )
+        if resolved_scratch is not None:
+            scratch_rules.extend(
+                [
+                    f"(allow file-write* (subpath {_sbpl_quote(dotdesk_scratch_path)}))",
+                    f"(deny file-write* (literal {_sbpl_quote(dotdesk_scratch_path)}))",
+                    f"(allow file-write* (subpath {_sbpl_quote(resolved_scratch)}))",
+                    f"(deny file-write* (literal {_sbpl_quote(resolved_scratch)}))",
+                ]
+            )
+    elif resolved_scratch is not None:
+        scratch_rules.extend(
+            [
+                f"(allow file-write* (subpath {_sbpl_quote(resolved_scratch)}))",
+                f"(deny file-write* (literal {_sbpl_quote(resolved_scratch)}))",
+            ]
+        )
+    process_rule = (
+        "(allow process-exec process-fork file-map-executable)"
+        if allow_process_fork
+        else "(allow process-exec file-map-executable)\n(deny process-fork)"
+    )
     return "\n".join(
         [
             "(version 1)",
             "(deny default)",
             '(import "system.sb")',
-            "(allow process-exec process-fork file-map-executable)",
+            process_rule,
             "(allow signal (target self))",
             "(allow file-read-metadata)",
             "(allow file-read*",
@@ -311,6 +386,8 @@ def build_desk_sandbox_profile(
             "(allow file-read* file-write*",
             rw_block + ")",
             *extra_file_lines,
+            *desk_deny_rules,
+            *scratch_rules,
             "(deny file-read* file-write*",
             f"    (literal {_sbpl_quote(resolved_store)})",
             f"    (literal {_sbpl_quote(store_wal)})",
@@ -365,18 +442,329 @@ def run_in_desk_sandbox(
     )
 
 
+@dataclass(frozen=True)
+class DeskCommandLimits:
+    timeout_seconds: float = 15.0
+    cpu_seconds: int = 10
+    memory_bytes: int = 1_073_741_824
+    max_processes: int = 16
+    max_open_files: int = 64
+    max_file_bytes: int = 4_194_304
+    max_stdout_bytes: int = 16_384
+    max_stderr_bytes: int = 8_192
+
+    def __post_init__(self) -> None:
+        if isinstance(self.timeout_seconds, bool) or not isinstance(
+            self.timeout_seconds, (int, float)
+        ):
+            raise DutyRefused("Invalid DeskCommandLimits configuration")
+        try:
+            timeout_val = float(self.timeout_seconds)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise DutyRefused("Invalid DeskCommandLimits configuration") from exc
+        if not math.isfinite(timeout_val) or timeout_val <= 0:
+            raise DutyRefused("Invalid DeskCommandLimits configuration")
+        for int_val in (
+            self.cpu_seconds,
+            self.memory_bytes,
+            self.max_processes,
+            self.max_open_files,
+            self.max_file_bytes,
+            self.max_stdout_bytes,
+            self.max_stderr_bytes,
+        ):
+            if isinstance(int_val, bool) or not isinstance(int_val, int):
+                raise DutyRefused("Invalid DeskCommandLimits configuration")
+        if (
+            self.cpu_seconds <= 0
+            or self.memory_bytes <= 0
+            or self.max_processes <= 0
+            or self.max_open_files < 16
+            or self.max_file_bytes <= 0
+            or self.max_stdout_bytes <= 0
+            or self.max_stderr_bytes <= 0
+        ):
+            raise DutyRefused("Invalid DeskCommandLimits configuration")
+
+
+def has_desk_exec_grant(
+    connection: Any,
+    company_id: str,
+    agent_id: str,
+) -> bool:
+    """Return True iff the active Agent holds an explicit authoritative desk:exec grant."""
+    if employment_cutoff(connection, agent_id) is not None:
+        return False
+    grant_row = connection.execute(
+        """SELECT g.scope
+           FROM standing_grant g
+           JOIN agent a ON a.id = g.agent_id
+           WHERE a.company_id = ? AND a.id = ?
+             AND trim(g.scope) != '' AND lower(trim(g.scope)) != 'revoked'""",
+        (company_id, agent_id),
+    ).fetchone()
+    if grant_row is None:
+        return False
+    if str(grant_row[0]).strip() == "desk:exec":
+        return True
+    rows = connection.execute(
+        """SELECT readable_scope_json
+           FROM work_responsibilities
+           WHERE company_id = ? AND owner_agent_id = ? AND status = 'active'""",
+        (company_id, agent_id),
+    ).fetchall()
+    for (raw_scope,) in rows:
+        try:
+            scope = json.loads(str(raw_scope))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(scope, dict):
+            grants = scope.get("grants")
+            if isinstance(grants, list) and "desk:exec" in grants:
+                return True
+    return False
+
+
+def _read_stream_bounded(
+    stream: Any,
+    max_bytes: int,
+    sink: dict[str, Any],
+) -> None:
+    buf = bytearray()
+    truncated = False
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            remaining = max_bytes - len(buf)
+            if remaining > 0:
+                buf.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncated = True
+            else:
+                truncated = True
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+    sink["text"] = bytes(buf).decode("utf-8", errors="replace")
+    sink["truncated"] = truncated
+
+
+def run_desk_command_sandboxed(
+    session: AgentSession,
+    command: Sequence[str],
+    *,
+    store: Path,
+    sandbox_backend: str = "local-macos",
+    limits: DeskCommandLimits = DeskCommandLimits(),
+    desk_limits: DeskLimits = PRODUCTION_DESK_LIMITS,
+    granted_capabilities: Collection[str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run a non-shell command inside macOS sandbox-exec with rlimits and output byte caps."""
+    if (
+        sandbox_backend != "local-macos"
+        or sys.platform != "darwin"
+        or not _SANDBOX_EXEC.is_file()
+    ):
+        raise DutyRefused("desk_run_command requires local-macos sandbox backend")
+    if (
+        not isinstance(command, Sequence)
+        or isinstance(command, (str, bytes))
+        or not command
+        or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in command)
+    ):
+        raise DutyRefused("desk_run_command requires a nonempty argument list")
+
+    with closing(_connect(store, "ro")) as db:
+        db.execute("BEGIN")
+        if employment_cutoff(db, session.agent_id) is not None:
+            raise DutyRefused("Agent employment is fenced")
+        grant_ok = (
+            "desk:exec" in granted_capabilities
+            and db.execute(
+                """SELECT 1
+                   FROM standing_grant g
+                   JOIN agent a ON a.id = g.agent_id
+                   WHERE a.company_id = ? AND a.id = ?
+                     AND trim(g.scope) != '' AND lower(trim(g.scope)) != 'revoked'""",
+                (session.company_id, session.agent_id),
+            ).fetchone()
+            is not None
+            if granted_capabilities is not None
+            else has_desk_exec_grant(db, session.company_id, session.agent_id)
+        )
+    if not grant_ok:
+        raise DutyRefused("desk_run_command requires explicit desk:exec grant")
+
+    root = store.resolve(strict=False).parent
+    _ensure_private_directory(session.desk_path, root)
+    scratch_dir = allocate_run_scratch(
+        store, session.agent_id, session.run_id, limits=desk_limits
+    )
+    scratch_root = session.desk_path / ".desk" / "scratch"
+    max_scratch_bytes = desk_limits.max_scratch_bytes
+    max_scratch_entries = desk_limits.max_scratch_entries
+    max_desk_bytes = desk_limits.max_total_bytes + desk_limits.max_scratch_bytes
+    max_desk_entries = desk_limits.max_drafts * 4 + desk_limits.max_scratch_entries
+    profile = build_desk_sandbox_profile(
+        store,
+        session.desk_path,
+        broker_socket=None,
+        scratch_dir=scratch_dir,
+        allow_process_fork=False,
+    )
+    sandbox_env = (
+        {"PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.defpath}"}
+        if env is None
+        else dict(env)
+    )
+    sandbox_env["HOME"] = str(session.desk_path)
+    sandbox_env["TMPDIR"] = str(scratch_dir)
+
+    def _apply_rlimits() -> None:
+        for res, target in (
+            (resource.RLIMIT_CPU, limits.cpu_seconds),
+            (resource.RLIMIT_FSIZE, limits.max_file_bytes),
+            (resource.RLIMIT_NOFILE, limits.max_open_files),
+        ):
+            _soft, hard = resource.getrlimit(res)
+            capped = min(target, hard) if hard != resource.RLIM_INFINITY else target
+            resource.setrlimit(res, (capped, capped))
+        for mem_res in (resource.RLIMIT_DATA, resource.RLIMIT_AS):
+            try:
+                _soft, hard = resource.getrlimit(mem_res)
+                capped = (
+                    min(limits.memory_bytes, hard)
+                    if hard != resource.RLIM_INFINITY
+                    else limits.memory_bytes
+                )
+                resource.setrlimit(mem_res, (capped, capped))
+            except (ValueError, OSError):
+                pass
+        if sys.platform != "darwin" and hasattr(resource, "RLIMIT_NPROC"):
+            try:
+                _soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+                capped = (
+                    min(limits.max_processes, hard)
+                    if hard != resource.RLIM_INFINITY
+                    else limits.max_processes
+                )
+                resource.setrlimit(resource.RLIMIT_NPROC, (capped, capped))
+            except (ValueError, OSError):
+                pass
+
+    proc = subprocess.Popen(
+        [str(_SANDBOX_EXEC), "-p", profile, *command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(session.desk_path),
+        env=sandbox_env,
+        start_new_session=True,
+        preexec_fn=_apply_rlimits,
+    )
+    stdout_sink: dict[str, Any] = {"text": "", "truncated": False}
+    stderr_sink: dict[str, Any] = {"text": "", "truncated": False}
+    t_out = threading.Thread(
+        target=_read_stream_bounded,
+        args=(proc.stdout, limits.max_stdout_bytes, stdout_sink),
+        daemon=True,
+    )
+    t_err = threading.Thread(
+        target=_read_stream_bounded,
+        args=(proc.stderr, limits.max_stderr_bytes, stderr_sink),
+        daemon=True,
+    )
+    t_out.start()
+    t_err.start()
+    timed_out = False
+    quota_exceeded = False
+    returncode: int | None = None
+    stop_quota_watch = threading.Event()
+
+    def _scratch_over_quota() -> bool:
+        try:
+            s_bytes, s_entries = _dir_usage(scratch_root)
+            if s_bytes > max_scratch_bytes or s_entries > max_scratch_entries:
+                return True
+            d_bytes, d_entries = _dir_usage(session.desk_path)
+            if d_bytes > max_desk_bytes or d_entries > max_desk_entries:
+                return True
+        except (OSError, DutyRefused):
+            return True
+        return False
+
+    def _watch_quota() -> None:
+        nonlocal quota_exceeded
+        while not stop_quota_watch.wait(0.02):
+            if _scratch_over_quota():
+                quota_exceeded = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                return
+
+    t_quota = threading.Thread(target=_watch_quota, daemon=True)
+    t_quota.start()
+    try:
+        returncode = proc.wait(timeout=limits.timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        stop_quota_watch.set()
+        # Terminate any surviving descendants in the command's process group on every exit path.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
+        t_quota.join(timeout=2.0)
+        t_out.join(timeout=5.0)
+        t_err.join(timeout=5.0)
+
+    if not quota_exceeded and _scratch_over_quota():
+        quota_exceeded = True
+    if quota_exceeded:
+        if os.path.lexists(scratch_dir):
+            for entry in list(scratch_dir.iterdir()):
+                _safe_unlink_tree_no_follow(entry)
+
+    return {
+        "ok": (not timed_out and not quota_exceeded and returncode == 0),
+        "timed_out": timed_out,
+        "quota_exceeded": quota_exceeded,
+        "returncode": None if quota_exceeded else returncode,
+        "stdout": stdout_sink["text"],
+        "stderr": stderr_sink["text"],
+        "stdout_truncated": stdout_sink["truncated"],
+        "stderr_truncated": stderr_sink["truncated"],
+        "scratch_dir": f".desk/scratch/{session.run_id}",
+        **({"error": "Desk scratch quota exceeded"} if quota_exceeded else {}),
+    }
+
+
 class ScopedRun:
     """Outer Capability Broker exposing only company-selected tools for one AgentSession."""
 
     def __init__(
         self,
         writer: WriterLease,
-        claim: DutyClaim,
+        claim: DutyClaim | WorkRunClaim,
         workflow: ScopedWorkflow,
         invoke: Callable[[str, dict], dict],
         *,
         context_current: Callable[[], bool] | None = None,
         offload_threshold_bytes: int | None = None,
+        limits: DeskLimits | None = None,
     ):
         definitions = {item["name"]: item["inputSchema"] for item in workflow.tools}
         terminal = workflow.terminal_tool
@@ -400,12 +788,22 @@ class ScopedRun:
         self._invoke = invoke
         self._context_current = context_current
         self._offload_threshold_bytes = offload_threshold_bytes
+        self._limits = (
+            limits
+            if limits is not None
+            else (
+                PRODUCTION_DESK_LIMITS
+                if isinstance(claim, WorkRunClaim)
+                else LEGACY_DESK_LIMITS
+            )
+        )
         self._call_seq = 0
         self._desk_revision, drafts = resolve_desk(
             writer,
             claim,
             workflow.purpose,
             include_drafts=True,
+            limits=self._limits,
         )
         self._session = create_agent_session(writer, claim, workflow.purpose)
         manifest = {
@@ -417,7 +815,8 @@ class ScopedRun:
             "terminal_tool": workflow.terminal_tool,
         }
         self._manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-        if len(self._manifest.encode()) > 32_000:
+        manifest_cap = 262_144 if isinstance(claim, WorkRunClaim) else 32_000
+        if len(self._manifest.encode()) > manifest_cap:
             raise DutyRefused("Scoped workflow manifest exceeds the run budget")
         self._definitions = {
             item["name"]: item["inputSchema"]
@@ -425,7 +824,9 @@ class ScopedRun:
         }
 
     def _current_desk(self) -> str:
-        revision, _ = resolve_desk(self._writer, self._claim, self._purpose)
+        revision, _ = resolve_desk(
+            self._writer, self._claim, self._purpose, limits=self._limits
+        )
         return revision
 
     def _verify_kernel_fencing(self) -> None:
@@ -448,7 +849,7 @@ class ScopedRun:
                 ) from error
 
     @property
-    def claim(self) -> DutyClaim:
+    def claim(self) -> DutyClaim | WorkRunClaim:
         return self._claim
 
     @property

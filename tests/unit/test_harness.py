@@ -44,7 +44,7 @@ class ScopedHarness(unittest.TestCase):
         )
         with closing(_connect(self.store, "rw")) as database, database:
             database.execute(
-                "INSERT INTO private_desk VALUES (?,?)",
+                "INSERT INTO private_desk VALUES (?,?) ON CONFLICT(agent_id) DO UPDATE SET manifest_revision = excluded.manifest_revision",
                 (self.claim.founder_id, "current-desk"),
             )
         self.calls = []

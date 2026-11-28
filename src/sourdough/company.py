@@ -134,6 +134,14 @@ def found(store: Path, terms: FoundingTerms) -> FoundingReceipt:
                 "INSERT INTO agent VALUES (?, ?, ?)",
                 (receipt.founder_id, receipt.company_id, terms.execution_profile),
             )
+            from .agent_desk import ensure_private_desk
+
+            ensure_private_desk(
+                connection,
+                receipt.company_id,
+                receipt.founder_id,
+                terms.execution_profile,
+            )
             connection.execute(
                 "INSERT INTO standing_grant VALUES (?, ?, ?)",
                 (receipt.grant_id, receipt.founder_id, terms.founder_scope),

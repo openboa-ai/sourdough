@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import monotonic, time_ns
 
@@ -24,6 +24,11 @@ class ResidentHealth:
     triggers_enqueued: int
     last_tick_at_ns: int | None
     last_error: str | None
+    sleep_state: str = "sleeping"
+    wake_count: int = 0
+    last_wake_reason: str | None = None
+    last_good_tick_at_ns: int | None = None
+    recovered_runs_count: int = 0
 
 
 class ResidentCompanyService:
@@ -68,7 +73,13 @@ class ResidentCompanyService:
         self._runs_executed = 0
         self._triggers_enqueued = 0
         self._last_tick_at_ns: int | None = None
+        self._last_good_tick_at_ns: int | None = None
         self._last_error: str | None = None
+        self._sleep_state = "sleeping"
+        self._wake_count = 0
+        self._last_wake_reason: str | None = None
+        self._pending_wake_reason: str | None = None
+        self._recovered_runs_count = 0
         self._last_summary: RuntimeStepSummary | None = None
         self._thread: threading.Thread | None = None
 
@@ -84,8 +95,9 @@ class ResidentCompanyService:
             evaluator_store=evaluator_store,
             bootstrap_challenge=bootstrap_challenge,
             request_timeout=request_timeout,
-            on_commit=self.trigger_now,
+            on_commit=lambda: self.trigger_now("ipc_commit"),
             domain_plugins=domain_plugins,
+            health_provider=lambda: asdict(self.health),
         )
         self._runtime = CompanyRuntime(
             self._store,
@@ -109,27 +121,68 @@ class ResidentCompanyService:
     def info(self) -> DaemonInfo:
         return self._daemon.info
 
+    def _snapshot_health_locked(self) -> ResidentHealth:
+        return ResidentHealth(
+            running=self._started,
+            ticks_completed=self._ticks_completed,
+            runs_executed=self._runs_executed,
+            triggers_enqueued=self._triggers_enqueued,
+            last_tick_at_ns=self._last_tick_at_ns,
+            last_error=self._last_error,
+            sleep_state=self._sleep_state,
+            wake_count=self._wake_count,
+            last_wake_reason=self._last_wake_reason,
+            last_good_tick_at_ns=self._last_good_tick_at_ns,
+            recovered_runs_count=self._recovered_runs_count,
+        )
+
     @property
     def health(self) -> ResidentHealth:
         with self._state_cond:
-            return ResidentHealth(
-                running=self._started,
-                ticks_completed=self._ticks_completed,
-                runs_executed=self._runs_executed,
-                triggers_enqueued=self._triggers_enqueued,
-                last_tick_at_ns=self._last_tick_at_ns,
-                last_error=self._last_error,
-            )
+            return self._snapshot_health_locked()
 
-    def trigger_now(self) -> None:
+    def trigger_now(self, reason: str = "trigger") -> None:
         """Wake the autonomous scheduler immediately."""
+        with self._state_cond:
+            self._pending_wake_reason = reason
         self._wake_event.set()
+
+    def _run_company_tick(
+        self,
+        *,
+        max_dispatches: int,
+        stop_event: threading.Event | None = None,
+    ) -> tuple[int, RuntimeStepSummary]:
+        writer = self._daemon.writer_lease
+        lock = self._daemon.write_lock
+        created = 0
+        if self._enable_board_trigger_intake:
+            with lock:
+                created = sync_board_triggers(
+                    writer, self._company_id, now_ns=self._clock()
+                )
+            if created > 0:
+                self._daemon.notify_commit(invoke_hook=False)
+        summary = self._runtime.step_with_writer(
+            writer,
+            max_dispatches=max_dispatches,
+            tx_lock=lock,
+            on_commit=lambda: self._daemon.notify_commit(invoke_hook=False),
+            stop_event=stop_event,
+        )
+        return created, summary
 
     def start(self) -> DaemonInfo:
         if self._started:
             return self._daemon.info
         info = self._daemon.start()
         try:
+            created, sweep_summary = self._run_company_tick(max_dispatches=0)
+            with self._state_cond:
+                self._triggers_enqueued += created
+                self._recovered_runs_count += len(sweep_summary.fenced_runs)
+                self._last_summary = sweep_summary
+                self._pending_wake_reason = "startup"
             self._stop_event.clear()
             self._wake_event.set()
             with self._state_cond:
@@ -158,6 +211,7 @@ class ResidentCompanyService:
         self._daemon.stop()
         with self._state_cond:
             self._started = False
+            self._sleep_state = "sleeping"
             self._state_cond.notify_all()
 
     def __enter__(self) -> ResidentCompanyService:
@@ -177,14 +231,7 @@ class ResidentCompanyService:
         deadline = monotonic() + timeout_seconds
         with self._state_cond:
             while True:
-                current = ResidentHealth(
-                    running=self._started,
-                    ticks_completed=self._ticks_completed,
-                    runs_executed=self._runs_executed,
-                    triggers_enqueued=self._triggers_enqueued,
-                    last_tick_at_ns=self._last_tick_at_ns,
-                    last_error=self._last_error,
-                )
+                current = self._snapshot_health_locked()
                 if predicate(current):
                     return current
                 remaining = deadline - monotonic()
@@ -195,22 +242,8 @@ class ResidentCompanyService:
                 self._state_cond.wait(timeout=min(remaining, 0.25))
 
     def _run_one_tick(self) -> RuntimeStepSummary:
-        writer = self._daemon.writer_lease
-        lock = self._daemon.write_lock
-        created = 0
-        if self._enable_board_trigger_intake:
-            with lock:
-                created = sync_board_triggers(
-                    writer, self._company_id, now_ns=self._clock()
-                )
-            if created > 0:
-                self._daemon.notify_commit(invoke_hook=False)
-
-        summary = self._runtime.step_with_writer(
-            writer,
+        created, summary = self._run_company_tick(
             max_dispatches=self._max_dispatches_per_tick,
-            tx_lock=lock,
-            on_commit=lambda: self._daemon.notify_commit(invoke_hook=False),
             stop_event=self._stop_event,
         )
         tick_ts = self._clock()
@@ -218,25 +251,57 @@ class ResidentCompanyService:
             self._ticks_completed += 1
             self._runs_executed += len(summary.executed_runs)
             self._triggers_enqueued += created
+            self._recovered_runs_count += len(summary.fenced_runs)
             self._last_tick_at_ns = tick_ts
+            self._last_good_tick_at_ns = tick_ts
+            self._last_error = None
             self._last_summary = summary
             self._state_cond.notify_all()
         return summary
 
     def _scheduler_loop(self) -> None:
+        with self._state_cond:
+            self._sleep_state = "awake"
+            self._wake_count += 1
+            self._last_wake_reason = self._pending_wake_reason or "startup"
+            self._pending_wake_reason = None
+            self._state_cond.notify_all()
         while not self._stop_event.is_set():
             self._wake_event.clear()
+            had_error = False
+            summary: RuntimeStepSummary | None = None
             try:
                 summary = self._run_one_tick()
             except Exception as error:
+                had_error = True
                 with self._state_cond:
                     self._ticks_completed += 1
                     self._last_tick_at_ns = self._clock()
                     self._last_error = f"{type(error).__name__}: {error}"
                     self._state_cond.notify_all()
-                self._wake_event.wait(timeout=self._tick_interval_seconds)
-                continue
-            if summary.executed_runs and not self._stop_event.is_set():
+            if (
+                not had_error
+                and summary is not None
+                and (summary.executed_runs or summary.has_more_events)
+                and not self._stop_event.is_set()
+            ):
                 # Drain queued follow-up items promptly before sleeping.
                 continue
-            self._wake_event.wait(timeout=self._tick_interval_seconds)
+            with self._state_cond:
+                if not self._wake_event.is_set():
+                    self._sleep_state = "sleeping"
+                    self._state_cond.notify_all()
+            woken = self._wake_event.wait(timeout=self._tick_interval_seconds)
+            if self._stop_event.is_set():
+                with self._state_cond:
+                    self._sleep_state = "sleeping"
+                    self._state_cond.notify_all()
+                break
+            with self._state_cond:
+                self._sleep_state = "awake"
+                self._wake_count += 1
+                self._last_wake_reason = (
+                    (self._pending_wake_reason or "trigger") if woken else "timer"
+                )
+                self._pending_wake_reason = None
+                self._state_cond.notify_all()

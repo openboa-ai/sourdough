@@ -7,6 +7,7 @@ from typing import Any
 
 from ..writer_lease import WriterLease
 from .accounts import open_agent_sandbox
+from .company_tools import opaque_trading_action_id
 from .domain import ExecutionTierRefused
 from .ledger import (
     cancel_agent_sandbox_order,
@@ -72,8 +73,12 @@ class AgentSandboxTools:
                 raise ExecutionTierRefused(
                     "Invalid submit_agent_sandbox_order arguments"
                 )
+            sanitized_args = dict(arguments)
+            sanitized_args["action_id"] = opaque_trading_action_id(
+                self.writer.company_id, self.agent_id, arguments["action_id"]
+            )
             receipt = submit_agent_sandbox_order(
-                self.writer, agent_id=self.agent_id, **arguments
+                self.writer, agent_id=self.agent_id, **sanitized_args
             )
             return asdict(receipt)
         if name == "cancel_agent_sandbox_order":

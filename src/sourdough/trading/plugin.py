@@ -8,17 +8,11 @@ import os
 import sqlite3
 from collections.abc import Callable, Mapping
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from ..agent_desk import desk_directory
-from ..agent_runtime.cost_accounting import settle_shift_cost_to_ledger
-from ..agent_runtime.protocol import (
-    OuterToolBroker,
-    ShiftRequest,
-    ToolSpec,
-    hydrate_shift_context,
-)
+from ..agent_runtime.protocol import ToolSpec
 from ..ipc.protocol import IpcRefused, valid_path_segment as _valid_path_segment
 from ..runtime.domains import (
     BaseDomainPlugin,
@@ -36,7 +30,7 @@ from ..runtime.domains import (
     WorkDomainPolicy,
     WorkTimelineContribution,
 )
-from ..runtime.registry import DutyContext, DutyDescriptor, DutyOutcome
+from ..runtime.registry import DutyContext, DutyDescriptor, DutyOutcome, RuntimeRefused
 from ..runtime.work_kernel import WorkItem
 from ..storage.db import open_reader, read_tx
 from ..storage.schema import is_domain_installed
@@ -489,29 +483,31 @@ class TradingDomainPlugin(BaseDomainPlugin):
 
             specs.append(READ_MARKET_QUOTE_SPEC)
             handlers["read_market_quote"] = _read_quote
-        return ToolContribution(specs=tuple(specs), handlers=handlers)
+        return ToolContribution(
+            specs=tuple(specs),
+            handlers=handlers,
+            recoverable_exceptions=(ExecutionTierRefused, QuoteRefused),
+        )
 
     def contribute_duties(
         self, services: DutyRuntimeServices
     ) -> tuple[DutyDescriptor, ...]:
         def _run_quant_agent_sandbox(ctx: DutyContext) -> DutyOutcome:
+            if services.shift_runner is None:
+                raise RuntimeRefused("ShiftRunner service is unavailable")
             payload = json.loads(ctx.work_item.payload_json)
             instruction = str(
                 payload.get("instruction")
                 or "Run your isolated Tier 1 sandbox strategy experiment and summarize results."
             )
             agent_id = ctx.work_item.owner_agent_id
-            persisted_profile, grant_scope = services.read_agent_state(
-                ctx.writer.store, ctx.company_id, agent_id
-            )
-            profile = services.resolve_profile(services.profile_bindings, agent_id)
             sandbox_tools = AgentSandboxTools(writer=ctx.writer, agent_id=agent_id)
-            broker = OuterToolBroker(
-                company_id=ctx.company_id,
-                agent_id=agent_id,
-                run_id=ctx.run.run_id,
-                fencing_token=ctx.run.fencing_token,
-                handlers={
+            run_res = services.shift_runner.run(
+                ctx,
+                mandate_summary="Autonomous isolated Tier 1 per-Agent sandbox experiment.",
+                instruction=instruction,
+                base_tools=_SANDBOX_TOOL_SPECS,
+                base_handlers={
                     "open_agent_sandbox": lambda a: sandbox_tools.invoke(
                         "open_agent_sandbox", a
                     ),
@@ -525,49 +521,13 @@ class TradingDomainPlugin(BaseDomainPlugin):
                         "read_agent_sandbox_portfolio", a
                     ),
                 },
+                include_core_desk_tools=True,
+                include_plugin_tools=False,
+                extra_recoverable_exceptions=(ExecutionTierRefused, QuoteRefused),
             )
-            desk = desk_directory(ctx.writer.store, agent_id)
-            desk.mkdir(parents=True, exist_ok=True)
-            context_pack = hydrate_shift_context(
-                company_id=ctx.company_id,
-                agent_id=agent_id,
-                run_id=ctx.run.run_id,
-                fencing_token=ctx.run.fencing_token,
-                grant_scope=grant_scope,
-                mandate_summary="Autonomous isolated Tier 1 per-Agent sandbox experiment.",
-            )
-            budget_ceiling = (
-                ctx.run.budget_ceiling_minor
-                if ctx.run.budget_ceiling_minor > 0
-                else services.default_budget_ceiling_minor
-            )
-            req = ShiftRequest(
-                company_id=ctx.company_id,
-                agent_id=agent_id,
-                run_id=ctx.run.run_id,
-                turn_id="turn-1",
-                fencing_token=ctx.run.fencing_token,
-                instruction=instruction,
-                context=context_pack,
-                tools=_SANDBOX_TOOL_SPECS,
-                budget_ceiling_minor_units=budget_ceiling,
-                desk_path=desk,
-                store_path=ctx.writer.store,
-            )
-            result = services.adapter_registry.execute_shift(
-                persisted_profile_id=persisted_profile,
-                profile=profile,
-                request=req,
-                broker=broker,
-            )
-            settlement = settle_shift_cost_to_ledger(
-                ctx.writer,
-                profile=profile,
-                run_id=ctx.run.run_id,
-                turn_id="turn-1",
-                usage=result.usage,
-                budget_ceiling_minor_units=budget_ceiling,
-            )
+            result = run_res.shift_result
+            settlement = run_res.settlement
+            sbx_out_bytes = result.output_text.strip().encode("utf-8")
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -575,23 +535,22 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "provider": result.provider,
                     "model": result.model,
                     "tool_calls_executed": result.tool_calls_executed,
-                    "output_text": result.output_text,
+                    "output_digest": sha256(sbx_out_bytes).hexdigest(),
+                    "output_bytes": len(sbx_out_bytes),
                     "cost_minor_units": settlement.cost_minor_units,
                     "journal_entry_id": settlement.journal_entry_id,
                 },
             )
 
         def _run_quant_paper_decision(ctx: DutyContext) -> DutyOutcome:
+            if services.shift_runner is None:
+                raise RuntimeRefused("ShiftRunner service is unavailable")
             payload = json.loads(ctx.work_item.payload_json)
             instruction = str(
                 payload.get("instruction")
                 or "Evaluate market quotes and active Company Trading books, execute authorized trades or recommendations, and schedule your next check."
             )
             agent_id = ctx.work_item.owner_agent_id
-            persisted_profile, grant_scope = services.read_agent_state(
-                ctx.writer.store, ctx.company_id, agent_id
-            )
-            profile = services.resolve_profile(services.profile_bindings, agent_id)
             trading_tools = CompanyTradingTools(
                 writer=ctx.writer,
                 agent_id=agent_id,
@@ -613,28 +572,6 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 broker_handlers[tool_name] = (
                     lambda a, _name=tool_name: trading_tools.invoke(_name, a)
                 )
-            broker = OuterToolBroker(
-                company_id=ctx.company_id,
-                agent_id=agent_id,
-                run_id=ctx.run.run_id,
-                fencing_token=ctx.run.fencing_token,
-                handlers=broker_handlers,
-            )
-            desk = desk_directory(ctx.writer.store, agent_id)
-            desk.mkdir(parents=True, exist_ok=True)
-            context_pack = hydrate_shift_context(
-                company_id=ctx.company_id,
-                agent_id=agent_id,
-                run_id=ctx.run.run_id,
-                fencing_token=ctx.run.fencing_token,
-                grant_scope=grant_scope,
-                mandate_summary="Autonomous Company Trading decision shift (Paper & Board-approved Live).",
-            )
-            budget_ceiling = (
-                ctx.run.budget_ceiling_minor
-                if ctx.run.budget_ceiling_minor > 0
-                else services.default_budget_ceiling_minor
-            )
             decision_tools = (
                 ToolSpec(
                     name="read_company_status",
@@ -644,33 +581,19 @@ class TradingDomainPlugin(BaseDomainPlugin):
                 _READ_EXECUTION_TIERS_SPEC,
                 *COMPANY_TRADING_TOOL_SPECS,
             )
-            req = ShiftRequest(
-                company_id=ctx.company_id,
-                agent_id=agent_id,
-                run_id=ctx.run.run_id,
-                turn_id="turn-1",
-                fencing_token=ctx.run.fencing_token,
+            run_res = services.shift_runner.run(
+                ctx,
+                mandate_summary="Autonomous Company Trading decision shift (Paper & Board-approved Live).",
                 instruction=instruction,
-                context=context_pack,
-                tools=decision_tools,
-                budget_ceiling_minor_units=budget_ceiling,
-                desk_path=desk,
-                store_path=ctx.writer.store,
+                base_tools=decision_tools,
+                base_handlers=broker_handlers,
+                include_core_desk_tools=True,
+                include_plugin_tools=False,
+                extra_recoverable_exceptions=(ExecutionTierRefused, QuoteRefused),
             )
-            result = services.adapter_registry.execute_shift(
-                persisted_profile_id=persisted_profile,
-                profile=profile,
-                request=req,
-                broker=broker,
-            )
-            settlement = settle_shift_cost_to_ledger(
-                ctx.writer,
-                profile=profile,
-                run_id=ctx.run.run_id,
-                turn_id="turn-1",
-                usage=result.usage,
-                budget_ceiling_minor_units=budget_ceiling,
-            )
+            result = run_res.shift_result
+            settlement = run_res.settlement
+            sbx_out_bytes = result.output_text.strip().encode("utf-8")
             return DutyOutcome(
                 disposition="completed",
                 result={
@@ -678,7 +601,8 @@ class TradingDomainPlugin(BaseDomainPlugin):
                     "provider": result.provider,
                     "model": result.model,
                     "tool_calls_executed": result.tool_calls_executed,
-                    "output_text": result.output_text,
+                    "output_digest": sha256(sbx_out_bytes).hexdigest(),
+                    "output_bytes": len(sbx_out_bytes),
                     "cost_minor_units": settlement.cost_minor_units,
                     "journal_entry_id": settlement.journal_entry_id,
                 },

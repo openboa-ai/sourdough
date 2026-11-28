@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import closing
+from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
 from time import time_ns
@@ -27,10 +29,23 @@ from ..board_control import (
     resolve_board_access,
 )
 from ..company import FoundingRefused, _identity
+from ..method_learning import (
+    collect_lineage_blast_radii,
+    compute_active_snapshot_id,
+    opaque_one_agent_delta_id,
+    opaque_one_agent_method_id,
+    resolve_active_methods,
+)
 from ..runtime.domains import DomainPlugin, load_domain_plugins
-from ..storage.db import connect_sqlite, open_reader, read_tx
+from ..runtime.work_kernel import WORK_DECISION_ACTION_KINDS
+from ..storage.db import open_reader, read_tx
 from ..storage.kernel import max_event_seq
 from ..storage.schema import installed_domains
+from ..trial_registry import (
+    TrialRefused,
+    read_sealed_suite_meta,
+    summarize_rsi_transfer,
+)
 
 PROJECTION_AGENTS_GRAPH = "agents-graph-v1"
 PROJECTION_AGENT_DETAIL = "agent-detail-v1"
@@ -111,21 +126,226 @@ def _json_loads_safe(raw: str | None, default: Any) -> Any:
         return default
 
 
+def _redact_one_agent_ref_for_board(
+    ref: str,
+    *,
+    force_opaque: bool,
+    one_agent_deltas: set[tuple[str, str]],
+    one_agent_mids: set[str],
+) -> str:
+    """Opaque-map a method/delta reference when it belongs to a one_agent method."""
+    if ":" in ref:
+        mid, rev = ref.rsplit(":", 1)
+        if force_opaque or (mid, rev) in one_agent_deltas or mid in one_agent_mids:
+            return opaque_one_agent_delta_id(mid, rev)
+        return ref
+    if force_opaque or ref in one_agent_mids:
+        return opaque_one_agent_method_id(ref)
+    return ref
+
+
+def _load_one_agent_method_sets(
+    db: sqlite3.Connection, company_id: str
+) -> tuple[set[tuple[str, str]], set[str]]:
+    """Return (one_agent_deltas, one_agent_only_method_ids) for Board projection redaction."""
+    one_agent_deltas: set[tuple[str, str]] = set()
+    one_agent_mids: set[str] = set()
+    shared_mids: set[str] = set()
+    for mid, rev, scope in db.execute(
+        """SELECT method_id, revision_sha256, audience_scope
+           FROM method_delta
+           WHERE company_id = ?""",
+        (company_id,),
+    ).fetchall():
+        mid_s, rev_s, scope_s = str(mid), str(rev), str(scope)
+        if scope_s == "one_agent":
+            one_agent_deltas.add((mid_s, rev_s))
+            one_agent_mids.add(mid_s)
+        else:
+            shared_mids.add(mid_s)
+    return one_agent_deltas, (one_agent_mids - shared_mids)
+
+
+def _redact_active_method_for_board(method_dict: dict[str, Any]) -> dict[str, Any]:
+    """Keep Agent-only (one_agent) method identifiers, bodies, lineage, and notes out of Board projections."""
+    projected = dict(method_dict)
+    if str(projected.get("audience_scope", "")) != "one_agent":
+        return projected
+    raw_mid = str(projected.get("method_id", "") or "")
+    raw_rev = str(projected.get("revision_sha256", "") or "")
+    opaque_mid = opaque_one_agent_method_id(raw_mid)
+    projected["method_id"] = opaque_mid
+    projected["method_id_redacted"] = True
+    if "delta_id" in projected:
+        projected["delta_id"] = (
+            opaque_one_agent_delta_id(raw_mid, raw_rev) if raw_rev else opaque_mid
+        )
+    if isinstance(projected.get("parent_method_ids"), (list, tuple)):
+        projected["parent_method_ids"] = [
+            _redact_one_agent_ref_for_board(
+                str(p),
+                force_opaque=True,
+                one_agent_deltas=set(),
+                one_agent_mids=set(),
+            )
+            for p in projected["parent_method_ids"]
+        ]
+    raw_body = str(projected.get("body_text", "") or "")
+    projected["body_text"] = None
+    projected["body_redacted"] = True
+    projected["body_digest"] = sha256(raw_body.encode("utf-8")).hexdigest()
+    if "uncertainty_note" in projected:
+        projected["uncertainty_note"] = None
+    if "falsification_criteria" in projected:
+        projected["falsification_criteria"] = None
+    if "trigger_spec" in projected:
+        projected["trigger_spec"] = {"redacted": True}
+    if "procedure_meta" in projected:
+        projected["procedure_meta"] = None
+    return projected
+
+
+_OPAQUE_TIMER_SOURCE_RE = re.compile(r"^(?:timer|result_dep):[0-9a-f]{12,64}$")
+
+
+def _sanitize_action_kind_for_board(action_kind: Any) -> str:
+    """Allow only server-defined decision action kinds in Board projections; redact legacy values."""
+    val = str(action_kind or "")
+    return val if val in WORK_DECISION_ACTION_KINDS else "redacted"
+
+
+def _redact_condition_source_for_board(
+    db: sqlite3.Connection,
+    company_id: str,
+    trigger_kind: str | None,
+    source_identity: str | None,
+) -> str | None:
+    """Keep arbitrary Agent-supplied condition labels out of Board projections."""
+    if source_identity is None:
+        return None
+    raw = str(source_identity)
+    if _OPAQUE_TIMER_SOURCE_RE.fullmatch(raw):
+        return raw
+    if trigger_kind == "shared_asset_revision":
+        pub = db.execute(
+            "SELECT 1 FROM shared_publication WHERE company_id = ? AND asset_id = ? LIMIT 1",
+            (company_id, raw),
+        ).fetchone()
+        if pub is not None:
+            return raw
+    elif trigger_kind == "peer_response":
+        req_id = raw.removeprefix("peer_response:")
+        req = db.execute(
+            "SELECT 1 FROM work_peer_requests WHERE company_id = ? AND request_id = ? LIMIT 1",
+            (company_id, req_id),
+        ).fetchone()
+        if req is not None:
+            return raw
+    return f"redacted:{sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _redact_work_item_payload_for_board(
+    db: sqlite3.Connection, company_id: str, raw_json: str
+) -> dict[str, Any]:
+    """Sanitize condition/trigger source identities inside projected work_item payloads."""
+    parsed = _json_loads_safe(raw_json, {})
+    if not isinstance(parsed, dict):
+        return {}
+    projected = dict(parsed)
+    trig_kind = (
+        str(projected.get("trigger_kind"))
+        if projected.get("trigger_kind") is not None
+        else None
+    )
+    if isinstance(projected.get("source_identity"), str):
+        projected["source_identity"] = _redact_condition_source_for_board(
+            db, company_id, trig_kind, projected["source_identity"]
+        )
+    if isinstance(projected.get("coalesced_revisions"), list):
+        safe_coal: list[Any] = []
+        for entry in projected["coalesced_revisions"]:
+            if isinstance(entry, Mapping):
+                e_copy = dict(entry)
+                e_trig = (
+                    str(e_copy.get("trigger_kind"))
+                    if e_copy.get("trigger_kind") is not None
+                    else trig_kind
+                )
+                if isinstance(e_copy.get("source_identity"), str):
+                    e_copy["source_identity"] = _redact_condition_source_for_board(
+                        db, company_id, e_trig, e_copy["source_identity"]
+                    )
+                safe_coal.append(e_copy)
+        projected["coalesced_revisions"] = safe_coal
+    return projected
+
+
+def _redact_run_outcome_for_board(raw_json: str | None) -> Any:
+    """Redact free-form model prose (output_text) and non-enum action_kind from work_runs outcomes."""
+    parsed = _json_loads_safe(raw_json, None)
+    if not isinstance(parsed, dict):
+        return parsed
+    projected = dict(parsed)
+    if "output_text" in projected:
+        raw_out = projected.pop("output_text", None)
+        projected["output_text"] = None
+        projected["output_redacted"] = True
+        if raw_out is not None and "output_digest" not in projected:
+            projected["output_digest"] = sha256(
+                str(raw_out).encode("utf-8")
+            ).hexdigest()
+    if "action_kind" in projected and projected["action_kind"] is not None:
+        raw_act = str(projected["action_kind"])
+        safe_act = _sanitize_action_kind_for_board(raw_act)
+        projected["action_kind"] = safe_act
+        if safe_act != raw_act:
+            projected["action_kind_redacted"] = True
+    return projected
+
+
+def _redact_evidence_refs_for_board(raw_json: str) -> list[Any]:
+    parsed = _json_loads_safe(raw_json, [])
+    if not isinstance(parsed, list):
+        return []
+    redacted: list[Any] = []
+    for entry in parsed:
+        if isinstance(entry, Mapping) and str(entry.get("kind", "")) == "private_draft":
+            item = dict(entry)
+            raw_res = str(item.get("resource_id", ""))
+            if not raw_res.startswith("private_draft:opaque:"):
+                item["resource_id"] = (
+                    f"private_draft:{sha256(raw_res.encode('utf-8')).hexdigest()[:16]}"
+                )
+            redacted.append(item)
+        else:
+            redacted.append(entry)
+    return redacted
+
+
 def _count_private_drafts(store: Path, agent_id: str) -> int:
-    """Count private Desk draft files without opening, reading, or naming any file."""
+    """Count unique private Desk draft stems without opening, reading, or naming any file."""
     try:
         root = store.resolve(strict=False).parent
         drafts_dir = _drafts_directory(store, agent_id)
         if not _check_no_symlinks(drafts_dir, root):
             return 0
-        count = 0
+        dir_st = os.lstat(drafts_dir)
+        if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
+            return 0
+        stems: set[str] = set()
         for entry in drafts_dir.iterdir():
-            if entry.name.startswith(".") or entry.suffix != ".json":
+            name = entry.name
+            if name.startswith("."):
                 continue
             st = os.lstat(entry)
-            if stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode):
-                count += 1
-        return count
+            if (
+                stat.S_ISLNK(st.st_mode)
+                or not stat.S_ISREG(st.st_mode)
+                or st.st_nlink != 1
+            ):
+                continue
+            stems.add(entry.stem if entry.suffix else name)
+        return len(stems)
     except Exception:
         return 0
 
@@ -579,7 +799,7 @@ def read_agent_detail_projection(
                 "status": str(r[3]),
                 "fencing_token": int(r[4]),
                 "budget_ceiling_minor": int(r[5]),
-                "outcome": _json_loads_safe(r[6], None),
+                "outcome": _redact_run_outcome_for_board(r[6]),
                 "created_at_ns": int(r[7]),
                 "updated_at_ns": int(r[8]),
             }
@@ -600,7 +820,9 @@ def read_agent_detail_projection(
                 "state": str(r[2]),
                 "source_kind": str(r[3]),
                 "source_id": str(r[4]),
-                "payload": _json_loads_safe(str(r[5]), {}),
+                "payload": _redact_work_item_payload_for_board(
+                    db, company_id, str(r[5])
+                ),
                 "updated_at_ns": int(r[6]),
             }
             for r in db.execute(
@@ -618,14 +840,93 @@ def read_agent_detail_projection(
                 "condition_id": str(r[0]),
                 "trigger_kind": str(r[1]),
                 "due_at_ns": None if r[2] is None else int(r[2]),
-                "source_identity": None if r[3] is None else str(r[3]),
+                "source_identity": _redact_condition_source_for_board(
+                    db, company_id, str(r[1]), None if r[3] is None else str(r[3])
+                ),
                 "status": str(r[4]),
+                "condition_revision": int(r[5]),
+                "responsibility_id": None if r[6] is None else str(r[6]),
+                "work_item_id": None if r[7] is None else str(r[7]),
+                "cooldown_ns": int(r[8]),
+                "max_fires": None if r[9] is None else int(r[9]),
+                "fire_count": int(r[10]),
             }
             for r in db.execute(
-                """SELECT condition_id, trigger_kind, due_at_ns, source_identity, status
+                """SELECT condition_id, trigger_kind, due_at_ns, source_identity, status,
+                          condition_revision, responsibility_id, work_item_id,
+                          cooldown_ns, max_fires, fire_count
                    FROM work_conditions
                    WHERE company_id = ? AND owner_agent_id = ?
-                   ORDER BY updated_at_ns DESC LIMIT 20""",
+                   ORDER BY updated_at_ns DESC, condition_id ASC LIMIT 20""",
+                (company_id, agent_id),
+            ).fetchall()
+        ]
+        armed_conditions = [c for c in conditions if c["status"] == "armed"]
+
+        active_methods_resolved = resolve_active_methods(
+            db, company_id, agent_id=agent_id
+        )
+        active_methods = [
+            _redact_active_method_for_board(
+                m.to_dict() | {"delta_id": f"{m.method_id}:{m.revision_sha256}"}
+            )
+            for m in active_methods_resolved
+        ]
+        active_snapshot_id = compute_active_snapshot_id(active_methods_resolved)
+
+        work_decisions = [
+            {
+                "decision_id": str(r[0]),
+                "work_item_id": str(r[1]),
+                "run_id": str(r[2]),
+                "action_id": f"action:{sha256(str(r[3]).encode('utf-8')).hexdigest()[:16]}",
+                "action_id_redacted": True,
+                "action_kind": _sanitize_action_kind_for_board(r[4]),
+                "action_kind_redacted": str(r[4]) not in WORK_DECISION_ACTION_KINDS,
+                "evidence_refs": _redact_evidence_refs_for_board(str(r[5])),
+                "evidence_digest": str(r[6]),
+                "rationale": None,
+                "rationale_redacted": True,
+                "rationale_digest": sha256(str(r[7]).encode("utf-8")).hexdigest(),
+                "next_condition_id": None if r[8] is None else str(r[8]),
+                "active_snapshot_id": None if r[9] is None else str(r[9]),
+                "decision_at_ns": int(r[10]),
+            }
+            for r in db.execute(
+                """SELECT decision_id, work_item_id, run_id, action_id, action_kind,
+                          evidence_refs_json, evidence_digest, rationale,
+                          next_condition_id, active_snapshot_id, decision_at_ns
+                   FROM work_decision
+                   WHERE company_id = ? AND agent_id = ?
+                   ORDER BY decision_at_ns DESC, decision_id ASC LIMIT 30""",
+                (company_id, agent_id),
+            ).fetchall()
+        ]
+
+        agent_episodes = [
+            {
+                "episode_id": str(r[0]),
+                "work_item_id": str(r[1]),
+                "run_id": str(r[2]),
+                "duty_kind": str(r[3]),
+                "outcome_status": str(r[4]),
+                "active_snapshot_id": None if r[5] is None else str(r[5]),
+                "summary_text": f"{r[4]}:{r[3]}",
+                "summary_redacted": True,
+                "summary_digest": sha256(str(r[6]).encode("utf-8")).hexdigest(),
+                "tool_calls_count": int(r[7]),
+                "input_tokens": int(r[8]),
+                "output_tokens": int(r[9]),
+                "cost_minor_units": int(r[10]),
+                "recorded_at_ns": int(r[11]),
+            }
+            for r in db.execute(
+                """SELECT episode_id, work_item_id, run_id, duty_kind, outcome_status,
+                          active_snapshot_id, summary_text, tool_calls_count,
+                          input_tokens, output_tokens, cost_minor_units, recorded_at_ns
+                   FROM agent_episode
+                   WHERE company_id = ? AND agent_id = ?
+                   ORDER BY recorded_at_ns DESC, episode_id ASC LIMIT 30""",
                 (company_id, agent_id),
             ).fetchall()
         ]
@@ -774,10 +1075,16 @@ def read_agent_detail_projection(
                 "allocated_turns": info["allocated_turns"],
                 "prohibitions": prohibitions,
             },
+            "active_methods": active_methods,
+            "active_snapshot_id": active_snapshot_id,
+            "armed_conditions": armed_conditions,
             "tabs": {
                 "work_activity": work_activity,
                 "work_items": work_items,
                 "conditions": conditions,
+                "armed_conditions": armed_conditions,
+                "work_decisions": work_decisions,
+                "agent_episodes": agent_episodes,
                 "interactions_and_talks": interactions,
                 "published_reports": published_reports,
                 "peer_requests": peer_requests,
@@ -1316,6 +1623,7 @@ def read_system_evals_projection(
     company_id: str,
     *,
     evaluator_store: Path | None = None,
+    analysis_plan: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Read Flow 12 review tool pass^3 / DAG lineage + optional isolated Flow 13 offline DB."""
     with closing(open_reader(store)) as db, read_tx(db):
@@ -1367,6 +1675,196 @@ def read_system_evals_projection(
             ).fetchall()
         ]
 
+        one_agent_deltas, one_agent_mids = _load_one_agent_method_sets(db, company_id)
+
+        method_deltas: list[dict[str, Any]] = []
+        for r in db.execute(
+            """SELECT method_id, revision_sha256, delta_kind, item_kind,
+                      audience_scope, audience_target_id, author_agent_id,
+                      parent_method_ids_json, active_snapshot_id,
+                      superseded_revision, redaction_passed, status, created_at_ns
+               FROM method_delta
+               WHERE company_id = ?
+               ORDER BY created_at_ns DESC, method_id ASC, revision_sha256 ASC
+               LIMIT 50""",
+            (company_id,),
+        ).fetchall():
+            raw_mid, raw_rev, scope_s = str(r[0]), str(r[1]), str(r[4])
+            is_one_agent = scope_s == "one_agent"
+            proj_mid = opaque_one_agent_method_id(raw_mid) if is_one_agent else raw_mid
+            raw_parents = _json_loads_safe(str(r[7]), [])
+            proj_parents = (
+                [
+                    _redact_one_agent_ref_for_board(
+                        str(p),
+                        force_opaque=is_one_agent,
+                        one_agent_deltas=one_agent_deltas,
+                        one_agent_mids=one_agent_mids,
+                    )
+                    for p in raw_parents
+                ]
+                if isinstance(raw_parents, list)
+                else []
+            )
+            method_deltas.append(
+                {
+                    "delta_id": f"{proj_mid}:{raw_rev}",
+                    "method_id": proj_mid,
+                    "method_id_redacted": is_one_agent,
+                    "revision_sha256": raw_rev,
+                    "delta_kind": str(r[2]),
+                    "item_kind": str(r[3]),
+                    "audience_scope": scope_s,
+                    "audience_target_id": None if r[5] is None else str(r[5]),
+                    "author_agent_id": str(r[6]),
+                    "parent_method_ids": proj_parents,
+                    "active_snapshot_id": None if r[8] is None else str(r[8]),
+                    "superseded_revision": None if r[9] is None else str(r[9]),
+                    "redaction_passed": bool(r[10]),
+                    "status": str(r[11]),
+                    "created_at_ns": int(r[12]),
+                }
+            )
+
+        method_qualifications: list[dict[str, Any]] = []
+        for r in db.execute(
+            """SELECT q.qualification_id, q.method_id, q.revision_sha256,
+                      q.baseline_revision_sha256, q.stage1_passed, q.stage2_passed,
+                      q.stage3_passed, q.trial_count, q.metrics_json, q.evaluator_revision,
+                      q.passed, q.recorded_at_ns, d.audience_scope
+               FROM method_qualification q
+               LEFT JOIN method_delta d
+                 ON d.company_id = q.company_id
+                AND d.method_id = q.method_id
+                AND d.revision_sha256 = q.revision_sha256
+               WHERE q.company_id = ?
+               ORDER BY q.recorded_at_ns DESC, q.qualification_id ASC
+               LIMIT 50""",
+            (company_id,),
+        ).fetchall():
+            raw_mid, raw_rev = str(r[1]), str(r[2])
+            is_one_agent = (
+                str(r[12] or "") == "one_agent"
+                or (raw_mid, raw_rev) in one_agent_deltas
+            )
+            proj_mid = opaque_one_agent_method_id(raw_mid) if is_one_agent else raw_mid
+            method_qualifications.append(
+                {
+                    "qualification_id": str(r[0]),
+                    "method_id": proj_mid,
+                    "method_id_redacted": is_one_agent,
+                    "revision_sha256": raw_rev,
+                    "delta_id": f"{proj_mid}:{raw_rev}",
+                    "baseline_revision_sha256": None if r[3] is None else str(r[3]),
+                    "stage1_passed": bool(r[4]),
+                    "stage2_passed": bool(r[5]),
+                    "stage3_passed": bool(r[6]),
+                    "trial_count": int(r[7]),
+                    "metrics": _json_loads_safe(str(r[8]), {}),
+                    "evaluator_revision": str(r[9]),
+                    "passed": bool(r[10]),
+                    "recorded_at_ns": int(r[11]),
+                }
+            )
+
+        delta_meta_by_id: dict[str, tuple[str, str]] = {}
+        raw_act_keys: list[tuple[str, str]] = []
+        method_activations: list[dict[str, Any]] = []
+        for r in db.execute(
+            """SELECT a.request_id, a.operation, a.method_id, a.revision_sha256,
+                      a.qualification_id, a.audience_scope, a.audience_target_id,
+                      a.activation_seq, a.principal_id, a.grant_id, a.quarantined,
+                      a.quarantine_reason, a.recorded_at_ns,
+                      d.delta_kind, d.status
+               FROM method_activation a
+               LEFT JOIN method_delta d
+                 ON d.company_id = a.company_id
+                AND d.method_id = a.method_id
+                AND d.revision_sha256 = a.revision_sha256
+               WHERE a.company_id = ?
+               ORDER BY a.activation_seq DESC
+               LIMIT 50""",
+            (company_id,),
+        ).fetchall():
+            raw_mid, raw_rev, scope_s = str(r[2]), str(r[3]), str(r[5])
+            is_one_agent = scope_s == "one_agent"
+            proj_mid = opaque_one_agent_method_id(raw_mid) if is_one_agent else raw_mid
+            raw_delta_id = f"{raw_mid}:{raw_rev}"
+            proj_delta_id = f"{proj_mid}:{raw_rev}"
+            raw_act_keys.append((raw_mid, raw_rev))
+            delta_meta_by_id[raw_delta_id] = (
+                "" if r[13] is None else str(r[13]),
+                "" if r[14] is None else str(r[14]),
+            )
+            method_activations.append(
+                {
+                    "request_id": str(r[0]),
+                    "operation": str(r[1]),
+                    "method_id": proj_mid,
+                    "method_id_redacted": is_one_agent,
+                    "revision_sha256": raw_rev,
+                    "delta_id": proj_delta_id,
+                    "qualification_id": str(r[4]),
+                    "audience_scope": scope_s,
+                    "audience_target_id": None if r[6] is None else str(r[6]),
+                    "activation_seq": int(r[7]),
+                    "principal_id": str(r[8]),
+                    "grant_id": str(r[9]),
+                    "quarantined": bool(r[10]),
+                    "quarantine_reason": (
+                        "redacted_one_agent_reason"
+                        if is_one_agent and r[11] is not None
+                        else (None if r[11] is None else str(r[11]))
+                    ),
+                    "recorded_at_ns": int(r[12]),
+                    "_raw_delta_id": raw_delta_id,
+                    "_raw_key": (raw_mid, raw_rev),
+                }
+            )
+
+        blast_radii = collect_lineage_blast_radii(
+            db,
+            company_id,
+            raw_act_keys,
+        )
+        for m_act in method_activations:
+            raw_key = m_act.pop("_raw_key")
+            raw_delta_id = m_act.pop("_raw_delta_id")
+            is_one_agent = m_act["audience_scope"] == "one_agent"
+            raw_desc = list(blast_radii.get(raw_key, ()))
+            m_act["blast_radius_descendants"] = [
+                _redact_one_agent_ref_for_board(
+                    str(d_ref),
+                    force_opaque=is_one_agent,
+                    one_agent_deltas=one_agent_deltas,
+                    one_agent_mids=one_agent_mids,
+                )
+                for d_ref in raw_desc
+            ]
+            blocked = {raw_delta_id, *raw_desc}
+            fallback = next(
+                (
+                    other["revision_sha256"]
+                    for other, other_raw in zip(method_activations, raw_act_keys)
+                    if other["method_id"] == m_act["method_id"]
+                    and other["audience_scope"] == m_act["audience_scope"]
+                    and other["audience_target_id"] == m_act["audience_target_id"]
+                    and not other["quarantined"]
+                    and other["operation"] != "quarantine"
+                    and f"{other_raw[0]}:{other_raw[1]}" not in blocked
+                    and delta_meta_by_id.get(
+                        f"{other_raw[0]}:{other_raw[1]}", ("", "")
+                    )[0]
+                    != "DEPRECATE"
+                    and delta_meta_by_id.get(
+                        f"{other_raw[0]}:{other_raw[1]}", ("", "")
+                    )[1]
+                    != "quarantined"
+                ),
+                None,
+            )
+            m_act["fallback_revision"] = fallback
+
     # Pre-compute transitive blast radius for each activated tool candidate
     children_map: dict[str, list[str]] = {}
     for act in activations:
@@ -1398,12 +1896,13 @@ def read_system_evals_projection(
         )
         act["fallback_candidate_id"] = fallback
 
-    # Optional physically separate Flow 13 offline evaluator database (strictly read-only)
+    # Optional physically separate offline evaluator database (strictly read-only)
     offline_evals: dict[str, Any] = {
         "connected": False,
         "isolated_notice": "Offline evaluator registry runs in a separate read-only SQLite database outside company.sqlite.",
         "suites": [],
     }
+    rsi_transfer_summaries: list[dict[str, Any]] = []
     if evaluator_store is not None:
         try:
             st = os.lstat(evaluator_store)
@@ -1411,56 +1910,59 @@ def read_system_evals_projection(
                 not stat.S_ISLNK(st.st_mode)
                 and stat.S_ISREG(st.st_mode)
                 and st.st_uid == os.geteuid()
+                and st.st_nlink == 1
             ):
-                from urllib.parse import quote
-
-                encoded_path = quote(str(evaluator_store.absolute()), safe="/")
-                with closing(
-                    connect_sqlite(
-                        f"file:{encoded_path}?mode=ro",
-                        uri=True,
-                        autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,
+                meta = read_sealed_suite_meta(evaluator_store)
+                offline_evals["connected"] = True
+                offline_evals["suites"] = [
+                    {
+                        "revision": meta["revision"],
+                        "suite_id": meta["suite_id"],
+                        "purpose": meta["purpose"],
+                        "sealed_at_ns": int(st.st_mtime_ns),
+                        "observation_count": meta["observation_count"],
+                        "grade_count": meta["grade_count"],
+                        "pairwise_grade_count": meta["pairwise_grade_count"],
+                    }
+                ]
+                if meta["purpose"] == "recursive":
+                    effective_plan = (
+                        analysis_plan
+                        if analysis_plan is not None
+                        else meta.get("analysis_plan")
                     )
-                ) as edb:
-                    edb.execute("PRAGMA query_only = ON")
-                    edb.execute("PRAGMA trusted_schema = OFF")
-                    suite_rows = edb.execute(
-                        "SELECT revision, suite_json, sealed_at_ns FROM trial_suite ORDER BY sealed_at_ns DESC LIMIT 10"
-                    ).fetchall()
-                    suites = []
-                    for sr in suite_rows:
-                        rev = str(sr[0])
-                        obs_count = int(
-                            edb.execute(
-                                "SELECT COUNT(*) FROM trial_observation WHERE revision = ?",
-                                (rev,),
-                            ).fetchone()[0]
+                    if effective_plan is not None:
+                        summary = summarize_rsi_transfer(
+                            evaluator_store,
+                            revision=meta["revision"],
+                            analysis_plan=effective_plan,
                         )
-                        grade_count = int(
-                            edb.execute(
-                                "SELECT COUNT(*) FROM trial_grade WHERE revision = ?",
-                                (rev,),
-                            ).fetchone()[0]
-                        )
-                        pair_count = int(
-                            edb.execute(
-                                "SELECT COUNT(*) FROM trial_pairwise_grade WHERE revision = ?",
-                                (rev,),
-                            ).fetchone()[0]
-                        )
-                        suites.append(
+                        rsi_transfer_summaries.append(
                             {
-                                "revision": rev,
-                                "sealed_at_ns": int(sr[2]),
-                                "observation_count": obs_count,
-                                "grade_count": grade_count,
-                                "pairwise_grade_count": pair_count,
+                                "suite_id": meta["suite_id"],
+                                "revision": meta["revision"],
+                                **asdict(summary),
                             }
                         )
-                    offline_evals["connected"] = True
-                    offline_evals["suites"] = suites
-        except (OSError, sqlite3.Error):
+                    else:
+                        rsi_transfer_summaries.append(
+                            {
+                                "suite_id": meta["suite_id"],
+                                "revision": meta["revision"],
+                                "verdict": "UNAVAILABLE",
+                                "reasons": ("sealed-analysis-plan-unavailable",),
+                                "analysis_plan_digest": meta["analysis_plan_digest"],
+                                "planned_pairs": meta["planned_pairs"],
+                                "complete_pairs": meta["pairwise_grade_count"],
+                                "distinct_transfer_families": meta[
+                                    "distinct_transfer_families"
+                                ],
+                            }
+                        )
+        except (TrialRefused, OSError, sqlite3.Error):
             offline_evals["connected"] = False
+            offline_evals["suites"] = []
+            rsi_transfer_summaries = []
 
     return (
         {
@@ -1470,6 +1972,10 @@ def read_system_evals_projection(
             "event_seq": event_seq,
             "qualifications": qualifications,
             "activations": activations,
+            "method_deltas": method_deltas,
+            "method_qualifications": method_qualifications,
+            "method_activations": method_activations,
+            "rsi_transfer_summaries": rsi_transfer_summaries,
             "offline_evaluator": offline_evals,
         },
         event_seq,
@@ -1488,12 +1994,23 @@ def read_system_audit_projection(
             raise FoundingRefused("Company identity mismatch")
         as_of_ns = time_ns()
         event_seq = max_event_seq(db, company_id)
+        one_agent_deltas, one_agent_mids = _load_one_agent_method_sets(db, company_id)
         events = [
             {
                 "event_seq": int(r[0]),
                 "domain": str(r[1]),
                 "entity_type": str(r[2]),
-                "entity_id": str(r[3]),
+                "entity_id": (
+                    _redact_one_agent_ref_for_board(
+                        str(r[3]),
+                        force_opaque=False,
+                        one_agent_deltas=one_agent_deltas,
+                        one_agent_mids=one_agent_mids,
+                    )
+                    if str(r[2])
+                    in ("method_delta", "method_activation", "method_qualification")
+                    else str(r[3])
+                ),
                 "event_type": str(r[4]),
                 "recorded_at_ns": int(r[5]),
             }
@@ -1511,7 +2028,9 @@ def read_system_audit_projection(
                 "owner_agent_id": str(r[1]),
                 "trigger_kind": str(r[2]),
                 "due_at_ns": None if r[3] is None else int(r[3]),
-                "source_identity": None if r[4] is None else str(r[4]),
+                "source_identity": _redact_condition_source_for_board(
+                    db, company_id, str(r[2]), None if r[4] is None else str(r[4])
+                ),
                 "status": str(r[5]),
             }
             for r in db.execute(

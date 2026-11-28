@@ -1,4 +1,8 @@
-"""Offer project tools only when the current Agent has an assigned shared project."""
+"""Legacy DutyClaim/ScopedRun project collaboration adapter retained for `assessment_run.py`.
+
+`CompanyRuntime` and `ShiftRunner` use `runtime/desk_tools.py` and
+`runtime/collab_tools.py` as the canonical `WorkRunClaim` tool surface.
+"""
 
 from collections.abc import Callable
 from dataclasses import asdict, replace

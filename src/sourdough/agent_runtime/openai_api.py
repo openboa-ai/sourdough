@@ -121,10 +121,11 @@ class OpenAiResponsesAdapter:
             usage_obj = response.get("usage")
             if isinstance(usage_obj, dict):
                 round_usage = TokenUsage(
-                    input_tokens=int(usage_obj.get("input_tokens", 0)),
-                    output_tokens=int(usage_obj.get("output_tokens", 0)),
+                    input_tokens=int(usage_obj.get("input_tokens") or 0),
+                    output_tokens=int(usage_obj.get("output_tokens") or 0),
                 )
                 total_usage = total_usage + round_usage
+                broker.record_usage(round_usage)
                 events.append(
                     AdapterEvent(
                         kind="usage",

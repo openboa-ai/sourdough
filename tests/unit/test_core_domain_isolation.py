@@ -20,6 +20,11 @@ from sourdough.runtime.domains import DomainPluginRegistry, load_domain_plugins
 from sourdough.runtime.handlers import (
     DUTY_BOARD_APPLY_DECISION,
     DUTY_CEO_RESPOND_MESSAGE,
+    DUTY_WORK_ASSESSMENT_REVIEW,
+    DUTY_WORK_DISCOVERY_REVIEW,
+    DUTY_WORK_DREAMING,
+    DUTY_WORK_HANDOFF_FOLLOWUP,
+    DUTY_WORK_PEER_RESPONSE,
     build_production_duty_registry,
 )
 from sourdough.storage.db import open_writer, write_tx
@@ -102,11 +107,14 @@ _CORE_SINGLE_MODULES = (
     "conversations.py",
     "duty_run.py",
     "employee_process.py",
+    "episode_index.py",
     "evidence_review.py",
     "first_duty.py",
     "general_ledger.py",
     "harness.py",
     "hiring_run.py",
+    "memory.py",
+    "method_learning.py",
     "onboarding.py",
     "retirement.py",
     "review_qualification_store.py",
@@ -116,6 +124,7 @@ _CORE_SINGLE_MODULES = (
     "supervisor.py",
     "trial_execution.py",
     "trial_registry.py",
+    "trial_runner.py",
     "work.py",
     "work_handoff.py",
     "work_peer_response.py",
@@ -199,7 +208,15 @@ class CoreDomainIsolationTests(unittest.TestCase):
         )
         self.assertEqual(
             set(registry.registered_kinds()),
-            {DUTY_CEO_RESPOND_MESSAGE, DUTY_BOARD_APPLY_DECISION},
+            {
+                DUTY_CEO_RESPOND_MESSAGE,
+                DUTY_BOARD_APPLY_DECISION,
+                DUTY_WORK_PEER_RESPONSE,
+                DUTY_WORK_ASSESSMENT_REVIEW,
+                DUTY_WORK_HANDOFF_FOLLOWUP,
+                DUTY_WORK_DISCOVERY_REVIEW,
+                DUTY_WORK_DREAMING,
+            },
         )
 
     def test_core_work_projection_without_plugins_emits_empty_domains(self):

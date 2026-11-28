@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
+from hashlib import sha256
 from time import time_ns
 from typing import Any
 from uuid import uuid4
@@ -42,6 +43,28 @@ _ALLOWED_SCHEDULE_DUTIES = frozenset(
 )
 _MIN_SHIFT_DELAY_SECONDS = 60
 _MAX_SHIFT_DELAY_SECONDS = 86_400
+_ALLOWED_CANCEL_REASONS = frozenset(
+    {
+        "agent_cancelled",
+        "risk_limit",
+        "quote_stale",
+        "rebalance",
+        "manual_cancel",
+    }
+)
+
+
+def opaque_trading_action_id(company_id: str, scope_id: str, raw_action_id: str) -> str:
+    """Derive a deterministic opaque order action ID so raw LLM text never reaches ledgers or Board projections."""
+    if not isinstance(raw_action_id, str) or not raw_action_id.strip():
+        raise ExecutionTierRefused("action_id must be a non-empty string")
+    digest = sha256(
+        f"sourdough:trading-action-id:v1\x1f{company_id}\x1f{scope_id}\x1f{raw_action_id.strip()}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+    return f"ordact:{digest}"
+
 
 READ_MARKET_QUOTE_SPEC = ToolSpec(
     name="read_market_quote",
@@ -325,11 +348,16 @@ class CompanyTradingTools:
             quote = self._require_fresh_quote(
                 arguments["instrument_id"], max_age_ns=self.max_quote_age_ns
             )
+            opaque_action_id = opaque_trading_action_id(
+                self.writer.company_id,
+                str(arguments["binding_id"]),
+                arguments["action_id"],
+            )
             return submit_company_paper_book_order(
                 self.writer,
                 binding_id=arguments["binding_id"],
                 actor_id=self.agent_id,
-                action_id=arguments["action_id"],
+                action_id=opaque_action_id,
                 instrument_id=quote["instrument_id"],
                 side=arguments["side"],
                 quantity=arguments["quantity"],
@@ -350,12 +378,20 @@ class CompanyTradingTools:
                 raise ExecutionTierRefused(
                     "Invalid cancel_company_paper_order arguments"
                 )
+            raw_reason = arguments.get("reason", "agent_cancelled")
+            if (
+                not isinstance(raw_reason, str)
+                or raw_reason not in _ALLOWED_CANCEL_REASONS
+            ):
+                raise ExecutionTierRefused(
+                    "cancel_company_paper_order reason must be one of the allowed closed cancel reasons"
+                )
             return cancel_company_paper_book_order(
                 self.writer,
                 binding_id=arguments["binding_id"],
                 actor_id=self.agent_id,
                 order_id=arguments["order_id"],
-                reason=arguments.get("reason", "agent_cancelled"),
+                reason=raw_reason,
                 now_ns=self.clock(),
             )
 
@@ -390,11 +426,16 @@ class CompanyTradingTools:
                 raise ExecutionTierRefused(
                     f"No external venue adapter bound for live binding '{arguments['binding_id']}'"
                 )
+            opaque_action_id = opaque_trading_action_id(
+                self.writer.company_id,
+                str(arguments["binding_id"]),
+                arguments["action_id"],
+            )
             return submit_company_live_book_order(
                 self.writer,
                 binding_id=arguments["binding_id"],
                 actor_id=self.agent_id,
-                action_id=arguments["action_id"],
+                action_id=opaque_action_id,
                 instrument_id=arguments["instrument_id"],
                 side=arguments["side"],
                 quantity=arguments["quantity"],
