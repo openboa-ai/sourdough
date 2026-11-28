@@ -1187,6 +1187,15 @@ def build_production_duty_registry(
         merged_specs, merged_handlers, merged_recoverable = merge_tool_contributions(
             (), {}, (proactive, collab)
         )
+        sealed_tool_allowlist: frozenset[str] | None = None
+        if ctx.work_item.source_kind == "offline_trial" and isinstance(
+            payload.get("sealed_tool_manifest"), list
+        ):
+            sealed_tool_allowlist = frozenset(
+                str(name)
+                for name in payload["sealed_tool_manifest"]
+                if isinstance(name, str) and name.strip()
+            )
         run_res = shift_runner.run(
             ctx,
             mandate_summary=(
@@ -1210,6 +1219,7 @@ def build_production_duty_registry(
             include_plugin_tools=True,
             extra_recoverable_exceptions=merged_recoverable,
             pre_resolved_active_methods=(resolved_methods, resolved_snapshot_id),
+            allowed_tool_names=sealed_tool_allowlist,
         )
         if run_res.run_status == "waiting":
             return DutyOutcome(

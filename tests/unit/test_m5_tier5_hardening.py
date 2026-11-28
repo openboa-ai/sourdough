@@ -4233,14 +4233,20 @@ class TestM5Tier5Hardening(unittest.TestCase):
             "PRIVATE_UNCERTAINTY_88",
             "PRIVATE_FALSIFICATION_99",
             "PRIVATE_TRIGGER_HINT_66",
+            "priv-method-r5",
             "secret-alpha",
             "TOP_SECRET_ALPHA_DRAFT",
             "SECRET_EPISODE_DRAFT_TEXT_55",
         ):
             self.assertNotIn(leaked, serialized)
 
-        by_method = {m["method_id"]: m for m in detail["active_methods"]}
-        priv_proj = by_method["priv-method-r5"]
+        priv_list = [
+            m for m in detail["active_methods"] if m["audience_scope"] == "one_agent"
+        ]
+        self.assertEqual(len(priv_list), 1)
+        priv_proj = priv_list[0]
+        self.assertTrue(priv_proj["method_id"].startswith("one_agent_method:"))
+        self.assertTrue(priv_proj["method_id_redacted"])
         self.assertIsNone(priv_proj["body_text"])
         self.assertTrue(priv_proj["body_redacted"])
         self.assertEqual(
@@ -4251,6 +4257,7 @@ class TestM5Tier5Hardening(unittest.TestCase):
         self.assertIsNone(priv_proj["falsification_criteria"])
         self.assertEqual(priv_proj["trigger_spec"], {"redacted": True})
 
+        by_method = {m["method_id"]: m for m in detail["active_methods"]}
         pub_proj = by_method["shared-method-r5"]
         self.assertEqual(pub_proj["body_text"], "COMPANY_SHARED_METHOD_OK")
 
@@ -5040,20 +5047,40 @@ class TestM5Tier5Hardening(unittest.TestCase):
             self.assertEqual(bob_act.method_id, "shared-slug")
             self.assertEqual(bob_act.audience_target_id, bob_id)
 
-            # A descendant citing Alice's quarantined node as parent is STILL refused
+            # Bob cannot cite Alice's private one_agent method as parent_method_ids
+            with self.assertRaisesRegex(
+                MethodRefused, "another Agent's private method"
+            ):
+                distill_method_delta(
+                    w,
+                    claim_b,
+                    method_id="bob-cross-agent-ref",
+                    delta_kind="ADD",
+                    item_kind="work_method",
+                    audience_scope="one_agent",
+                    audience_target_id=bob_id,
+                    trigger_spec={"duty_kinds": ["work.discovery_review"]},
+                    body="Attempted cross-agent private lineage.",
+                    falsification_criteria="Fails if cross-agent private lineage succeeds.",
+                    parent_method_ids=(f"shared-slug:{alice_v1.revision_sha256}",),
+                    source_refs=(f"work_run:{run_b.run_id}",),
+                    now_ns=1_490,
+                )
+
+            # A descendant by Alice citing Alice's quarantined node as parent is STILL refused
             derived = distill_method_delta(
                 w,
-                claim_b,
+                claim_a,
                 method_id="derived-from-alice",
                 delta_kind="ADD",
                 item_kind="work_method",
                 audience_scope="one_agent",
-                audience_target_id=bob_id,
+                audience_target_id=alice_id,
                 trigger_spec={"duty_kinds": ["work.discovery_review"]},
                 body="Derived from Alice quarantined revision.",
                 falsification_criteria="Fails if tainted lineage activates.",
                 parent_method_ids=(f"shared-slug:{alice_v1.revision_sha256}",),
-                source_refs=(f"work_run:{run_b.run_id}",),
+                source_refs=(f"work_run:{run_a.run_id}",),
                 now_ns=1_500,
             )
             with self.assertRaisesRegex(MethodRefused, "quarantined"):
@@ -5070,8 +5097,8 @@ class TestM5Tier5Hardening(unittest.TestCase):
                 activate_method_delta(
                     w,
                     derived.delta_id,
-                    actor_id=bob_id,
-                    grant_id=bob_g,
+                    actor_id=alice_id,
+                    grant_id=alice_g,
                     now_ns=1_600,
                 )
 
@@ -7923,7 +7950,7 @@ class TestM5Tier5Hardening(unittest.TestCase):
         )
         case_bytes = b'{"case":"r16-tokens"}'
         ctx_bytes = b'{"arm":"cand"}'
-        tools_bytes = b'{"tools":[]}'
+        tools_bytes = b'{"tools":["record_work_decision"]}'
         tight_limits = TrialCeiling(turns=1, wall_seconds=30, tokens=2_000)
         generous_limits = TrialCeiling(turns=1, wall_seconds=30, tokens=20_000)
         sealed_inputs = TrialInputs(
@@ -10518,6 +10545,377 @@ class TestM5Tier5Hardening(unittest.TestCase):
             rc = cli.main()
         self.assertNotEqual(rc, 0)
         self.assertIn("Company single-tick failed", stderr_buf.getvalue())
+
+    def test_pr191_r23_trial_executor_guard_tool_manifest_and_scoped_store_grading(
+        self,
+    ) -> None:
+        """PR #191 R23 Code P2: source_store requires executor, enforces sealed tool manifest, and scopes store grading to trial runs."""
+        from sourdough.trial_execution import TrialWorkerInput
+        from sourdough.trial_registry import (
+            BlindedTrial,
+            TrialCeiling,
+            TrialInputs,
+            TrialRefused,
+            TrialSlot,
+            TrialSuite,
+            seal_trial_suite,
+        )
+        from sourdough.trial_runner import (
+            _compute_source_store_fixture,
+            grade_trial_observation,
+            run_isolated_trial_slot,
+        )
+
+        # Seed source_store with a historical fatal tool_call_receipt + historical settled item/decision
+        now_ns = time_ns()
+        with hold_company_writer(self.store, self.company_id) as w:
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                hist_item, hist_run, hist_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=self.founder_id,
+                    grant_id=self.grant_id,
+                    grant_scope="manage-company",
+                    duty_kind="work.discovery_review",
+                    purpose="discovery_review",
+                )
+                db.execute(
+                    """INSERT INTO tool_call_receipt (
+                           company_id, run_id, agent_id, call_id, tool_name, arg_digest,
+                           status, result_digest, result_json, error_type, error_message,
+                           offloaded_log_path, recorded_at_ns
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        self.company_id,
+                        hist_run.run_id,
+                        self.founder_id,
+                        "hist-fatal-r23",
+                        "append_message",
+                        sha256(b"{}").hexdigest(),
+                        "fatal",
+                        sha256(b"{}").hexdigest(),
+                        "{}",
+                        "AgentRuntimeRefused",
+                        "Historical pre-trial failure",
+                        None,
+                        now_ns,
+                    ),
+                )
+                record_work_decision(
+                    db,
+                    company_id=self.company_id,
+                    work_item_id=hist_item.work_item_id,
+                    run_id=hist_run.run_id,
+                    fencing_token=hist_run.fencing_token,
+                    agent_id=self.founder_id,
+                    action_kind="defer",
+                    rationale="Historical pre-trial decision.",
+                    evidence=(),
+                    decision_at_ns=now_ns + 1,
+                )
+                complete_work_run(
+                    db,
+                    hist_run.run_id,
+                    hist_run.fencing_token,
+                    outcome={"done": True},
+                    now_ns=now_ns + 2,
+                )
+                _ = hist_claim
+
+        eval_store = self.root / "eval_r23" / "evaluator.sqlite"
+        eval_store.parent.mkdir(parents=True, exist_ok=True)
+        trial_root = self.root / "trials_r23"
+        fixture_bytes, profiles, _ = _compute_source_store_fixture(
+            self.store, self.company_id
+        )
+        case_bytes = b'{"case":"r23-manifest"}'
+        ctx_bytes = b'{"arm":"base"}'
+        tools_only_decision = b'{"tools":["record_work_decision"]}'
+        tools_missing = b'{"tools":["record_work_decision","nonexistent_tool_r23"]}'
+        limits = TrialCeiling(turns=1, wall_seconds=30, tokens=2_000)
+
+        def _mk_inputs(tb: bytes) -> TrialInputs:
+            return TrialInputs(
+                company_fixture=sha256(fixture_bytes).hexdigest(),
+                case_inputs=sha256(case_bytes).hexdigest(),
+                worker_context=sha256(ctx_bytes).hexdigest(),
+                tools=sha256(tb).hexdigest(),
+                runtime_profile=profiles[self.founder_id],
+            )
+
+        suite = TrialSuite(
+            suite_id="r23-suite",
+            purpose="method",
+            rubric_digest=sha256(b"r").hexdigest(),
+            evaluator_digest=sha256(b"e").hexdigest(),
+            analysis_plan_digest=sha256(b"p").hexdigest(),
+            slots=(
+                TrialSlot(
+                    "s-manifest", "c1", "f1", _mk_inputs(tools_only_decision), limits
+                ),
+                TrialSlot("s-missing", "c2", "f2", _mk_inputs(tools_missing), limits),
+            ),
+        )
+        rev = seal_trial_suite(eval_store, suite)
+        wi_decision = TrialWorkerInput(
+            case_bytes, ctx_bytes, tools_only_decision, limits
+        )
+        wi_missing = TrialWorkerInput(case_bytes, ctx_bytes, tools_missing, limits)
+
+        # 1. source_store without execute_case or duty_registry MUST refuse BEFORE consuming slot!
+        with self.assertRaisesRegex(TrialRefused, "execute_case|duty_registry"):
+            run_isolated_trial_slot(
+                eval_store,
+                revision=rev,
+                slot_id="s-manifest",
+                run_id="r23-no-exec",
+                trial_root=trial_root,
+                source_store=self.store,
+                company_id=self.company_id,
+                worker_input=wi_decision,
+            )
+
+        # 2. Sealed tool manifest restricts request.tools & OuterToolBroker to ONLY ['record_work_decision']
+        observed: dict[str, Any] = {}
+
+        class _ManifestProbeAdapter(AgentRuntimeAdapter):
+            @property
+            def manifest(self) -> AdapterManifest:
+                return AdapterManifest(
+                    PROVIDER_OPENAI, "v1", "https_json", True, True, True
+                )
+
+            def run_shift(
+                self, profile, request: ShiftRequest, broker: OuterToolBroker
+            ) -> ShiftResult:
+                observed["tool_names"] = [t.name for t in request.tools]
+                try:
+                    broker.invoke("try-roster", "org_list_roster", {})
+                    observed["roster_refused"] = False
+                except AgentRuntimeRefused:
+                    observed["roster_refused"] = True
+                dec = broker.invoke(
+                    "rec-dec",
+                    "record_work_decision",
+                    {
+                        "action_kind": "defer",
+                        "rationale": "Scoped decision.",
+                        "evidence": [],
+                    },
+                )
+                observed["dec_ok"] = dec.get("ok") is True
+                return ShiftResult(
+                    output_text="Done.",
+                    usage=TokenUsage(input_tokens=30, output_tokens=10),
+                    provider=profile.provider,
+                    model=profile.model,
+                    run_id=request.run_id,
+                    turn_id=request.turn_id,
+                    tool_calls_executed=broker.call_count,
+                    events=(),
+                )
+
+        areg = AgentAdapterRegistry()
+        areg.register(_ManifestProbeAdapter())
+        dreg = build_production_duty_registry(
+            adapter_registry=areg,
+            profile_bindings={self.founder_id: self.profile},
+        )
+        ev = run_isolated_trial_slot(
+            eval_store,
+            revision=rev,
+            slot_id="s-manifest",
+            run_id="r23-manifest-ok",
+            trial_root=trial_root,
+            source_store=self.store,
+            company_id=self.company_id,
+            worker_input=wi_decision,
+            duty_registry=dreg,
+        )
+        self.assertEqual(ev.outcome, "completed")
+        self.assertEqual(observed["tool_names"], ["record_work_decision"])
+        self.assertTrue(observed["roster_refused"])
+        self.assertTrue(observed["dec_ok"])
+
+        # 3. Store-backed grading ignores historical pre-trial fatal receipt in cloned store!
+        pkt = BlindedTrial(
+            result_id="c" * 32,
+            rubric_digest=suite.rubric_digest,
+            evaluator_digest=suite.evaluator_digest,
+            outcome=ev.outcome,
+            decision_digest=ev.decision_digest,
+            tool_trace_digest=ev.tool_trace_digest,
+            service_effects_digest=ev.service_effects_digest,
+        )
+        grade_scoped = grade_trial_observation(
+            pkt,
+            run_store=trial_root / "trial-r23-manifest-ok" / "company.sqlite",
+        )
+        self.assertEqual(grade_scoped.authority_violations, 0)
+        self.assertTrue(grade_scoped.judgment_passed(pkt.outcome))
+
+        # 4. Sealed tool manifest requesting unavailable tool fails closed!
+        from sourdough.runtime.registry import RuntimeRefused
+
+        with self.assertRaisesRegex(RuntimeRefused, "Sealed tool manifest"):
+            run_isolated_trial_slot(
+                eval_store,
+                revision=rev,
+                slot_id="s-missing",
+                run_id="r23-missing-tool",
+                trial_root=trial_root,
+                source_store=self.store,
+                company_id=self.company_id,
+                worker_input=wi_missing,
+                duty_registry=dreg,
+            )
+
+    def test_pr191_r23_security_one_agent_method_metadata_redacted_and_lineage_validated(
+        self,
+    ) -> None:
+        """PR #191 R23 Security #20: reject forged parent_method_ids and opaque-map one_agent method metadata in Board evals/detail/audit."""
+        from sourdough.ipc.projections import (
+            read_agent_detail_projection,
+            read_system_audit_projection,
+            read_system_evals_projection,
+        )
+        from sourdough.method_learning import (
+            MethodRefused,
+            activate_method_delta,
+            distill_method_delta,
+            qualify_method_delta,
+        )
+
+        now_ns = time_ns()
+        with hold_company_writer(self.store, self.company_id) as w:
+            worker, worker_grant = _hire_active_agent(
+                w,
+                company_id=self.company_id,
+                grant_id=self.grant_id,
+                agent_id="worker-sec20-r23",
+                profile_id=self.profile.profile_id(),
+            )
+            with closing(open_writer(self.store, lease=w)) as db, write_tx(db):
+                _, _, w_claim = _open_work_run_claim(
+                    db,
+                    company_id=self.company_id,
+                    agent_id=worker,
+                    grant_id=worker_grant,
+                    grant_scope="assessment",
+                    duty_kind="work.assessment_review",
+                    purpose="assessment_review",
+                )
+            # 1. Forged parent_method_ids carrying canary text MUST be refused!
+            with self.assertRaisesRegex(MethodRefused, "parent_method_ids"):
+                distill_method_delta(
+                    w,
+                    w_claim,
+                    delta_kind="ADD",
+                    target_kind="work_method",
+                    method_id="forged-parent-r23",
+                    trigger_spec={"duty_kind": "work.assessment_review"},
+                    body="Safe body.",
+                    audience_scope="one_agent",
+                    parent_method_ids=("PRIVATE_DESK_CONTENT_CANARY_7491",),
+                    source_refs=[f"work_run:{w_claim.run_id}"],
+                    now_ns=now_ns,
+                )
+
+            # 2. Legitimate one_agent parent + child with filename-like method_ids
+            d_parent = distill_method_delta(
+                w,
+                w_claim,
+                delta_kind="ADD",
+                target_kind="work_method",
+                method_id="secret-merger-plan-r23",
+                trigger_spec={"duty_kind": "work.assessment_review"},
+                body="Private parent body.",
+                audience_scope="one_agent",
+                source_refs=[f"work_run:{w_claim.run_id}"],
+                now_ns=now_ns + 10,
+            )
+            qualify_method_delta(
+                w,
+                d_parent.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=now_ns + 20,
+            )
+            activate_method_delta(
+                w,
+                d_parent.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=now_ns + 30,
+            )
+            d_child = distill_method_delta(
+                w,
+                w_claim,
+                delta_kind="ADD",
+                target_kind="work_method",
+                method_id="secret-child-canary-r23",
+                trigger_spec={"duty_kind": "work.assessment_review"},
+                body="Private child body.",
+                audience_scope="one_agent",
+                parent_method_ids=(d_parent.delta_id,),
+                source_refs=[f"work_run:{w_claim.run_id}"],
+                now_ns=now_ns + 40,
+            )
+            qualify_method_delta(
+                w,
+                d_child.delta_id,
+                passed_k=3,
+                negative_trigger_passed=True,
+                safety_passed=True,
+                holdout_margin=0.1,
+                now_ns=now_ns + 50,
+            )
+            activate_method_delta(
+                w,
+                d_child.delta_id,
+                actor_id=self.founder_id,
+                grant_id=self.grant_id,
+                now_ns=now_ns + 60,
+            )
+
+        evals_proj, _ = read_system_evals_projection(self.store, self.company_id)
+        detail_proj, _ = read_agent_detail_projection(
+            self.store, self.company_id, worker
+        )
+        audit_proj, _ = read_system_audit_projection(self.store, self.company_id)
+
+        for label, blob in (
+            ("system-evals-v1", json.dumps(evals_proj, sort_keys=True)),
+            ("agent-detail-v1", json.dumps(detail_proj, sort_keys=True)),
+            ("system-audit-v1", json.dumps(audit_proj, sort_keys=True)),
+        ):
+            for secret in (
+                "PRIVATE_DESK_CONTENT_CANARY_7491",
+                "secret-merger-plan-r23",
+                "secret-child-canary-r23",
+            ):
+                self.assertNotIn(
+                    secret, blob, f"{label} leaked one_agent identifier {secret}"
+                )
+        # Verify opaque mapping preserved count & parent linkage
+        one_agent_deltas = [
+            d for d in evals_proj["method_deltas"] if d["audience_scope"] == "one_agent"
+        ]
+        self.assertEqual(len(one_agent_deltas), 2)
+        self.assertTrue(
+            all(
+                d["method_id"].startswith("one_agent_method:") for d in one_agent_deltas
+            )
+        )
+        with closing(open_reader(self.store)) as ro_db, read_tx(ro_db):
+            audit_rows = ro_db.execute(
+                "SELECT entity_id, payload_json FROM audit_event WHERE domain = 'learning'"
+            ).fetchall()
+        audit_blob = json.dumps(audit_rows)
+        self.assertNotIn("secret-merger-plan-r23", audit_blob)
+        self.assertNotIn("secret-child-canary-r23", audit_blob)
 
 
 if __name__ == "__main__":

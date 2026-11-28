@@ -502,6 +502,108 @@ def _count_receipt_violations(
     return fatal_calls, authority_refusals, tool_names
 
 
+def _parse_sealed_tool_manifest(blob: bytes) -> list[str]:
+    """Extract canonical allowed tool names from a sealed TrialWorkerInput.tool_manifest."""
+    try:
+        parsed = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TrialRefused("Sealed tool_manifest must be valid UTF-8 JSON") from error
+    raw_items: Any
+    if isinstance(parsed, Mapping):
+        if "tools" not in parsed or not isinstance(parsed["tools"], list):
+            raise TrialRefused(
+                "Sealed tool_manifest JSON object must define a 'tools' list"
+            )
+        raw_items = parsed["tools"]
+    elif isinstance(parsed, list):
+        raw_items = parsed
+    else:
+        raise TrialRefused(
+            "Sealed tool_manifest must be a JSON list or object with a 'tools' list"
+        )
+    names: list[str] = []
+    for item in raw_items:
+        if isinstance(item, str) and item.strip():
+            name = item.strip()
+        elif (
+            isinstance(item, Mapping)
+            and isinstance(item.get("name"), str)
+            and item["name"].strip()
+        ):
+            name = item["name"].strip()
+        else:
+            raise TrialRefused(
+                "Sealed tool_manifest entries must be nonempty tool name strings or objects with 'name'"
+            )
+        if name not in names:
+            names.append(name)
+    return sorted(names)
+
+
+def _write_trial_execution_manifest(
+    run_dir: Path,
+    *,
+    company_id: str,
+    run_id: str,
+    slot_id: str,
+    work_item_ids: Sequence[str],
+    executed_runs: Sequence[str],
+) -> None:
+    """Persist the trial's own newly created work items and executed runs for scoped grading."""
+    manifest_path = run_dir / "trial_execution_manifest.json"
+    data = _canonical_json(
+        {
+            "company_id": company_id,
+            "run_id": run_id,
+            "slot_id": slot_id,
+            "work_item_ids": sorted(set(work_item_ids)),
+            "executed_runs": sorted(set(executed_runs)),
+        }
+    ).encode("utf-8")
+    tmp_path = run_dir / f".tmp-manifest-{uuid4().hex}.json"
+    fd = os.open(
+        tmp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, manifest_path)
+
+
+def _read_trial_execution_manifest(
+    run_store: Path,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Read (work_item_ids, executed_runs) from trial_execution_manifest.json beside run_store."""
+    manifest_path = run_store.parent / "trial_execution_manifest.json"
+    if not os.path.lexists(manifest_path):
+        return None
+    st = os.lstat(manifest_path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise TrialRefused("Trial execution manifest must be a regular file")
+    fd = os.open(manifest_path, os.O_RDONLY | _O_NOFOLLOW)
+    try:
+        raw = os.read(fd, 1_048_576)
+    finally:
+        os.close(fd)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TrialRefused("Trial execution manifest is corrupted") from error
+    if not isinstance(payload, Mapping):
+        raise TrialRefused("Trial execution manifest must be a JSON object")
+    raw_items = payload.get("work_item_ids")
+    raw_runs = payload.get("executed_runs")
+    if not isinstance(raw_items, list) or not isinstance(raw_runs, list):
+        raise TrialRefused("Trial execution manifest has invalid scope fields")
+    items = tuple(str(x) for x in raw_items if isinstance(x, str) and x)
+    runs = tuple(str(x) for x in raw_runs if isinstance(x, str) and x)
+    return items, runs
+
+
 def _compute_source_store_fixture(
     source_store: Path,
     company_id: str,
@@ -645,12 +747,21 @@ def run_isolated_trial_slot(
 
     actual_fixture_bytes: bytes | None = None
     expected_desk_digests: dict[str, str] | None = None
+    sealed_allowed_tools: list[str] | None = None
     if source_store is not None:
         if not company_id:
             raise TrialRefused("source_store requires company_id")
         if worker_input is None:
             raise TrialRefused(
                 "source_store trial execution requires worker_input to verify sealed slot inputs"
+            )
+        if execute_case is None and duty_registry is None:
+            raise TrialRefused(
+                "source_store isolated trial requires an execute_case callback or production duty_registry"
+            )
+        if execute_case is None:
+            sealed_allowed_tools = _parse_sealed_tool_manifest(
+                worker_input.tool_manifest
             )
         actual_fixture_bytes, store_profiles, founder_id = (
             _compute_source_store_fixture(source_store, company_id, agent_ids=agent_ids)
@@ -764,11 +875,58 @@ def run_isolated_trial_slot(
         lease_directory=lease_dir,
     )
 
+    with closing(open_reader(run_store)) as pre_db, read_tx(pre_db):
+        preexisting_item_ids = {
+            str(r[0])
+            for r in pre_db.execute(
+                "SELECT work_item_id FROM work_items WHERE company_id = ?",
+                (target_cid,),
+            ).fetchall()
+        }
+        preexisting_run_ids = {
+            str(r[0])
+            for r in pre_db.execute(
+                "SELECT run_id FROM work_runs WHERE company_id = ?",
+                (target_cid,),
+            ).fetchall()
+        }
+
+    def _finalize_execution_manifest(
+        explicit_items: Sequence[str] = (),
+        explicit_runs: Sequence[str] = (),
+    ) -> None:
+        with closing(open_reader(run_store)) as post_db, read_tx(post_db):
+            post_items = {
+                str(r[0])
+                for r in post_db.execute(
+                    "SELECT work_item_id FROM work_items WHERE company_id = ?",
+                    (target_cid,),
+                ).fetchall()
+            }
+            post_runs = {
+                str(r[0])
+                for r in post_db.execute(
+                    "SELECT run_id FROM work_runs WHERE company_id = ?",
+                    (target_cid,),
+                ).fetchall()
+            }
+        new_items = (post_items - preexisting_item_ids) | set(explicit_items)
+        new_runs = (post_runs - preexisting_run_ids) | set(explicit_runs)
+        _write_trial_execution_manifest(
+            run_dir,
+            company_id=target_cid,
+            run_id=run_id,
+            slot_id=slot.slot_id,
+            work_item_ids=sorted(new_items),
+            executed_runs=sorted(new_runs),
+        )
+
     started = monotonic()
     if execute_case is not None:
         try:
             result = execute_case(runtime, desk_dir, slot)
         except TimeoutError:
+            _finalize_execution_manifest()
             return TrialTerminalEvidence(
                 outcome="timed-out",
                 observation_digest=_canonical_digest(
@@ -779,6 +937,7 @@ def run_isolated_trial_slot(
                     }
                 ),
             )
+        _finalize_execution_manifest()
     else:
 
         def _decode_trial_blob(blob: bytes) -> Any:
@@ -807,6 +966,8 @@ def run_isolated_trial_slot(
             trial_payload["tool_manifest"] = _decode_trial_blob(
                 worker_input.tool_manifest
             )
+            if sealed_allowed_tools is not None:
+                trial_payload["sealed_tool_manifest"] = list(sealed_allowed_tools)
         with hold_company_writer(
             run_store, target_cid, lease_directory=lease_dir
         ) as trial_w:
@@ -831,6 +992,10 @@ def run_isolated_trial_slot(
             target_work_item_id=trial_item.work_item_id,
         )
         exec_runs = tuple(step_summary.executed_runs)
+        _finalize_execution_manifest(
+            explicit_items=(trial_item.work_item_id,),
+            explicit_runs=exec_runs,
+        )
         with closing(open_reader(run_store)) as ro_db, read_tx(ro_db):
             settled_count = int(
                 ro_db.execute(
@@ -1002,6 +1167,8 @@ def grade_trial_observation(
     service_effects: Mapping[str, Any] | None = None,
     decision: Mapping[str, Any] | None = None,
     run_store: Path | None = None,
+    work_item_ids: Sequence[str] | None = None,
+    executed_runs: Sequence[str] | None = None,
 ) -> TrialGrade:
     """Deterministically grade a blinded trial packet against its sealed digests and outcomes."""
     if not isinstance(packet, BlindedTrial):
@@ -1035,20 +1202,115 @@ def grade_trial_observation(
     store_decisions: int | None = None
     store_fatal_tools: int | None = None
     if run_store is not None:
-        with closing(open_reader(run_store)) as ro_db, read_tx(ro_db):
-            store_settled = (
-                int(
-                    ro_db.execute(
-                        "SELECT COUNT(*) FROM work_items WHERE state = 'settled'"
-                    ).fetchone()[0]
+        scoped_items: tuple[str, ...] | None = (
+            tuple(str(x) for x in work_item_ids if isinstance(x, str) and x)
+            if work_item_ids is not None
+            else None
+        )
+        scoped_runs: tuple[str, ...] | None = (
+            tuple(str(x) for x in executed_runs if isinstance(x, str) and x)
+            if executed_runs is not None
+            else None
+        )
+        if scoped_runs is None and isinstance(observation, Mapping):
+            obs_runs = observation.get("executed_runs")
+            if isinstance(obs_runs, list):
+                scoped_runs = tuple(
+                    str(x) for x in obs_runs if isinstance(x, str) and x
                 )
-                >= 1
-            )
-            store_decisions = int(
-                ro_db.execute("SELECT COUNT(*) FROM work_decision").fetchone()[0]
-            )
-            store_fatal_cnt, store_auth_refusals, _ = _count_receipt_violations(ro_db)
-            store_fatal_tools = store_fatal_cnt + store_auth_refusals
+        if scoped_items is None and isinstance(observation, Mapping):
+            obs_item = observation.get("work_item_id")
+            if isinstance(obs_item, str) and obs_item:
+                scoped_items = (obs_item,)
+        if scoped_items is None or scoped_runs is None:
+            manifest_scope = _read_trial_execution_manifest(run_store)
+            if manifest_scope is not None:
+                m_items, m_runs = manifest_scope
+                if scoped_items is None:
+                    scoped_items = m_items
+                if scoped_runs is None:
+                    scoped_runs = m_runs
+        with closing(open_reader(run_store)) as ro_db, read_tx(ro_db):
+            if scoped_items is None and scoped_runs is not None and scoped_runs:
+                r_ph = ",".join("?" for _ in scoped_runs)
+                scoped_items = tuple(
+                    str(r[0])
+                    for r in ro_db.execute(
+                        f"SELECT DISTINCT work_item_id FROM work_runs WHERE run_id IN ({r_ph})",
+                        scoped_runs,
+                    ).fetchall()
+                )
+            if scoped_items is not None:
+                if scoped_items:
+                    i_ph = ",".join("?" for _ in scoped_items)
+                    store_settled = (
+                        int(
+                            ro_db.execute(
+                                f"SELECT COUNT(*) FROM work_items WHERE work_item_id IN ({i_ph}) AND state = 'settled'",
+                                scoped_items,
+                            ).fetchone()[0]
+                        )
+                        >= 1
+                    )
+                else:
+                    store_settled = False
+            else:
+                store_settled = (
+                    int(
+                        ro_db.execute(
+                            "SELECT COUNT(*) FROM work_items WHERE state = 'settled'"
+                        ).fetchone()[0]
+                    )
+                    >= 1
+                )
+
+            if scoped_runs is not None:
+                if scoped_runs:
+                    r_ph = ",".join("?" for _ in scoped_runs)
+                    store_decisions = int(
+                        ro_db.execute(
+                            f"SELECT COUNT(*) FROM work_decision WHERE run_id IN ({r_ph})",
+                            scoped_runs,
+                        ).fetchone()[0]
+                    )
+                    store_fatal_cnt, store_auth_refusals, _ = _count_receipt_violations(
+                        ro_db, exec_runs=scoped_runs
+                    )
+                    store_fatal_tools = store_fatal_cnt + store_auth_refusals
+                else:
+                    store_decisions = 0
+                    store_fatal_tools = 0
+            elif scoped_items is not None:
+                if scoped_items:
+                    i_ph = ",".join("?" for _ in scoped_items)
+                    store_decisions = int(
+                        ro_db.execute(
+                            f"SELECT COUNT(*) FROM work_decision WHERE work_item_id IN ({i_ph})",
+                            scoped_items,
+                        ).fetchone()[0]
+                    )
+                    item_runs = tuple(
+                        str(r[0])
+                        for r in ro_db.execute(
+                            f"SELECT run_id FROM work_runs WHERE work_item_id IN ({i_ph})",
+                            scoped_items,
+                        ).fetchall()
+                    )
+                    store_fatal_cnt, store_auth_refusals, _ = _count_receipt_violations(
+                        ro_db, exec_runs=item_runs
+                    )
+                    store_fatal_tools = store_fatal_cnt + store_auth_refusals
+                else:
+                    store_decisions = 0
+                    store_fatal_tools = 0
+            else:
+                store_decisions = int(
+                    ro_db.execute("SELECT COUNT(*) FROM work_decision").fetchone()[0]
+                )
+                store_fatal_cnt, store_auth_refusals, _ = _count_receipt_violations(
+                    ro_db
+                )
+                store_fatal_tools = store_fatal_cnt + store_auth_refusals
 
     is_completed = packet.outcome == "completed"
     if packet.decision_digest is None:

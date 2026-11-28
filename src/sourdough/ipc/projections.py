@@ -32,6 +32,8 @@ from ..company import FoundingRefused, _identity
 from ..method_learning import (
     collect_lineage_blast_radii,
     compute_active_snapshot_id,
+    opaque_one_agent_delta_id,
+    opaque_one_agent_method_id,
     resolve_active_methods,
 )
 from ..runtime.domains import DomainPlugin, load_domain_plugins
@@ -124,11 +126,70 @@ def _json_loads_safe(raw: str | None, default: Any) -> Any:
         return default
 
 
+def _redact_one_agent_ref_for_board(
+    ref: str,
+    *,
+    force_opaque: bool,
+    one_agent_deltas: set[tuple[str, str]],
+    one_agent_mids: set[str],
+) -> str:
+    """Opaque-map a method/delta reference when it belongs to a one_agent method."""
+    if ":" in ref:
+        mid, rev = ref.rsplit(":", 1)
+        if force_opaque or (mid, rev) in one_agent_deltas or mid in one_agent_mids:
+            return opaque_one_agent_delta_id(mid, rev)
+        return ref
+    if force_opaque or ref in one_agent_mids:
+        return opaque_one_agent_method_id(ref)
+    return ref
+
+
+def _load_one_agent_method_sets(
+    db: sqlite3.Connection, company_id: str
+) -> tuple[set[tuple[str, str]], set[str]]:
+    """Return (one_agent_deltas, one_agent_only_method_ids) for Board projection redaction."""
+    one_agent_deltas: set[tuple[str, str]] = set()
+    one_agent_mids: set[str] = set()
+    shared_mids: set[str] = set()
+    for mid, rev, scope in db.execute(
+        """SELECT method_id, revision_sha256, audience_scope
+           FROM method_delta
+           WHERE company_id = ?""",
+        (company_id,),
+    ).fetchall():
+        mid_s, rev_s, scope_s = str(mid), str(rev), str(scope)
+        if scope_s == "one_agent":
+            one_agent_deltas.add((mid_s, rev_s))
+            one_agent_mids.add(mid_s)
+        else:
+            shared_mids.add(mid_s)
+    return one_agent_deltas, (one_agent_mids - shared_mids)
+
+
 def _redact_active_method_for_board(method_dict: dict[str, Any]) -> dict[str, Any]:
-    """Keep Agent-only (one_agent) method bodies and notes out of Board projections."""
+    """Keep Agent-only (one_agent) method identifiers, bodies, lineage, and notes out of Board projections."""
     projected = dict(method_dict)
     if str(projected.get("audience_scope", "")) != "one_agent":
         return projected
+    raw_mid = str(projected.get("method_id", "") or "")
+    raw_rev = str(projected.get("revision_sha256", "") or "")
+    opaque_mid = opaque_one_agent_method_id(raw_mid)
+    projected["method_id"] = opaque_mid
+    projected["method_id_redacted"] = True
+    if "delta_id" in projected:
+        projected["delta_id"] = (
+            opaque_one_agent_delta_id(raw_mid, raw_rev) if raw_rev else opaque_mid
+        )
+    if isinstance(projected.get("parent_method_ids"), (list, tuple)):
+        projected["parent_method_ids"] = [
+            _redact_one_agent_ref_for_board(
+                str(p),
+                force_opaque=True,
+                one_agent_deltas=set(),
+                one_agent_mids=set(),
+            )
+            for p in projected["parent_method_ids"]
+        ]
     raw_body = str(projected.get("body_text", "") or "")
     projected["body_text"] = None
     projected["body_redacted"] = True
@@ -1614,66 +1675,100 @@ def read_system_evals_projection(
             ).fetchall()
         ]
 
-        method_deltas = [
-            {
-                "delta_id": f"{r[0]}:{r[1]}",
-                "method_id": str(r[0]),
-                "revision_sha256": str(r[1]),
-                "delta_kind": str(r[2]),
-                "item_kind": str(r[3]),
-                "audience_scope": str(r[4]),
-                "audience_target_id": None if r[5] is None else str(r[5]),
-                "author_agent_id": str(r[6]),
-                "parent_method_ids": _json_loads_safe(str(r[7]), []),
-                "active_snapshot_id": None if r[8] is None else str(r[8]),
-                "superseded_revision": None if r[9] is None else str(r[9]),
-                "redaction_passed": bool(r[10]),
-                "status": str(r[11]),
-                "created_at_ns": int(r[12]),
-            }
-            for r in db.execute(
-                """SELECT method_id, revision_sha256, delta_kind, item_kind,
-                          audience_scope, audience_target_id, author_agent_id,
-                          parent_method_ids_json, active_snapshot_id,
-                          superseded_revision, redaction_passed, status, created_at_ns
-                   FROM method_delta
-                   WHERE company_id = ?
-                   ORDER BY created_at_ns DESC, method_id ASC, revision_sha256 ASC
-                   LIMIT 50""",
-                (company_id,),
-            ).fetchall()
-        ]
+        one_agent_deltas, one_agent_mids = _load_one_agent_method_sets(db, company_id)
 
-        method_qualifications = [
-            {
-                "qualification_id": str(r[0]),
-                "method_id": str(r[1]),
-                "revision_sha256": str(r[2]),
-                "delta_id": f"{r[1]}:{r[2]}",
-                "baseline_revision_sha256": None if r[3] is None else str(r[3]),
-                "stage1_passed": bool(r[4]),
-                "stage2_passed": bool(r[5]),
-                "stage3_passed": bool(r[6]),
-                "trial_count": int(r[7]),
-                "metrics": _json_loads_safe(str(r[8]), {}),
-                "evaluator_revision": str(r[9]),
-                "passed": bool(r[10]),
-                "recorded_at_ns": int(r[11]),
-            }
-            for r in db.execute(
-                """SELECT qualification_id, method_id, revision_sha256,
-                          baseline_revision_sha256, stage1_passed, stage2_passed,
-                          stage3_passed, trial_count, metrics_json, evaluator_revision,
-                          passed, recorded_at_ns
-                   FROM method_qualification
-                   WHERE company_id = ?
-                   ORDER BY recorded_at_ns DESC, qualification_id ASC
-                   LIMIT 50""",
-                (company_id,),
-            ).fetchall()
-        ]
+        method_deltas: list[dict[str, Any]] = []
+        for r in db.execute(
+            """SELECT method_id, revision_sha256, delta_kind, item_kind,
+                      audience_scope, audience_target_id, author_agent_id,
+                      parent_method_ids_json, active_snapshot_id,
+                      superseded_revision, redaction_passed, status, created_at_ns
+               FROM method_delta
+               WHERE company_id = ?
+               ORDER BY created_at_ns DESC, method_id ASC, revision_sha256 ASC
+               LIMIT 50""",
+            (company_id,),
+        ).fetchall():
+            raw_mid, raw_rev, scope_s = str(r[0]), str(r[1]), str(r[4])
+            is_one_agent = scope_s == "one_agent"
+            proj_mid = opaque_one_agent_method_id(raw_mid) if is_one_agent else raw_mid
+            raw_parents = _json_loads_safe(str(r[7]), [])
+            proj_parents = (
+                [
+                    _redact_one_agent_ref_for_board(
+                        str(p),
+                        force_opaque=is_one_agent,
+                        one_agent_deltas=one_agent_deltas,
+                        one_agent_mids=one_agent_mids,
+                    )
+                    for p in raw_parents
+                ]
+                if isinstance(raw_parents, list)
+                else []
+            )
+            method_deltas.append(
+                {
+                    "delta_id": f"{proj_mid}:{raw_rev}",
+                    "method_id": proj_mid,
+                    "method_id_redacted": is_one_agent,
+                    "revision_sha256": raw_rev,
+                    "delta_kind": str(r[2]),
+                    "item_kind": str(r[3]),
+                    "audience_scope": scope_s,
+                    "audience_target_id": None if r[5] is None else str(r[5]),
+                    "author_agent_id": str(r[6]),
+                    "parent_method_ids": proj_parents,
+                    "active_snapshot_id": None if r[8] is None else str(r[8]),
+                    "superseded_revision": None if r[9] is None else str(r[9]),
+                    "redaction_passed": bool(r[10]),
+                    "status": str(r[11]),
+                    "created_at_ns": int(r[12]),
+                }
+            )
+
+        method_qualifications: list[dict[str, Any]] = []
+        for r in db.execute(
+            """SELECT q.qualification_id, q.method_id, q.revision_sha256,
+                      q.baseline_revision_sha256, q.stage1_passed, q.stage2_passed,
+                      q.stage3_passed, q.trial_count, q.metrics_json, q.evaluator_revision,
+                      q.passed, q.recorded_at_ns, d.audience_scope
+               FROM method_qualification q
+               LEFT JOIN method_delta d
+                 ON d.company_id = q.company_id
+                AND d.method_id = q.method_id
+                AND d.revision_sha256 = q.revision_sha256
+               WHERE q.company_id = ?
+               ORDER BY q.recorded_at_ns DESC, q.qualification_id ASC
+               LIMIT 50""",
+            (company_id,),
+        ).fetchall():
+            raw_mid, raw_rev = str(r[1]), str(r[2])
+            is_one_agent = (
+                str(r[12] or "") == "one_agent"
+                or (raw_mid, raw_rev) in one_agent_deltas
+            )
+            proj_mid = opaque_one_agent_method_id(raw_mid) if is_one_agent else raw_mid
+            method_qualifications.append(
+                {
+                    "qualification_id": str(r[0]),
+                    "method_id": proj_mid,
+                    "method_id_redacted": is_one_agent,
+                    "revision_sha256": raw_rev,
+                    "delta_id": f"{proj_mid}:{raw_rev}",
+                    "baseline_revision_sha256": None if r[3] is None else str(r[3]),
+                    "stage1_passed": bool(r[4]),
+                    "stage2_passed": bool(r[5]),
+                    "stage3_passed": bool(r[6]),
+                    "trial_count": int(r[7]),
+                    "metrics": _json_loads_safe(str(r[8]), {}),
+                    "evaluator_revision": str(r[9]),
+                    "passed": bool(r[10]),
+                    "recorded_at_ns": int(r[11]),
+                }
+            )
 
         delta_meta_by_id: dict[str, tuple[str, str]] = {}
+        raw_act_keys: list[tuple[str, str]] = []
         method_activations: list[dict[str, Any]] = []
         for r in db.execute(
             """SELECT a.request_id, a.operation, a.method_id, a.revision_sha256,
@@ -1691,8 +1786,13 @@ def read_system_evals_projection(
                LIMIT 50""",
             (company_id,),
         ).fetchall():
-            delta_id = f"{r[2]}:{r[3]}"
-            delta_meta_by_id[delta_id] = (
+            raw_mid, raw_rev, scope_s = str(r[2]), str(r[3]), str(r[5])
+            is_one_agent = scope_s == "one_agent"
+            proj_mid = opaque_one_agent_method_id(raw_mid) if is_one_agent else raw_mid
+            raw_delta_id = f"{raw_mid}:{raw_rev}"
+            proj_delta_id = f"{proj_mid}:{raw_rev}"
+            raw_act_keys.append((raw_mid, raw_rev))
+            delta_meta_by_id[raw_delta_id] = (
                 "" if r[13] is None else str(r[13]),
                 "" if r[14] is None else str(r[14]),
             )
@@ -1700,48 +1800,65 @@ def read_system_evals_projection(
                 {
                     "request_id": str(r[0]),
                     "operation": str(r[1]),
-                    "method_id": str(r[2]),
-                    "revision_sha256": str(r[3]),
-                    "delta_id": delta_id,
+                    "method_id": proj_mid,
+                    "method_id_redacted": is_one_agent,
+                    "revision_sha256": raw_rev,
+                    "delta_id": proj_delta_id,
                     "qualification_id": str(r[4]),
-                    "audience_scope": str(r[5]),
+                    "audience_scope": scope_s,
                     "audience_target_id": None if r[6] is None else str(r[6]),
                     "activation_seq": int(r[7]),
                     "principal_id": str(r[8]),
                     "grant_id": str(r[9]),
                     "quarantined": bool(r[10]),
-                    "quarantine_reason": None if r[11] is None else str(r[11]),
+                    "quarantine_reason": (
+                        "redacted_one_agent_reason"
+                        if is_one_agent and r[11] is not None
+                        else (None if r[11] is None else str(r[11]))
+                    ),
                     "recorded_at_ns": int(r[12]),
+                    "_raw_delta_id": raw_delta_id,
+                    "_raw_key": (raw_mid, raw_rev),
                 }
             )
 
         blast_radii = collect_lineage_blast_radii(
             db,
             company_id,
-            [
-                (m_act["method_id"], m_act["revision_sha256"])
-                for m_act in method_activations
-            ],
+            raw_act_keys,
         )
         for m_act in method_activations:
-            desc = list(
-                blast_radii.get((m_act["method_id"], m_act["revision_sha256"]), ())
-            )
-            m_act["blast_radius_descendants"] = desc
-            blocked = {m_act["delta_id"], *desc}
+            raw_key = m_act.pop("_raw_key")
+            raw_delta_id = m_act.pop("_raw_delta_id")
+            is_one_agent = m_act["audience_scope"] == "one_agent"
+            raw_desc = list(blast_radii.get(raw_key, ()))
+            m_act["blast_radius_descendants"] = [
+                _redact_one_agent_ref_for_board(
+                    str(d_ref),
+                    force_opaque=is_one_agent,
+                    one_agent_deltas=one_agent_deltas,
+                    one_agent_mids=one_agent_mids,
+                )
+                for d_ref in raw_desc
+            ]
+            blocked = {raw_delta_id, *raw_desc}
             fallback = next(
                 (
                     other["revision_sha256"]
-                    for other in method_activations
+                    for other, other_raw in zip(method_activations, raw_act_keys)
                     if other["method_id"] == m_act["method_id"]
                     and other["audience_scope"] == m_act["audience_scope"]
                     and other["audience_target_id"] == m_act["audience_target_id"]
                     and not other["quarantined"]
                     and other["operation"] != "quarantine"
-                    and other["delta_id"] not in blocked
-                    and delta_meta_by_id.get(other["delta_id"], ("", ""))[0]
+                    and f"{other_raw[0]}:{other_raw[1]}" not in blocked
+                    and delta_meta_by_id.get(
+                        f"{other_raw[0]}:{other_raw[1]}", ("", "")
+                    )[0]
                     != "DEPRECATE"
-                    and delta_meta_by_id.get(other["delta_id"], ("", ""))[1]
+                    and delta_meta_by_id.get(
+                        f"{other_raw[0]}:{other_raw[1]}", ("", "")
+                    )[1]
                     != "quarantined"
                 ),
                 None,
@@ -1877,12 +1994,23 @@ def read_system_audit_projection(
             raise FoundingRefused("Company identity mismatch")
         as_of_ns = time_ns()
         event_seq = max_event_seq(db, company_id)
+        one_agent_deltas, one_agent_mids = _load_one_agent_method_sets(db, company_id)
         events = [
             {
                 "event_seq": int(r[0]),
                 "domain": str(r[1]),
                 "entity_type": str(r[2]),
-                "entity_id": str(r[3]),
+                "entity_id": (
+                    _redact_one_agent_ref_for_board(
+                        str(r[3]),
+                        force_opaque=False,
+                        one_agent_deltas=one_agent_deltas,
+                        one_agent_mids=one_agent_mids,
+                    )
+                    if str(r[2])
+                    in ("method_delta", "method_activation", "method_qualification")
+                    else str(r[3])
+                ),
                 "event_type": str(r[4]),
                 "recorded_at_ns": int(r[5]),
             }

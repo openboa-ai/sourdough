@@ -306,6 +306,16 @@ def _format_delta_id(method_id: str, revision_sha256: str) -> str:
     return f"{method_id}:{revision_sha256}"
 
 
+def opaque_one_agent_method_id(method_id: str) -> str:
+    """Return a deterministic opaque Board-safe identifier for an Agent-private method_id."""
+    return f"one_agent_method:{sha256(str(method_id).encode('utf-8')).hexdigest()[:16]}"
+
+
+def opaque_one_agent_delta_id(method_id: str, revision_sha256: str) -> str:
+    """Return a deterministic opaque Board-safe delta_id for an Agent-private method delta."""
+    return _format_delta_id(opaque_one_agent_method_id(method_id), revision_sha256)
+
+
 def _require_safe_id(value: Any, label: str) -> str:
     if not isinstance(value, str) or not _SAFE_ID_RE.fullmatch(value) or ".." in value:
         raise MethodRefused(f"{label} must be a valid identifier")
@@ -1453,6 +1463,36 @@ def distill_method_delta(
                         f"superseded_revision '{eff_superseded}' does not exist for '{clean_method_id}'"
                     )
 
+        for parent_ref in parents_tuple:
+            if ":" in parent_ref:
+                p_mid, p_rev = parent_ref.rsplit(":", 1)
+                p_rows = db.execute(
+                    """SELECT audience_scope, audience_target_id, author_agent_id
+                       FROM method_delta
+                       WHERE company_id = ? AND method_id = ? AND revision_sha256 = ?""",
+                    (company_id, p_mid, p_rev),
+                ).fetchall()
+            else:
+                p_rows = db.execute(
+                    """SELECT audience_scope, audience_target_id, author_agent_id
+                       FROM method_delta
+                       WHERE company_id = ? AND method_id = ?""",
+                    (company_id, parent_ref),
+                ).fetchall()
+            if not p_rows:
+                raise MethodRefused(
+                    "parent_method_ids must reference existing method_delta records"
+                )
+            if not any(
+                str(r[0]) != "one_agent"
+                or str(r[1] or r[2]) == claim.founder_id
+                or str(r[2]) == claim.founder_id
+                for r in p_rows
+            ):
+                raise MethodRefused(
+                    "parent_method_ids cannot reference another Agent's private method"
+                )
+
         verified_refs, missing_refs = _verify_source_refs(
             db,
             store_path=store_path,
@@ -1540,12 +1580,17 @@ def distill_method_delta(
                 ts,
             ),
         )
+        audit_mid = (
+            opaque_one_agent_method_id(clean_method_id)
+            if audience_scope == "one_agent"
+            else clean_method_id
+        )
         append_audit_event(
             db,
             company_id=company_id,
             domain="learning",
             entity_type="method_delta",
-            entity_id=_format_delta_id(clean_method_id, revision_sha256),
+            entity_id=_format_delta_id(audit_mid, revision_sha256),
             event_type=(
                 "learning.method_delta_disputed"
                 if status == "disputed"
@@ -1554,7 +1599,7 @@ def distill_method_delta(
             actor_id=claim.founder_id,
             run_id=claim.run_id,
             payload={
-                "method_id": clean_method_id,
+                "method_id": audit_mid,
                 "revision_sha256": revision_sha256,
                 "delta_kind": delta_kind,
                 "item_kind": eff_item_kind,
@@ -1677,6 +1722,11 @@ def qualify_method_delta(
                 ts,
             ),
         )
+        audit_delta_id = (
+            opaque_one_agent_delta_id(delta.method_id, delta.revision_sha256)
+            if delta.audience_scope == "one_agent"
+            else delta.delta_id
+        )
         append_audit_event(
             db,
             company_id=company_id,
@@ -1687,7 +1737,7 @@ def qualify_method_delta(
             actor_id=delta.author_agent_id,
             payload={
                 "qualification_id": qid,
-                "delta_id": delta.delta_id,
+                "delta_id": audit_delta_id,
                 "stage1_passed": stage1_passed,
                 "stage2_passed": stage2_passed,
                 "stage3_passed": stage3_passed,
@@ -2127,16 +2177,43 @@ def activate_method_delta(
             "content_snapshot_id": content_snap_id,
             "snapshot_members": snapshot_members,
         }
+        one_agent_snap_pairs = {
+            (str(r[0]), str(r[1]))
+            for r in db.execute(
+                """SELECT method_id, revision_sha256 FROM method_delta
+                   WHERE company_id = ? AND audience_scope = 'one_agent'""",
+                (company_id,),
+            ).fetchall()
+        }
+        audit_act_mid = (
+            opaque_one_agent_method_id(delta.method_id)
+            if delta.audience_scope == "one_agent"
+            else delta.method_id
+        )
+        audit_act_delta_id = _format_delta_id(audit_act_mid, delta.revision_sha256)
+        audit_act_payload = {
+            **receipt_result,
+            "method_id": audit_act_mid,
+            "snapshot_members": [
+                [
+                    opaque_one_agent_method_id(m)
+                    if (m, r) in one_agent_snap_pairs
+                    else m,
+                    r,
+                ]
+                for m, r in snapshot_members
+            ],
+        }
         event_seq = append_audit_event(
             db,
             company_id=company_id,
             domain="learning",
             entity_type="method_activation",
-            entity_id=delta.delta_id,
+            entity_id=audit_act_delta_id,
             event_type=f"learning.method_{operation}d",
             actor_id=actor_id,
             command_id=req_id,
-            payload=receipt_result,
+            payload=audit_act_payload,
             recorded_at_ns=ts,
         )
         try:
@@ -2499,16 +2576,65 @@ def quarantine_method_lineage(
             "snapshot_members": snapshot_members,
             "reason": clean_reason,
         }
+        one_agent_q_pairs = {
+            (str(r[0]), str(r[1]))
+            for r in db.execute(
+                """SELECT method_id, revision_sha256 FROM method_delta
+                   WHERE company_id = ? AND audience_scope = 'one_agent'""",
+                (company_id,),
+            ).fetchall()
+        }
+        one_agent_q_mids = {m for m, _r in one_agent_q_pairs}
+        audit_q_mid = (
+            opaque_one_agent_method_id(target_delta.method_id)
+            if target_delta.audience_scope == "one_agent"
+            else target_delta.method_id
+        )
+        audit_q_delta_id = _format_delta_id(audit_q_mid, target_delta.revision_sha256)
+        audit_q_payload = {
+            **receipt_payload,
+            "faulted_method_id": audit_q_mid,
+            "quarantined_methods": [
+                opaque_one_agent_method_id(m)
+                if target_delta.audience_scope == "one_agent" or m in one_agent_q_mids
+                else m
+                for m in quarantined_methods
+            ],
+            "quarantined_revisions": [
+                [
+                    opaque_one_agent_method_id(m) if (m, r) in one_agent_q_pairs else m,
+                    r,
+                ]
+                for m, r in quarantined_revisions
+            ],
+            "restored_method_id": (
+                None
+                if restored_method_id is None
+                else (
+                    opaque_one_agent_method_id(restored_method_id)
+                    if (restored_method_id, restored_revision_sha256 or "")
+                    in one_agent_q_pairs
+                    else restored_method_id
+                )
+            ),
+            "snapshot_members": [
+                [
+                    opaque_one_agent_method_id(m) if (m, r) in one_agent_q_pairs else m,
+                    r,
+                ]
+                for m, r in snapshot_members
+            ],
+        }
         event_seq = append_audit_event(
             db,
             company_id=company_id,
             domain="learning",
             entity_type="method_activation",
-            entity_id=target_delta.delta_id,
+            entity_id=audit_q_delta_id,
             event_type="learning.method_lineage_quarantined",
             actor_id=eff_actor_id,
             command_id=req_id,
-            payload=receipt_payload,
+            payload=audit_q_payload,
             recorded_at_ns=ts,
         )
         try:
@@ -3588,8 +3714,16 @@ def audit_episodes_for_dreaming(
                 "patterns_detected": len(patterns),
                 "proposals_drafted": [
                     {
-                        "delta_id": d.delta_id,
-                        "method_id": d.method_id,
+                        "delta_id": (
+                            opaque_one_agent_delta_id(d.method_id, d.revision_sha256)
+                            if d.audience_scope == "one_agent"
+                            else d.delta_id
+                        ),
+                        "method_id": (
+                            opaque_one_agent_method_id(d.method_id)
+                            if d.audience_scope == "one_agent"
+                            else d.method_id
+                        ),
                         "delta_kind": d.delta_kind,
                         "status": d.status,
                     }

@@ -394,6 +394,26 @@ def reconcile_shift_episode_outcome(
             or reconciled.get("retrieved")
             or reconciled.get("invoked")
         ):
+            from ..method_learning import opaque_one_agent_method_id
+
+            one_agent_mids = {
+                str(r[0])
+                for r in db.execute(
+                    """SELECT DISTINCT method_id FROM method_delta
+                       WHERE company_id = ? AND audience_scope = 'one_agent'""",
+                    (ctx.company_id,),
+                ).fetchall()
+            }
+            audit_reconciled = dict(reconciled)
+            for key in ("available", "retrieved", "invoked"):
+                vals = audit_reconciled.get(key)
+                if isinstance(vals, list):
+                    audit_reconciled[key] = [
+                        opaque_one_agent_method_id(v)
+                        if isinstance(v, str) and v in one_agent_mids
+                        else v
+                        for v in vals
+                    ]
             append_audit_event(
                 db,
                 company_id=ctx.company_id,
@@ -403,7 +423,7 @@ def reconcile_shift_episode_outcome(
                 event_type="learning.causal_method_trace_reconciled",
                 actor_id=ctx.work_item.owner_agent_id,
                 run_id=ctx.run.run_id,
-                payload=reconciled,
+                payload=audit_reconciled,
                 recorded_at_ns=max(1, int(ctx.now_ns)),
             )
     if updated_ep is not None:
@@ -456,6 +476,7 @@ class ShiftRunner:
         max_tool_calls: int = 16,
         timeout_seconds: float | None = None,
         pre_resolved_active_methods: tuple[Sequence[Any], str | None] | None = None,
+        allowed_tool_names: frozenset[str] | None = None,
     ) -> ShiftRunResult:
         agent_id = ctx.work_item.owner_agent_id
         persisted_profile, grant_scope = self._read_agent_state(
@@ -485,11 +506,20 @@ class ShiftRunner:
             limits=PRODUCTION_DESK_LIMITS,
         )
 
+        effective_base_names = (
+            set(base_handlers)
+            if allowed_tool_names is None
+            else (set(base_handlers) & allowed_tool_names)
+        )
         has_peer_collab_tools = bool(
-            set(base_handlers) & (_PEER_INPUT_TOOLS | _PEER_OUTBOUND_SINKS)
+            effective_base_names & (_PEER_INPUT_TOOLS | _PEER_OUTBOUND_SINKS)
+        )
+        desk_tools_permitted = include_core_desk_tools and (
+            allowed_tool_names is None
+            or bool(allowed_tool_names & _PRIVATE_DESK_ALL_TOOLS)
         )
         hydrate_passive_private_context = (
-            include_core_desk_tools and not has_peer_collab_tools
+            desk_tools_permitted and not has_peer_collab_tools
         )
         if hydrate_passive_private_context:
             _, drafts = resolve_desk(
@@ -723,6 +753,20 @@ class ShiftRunner:
         tool_specs, merged_handlers, contributed_recoverable = merge_tool_contributions(
             base_tools, base_handlers, contributions
         )
+        if allowed_tool_names is not None:
+            missing_tools = sorted(allowed_tool_names - set(merged_handlers))
+            if missing_tools:
+                raise RuntimeRefused(
+                    f"Sealed tool manifest requires unavailable tools: {', '.join(missing_tools)}"
+                )
+            tool_specs = tuple(
+                spec for spec in tool_specs if spec.name in allowed_tool_names
+            )
+            merged_handlers = {
+                name: fn
+                for name, fn in merged_handlers.items()
+                if name in allowed_tool_names
+            }
         tool_specs = tuple(sorted(tool_specs, key=lambda spec: spec.name))
         merged_recoverable = tuple(
             dict.fromkeys(
