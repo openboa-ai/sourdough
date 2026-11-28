@@ -96,6 +96,28 @@ function workEventStateForRun(
   return "done";
 }
 
+function workEventStateForHandoff(
+  state: string | undefined,
+  accepted: boolean
+): "ready" | "waiting" | "failed" | "done" {
+  const effective = state || (accepted ? "accepted" : "offered");
+  if (effective === "accepted") return "ready";
+  if (effective === "offered") return "waiting";
+  if (effective === "declined" || effective === "expired") return "failed";
+  return "done";
+}
+
+function handoffStateTone(
+  state: string | undefined,
+  accepted: boolean
+): "success" | "warning" | "danger" | "neutral" {
+  const effective = state || (accepted ? "accepted" : "offered");
+  if (effective === "accepted") return "success";
+  if (effective === "offered") return "warning";
+  if (effective === "declined" || effective === "expired") return "danger";
+  return "neutral";
+}
+
 function workItemStateTone(
   state: string
 ): "brand" | "warning" | "success" | "danger" | "neutral" {
@@ -1266,7 +1288,9 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                     <Text variant="help">No work handoffs recorded.</Text>
                   ) : (
                     <List label="Work handoff offers" divided>
-                      {activeData.tabs.handoffs.map((h) => (
+                      {activeData.tabs.handoffs.map((h) => {
+                        const handoffState = h.state || (h.accepted ? "accepted" : "offered");
+                        return (
                         <li key={h.offer_id} className="yg-list-item">
                           <WorkEvent
                             event={{
@@ -1274,10 +1298,17 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                               kind: "handoff",
                               title: `${h.sender_name} → ${h.recipient_name}`,
                               detail: h.expected_result,
-                              state: h.accepted ? "ready" : "waiting",
+                              state: workEventStateForHandoff(h.state, h.accepted),
                             }}
                             inlineMeta={
                               <Inline gap={6} align="center" wrap>
+                                <Badge
+                                  tone={handoffStateTone(h.state, h.accepted)}
+                                  variant="soft"
+                                  dot={false}
+                                >
+                                  {handoffState}
+                                </Badge>
                                 <Badge tone="neutral" variant="outline" dot={false}>
                                   {h.direction}
                                 </Badge>
@@ -1309,7 +1340,8 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
                             }
                           />
                         </li>
-                      ))}
+                        );
+                      })}
                     </List>
                   )}
                 </Card>

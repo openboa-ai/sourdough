@@ -29,6 +29,7 @@ from ..board_control import (
     resolve_board_access,
 )
 from ..company import FoundingRefused, _identity
+from ..duty_run import DutyRefused
 from ..method_learning import (
     collect_lineage_blast_radii,
     compute_active_snapshot_id,
@@ -144,7 +145,30 @@ def _redact_one_agent_ref_for_board(
     return ref
 
 
-def _load_one_agent_method_sets(
+AUDIT_ONE_AGENT_ENTITY_TYPES: frozenset[str] = frozenset(
+    {"method_delta", "method_activation", "method_qualification"}
+)
+
+
+def redact_audit_entity_id_for_board(
+    entity_type: str,
+    entity_id: str,
+    *,
+    one_agent_deltas: set[tuple[str, str]],
+    one_agent_mids: set[str],
+) -> str:
+    """Opaque-map one_agent method/delta entity_ids in Board-facing audit event streams."""
+    if entity_type not in AUDIT_ONE_AGENT_ENTITY_TYPES:
+        return entity_id
+    return _redact_one_agent_ref_for_board(
+        entity_id,
+        force_opaque=False,
+        one_agent_deltas=one_agent_deltas,
+        one_agent_mids=one_agent_mids,
+    )
+
+
+def load_one_agent_method_sets(
     db: sqlite3.Connection, company_id: str
 ) -> tuple[set[tuple[str, str]], set[str]]:
     """Return (one_agent_deltas, one_agent_only_method_ids) for Board projection redaction."""
@@ -164,6 +188,9 @@ def _load_one_agent_method_sets(
         else:
             shared_mids.add(mid_s)
     return one_agent_deltas, (one_agent_mids - shared_mids)
+
+
+_load_one_agent_method_sets = load_one_agent_method_sets
 
 
 def _redact_active_method_for_board(method_dict: dict[str, Any]) -> dict[str, Any]:
@@ -280,11 +307,18 @@ def _redact_work_item_payload_for_board(
     return projected
 
 
-def _redact_run_outcome_for_board(raw_json: str | None) -> Any:
-    """Redact free-form model prose (output_text) and non-enum action_kind from work_runs outcomes."""
+def _redact_run_outcome_for_board(
+    raw_json: str | None,
+    *,
+    one_agent_deltas: set[tuple[str, str]] | None = None,
+    one_agent_mids: set[str] | None = None,
+) -> Any:
+    """Redact free-form prose, non-enum action_kind, and one_agent method/delta IDs from work_runs outcomes."""
     parsed = _json_loads_safe(raw_json, None)
     if not isinstance(parsed, dict):
         return parsed
+    oa_deltas = one_agent_deltas or set()
+    oa_mids = one_agent_mids or set()
     projected = dict(parsed)
     if "output_text" in projected:
         raw_out = projected.pop("output_text", None)
@@ -300,6 +334,74 @@ def _redact_run_outcome_for_board(raw_json: str | None) -> Any:
         projected["action_kind"] = safe_act
         if safe_act != raw_act:
             projected["action_kind_redacted"] = True
+    raw_trace = projected.get("causal_method_trace")
+    if isinstance(raw_trace, Mapping) and (oa_deltas or oa_mids):
+        safe_trace = dict(raw_trace)
+        for key in ("available", "retrieved", "invoked"):
+            vals = safe_trace.get(key)
+            if isinstance(vals, list):
+                safe_trace[key] = [
+                    _redact_one_agent_ref_for_board(
+                        str(v),
+                        force_opaque=False,
+                        one_agent_deltas=oa_deltas,
+                        one_agent_mids=oa_mids,
+                    )
+                    for v in vals
+                ]
+        projected["causal_method_trace"] = safe_trace
+    raw_proposals = projected.get("proposals")
+    if isinstance(raw_proposals, list):
+        safe_proposals: list[Any] = []
+        for entry in raw_proposals:
+            if not isinstance(entry, Mapping):
+                safe_proposals.append(entry)
+                continue
+            item = dict(entry)
+            raw_mid = str(item.get("method_id") or "")
+            raw_rev = str(item.get("revision_sha256") or "")
+            raw_did = str(item.get("delta_id") or "")
+            is_oa = (
+                str(item.get("audience_scope") or "") == "one_agent"
+                or (raw_mid, raw_rev) in oa_deltas
+                or raw_mid in oa_mids
+                or (":" in raw_did and tuple(raw_did.rsplit(":", 1)) in oa_deltas)
+            )
+            if is_oa:
+                if raw_mid:
+                    item["method_id"] = opaque_one_agent_method_id(raw_mid)
+                if raw_did:
+                    item["delta_id"] = (
+                        opaque_one_agent_delta_id(raw_mid, raw_rev)
+                        if raw_mid and raw_rev
+                        else _redact_one_agent_ref_for_board(
+                            raw_did,
+                            force_opaque=True,
+                            one_agent_deltas=oa_deltas,
+                            one_agent_mids=oa_mids,
+                        )
+                    )
+                item["method_id_redacted"] = True
+            safe_proposals.append(item)
+        projected["proposals"] = safe_proposals
+    raw_patterns = projected.get("patterns")
+    if isinstance(raw_patterns, list):
+        oa_any_mids = oa_mids | {mid for mid, _ in oa_deltas}
+        safe_patterns: list[Any] = []
+        for entry in raw_patterns:
+            if not isinstance(entry, Mapping):
+                safe_patterns.append(entry)
+                continue
+            item = dict(entry)
+            raw_mid = str(item.get("method_id") or "")
+            if raw_mid and (
+                str(item.get("audience_scope") or "") == "one_agent"
+                or raw_mid in oa_any_mids
+            ):
+                item["method_id"] = opaque_one_agent_method_id(raw_mid)
+                item["method_id_redacted"] = True
+            safe_patterns.append(item)
+        projected["patterns"] = safe_patterns
     return projected
 
 
@@ -346,7 +448,7 @@ def _count_private_drafts(store: Path, agent_id: str) -> int:
                 continue
             stems.add(entry.stem if entry.suffix else name)
         return len(stems)
-    except Exception:
+    except (OSError, DutyRefused):
         return 0
 
 
@@ -602,7 +704,7 @@ def read_agents_graph_projection(
                     "current_task": current_task,
                     "active_run": run,
                     "monthly_budget_minor": info["monthly_budget_minor"],
-                    "private_draft_count": _count_private_drafts(store, aid),
+                    "private_draft_count": 0,
                     "published_count": pub_counts.get(aid, 0),
                     "grant_scope": info["grant_scope"],
                     "sandbox_authorized": False,
@@ -652,7 +754,7 @@ def read_agents_graph_projection(
             )
 
         for r in db.execute(
-            """SELECT offer_id, sender_id, recipient_id, expected_result, accepted_run_id
+            """SELECT offer_id, sender_id, recipient_id, expected_result, accepted_run_id, state
                FROM work_handoff
                WHERE company_id = ?
                ORDER BY rowid DESC LIMIT 12""",
@@ -668,15 +770,19 @@ def read_agents_graph_projection(
                 else f"{expected_text[:177]}..."
             )
             sender_name = str(directory.get(src, {}).get("display_name", src))
-            accepted = bool(r[4])
+            state_str = (
+                str(r[5])
+                if r[5] is not None and str(r[5]).strip()
+                else ("accepted" if r[4] else "offered")
+            )
             edges.append(
                 {
                     "edge_id": f"handoff-{r[0]}",
                     "source_agent_id": src,
                     "target_agent_id": dst,
                     "kind": "handoff",
-                    "state": "accepted" if accepted else "offered",
-                    "active": not accepted,
+                    "state": state_str,
+                    "active": state_str == "offered",
                     "label": f"Handoff · {expected_text[:24]}",
                     "latest_preview": preview_text,
                     "latest_sender_name": sender_name,
@@ -755,7 +861,11 @@ def read_agents_graph_projection(
         _apply_core_enrichers(
             PROJECTION_AGENTS_GRAPH, db, company_id, payload, domain_plugins
         )
-        return payload, event_seq
+    for node in payload["nodes"]:
+        node["private_draft_count"] = _count_private_drafts(
+            store, str(node["agent_id"])
+        )
+    return payload, event_seq
 
 
 def read_agent_detail_projection(
@@ -791,6 +901,7 @@ def read_agent_detail_projection(
         )
 
         # Tab 1: Work Activity
+        one_agent_deltas, one_agent_mids = _load_one_agent_method_sets(db, company_id)
         work_activity = [
             {
                 "run_id": str(r[0]),
@@ -799,7 +910,11 @@ def read_agent_detail_projection(
                 "status": str(r[3]),
                 "fencing_token": int(r[4]),
                 "budget_ceiling_minor": int(r[5]),
-                "outcome": _redact_run_outcome_for_board(r[6]),
+                "outcome": _redact_run_outcome_for_board(
+                    r[6],
+                    one_agent_deltas=one_agent_deltas,
+                    one_agent_mids=one_agent_mids,
+                ),
                 "created_at_ns": int(r[7]),
                 "updated_at_ns": int(r[8]),
             }
@@ -1008,31 +1123,41 @@ def read_agent_detail_projection(
             ).fetchall()
         ]
 
-        handoffs = [
-            {
-                "offer_id": str(r[0]),
-                "direction": "outgoing" if str(r[1]) == agent_id else "incoming",
-                "sender_id": str(r[1]),
-                "sender_name": directory.get(str(r[1]), {}).get(
-                    "display_name", str(r[1])
-                ),
-                "recipient_id": str(r[2]),
-                "recipient_name": directory.get(str(r[2]), {}).get(
-                    "display_name", str(r[2])
-                ),
-                "asset_id": str(r[3]),
-                "expected_result": str(r[4]),
-                "accepted": r[5] is not None,
-            }
-            for r in db.execute(
-                """SELECT offer_id, sender_id, recipient_id, asset_id,
-                          expected_result, accepted_run_id
-                   FROM work_handoff
-                   WHERE company_id = ? AND (sender_id = ? OR recipient_id = ?)
-                   ORDER BY rowid DESC LIMIT 20""",
-                (company_id, agent_id, agent_id),
-            ).fetchall()
-        ]
+        handoffs = []
+        for r in db.execute(
+            """SELECT offer_id, sender_id, recipient_id, asset_id,
+                      expected_result, accepted_run_id, state, expires_at,
+                      successor_work_item_id
+               FROM work_handoff
+               WHERE company_id = ? AND (sender_id = ? OR recipient_id = ?)
+               ORDER BY rowid DESC LIMIT 20""",
+            (company_id, agent_id, agent_id),
+        ).fetchall():
+            state_str = (
+                str(r[6])
+                if r[6] is not None and str(r[6]).strip()
+                else ("accepted" if r[5] is not None else "offered")
+            )
+            handoffs.append(
+                {
+                    "offer_id": str(r[0]),
+                    "direction": "outgoing" if str(r[1]) == agent_id else "incoming",
+                    "sender_id": str(r[1]),
+                    "sender_name": directory.get(str(r[1]), {}).get(
+                        "display_name", str(r[1])
+                    ),
+                    "recipient_id": str(r[2]),
+                    "recipient_name": directory.get(str(r[2]), {}).get(
+                        "display_name", str(r[2])
+                    ),
+                    "asset_id": str(r[3]),
+                    "expected_result": str(r[4]),
+                    "state": state_str,
+                    "accepted": state_str == "accepted",
+                    "expires_at": int(r[7]),
+                    "successor_work_item_id": None if r[8] is None else str(r[8]),
+                }
+            )
 
         prohibitions = [
             "Cannot modify company charter or Board mandate",
@@ -1042,7 +1167,6 @@ def read_agent_detail_projection(
         if not info["is_ceo"]:
             prohibitions.append("Cannot retire employees or exceed delegated budget")
 
-        private_draft_count = _count_private_drafts(store, agent_id)
         active_run = next(
             (r for r in work_activity if r["status"] in ("running", "waiting")), None
         )
@@ -1060,7 +1184,7 @@ def read_agent_detail_projection(
                 "desk_manifest_revision": None
                 if desk_row is None
                 else str(desk_row[0]),
-                "private_draft_count": private_draft_count,
+                "private_draft_count": 0,
                 "private_draft_notice": "Private drafts remain physically isolated on the Agent's Desk and are never disclosed to the Board.",
                 "published_count": len(published_reports),
                 "work_run_count": len(work_activity),
@@ -1094,7 +1218,10 @@ def read_agent_detail_projection(
         _apply_core_enrichers(
             PROJECTION_AGENT_DETAIL, db, company_id, payload, domain_plugins
         )
-        return payload, event_seq
+    payload["desk_workspace"]["private_draft_count"] = _count_private_drafts(
+        store, agent_id
+    )
+    return payload, event_seq
 
 
 def read_messages_projection(
@@ -1403,10 +1530,7 @@ def read_org_projection(store: Path, company_id: str) -> tuple[dict[str, Any], i
         event_seq = max_event_seq(db, company_id)
         directory = _agent_directory(db, company_id)
 
-        roster = [
-            info | {"private_draft_count": _count_private_drafts(store, aid)}
-            for aid, info in directory.items()
-        ]
+        roster = [info | {"private_draft_count": 0} for info in directory.values()]
         publications = [
             {
                 "asset_id": str(r[0]),
@@ -1451,22 +1575,24 @@ def read_org_projection(store: Path, company_id: str) -> tuple[dict[str, Any], i
                 (company_id,),
             ).fetchall()
         ]
-        return (
-            {
-                "projection": PROJECTION_ORG,
-                "company_id": company_id,
-                "as_of_ns": as_of_ns,
-                "event_seq": event_seq,
-                "roster": roster,
-                "publications": publications,
-                "delegated_hr_custody": {
-                    "board_can_retire": False,
-                    "policy_notice": "Managed by CEO · Board view is read-only.",
-                    "archived_employees": archives,
-                },
+        payload = {
+            "projection": PROJECTION_ORG,
+            "company_id": company_id,
+            "as_of_ns": as_of_ns,
+            "event_seq": event_seq,
+            "roster": roster,
+            "publications": publications,
+            "delegated_hr_custody": {
+                "board_can_retire": False,
+                "policy_notice": "Managed by CEO · Board view is read-only.",
+                "archived_employees": archives,
             },
-            event_seq,
+        }
+    for entry in payload["roster"]:
+        entry["private_draft_count"] = _count_private_drafts(
+            store, str(entry["agent_id"])
         )
+    return payload, event_seq
 
 
 def read_restrictions_projection(
@@ -2000,16 +2126,11 @@ def read_system_audit_projection(
                 "event_seq": int(r[0]),
                 "domain": str(r[1]),
                 "entity_type": str(r[2]),
-                "entity_id": (
-                    _redact_one_agent_ref_for_board(
-                        str(r[3]),
-                        force_opaque=False,
-                        one_agent_deltas=one_agent_deltas,
-                        one_agent_mids=one_agent_mids,
-                    )
-                    if str(r[2])
-                    in ("method_delta", "method_activation", "method_qualification")
-                    else str(r[3])
+                "entity_id": redact_audit_entity_id_for_board(
+                    str(r[2]),
+                    str(r[3]),
+                    one_agent_deltas=one_agent_deltas,
+                    one_agent_mids=one_agent_mids,
                 ),
                 "event_type": str(r[4]),
                 "recorded_at_ns": int(r[5]),
