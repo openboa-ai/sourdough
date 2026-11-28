@@ -2004,6 +2004,427 @@ class ConnectorSubsystemTests(unittest.TestCase):
             srv.server_close()
             thread.join(timeout=5.0)
 
+    def test_unknown_read_retries_accumulate_reservations_and_preserve_ceiling(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-c-cumres-") as tmp:
+            store, leases, founding, claim, now = _setup_company_and_claim(Path(tmp))
+            adapter = _FakeAdapter()
+            adapter.next_execute = lambda _r, _s: (_ for _ in ()).throw(
+                ConnectorIndeterminate("upstream timeout")
+            )
+            proxy = ConnectorProxy(
+                ConnectorAdapterRegistry([adapter]),
+                InMemorySecretVault({"envref:FAKE_TEST_KEY": "test-cum-key-1111"}),
+                loopback_only=True,
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                # 1. Ceiling 25 allows attempt 1 (25 <= 25), then blocks retry (25+25=50 > 25)!
+                b25 = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="svc-cum-25",
+                    connector_kind="fake_service",
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9030",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=adapter.manifest.operations,
+                    credential_handle_ref="envref:FAKE_TEST_KEY",
+                    actor_id="board-1",
+                    max_requests_per_window=10,
+                    budget_ceiling_minor_units=25,
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=b25.binding_id,
+                    binding_revision=b25.revision,
+                    allowed_operations=("fetch_doc",),
+                    granted_by_actor_id="board-1",
+                    max_cost_minor_units=25,
+                    now_ns=now + 1,
+                )
+                r1 = proxy.invoke(
+                    w,
+                    claim,
+                    binding_id=b25.binding_id,
+                    operation="fetch_doc",
+                    request_id="same-read",
+                    payload={"doc": "a"},
+                    now_ns=now + 2,
+                )
+                self.assertEqual(r1.status, "unknown")
+                with self.assertRaises(ConnectorBudgetExceeded):
+                    proxy.invoke(
+                        w,
+                        claim,
+                        binding_id=b25.binding_id,
+                        operation="fetch_doc",
+                        request_id="same-read",
+                        payload={"doc": "a"},
+                        now_ns=now + 3,
+                    )
+                self.assertEqual(len(adapter.execute_calls), 1)
+
+                # 2. Ceiling 60 allows attempt 1 (25) and attempt 2 (50 <= 60), then blocks attempt 3 (75 > 60)!
+                b60 = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="svc-cum-60",
+                    connector_kind="fake_service",
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9031",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=adapter.manifest.operations,
+                    credential_handle_ref="envref:FAKE_TEST_KEY",
+                    actor_id="board-1",
+                    max_requests_per_window=10,
+                    budget_ceiling_minor_units=60,
+                    allow_loopback=True,
+                    now_ns=now + 10,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=b60.binding_id,
+                    binding_revision=b60.revision,
+                    allowed_operations=("fetch_doc",),
+                    granted_by_actor_id="board-1",
+                    max_cost_minor_units=60,
+                    now_ns=now + 11,
+                )
+                proxy.invoke(
+                    w,
+                    claim,
+                    binding_id=b60.binding_id,
+                    operation="fetch_doc",
+                    request_id="same-read-60",
+                    payload={"doc": "a"},
+                    now_ns=now + 12,
+                )
+                proxy.invoke(
+                    w,
+                    claim,
+                    binding_id=b60.binding_id,
+                    operation="fetch_doc",
+                    request_id="same-read-60",
+                    payload={"doc": "a"},
+                    now_ns=now + 13,
+                )
+                with self.assertRaises(ConnectorBudgetExceeded):
+                    proxy.invoke(
+                        w,
+                        claim,
+                        binding_id=b60.binding_id,
+                        operation="fetch_doc",
+                        request_id="same-read-60",
+                        payload={"doc": "a"},
+                        now_ns=now + 14,
+                    )
+                self.assertEqual(len(adapter.execute_calls), 3)
+
+    def test_recovery_missing_credentials_preserves_unknown_and_rate_limits_lookups(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="sd-c-rec-cred-") as tmp:
+            store, leases, founding, claim, now = _setup_company_and_claim(Path(tmp))
+            adapter = _FakeAdapter()
+            adapter.next_execute = lambda _r, _s: (_ for _ in ()).throw(
+                ConnectorIndeterminate("lost reply")
+            )
+            available_secret: dict[str, str] = {
+                "envref:FAKE_TEST_KEY": "test-rec-cred-1111"
+            }
+
+            class _DynamicVault:
+                def resolve_secret(
+                    self,
+                    handle_ref: str,
+                    *,
+                    expected_environment: str | None = None,
+                ) -> MaskedSecret:
+                    del expected_environment
+                    if handle_ref not in available_secret:
+                        from sourdough.secret_vault import CredentialRefused
+
+                        raise CredentialRefused(f"Missing secret {handle_ref}")
+                    return MaskedSecret(
+                        value=available_secret[handle_ref], handle_ref=handle_ref
+                    )
+
+                def resolve_bundle(
+                    self,
+                    handle_ref: str,
+                    fields: Any,
+                    *,
+                    expected_environment: str | None = None,
+                ) -> MaskedSecretBundle:
+                    raise NotImplementedError
+
+            proxy = ConnectorProxy(
+                ConnectorAdapterRegistry([adapter]),
+                _DynamicVault(),
+                loopback_only=True,
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                binding = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="svc-rec-cred",
+                    connector_kind="fake_service",
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9032",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=adapter.manifest.operations,
+                    credential_handle_ref="envref:FAKE_TEST_KEY",
+                    actor_id="board-1",
+                    max_requests_per_window=2,
+                    window_seconds=60,
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("submit_write",),
+                    granted_by_actor_id="board-1",
+                    now_ns=now + 1,
+                )
+                adm = issue_connector_admission(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    operation="submit_write",
+                    request_id="ord-cred-1",
+                    payload={"qty": 1},
+                    issued_by_service="trading.execution_service",
+                    actor_id=founding.founder_id,
+                    now_ns=now + 2,
+                )
+                r1 = proxy.invoke(
+                    w,
+                    claim,
+                    binding_id=binding.binding_id,
+                    operation="submit_write",
+                    request_id="ord-cred-1",
+                    payload={"qty": 1},
+                    admission_id=adm.admission_id,
+                    now_ns=now + 3,
+                )
+                self.assertEqual(r1.status, "unknown")
+                idem_key = r1.payload["idempotency_key"]
+
+                # Temporarily remove credentials -> retry in lookup mode MUST NOT turn action 'rejected'!
+                del available_secret["envref:FAKE_TEST_KEY"]
+                with self.assertRaises(ConnectorRefused):
+                    proxy.invoke(
+                        w,
+                        claim,
+                        binding_id=binding.binding_id,
+                        operation="submit_write",
+                        request_id="ord-cred-1",
+                        payload={"qty": 1},
+                        admission_id=adm.admission_id,
+                        now_ns=now + 4,
+                    )
+                with scoped_reader(store) as db:
+                    row = db.execute(
+                        "SELECT status FROM external_actions WHERE idempotency_key = ?",
+                        (idem_key,),
+                    ).fetchone()
+                    self.assertEqual(row, ("unknown",))
+
+                # Restore credentials; 2 attempts already consumed in this 60s window ->
+                # reconcile_unknown_action MUST enforce the binding rate limit!
+                available_secret["envref:FAKE_TEST_KEY"] = "test-rec-cred-1111"
+                with self.assertRaises(ConnectorRateLimited):
+                    proxy.reconcile_unknown_action(
+                        w, claim, idempotency_key=idem_key, now_ns=now + 5
+                    )
+                self.assertEqual(len(adapter.lookup_calls), 0)
+
+                # Once the 60s window passes, recovery succeeds cleanly!
+                reconciled = proxy.reconcile_unknown_action(
+                    w,
+                    claim,
+                    idempotency_key=idem_key,
+                    now_ns=now + 120_000_000_000,
+                )
+                self.assertEqual(reconciled.status, "observed")
+                self.assertEqual(len(adapter.lookup_calls), 1)
+
+    def test_cancel_order_recovery_does_not_confirm_active_order(self) -> None:
+        from decimal import Decimal
+        from sourdough.trading.external_venue import (
+            ExternalOrderStatus,
+            VenueCapabilities,
+        )
+
+        current_status = {"value": "open"}
+
+        class _StubVenue:
+            endpoint_url = "http://127.0.0.1:9040"
+            credential_handle_ref = "envref:BINANCE_TESTNET"
+            blocks_redirects = True
+            capabilities = VenueCapabilities(
+                adapter_revision="stub-v1",
+                venue_name="stub_exchange",
+                market_kind="spot",
+                environment="external_test",
+                supports_spot=True,
+                supports_usdm_futures=False,
+                supports_ioc_limit=True,
+                supports_gtc_limit=True,
+                seals_absent_orders=False,
+                supports_external_reconciliation=True,
+            )
+
+            def query_order(
+                self, *, symbol: str, client_order_id: str
+            ) -> ExternalOrderStatus:
+                return ExternalOrderStatus(
+                    venue_order_id="v-100",
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    side="buy",
+                    status=current_status["value"],
+                    original_quantity=Decimal("1"),
+                    filled_quantity=Decimal("0"),
+                    remaining_quantity=Decimal("1"),
+                    avg_price=Decimal("0"),
+                    update_time_ms=1700000000000,
+                )
+
+        adapter = TradingVenueConnectorAdapter(
+            venue_resolver=lambda _r, _s: _StubVenue()
+        )
+        secret = MaskedSecretBundle(
+            values={"api_key": "test-k-1", "api_secret": "test-s-1"},
+            handle_ref="envref:BINANCE_TESTNET",
+        )
+        req = ConnectorRequest(
+            company_id="co-1",
+            binding_id="venue-cancel",
+            binding_revision=1,
+            operation="cancel_order",
+            request_id="c-1",
+            idempotency_key="conn:co-1:venue-cancel:r1:cancel_order:c-1",
+            payload={"symbol": "BTCUSDT", "client_order_id": "ord-open-1"},
+            environment="external_test",
+            endpoint_url="http://127.0.0.1:9040",
+            allowed_hosts=("127.0.0.1",),
+        )
+        # Still open -> MUST remain unknown (never confirmed!)
+        r_open = adapter.lookup(req, secret=secret, timeout_seconds=5.0)
+        self.assertEqual(r_open.status, "unknown")
+        self.assertTrue(r_open.indeterminate)
+
+        # Partially filled -> MUST still remain unknown!
+        current_status["value"] = "partially_filled"
+        r_part = adapter.lookup(req, secret=secret, timeout_seconds=5.0)
+        self.assertEqual(r_part.status, "unknown")
+        self.assertTrue(r_part.indeterminate)
+
+        # Filled -> cancel was superseded -> rejected!
+        current_status["value"] = "filled"
+        r_fill = adapter.lookup(req, secret=secret, timeout_seconds=5.0)
+        self.assertEqual(r_fill.status, "rejected")
+        self.assertFalse(r_fill.indeterminate)
+
+        # Canceled -> observed!
+        current_status["value"] = "canceled"
+        r_cancel = adapter.lookup(req, secret=secret, timeout_seconds=5.0)
+        self.assertEqual(r_cancel.status, "observed")
+        self.assertFalse(r_cancel.indeterminate)
+
+    def test_journal_posting_failure_rolls_back_action_settlement_atomically(
+        self,
+    ) -> None:
+        from unittest.mock import patch
+        from sourdough.general_ledger import JournalRefused
+
+        with TemporaryDirectory(prefix="sd-c-glatom-") as tmp:
+            store, leases, founding, claim, now = _setup_company_and_claim(Path(tmp))
+            adapter = _FakeAdapter()
+            proxy = ConnectorProxy(
+                ConnectorAdapterRegistry([adapter]),
+                InMemorySecretVault({"envref:FAKE_TEST_KEY": "test-gl-key-1111"}),
+                loopback_only=True,
+            )
+            with hold_company_writer(
+                store, founding.company_id, lease_directory=leases
+            ) as w:
+                binding = register_connector_binding(
+                    w,
+                    company_id=founding.company_id,
+                    binding_id="svc-gl",
+                    connector_kind="fake_service",
+                    environment="external_test",
+                    endpoint_url="http://127.0.0.1:9045",
+                    allowed_hosts=("127.0.0.1",),
+                    operations=adapter.manifest.operations,
+                    credential_handle_ref="envref:FAKE_TEST_KEY",
+                    actor_id="board-1",
+                    allow_loopback=True,
+                    now_ns=now,
+                )
+                grant_connector_access(
+                    w,
+                    company_id=founding.company_id,
+                    agent_id=founding.founder_id,
+                    standing_grant_id=founding.grant_id,
+                    binding_id=binding.binding_id,
+                    binding_revision=binding.revision,
+                    allowed_operations=("fetch_doc",),
+                    granted_by_actor_id="board-1",
+                    now_ns=now + 1,
+                )
+                with patch(
+                    "sourdough.connectors.proxy.post_journal_in_tx",
+                    side_effect=JournalRefused("simulated GL failure"),
+                ):
+                    with self.assertRaises(JournalRefused):
+                        proxy.invoke(
+                            w,
+                            claim,
+                            binding_id=binding.binding_id,
+                            operation="fetch_doc",
+                            request_id="gl-atom-1",
+                            payload={"doc": "a"},
+                            now_ns=now + 2,
+                        )
+                idem_key = (
+                    f"conn:{founding.company_id}:{founding.founder_id}:"
+                    "svc-gl:r1:fetch_doc:gl-atom-1"
+                )
+                with scoped_reader(store) as db:
+                    status_row = db.execute(
+                        "SELECT status FROM external_actions WHERE idempotency_key = ?",
+                        (idem_key,),
+                    ).fetchone()
+                    # Settlement rolled back atomically: NEVER 'confirmed' without GL!
+                    self.assertNotEqual(status_row, ("confirmed",))
+                    gl_count = db.execute(
+                        "SELECT COUNT(*) FROM journal_entry WHERE source_event = ?",
+                        (idem_key,),
+                    ).fetchone()[0]
+                    self.assertEqual(gl_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

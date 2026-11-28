@@ -370,16 +370,47 @@ class TradingVenueConnectorAdapter:
                 source_ref=status.client_order_id,
                 indeterminate=True,
             )
+        base_payload = {
+            "venue_order_id": status.venue_order_id,
+            "client_order_id": status.client_order_id,
+            "symbol": status.symbol,
+            "order_status": status.status,
+            "filled_quantity": str(status.filled_quantity),
+            "remaining_quantity": str(status.remaining_quantity),
+        }
+        if request.operation == "cancel_order":
+            normalized_order_status = status.status.lower()
+            if normalized_order_status in ("canceled", "cancelled", "expired"):
+                return ConnectorResponse(
+                    status="observed",
+                    payload=base_payload,
+                    source_ref=status.venue_order_id or status.client_order_id,
+                    indeterminate=False,
+                )
+            if normalized_order_status in ("filled", "rejected"):
+                return ConnectorResponse(
+                    status="rejected",
+                    payload={
+                        **base_payload,
+                        "reason": f"cancel_superseded_by_{normalized_order_status}",
+                    },
+                    source_ref=status.venue_order_id or status.client_order_id,
+                    indeterminate=False,
+                )
+            # Active order statuses ("open", "partially_filled", "new", "pending", etc.)
+            # prove the order is still live — NEVER confirm cancellation!
+            return ConnectorResponse(
+                status="unknown",
+                payload={
+                    **base_payload,
+                    "reason": "cancel_target_still_active",
+                },
+                source_ref=status.venue_order_id or status.client_order_id,
+                indeterminate=True,
+            )
         return ConnectorResponse(
             status="rejected" if status.status == "rejected" else "observed",
-            payload={
-                "venue_order_id": status.venue_order_id,
-                "client_order_id": status.client_order_id,
-                "symbol": status.symbol,
-                "order_status": status.status,
-                "filled_quantity": str(status.filled_quantity),
-                "remaining_quantity": str(status.remaining_quantity),
-            },
+            payload=base_payload,
             source_ref=status.venue_order_id or status.client_order_id,
             indeterminate=False,
         )

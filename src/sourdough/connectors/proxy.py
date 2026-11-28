@@ -6,7 +6,6 @@ import json
 import threading
 import urllib.parse
 from collections.abc import Mapping
-from contextlib import nullcontext
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from time import time_ns
@@ -14,7 +13,7 @@ from typing import Any
 
 from ..agent_runtime.protocol import ToolHandler, ToolSpec
 from ..duty_run import DutyRefused, ExecutionClaim, resolve_run
-from ..general_ledger import JournalEntry, JournalLine, post_journal
+from ..general_ledger import JournalEntry, JournalLine, post_journal_in_tx
 from ..runtime.kernel import RunFenced, create_work_item
 from ..runtime.shift.flow_guard import ShiftFlowGuard
 from ..secret_vault import (
@@ -192,6 +191,59 @@ def _estimate_request_reservation_minor_units(
             "a pre-dispatch cost cap required for budgeted bindings/grants"
         )
     return 0
+
+
+def _check_and_record_rate_limit(
+    db: Any,
+    *,
+    company_id: str,
+    binding: ConnectorBinding,
+    agent_id: str,
+    run_id: str,
+    command_id: str | None,
+    idempotency_key: str,
+    operation: str,
+    retry: bool,
+    mode: str,
+    ts: int,
+) -> None:
+    """Enforce binding sliding-window rate limit and record one outbound dispatch attempt."""
+    window_start_ns = ts - (binding.window_seconds * _NS_PER_SECOND)
+    recent_attempts = int(
+        db.execute(
+            """SELECT COUNT(*) FROM audit_event
+               WHERE company_id = ?
+                 AND domain = 'connectors'
+                 AND event_type = 'connectors.dispatch_attempt'
+                 AND json_extract(payload_json, '$.binding_id') = ?
+                 AND recorded_at_ns >= ?""",
+            (company_id, binding.binding_id, window_start_ns),
+        ).fetchone()[0]
+    )
+    if recent_attempts >= binding.max_requests_per_window:
+        raise ConnectorRateLimited(
+            f"Connector '{binding.binding_id}' exceeded rate limit "
+            f"({binding.max_requests_per_window} per {binding.window_seconds}s)"
+        )
+    append_audit_event(
+        db,
+        company_id=company_id,
+        domain="connectors",
+        entity_type="external_action",
+        entity_id=idempotency_key,
+        event_type="connectors.dispatch_attempt",
+        actor_id=agent_id,
+        run_id=run_id,
+        command_id=command_id,
+        payload={
+            "binding_id": binding.binding_id,
+            "binding_revision": binding.revision,
+            "operation": operation,
+            "retry": retry,
+            "mode": mode,
+        },
+        recorded_at_ns=ts,
+    )
 
 
 def _scrub_response(
@@ -541,6 +593,10 @@ class ConnectorProxy:
                     now_ns=ts,
                 )
 
+            prior_obj: dict[str, Any] = {}
+            prior_reserved = 0
+            reserved_cost = 0
+            cumulative_reserved = 0
             if replayed:
                 prior_obj = _parse_receipt_meta(ext_action.receipt_json)
                 prior_owner = (
@@ -550,6 +606,13 @@ class ConnectorProxy:
                 )
                 prior_gen_raw = prior_obj.get("execution_generation", 0)
                 prior_gen = int(prior_gen_raw) if type(prior_gen_raw) is int else 0
+                prior_res_raw = prior_obj.get("reserved_cost_minor_units", 0)
+                prior_reserved = (
+                    int(prior_res_raw)
+                    if type(prior_res_raw) is int and prior_res_raw >= 0
+                    else 0
+                )
+                cumulative_reserved = prior_reserved
                 is_owner = prior_owner == agent_id
                 is_recovery_owner = (
                     db.execute(
@@ -608,8 +671,36 @@ class ConnectorProxy:
                     exec_gen = prior_gen + 1
                     mode_action = "execute"
 
-            if mode_action == "execute":
-                # Account for EVERY outbound execute attempt (including unresolved read retries).
+            if mode_action == "lookup":
+                _check_and_record_rate_limit(
+                    db,
+                    company_id=company_id,
+                    binding=binding,
+                    agent_id=agent_id,
+                    run_id=claim.run_id,
+                    command_id=clean_admission,
+                    idempotency_key=idempotency_key,
+                    operation=op_spec.name,
+                    retry=True,
+                    mode="lookup",
+                    ts=ts,
+                )
+            elif mode_action == "execute":
+                prefix = f"{binding.binding_id}:r"
+                budget_enforced = (
+                    binding.budget_ceiling_minor_units > 0
+                    or grant.max_cost_minor_units > 0
+                )
+                reserved_cost = _estimate_request_reservation_minor_units(
+                    adapter,
+                    op_spec.name,
+                    payload,
+                    budget_enforced=budget_enforced,
+                )
+                cumulative_reserved = prior_reserved + reserved_cost
+                # Enforce rate limit before reserving/dispatching (note: do not emit
+                # dispatch_attempt until budget checks pass so rejected calls do not
+                # consume rate quota before we verify they can run — check rate first!).
                 window_start_ns = ts - (binding.window_seconds * _NS_PER_SECOND)
                 recent_attempts = int(
                     db.execute(
@@ -627,18 +718,6 @@ class ConnectorProxy:
                         f"Connector '{binding.binding_id}' exceeded rate limit "
                         f"({binding.max_requests_per_window} per {binding.window_seconds}s)"
                     )
-
-                prefix = f"{binding.binding_id}:r"
-                budget_enforced = (
-                    binding.budget_ceiling_minor_units > 0
-                    or grant.max_cost_minor_units > 0
-                )
-                reserved_cost = _estimate_request_reservation_minor_units(
-                    adapter,
-                    op_spec.name,
-                    payload,
-                    budget_enforced=budget_enforced,
-                )
                 if binding.budget_ceiling_minor_units > 0:
                     in_flight_binding = db.execute(
                         """SELECT 1 FROM external_actions
@@ -654,13 +733,16 @@ class ConnectorProxy:
                             f"Another budgeted request on connector binding '{binding.binding_id}' "
                             "is currently in flight; await settlement before dispatching another"
                         )
+                    # Retain reservations for ALL unresolved attempts (including earlier
+                    # unknown attempts of this idempotency_key) so retries cannot bypass ceilings.
                     spent_binding = int(
                         db.execute(
                             """SELECT COALESCE(SUM(
                                    CASE
                                        WHEN status = 'confirmed'
                                            THEN CAST(COALESCE(json_extract(receipt_json, '$.cost_minor_units'), 0) AS INTEGER)
-                                       WHEN status = 'unknown' AND idempotency_key != ?
+                                              + CAST(COALESCE(json_extract(receipt_json, '$.prior_unknown_reserved_minor_units'), 0) AS INTEGER)
+                                       WHEN status = 'unknown'
                                            THEN CAST(COALESCE(json_extract(receipt_json, '$.reserved_cost_minor_units'), 0) AS INTEGER)
                                        ELSE 0
                                    END
@@ -669,7 +751,7 @@ class ConnectorProxy:
                                WHERE company_id = ?
                                  AND status IN ('confirmed', 'unknown')
                                  AND substr(connector, 1, ?) = ?""",
-                            (idempotency_key, company_id, len(prefix), prefix),
+                            (company_id, len(prefix), prefix),
                         ).fetchone()[0]
                     )
                     if (
@@ -703,7 +785,8 @@ class ConnectorProxy:
                                    CASE
                                        WHEN status = 'confirmed'
                                            THEN CAST(COALESCE(json_extract(receipt_json, '$.cost_minor_units'), 0) AS INTEGER)
-                                       WHEN status = 'unknown' AND idempotency_key != ?
+                                              + CAST(COALESCE(json_extract(receipt_json, '$.prior_unknown_reserved_minor_units'), 0) AS INTEGER)
+                                       WHEN status = 'unknown'
                                            THEN CAST(COALESCE(json_extract(receipt_json, '$.reserved_cost_minor_units'), 0) AS INTEGER)
                                        ELSE 0
                                    END
@@ -712,7 +795,7 @@ class ConnectorProxy:
                                WHERE company_id = ?
                                  AND status IN ('confirmed', 'unknown')
                                  AND json_extract(receipt_json, '$.grant_binding_id') = ?""",
-                            (idempotency_key, company_id, grant.grant_binding_id),
+                            (company_id, grant.grant_binding_id),
                         ).fetchone()[0]
                     )
                     if (
@@ -741,7 +824,8 @@ class ConnectorProxy:
                         "admission_id": clean_admission,
                         "request_sha256": req_sha256,
                         "execution_generation": exec_gen,
-                        "reserved_cost_minor_units": reserved_cost,
+                        "reserved_cost_minor_units": cumulative_reserved,
+                        "prior_unknown_reserved_minor_units": prior_reserved,
                         "lookup_context": lookup_context,
                     },
                     now_ns=ts,
@@ -761,6 +845,7 @@ class ConnectorProxy:
                         "binding_revision": binding.revision,
                         "operation": op_spec.name,
                         "retry": replayed,
+                        "mode": "execute",
                     },
                     recorded_at_ns=ts,
                 )
@@ -778,42 +863,98 @@ class ConnectorProxy:
         except ConnectorRefused as error:
             fail_ts = time_ns() if now_ns is None else (now_ns + 1)
             with write_uow(writer, tx_lock=self._tx_lock) as db:
-                settle_external_action(
-                    db,
-                    idempotency_key,
-                    status="rejected",
-                    receipt={
-                        "binding_id": binding.binding_id,
-                        "binding_revision": binding.revision,
-                        "connector_kind": binding.connector_kind,
-                        "operation": op_spec.name,
-                        "request_id": request_id.strip(),
-                        "agent_id": agent_id,
-                        "grant_binding_id": grant.grant_binding_id,
-                        "admission_id": clean_admission,
-                        "request_sha256": req_sha256,
-                        "response_payload": {"error": str(error)},
-                    },
-                    now_ns=fail_ts,
-                )
-                append_audit_event(
-                    db,
-                    company_id=company_id,
-                    domain="connectors",
-                    entity_type="external_action",
-                    entity_id=idempotency_key,
-                    event_type="connectors.operation_rejected",
-                    actor_id=agent_id,
-                    run_id=claim.run_id,
-                    command_id=clean_admission,
-                    payload={
-                        "binding_id": binding.binding_id,
-                        "binding_revision": binding.revision,
-                        "operation": op_spec.name,
-                        "reason": "secret_resolution_failed",
-                    },
-                    recorded_at_ns=fail_ts,
-                )
+                if mode_action == "lookup":
+                    # Never overwrite an unresolved effectful action as 'rejected' just
+                    # because recovery credentials were temporarily unavailable.
+                    append_audit_event(
+                        db,
+                        company_id=company_id,
+                        domain="connectors",
+                        entity_type="external_action",
+                        entity_id=idempotency_key,
+                        event_type="connectors.lookup_credentials_unavailable",
+                        actor_id=agent_id,
+                        run_id=claim.run_id,
+                        command_id=clean_admission,
+                        payload={
+                            "binding_id": binding.binding_id,
+                            "binding_revision": binding.revision,
+                            "operation": op_spec.name,
+                            "reason": "secret_resolution_failed",
+                        },
+                        recorded_at_ns=fail_ts,
+                    )
+                elif replayed and prior_reserved > 0:
+                    # Preserve earlier unknown attempt's status and reservation; only
+                    # release the unsent retry's incremental reservation.
+                    restored_receipt = {
+                        **prior_obj,
+                        "execution_generation": exec_gen,
+                        "reserved_cost_minor_units": prior_reserved,
+                    }
+                    settle_external_action(
+                        db,
+                        idempotency_key,
+                        status="unknown",
+                        receipt=restored_receipt,
+                        now_ns=fail_ts,
+                    )
+                    append_audit_event(
+                        db,
+                        company_id=company_id,
+                        domain="connectors",
+                        entity_type="external_action",
+                        entity_id=idempotency_key,
+                        event_type="connectors.operation_credentials_unavailable",
+                        actor_id=agent_id,
+                        run_id=claim.run_id,
+                        command_id=clean_admission,
+                        payload={
+                            "binding_id": binding.binding_id,
+                            "binding_revision": binding.revision,
+                            "operation": op_spec.name,
+                            "reason": "secret_resolution_failed",
+                        },
+                        recorded_at_ns=fail_ts,
+                    )
+                else:
+                    settle_external_action(
+                        db,
+                        idempotency_key,
+                        status="rejected",
+                        receipt={
+                            "binding_id": binding.binding_id,
+                            "binding_revision": binding.revision,
+                            "connector_kind": binding.connector_kind,
+                            "operation": op_spec.name,
+                            "request_id": request_id.strip(),
+                            "agent_id": agent_id,
+                            "grant_binding_id": grant.grant_binding_id,
+                            "admission_id": clean_admission,
+                            "request_sha256": req_sha256,
+                            "reserved_cost_minor_units": 0,
+                            "response_payload": {"error": str(error)},
+                        },
+                        now_ns=fail_ts,
+                    )
+                    append_audit_event(
+                        db,
+                        company_id=company_id,
+                        domain="connectors",
+                        entity_type="external_action",
+                        entity_id=idempotency_key,
+                        event_type="connectors.operation_rejected",
+                        actor_id=agent_id,
+                        run_id=claim.run_id,
+                        command_id=clean_admission,
+                        payload={
+                            "binding_id": binding.binding_id,
+                            "binding_revision": binding.revision,
+                            "operation": op_spec.name,
+                            "reason": "secret_resolution_failed",
+                        },
+                        recorded_at_ns=fail_ts,
+                    )
             raise
         raw_secrets = secret.raw_values() if secret is not None else ()
 
@@ -850,6 +991,7 @@ class ConnectorProxy:
                             "admission_id": clean_admission,
                             "request_sha256": req_sha256,
                             "execution_generation": exec_gen,
+                            "reserved_cost_minor_units": prior_reserved,
                             "lookup_context": _extract_lookup_context(
                                 payload, request_id.strip()
                             ),
@@ -930,14 +1072,26 @@ class ConnectorProxy:
                 indeterminate=True,
             )
         except ConnectorRefused as error:
-            raw_response = ConnectorResponse(
-                status="rejected",
-                payload={
-                    "idempotency_key": idempotency_key,
-                    "error": redact_secret_values(str(error), raw_secrets),
-                },
-                indeterminate=False,
-            )
+            if mode_action == "lookup" or (replayed and prior_reserved > 0):
+                # A refused lookup or retry error does not prove an earlier unknown
+                # execution was rejected; keep the action unresolved.
+                raw_response = ConnectorResponse(
+                    status="unknown",
+                    payload={
+                        "idempotency_key": idempotency_key,
+                        "error": redact_secret_values(str(error), raw_secrets),
+                    },
+                    indeterminate=True,
+                )
+            else:
+                raw_response = ConnectorResponse(
+                    status="rejected",
+                    payload={
+                        "idempotency_key": idempotency_key,
+                        "error": redact_secret_values(str(error), raw_secrets),
+                    },
+                    indeterminate=False,
+                )
         except Exception as error:
             # Never allow unexpected transport/client exceptions to leak resolved credentials.
             raw_response = ConnectorResponse(
@@ -978,7 +1132,10 @@ class ConnectorProxy:
             "request_sha256": req_sha256,
             "execution_generation": exec_gen,
             "reserved_cost_minor_units": (
-                reserved_cost if ext_status == "unknown" else 0
+                cumulative_reserved if ext_status == "unknown" else 0
+            ),
+            "prior_unknown_reserved_minor_units": (
+                prior_reserved if mode_action == "execute" and prior_reserved > 0 else 0
             ),
             "lookup_context": lookup_context,
             "source_ref": clean_response.source_ref,
@@ -996,6 +1153,36 @@ class ConnectorProxy:
                 receipt=receipt_envelope,
                 now_ns=settle_ts,
             )
+            if ext_status == "confirmed" and clean_response.cost_minor_units > 0:
+                entry_date = (
+                    datetime.now(UTC).date()
+                    if effective_date is None
+                    else effective_date
+                )
+                evidence_rev = sha256(
+                    f"{idempotency_key}:{clean_response.cost_minor_units}:{req_sha256}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                entry = JournalEntry(
+                    company_id=company_id,
+                    source=f"connector:{binding.connector_kind}",
+                    source_event=idempotency_key,
+                    evidence_revision=evidence_rev,
+                    effective_date=entry_date,
+                    currency="USD",
+                    mapping_revision="connector-usage-v1",
+                    lines=(
+                        JournalLine(
+                            "expense:connector_usage", clean_response.cost_minor_units
+                        ),
+                        JournalLine(
+                            "liability:accounts_payable",
+                            -clean_response.cost_minor_units,
+                        ),
+                    ),
+                )
+                post_journal_in_tx(db, entry, actor_id=agent_id)
             if ext_status == "unknown" and op_spec.mode in ("write", "effectful"):
                 rec_item, _ = create_work_item(
                     db,
@@ -1037,36 +1224,6 @@ class ConnectorProxy:
                 },
                 recorded_at_ns=settle_ts,
             )
-
-        if ext_status == "confirmed" and clean_response.cost_minor_units > 0:
-            entry_date = (
-                datetime.now(UTC).date() if effective_date is None else effective_date
-            )
-            evidence_rev = sha256(
-                f"{idempotency_key}:{clean_response.cost_minor_units}:{req_sha256}".encode(
-                    "utf-8"
-                )
-            ).hexdigest()
-            entry = JournalEntry(
-                company_id=company_id,
-                source=f"connector:{binding.connector_kind}",
-                source_event=idempotency_key,
-                evidence_revision=evidence_rev,
-                effective_date=entry_date,
-                currency="USD",
-                mapping_revision="connector-usage-v1",
-                lines=(
-                    JournalLine(
-                        "expense:connector_usage", clean_response.cost_minor_units
-                    ),
-                    JournalLine(
-                        "liability:accounts_payable", -clean_response.cost_minor_units
-                    ),
-                ),
-            )
-            lock_ctx = self._tx_lock if self._tx_lock is not None else nullcontext()
-            with lock_ctx:
-                post_journal(writer, entry)
 
         if (
             recovery_work_item_id is not None
@@ -1224,6 +1381,19 @@ class ConnectorProxy:
                             f"Recovery lookup_payload cannot substitute field '{k}' "
                             "outside the originally admitted action"
                         )
+            _check_and_record_rate_limit(
+                db,
+                company_id=company_id,
+                binding=binding,
+                agent_id=agent_id,
+                run_id=claim.run_id,
+                command_id=cmd_id,
+                idempotency_key=idempotency_key,
+                operation=op_name,
+                retry=True,
+                mode="lookup",
+                ts=ts,
+            )
 
         secret = _resolve_secret_for_binding(self._vault, binding, adapter)
         raw_secrets = secret.raw_values() if secret is not None else ()
@@ -1254,13 +1424,15 @@ class ConnectorProxy:
                 indeterminate=True,
             )
         except ConnectorRefused as error:
+            # A refused lookup (e.g. auth/config error) does not prove the original
+            # external effect was rejected; preserve 'unknown' until verified.
             raw_response = ConnectorResponse(
-                status="rejected",
+                status="unknown",
                 payload={
                     "idempotency_key": idempotency_key,
                     "error": redact_secret_values(str(error), raw_secrets),
                 },
-                indeterminate=False,
+                indeterminate=True,
             )
         except Exception as error:
             raw_response = ConnectorResponse(
@@ -1286,6 +1458,11 @@ class ConnectorProxy:
         )
         merged_receipt = {
             **prior_meta,
+            "reserved_cost_minor_units": (
+                prior_meta.get("reserved_cost_minor_units", 0)
+                if ext_status == "unknown"
+                else 0
+            ),
             "source_ref": clean_response.source_ref,
             "cost_minor_units": clean_response.cost_minor_units,
             "usage": clean_response.usage,
@@ -1327,6 +1504,31 @@ class ConnectorProxy:
                 receipt=merged_receipt,
                 now_ns=ts,
             )
+            if ext_status == "confirmed" and clean_response.cost_minor_units > 0:
+                evidence_rev = sha256(
+                    f"{idempotency_key}:{clean_response.cost_minor_units}:reconciled".encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                entry = JournalEntry(
+                    company_id=company_id,
+                    source=f"connector:{binding.connector_kind}",
+                    source_event=idempotency_key,
+                    evidence_revision=evidence_rev,
+                    effective_date=datetime.now(UTC).date(),
+                    currency="USD",
+                    mapping_revision="connector-usage-v1",
+                    lines=(
+                        JournalLine(
+                            "expense:connector_usage", clean_response.cost_minor_units
+                        ),
+                        JournalLine(
+                            "liability:accounts_payable",
+                            -clean_response.cost_minor_units,
+                        ),
+                    ),
+                )
+                post_journal_in_tx(db, entry, actor_id=agent_id)
             append_audit_event(
                 db,
                 company_id=company_id,
@@ -1346,32 +1548,6 @@ class ConnectorProxy:
                 },
                 recorded_at_ns=ts,
             )
-        if ext_status == "confirmed" and clean_response.cost_minor_units > 0:
-            evidence_rev = sha256(
-                f"{idempotency_key}:{clean_response.cost_minor_units}:reconciled".encode(
-                    "utf-8"
-                )
-            ).hexdigest()
-            entry = JournalEntry(
-                company_id=company_id,
-                source=f"connector:{binding.connector_kind}",
-                source_event=idempotency_key,
-                evidence_revision=evidence_rev,
-                effective_date=datetime.now(UTC).date(),
-                currency="USD",
-                mapping_revision="connector-usage-v1",
-                lines=(
-                    JournalLine(
-                        "expense:connector_usage", clean_response.cost_minor_units
-                    ),
-                    JournalLine(
-                        "liability:accounts_payable", -clean_response.cost_minor_units
-                    ),
-                ),
-            )
-            lock_ctx = self._tx_lock if self._tx_lock is not None else nullcontext()
-            with lock_ctx:
-                post_journal(writer, entry)
         return clean_response
 
     @staticmethod
