@@ -68,10 +68,16 @@ export function OutboxProvider({ children }: { children: ReactNode }) {
   } = useControlPlane();
 
   const [outbox, setOutbox] = useState<CommandOutboxState>(IDLE_OUTBOX_STATE);
+  const [recoveredSessionKey, setRecoveredSessionKey] = useState<string | null>(null);
+  const [recoveryRetryTick, setRecoveryRetryTick] = useState<number>(0);
   const submittingRef = useRef<boolean>(false);
   const outboxRef = useRef<CommandOutboxState>(outbox);
   outboxRef.current = outbox;
-  const recoveredForSessionRef = useRef<string | null>(null);
+
+  const sessionKey =
+    metaReady && meta
+      ? `${meta.company_id}:${meta.store_key}:${meta.service_incarnation_id}`
+      : null;
 
   // Clear "applied" confirmation banner on pathname changes.
   useEffect(() => {
@@ -83,19 +89,19 @@ export function OutboxProvider({ children }: { children: ReactNode }) {
   // Reset outbox when control plane session clears.
   useEffect(() => {
     return subscribeSessionClear(() => {
-      recoveredForSessionRef.current = null;
+      setRecoveredSessionKey(null);
       setOutbox(IDLE_OUTBOX_STATE);
     });
   }, [subscribeSessionClear]);
 
-  // Pending outbox recovery once initial metadata is loaded for the active session.
+  // Pending outbox recovery keyed strictly by primitive sessionKey so same-session
+  // metadata refreshes never cancel an in-flight readPendingOutboxApi() call, and only
+  // marking recovery complete after the pending response has been processed.
   useEffect(() => {
-    if (!metaReady || !meta) return;
-    const sessionKey = `${meta.company_id}:${meta.store_key}:${meta.service_incarnation_id}`;
-    if (recoveredForSessionRef.current === sessionKey) return;
-    recoveredForSessionRef.current = sessionKey;
+    if (!sessionKey || recoveredSessionKey === sessionKey) return;
 
     let active = true;
+    let retryTimer: number | null = null;
     void (async () => {
       try {
         const pendingInfo = await readPendingOutboxApi();
@@ -110,6 +116,7 @@ export function OutboxProvider({ children }: { children: ReactNode }) {
               pendingInfo.notice ??
               "A stale pending command file from another session was quarantined.",
           });
+          setRecoveredSessionKey(sessionKey);
           return;
         }
         if (pendingInfo.pending) {
@@ -172,15 +179,23 @@ export function OutboxProvider({ children }: { children: ReactNode }) {
             });
           }
         }
+        setRecoveredSessionKey(sessionKey);
       } catch {
-        // Ignore outbox recovery network hiccup; meta poll will retry.
+        // Keep session unrecovered on transient read failure and retry cleanly.
+        if (!active) return;
+        retryTimer = window.setTimeout(() => {
+          setRecoveryRetryTick((n) => n + 1);
+        }, 500);
       }
     })();
 
     return () => {
       active = false;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
     };
-  }, [meta, metaReady]);
+  }, [sessionKey, recoveredSessionKey, recoveryRetryTick]);
 
   const dispatchCommand = useCallback(
     async (intent: LocalCommandIntent): Promise<CommandLifecycle> => {
@@ -399,9 +414,12 @@ export function OutboxProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
+  const recoveryComplete = sessionKey !== null && recoveredSessionKey === sessionKey;
+
   const controlsLocked =
     linkState !== "live" ||
     hostLocked ||
+    !recoveryComplete ||
     outbox.lifecycle === "submitting" ||
     outbox.lifecycle === "unknown" ||
     outbox.lifecycle === "accepted" ||

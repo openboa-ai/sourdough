@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LocalCommandIntent } from "../api/types";
 import { clearProjectionCache } from "../api/useProjection";
-import { ControlPlaneProvider } from "./ControlPlaneContext";
+import { ControlPlaneProvider, useControlPlane } from "./ControlPlaneContext";
 import { OutboxProvider, useOutbox } from "./OutboxContext";
 import { PreferencesProvider } from "./PreferencesContext";
 import { RouterProvider } from "./RouterContext";
@@ -178,5 +178,70 @@ describe("state/OutboxContext command state machine", () => {
     });
     expect(result.current.outbox.lifecycle).toBe("idle");
     expect(result.current.controlsLocked).toBe(false);
+  });
+
+  it("keeps pending recovery alive across same-session meta refreshes and locks controls until recovered", async () => {
+    let resolvePending!: (res: Response) => void;
+    const pendingPromise = new Promise<Response>((resolve) => {
+      resolvePending = resolve;
+    });
+    let metaSeq = 1;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.startsWith("/api/v1/meta")) {
+        metaSeq += 1;
+        return new Response(JSON.stringify({ ...MOCK_META, event_seq: metaSeq }), {
+          status: 200,
+        });
+      }
+      if (url.startsWith("/api/v1/events")) {
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError"))
+          );
+        });
+      }
+      if (url === "/api/local/pending" && method === "GET") {
+        return await pendingPromise;
+      }
+      return new Response("Not found", { status: 404 });
+    });
+
+    const { result } = renderHook(
+      () => ({ outbox: useOutbox(), cp: useControlPlane() }),
+      { wrapper }
+    );
+
+    await waitFor(() => expect(result.current.cp.metaReady).toBe(true));
+    // Controls must stay locked while durable outbox recovery is still in flight.
+    expect(result.current.outbox.controlsLocked).toBe(true);
+    expect(result.current.outbox.canWrite).toBe(false);
+
+    // Trigger a same-session metadata refresh while /api/local/pending is still pending!
+    await act(async () => {
+      await result.current.cp.forceRefresh();
+    });
+    expect(result.current.cp.meta?.event_seq).toBeGreaterThan(2);
+
+    // Now resolve the in-flight recovery with an unconfirmed pending command.
+    await act(async () => {
+      resolvePending(
+        new Response(
+          JSON.stringify({
+            pending: SAMPLE_INTENT,
+            receipt: null,
+          }),
+          { status: 200 }
+        )
+      );
+    });
+
+    await waitFor(() => {
+      expect(result.current.outbox.outbox.lifecycle).toBe("unknown");
+      expect(result.current.outbox.outbox.intent?.command_id).toBe(SAMPLE_INTENT.command_id);
+    });
+    expect(result.current.outbox.controlsLocked).toBe(true);
   });
 });
