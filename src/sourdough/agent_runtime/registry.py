@@ -9,11 +9,13 @@ from .codex_cli import CodexCliAdapter
 from .gemini_api import GeminiGenerateContentAdapter
 from .openai_api import OpenAiResponsesAdapter
 from .protocol import (
-    VALID_PROVIDERS,
+    VALID_EXECUTION_PLANES,
+    AdapterManifest,
     AgentProfileBinding,
     AgentRuntimeAdapter,
     AgentRuntimeRefused,
     EnvSecretResolver,
+    ExecutionPlane,
     OuterToolBroker,
     SecretHandleResolver,
     ShiftRequest,
@@ -28,12 +30,16 @@ class AgentAdapterRegistry:
         self._adapters: dict[str, AgentRuntimeAdapter] = {}
 
     def register(self, adapter: AgentRuntimeAdapter) -> None:
-        provider = adapter.manifest.provider
-        if provider not in VALID_PROVIDERS:
+        manifest = adapter.manifest
+        if not isinstance(manifest, AdapterManifest):
             raise AgentRuntimeRefused(
-                f"Cannot register unsupported provider '{provider}'"
+                "Registered adapter must expose an AdapterManifest instance"
             )
-        self._adapters[provider] = adapter
+        if manifest.execution_plane not in VALID_EXECUTION_PLANES:
+            raise AgentRuntimeRefused(
+                f"Unsupported execution plane '{manifest.execution_plane}'"
+            )
+        self._adapters[manifest.provider] = adapter
 
     def registered_providers(self) -> tuple[str, ...]:
         return tuple(sorted(self._adapters.keys()))
@@ -46,6 +52,22 @@ class AgentAdapterRegistry:
             )
         return adapter
 
+    def get_manifest(self, provider: str) -> AdapterManifest:
+        return self.get(provider).manifest
+
+    def adapters_for_plane(
+        self, execution_plane: ExecutionPlane
+    ) -> tuple[AgentRuntimeAdapter, ...]:
+        if execution_plane not in VALID_EXECUTION_PLANES:
+            raise AgentRuntimeRefused(
+                f"Unsupported execution plane '{execution_plane}'"
+            )
+        return tuple(
+            self._adapters[name]
+            for name in sorted(self._adapters.keys())
+            if self._adapters[name].manifest.execution_plane == execution_plane
+        )
+
     def execute_shift(
         self,
         *,
@@ -57,6 +79,13 @@ class AgentAdapterRegistry:
         """Verify profile binding matches persisted Agent profile, then dispatch strictly."""
         profile.verify_matches_agent(persisted_profile_id)
         adapter = self.get(profile.provider)
+        if (
+            adapter.manifest.transport == "https_json"
+            and profile.credential_handle_ref is None
+        ):
+            raise AgentRuntimeRefused(
+                f"HTTPS runtime provider '{profile.provider}' requires an opaque credential_handle_ref"
+            )
         return adapter.run_shift(profile, request, broker)
 
 

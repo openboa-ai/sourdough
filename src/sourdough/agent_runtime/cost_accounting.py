@@ -12,11 +12,14 @@ from ..general_ledger import JournalEntry, JournalLine, post_journal
 from ..writer_lease import WriterLease
 from .protocol import (
     PROVIDER_ANTHROPIC,
+    PROVIDER_CODE_PLANE,
     PROVIDER_CODEX_CLI,
+    PROVIDER_DECISION_MODEL,
     PROVIDER_GEMINI,
     PROVIDER_OPENAI,
     AgentBudgetExceeded,
     AgentProfileBinding,
+    AgentRuntimeRefused,
     TokenUsage,
 )
 
@@ -35,6 +38,12 @@ class ModelPricing:
     minimum_charge_minor: int = 1
 
 
+ZERO_COST_PRICING = ModelPricing(
+    input_micro_per_1k=0,
+    output_micro_per_1k=0,
+    minimum_charge_minor=0,
+)
+
 DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
     PROVIDER_CODEX_CLI: ModelPricing(
         input_micro_per_1k=2_500, output_micro_per_1k=10_000
@@ -44,7 +53,28 @@ DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
         input_micro_per_1k=3_000, output_micro_per_1k=15_000
     ),
     PROVIDER_GEMINI: ModelPricing(input_micro_per_1k=1_250, output_micro_per_1k=5_000),
+    PROVIDER_CODE_PLANE: ZERO_COST_PRICING,
+    PROVIDER_DECISION_MODEL: ZERO_COST_PRICING,
 }
+
+
+def resolve_model_pricing(
+    provider: str,
+    *,
+    usage: TokenUsage | None = None,
+    explicit: ModelPricing | None = None,
+) -> ModelPricing:
+    """Resolve provider pricing, allowing zero-token custom/non-LLM providers at $0 cost."""
+    if explicit is not None:
+        return explicit
+    known = DEFAULT_MODEL_PRICING.get(provider)
+    if known is not None:
+        return known
+    if usage is not None and usage.input_tokens == 0 and usage.output_tokens == 0:
+        return ZERO_COST_PRICING
+    raise AgentRuntimeRefused(
+        f"No pricing configured for provider '{provider}' with nonzero token usage"
+    )
 
 
 @dataclass(frozen=True)
@@ -86,7 +116,9 @@ def settle_shift_cost_to_ledger(
     tx_lock: threading.RLock | None = None,
 ) -> TurnCostSettlement:
     """Settle shift token usage into General Ledger idempotently before enforcing budget ceiling."""
-    resolved_pricing = pricing or DEFAULT_MODEL_PRICING[profile.provider]
+    resolved_pricing = resolve_model_pricing(
+        profile.provider, usage=usage, explicit=pricing
+    )
     cost_minor = compute_usage_cost_minor_units(usage, resolved_pricing)
     released = max(0, budget_ceiling_minor_units - cost_minor)
     if cost_minor == 0:

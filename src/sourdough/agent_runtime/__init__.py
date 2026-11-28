@@ -1,12 +1,20 @@
 """Multi-provider Agent runtime adapters over Sourdough's Two-Plane Harness."""
 
 from .anthropic_api import AnthropicMessagesAdapter
+from .broker_bridge import (
+    DEFAULT_CLIENT_SOCKET_TIMEOUT_SECONDS,
+    DEFAULT_MAX_BROKER_REQUEST_BYTES,
+    UdsToolBrokerServer,
+    fatal_broker_exceptions,
+)
 from .codex_cli import CodexCliAdapter
 from .cost_accounting import (
     DEFAULT_MODEL_PRICING,
+    ZERO_COST_PRICING,
     ModelPricing,
     TurnCostSettlement,
     compute_usage_cost_minor_units,
+    resolve_model_pricing,
     settle_shift_cost_to_ledger,
 )
 from .gemini_api import GeminiGenerateContentAdapter
@@ -14,9 +22,13 @@ from .openai_api import OpenAiResponsesAdapter
 from .protocol import (
     EXTERNAL_ISOLATION_FLOW_CLASSES,
     PROVIDER_ANTHROPIC,
+    PROVIDER_CODE_PLANE,
     PROVIDER_CODEX_CLI,
+    PROVIDER_DECISION_MODEL,
     PROVIDER_GEMINI,
     PROVIDER_OPENAI,
+    REMOTE_CREDENTIAL_PROVIDERS,
+    VALID_EXECUTION_PLANES,
     VALID_PROVIDERS,
     VALID_TOOL_FLOW_CLASSES,
     AdapterEvent,
@@ -29,6 +41,7 @@ from .protocol import (
     AgentTransportInterrupted,
     ContextPack,
     EnvSecretResolver,
+    ExecutionPlane,
     InMemorySecretResolver,
     MaskedSecret,
     OuterToolBroker,
@@ -43,11 +56,17 @@ from .protocol import (
 from .registry import AgentAdapterRegistry, build_default_adapter_registry
 
 __all__ = [
+    "DEFAULT_CLIENT_SOCKET_TIMEOUT_SECONDS",
+    "DEFAULT_MAX_BROKER_REQUEST_BYTES",
     "EXTERNAL_ISOLATION_FLOW_CLASSES",
     "PROVIDER_ANTHROPIC",
+    "PROVIDER_CODE_PLANE",
     "PROVIDER_CODEX_CLI",
+    "PROVIDER_DECISION_MODEL",
     "PROVIDER_GEMINI",
     "PROVIDER_OPENAI",
+    "REMOTE_CREDENTIAL_PROVIDERS",
+    "VALID_EXECUTION_PLANES",
     "VALID_PROVIDERS",
     "VALID_TOOL_FLOW_CLASSES",
     "AdapterEvent",
@@ -64,6 +83,7 @@ __all__ = [
     "ContextPack",
     "DEFAULT_MODEL_PRICING",
     "EnvSecretResolver",
+    "ExecutionPlane",
     "GeminiGenerateContentAdapter",
     "InMemorySecretResolver",
     "MaskedSecret",
@@ -77,8 +97,12 @@ __all__ = [
     "ToolFlowClass",
     "ToolSpec",
     "TurnCostSettlement",
+    "UdsToolBrokerServer",
+    "ZERO_COST_PRICING",
     "build_default_adapter_registry",
     "compute_usage_cost_minor_units",
+    "fatal_broker_exceptions",
     "hydrate_shift_context",
+    "resolve_model_pricing",
     "settle_shift_cost_to_ledger",
 ]

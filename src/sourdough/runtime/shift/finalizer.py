@@ -9,9 +9,9 @@ from typing import Any
 
 from ...agent_desk import cleanup_run_scratch
 from ...agent_runtime.cost_accounting import (
-    DEFAULT_MODEL_PRICING,
     TurnCostSettlement,
     compute_usage_cost_minor_units,
+    resolve_model_pricing,
     settle_shift_cost_to_ledger,
 )
 from ...agent_runtime.protocol import (
@@ -192,13 +192,18 @@ def finalize_shift_run(
     except BaseException as exc:
         settlement_error = exc
 
-    cost_minor = (
-        settlement.cost_minor_units
-        if settlement is not None
-        else compute_usage_cost_minor_units(
-            incurred_usage, DEFAULT_MODEL_PRICING[profile.provider]
-        )
-    )
+    if settlement is not None:
+        cost_minor = settlement.cost_minor_units
+    else:
+        try:
+            fallback_pricing = resolve_model_pricing(
+                profile.provider, usage=incurred_usage
+            )
+            cost_minor = compute_usage_cost_minor_units(
+                incurred_usage, fallback_pricing
+            )
+        except Exception:
+            cost_minor = 0
 
     decision_ids: list[str] = []
     run_state_row: Any = None
