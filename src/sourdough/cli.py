@@ -467,6 +467,7 @@ def main() -> int:
             previous_sigint = signal.signal(signal.SIGINT, _request_resident_stop)
             previous_sigterm = signal.signal(signal.SIGTERM, _request_resident_stop)
             previous_sighup = signal.signal(signal.SIGHUP, _request_resident_stop)
+            exit_code = 0
             try:
                 with ExitStack() as stack:
                     service = stack.enter_context(
@@ -503,12 +504,21 @@ def main() -> int:
                     if args.once:
                         if not stop_requested:
                             single_tick_timeout = max(960.0, args.tick_interval + 960.0)
-                            service.wait_for(
+                            tick_health = service.wait_for(
                                 lambda h: stop_requested
                                 or h.ticks_completed >= 1
                                 or not h.running,
                                 timeout_seconds=single_tick_timeout,
                             )
+                            if not stop_requested and (
+                                tick_health.last_error is not None
+                                or tick_health.ticks_completed < 1
+                            ):
+                                print(
+                                    f"Company single-tick failed: {tick_health.last_error or 'service stopped before completing tick'}",
+                                    file=sys.stderr,
+                                )
+                                exit_code = 1
                     else:
                         while not stop_requested:
                             sleep(0.25)
@@ -516,7 +526,7 @@ def main() -> int:
                 signal.signal(signal.SIGINT, previous_sigint)
                 signal.signal(signal.SIGTERM, previous_sigterm)
                 signal.signal(signal.SIGHUP, previous_sighup)
-            return 0
+            return exit_code
         elif args.command == "client-web":
             stop_requested = False
 

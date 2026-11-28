@@ -16,7 +16,13 @@ from time import monotonic, time_ns
 from typing import Any
 from uuid import uuid4
 
-from .agent_desk import clone_desk_snapshot, desk_directory, desks_root
+from .agent_desk import (
+    EMPTY_DESK_DIGEST,
+    clone_desk_snapshot,
+    compute_agent_desk_digest,
+    desk_directory,
+    desks_root,
+)
 from .agent_runtime.protocol import (
     AgentBudgetExceeded,
     AgentProfileBinding,
@@ -29,7 +35,7 @@ from .agent_runtime.protocol import (
 )
 from .agent_runtime.registry import AgentAdapterRegistry
 from .company import FoundingTerms, _identity, found
-from .duty_run import DutyRefused, WorkRunClaim
+from .duty_run import DutyRefused, WorkRunClaim, employment_cutoff
 from .memory import record_episode
 from .method_learning import (
     MethodRefused,
@@ -51,6 +57,7 @@ from .runtime.registry import (
     DutyRegistry,
     RuntimeRefused,
 )
+from .runtime.shift_runner import is_authority_refusal_message
 from .runtime.work_kernel import (
     WorkKernelRefused,
     claim_work_run,
@@ -419,10 +426,89 @@ def _build_default_isolated_case_runner(
     return registry, captured
 
 
+def _compute_sqlite_state_digest(connection: Any) -> str:
+    """Compute a deterministic SHA-256 over all user tables and ordered rows in a SQLite store."""
+    hasher = sha256()
+    tables = [
+        str(r[0])
+        for r in connection.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+               ORDER BY name"""
+        ).fetchall()
+    ]
+    for table in tables:
+        escaped = table.replace('"', '""')
+        cols = [
+            str(r[1])
+            for r in connection.execute(f'PRAGMA table_info("{escaped}")').fetchall()
+        ]
+        order_clause = ", ".join(f'"{c.replace(chr(34), chr(34) * 2)}"' for c in cols)
+        query = f'SELECT * FROM "{escaped}"' + (
+            f" ORDER BY {order_clause}" if order_clause else ""
+        )
+        hasher.update(f"TABLE:{table}\n".encode("utf-8"))
+        for row in connection.execute(query).fetchall():
+            encoded_cells: list[Any] = []
+            for cell in row:
+                if isinstance(cell, bytes):
+                    encoded_cells.append({"hex": cell.hex()})
+                else:
+                    encoded_cells.append(cell)
+            hasher.update(_canonical_json(encoded_cells).encode("utf-8"))
+            hasher.update(b"\n")
+    return hasher.hexdigest()
+
+
+def _count_receipt_violations(
+    connection: Any,
+    *,
+    company_id: str | None = None,
+    exec_runs: Sequence[str] | None = None,
+) -> tuple[int, int, list[str]]:
+    """Return (fatal_calls, authority_refusal_calls, tool_names) from tool_call_receipt."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if company_id is not None:
+        clauses.append("company_id = ?")
+        params.append(company_id)
+    if exec_runs is not None:
+        if not exec_runs:
+            return 0, 0, []
+        placeholders = ",".join("?" for _ in exec_runs)
+        clauses.append(f"run_id IN ({placeholders})")
+        params.extend(exec_runs)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = connection.execute(
+        f"""SELECT tool_name, status, error_type, error_message
+            FROM tool_call_receipt
+            {where_sql}
+            ORDER BY recorded_at_ns ASC, call_id ASC""",
+        tuple(params),
+    ).fetchall()
+    fatal_calls = 0
+    authority_refusals = 0
+    tool_names: list[str] = []
+    for raw_tool, raw_status, raw_err_type, raw_err_msg in rows:
+        tool_names.append(str(raw_tool))
+        st = str(raw_status)
+        if st in ("fatal", "denied"):
+            fatal_calls += 1
+        elif st == "refused" and is_authority_refusal_message(
+            None if raw_err_type is None else str(raw_err_type),
+            None if raw_err_msg is None else str(raw_err_msg),
+        ):
+            authority_refusals += 1
+    return fatal_calls, authority_refusals, tool_names
+
+
 def _compute_source_store_fixture(
-    source_store: Path, company_id: str
+    source_store: Path,
+    company_id: str,
+    *,
+    agent_ids: Sequence[str] = (),
 ) -> tuple[bytes, dict[str, str], str]:
-    """Derive canonical company fixture bytes, agent profiles, and founder_id from source_store."""
+    """Derive canonical company + DB + Desk snapshot fixture bytes, agent profiles, and founder_id."""
     with closing(open_reader(source_store)) as ro_db, read_tx(ro_db):
         if _identity(ro_db) != company_id:
             raise TrialRefused("Source trial store company identity mismatch")
@@ -438,6 +524,7 @@ def _compute_source_store_fixture(
         ).fetchone()
         if founder_row is None:
             raise TrialRefused("Source trial store is missing founding receipt")
+        founder_id = str(founder_row[1])
         profiles = {
             str(r[0]): str(r[1])
             for r in ro_db.execute(
@@ -445,15 +532,41 @@ def _compute_source_store_fixture(
                 (company_id,),
             ).fetchall()
         }
+        target_agents = tuple(dict.fromkeys(agent_ids)) if agent_ids else (founder_id,)
+        desk_digests: dict[str, str] = {}
+        for aid in sorted(target_agents):
+            eligible = (
+                aid in profiles
+                and employment_cutoff(ro_db, aid) is None
+                and ro_db.execute(
+                    """SELECT 1 FROM standing_grant
+                       WHERE agent_id = ? AND trim(scope) != '' AND lower(trim(scope)) != 'revoked'""",
+                    (aid,),
+                ).fetchone()
+                is not None
+                and ro_db.execute(
+                    "SELECT 1 FROM private_desk WHERE agent_id = ?",
+                    (aid,),
+                ).fetchone()
+                is not None
+            )
+            desk_digests[aid] = (
+                compute_agent_desk_digest(source_store, aid)
+                if eligible
+                else EMPTY_DESK_DIGEST
+            )
+        db_state_sha256 = _compute_sqlite_state_digest(ro_db)
         fixture_bytes = _canonical_json(
             {
                 "company_id": str(co_row[0]),
                 "charter_revision": str(co_row[1]),
                 "schema_revision": int(co_row[2]),
                 "setup_identity": str(founder_row[0]),
+                "db_state_sha256": db_state_sha256,
+                "desk_digests": desk_digests,
             }
         ).encode("utf-8")
-        return fixture_bytes, profiles, str(founder_row[1])
+        return fixture_bytes, profiles, founder_id
 
 
 def run_isolated_trial_slot(
@@ -530,6 +643,8 @@ def run_isolated_trial_slot(
             raise TrialRefused("Trial slot reservation has already been consumed")
         return adapter.evidences[run_id]
 
+    actual_fixture_bytes: bytes | None = None
+    expected_desk_digests: dict[str, str] | None = None
     if source_store is not None:
         if not company_id:
             raise TrialRefused("source_store requires company_id")
@@ -538,12 +653,17 @@ def run_isolated_trial_slot(
                 "source_store trial execution requires worker_input to verify sealed slot inputs"
             )
         actual_fixture_bytes, store_profiles, founder_id = (
-            _compute_source_store_fixture(source_store, company_id)
+            _compute_source_store_fixture(source_store, company_id, agent_ids=agent_ids)
         )
         if company_fixture is not None and company_fixture != actual_fixture_bytes:
             raise TrialRefused(
                 "Supplied company_fixture does not match source_store state"
             )
+        parsed_fixture = json.loads(actual_fixture_bytes.decode("utf-8"))
+        if isinstance(parsed_fixture.get("desk_digests"), dict):
+            expected_desk_digests = {
+                str(k): str(v) for k, v in parsed_fixture["desk_digests"].items()
+            }
         verify_actor_id = agent_ids[0] if agent_ids else founder_id
         if verify_actor_id not in store_profiles:
             raise TrialRefused("Target trial Agent is missing from source_store")
@@ -596,7 +716,23 @@ def run_isolated_trial_slot(
                     raise TrialRefused("Trial company has no founder_id")
                 actor_id = str(row[0])
         clone_agents = tuple(agent_ids) if agent_ids else (actor_id,)
-        clone_desk_snapshot(source_store, company_id, clone_agents, run_store)
+        clone_desk_snapshot(
+            source_store,
+            company_id,
+            clone_agents,
+            run_store,
+            expected_revisions=expected_desk_digests,
+        )
+        cloned_fixture_bytes, _, _ = _compute_source_store_fixture(
+            run_store, company_id, agent_ids=clone_agents
+        )
+        if (
+            actual_fixture_bytes is not None
+            and cloned_fixture_bytes != actual_fixture_bytes
+        ):
+            raise TrialRefused(
+                "Cloned trial store or Desk snapshot diverged from sealed source fixture"
+            )
     else:
         receipt = found(
             run_store,
@@ -713,13 +849,10 @@ def run_isolated_trial_slot(
                         (target_cid, trial_item.work_item_id, *exec_runs),
                     ).fetchone()[0]
                 )
-                fatal_calls = int(
-                    ro_db.execute(
-                        f"""SELECT COUNT(*) FROM tool_call_receipt
-                            WHERE company_id = ? AND run_id IN ({run_placeholders})
-                              AND status = 'fatal'""",
-                        (target_cid, *exec_runs),
-                    ).fetchone()[0]
+                fatal_calls, authority_refusals, trace_call_names = (
+                    _count_receipt_violations(
+                        ro_db, company_id=target_cid, exec_runs=exec_runs
+                    )
                 )
                 ep_usage_row = ro_db.execute(
                     f"""SELECT COALESCE(SUM(input_tokens), 0),
@@ -736,10 +869,13 @@ def run_isolated_trial_slot(
             else:
                 dec_count = 0
                 fatal_calls = 0
+                authority_refusals = 0
+                trace_call_names = []
                 actual_input_tokens = 0
                 actual_output_tokens = 0
                 actual_tokens = 0
                 actual_cost_minor = 0
+        total_violations = fatal_calls + authority_refusals
         result = {
             "outcome": "completed"
             if settled_count >= 1 and dec_count >= 1
@@ -760,7 +896,12 @@ def run_isolated_trial_slot(
                 "relevant_constraints": settled_count >= 1,
                 "feasible_next_action": settled_count >= 1,
             },
-            "tool_trace": {"calls": [], "violations": fatal_calls},
+            "tool_trace": {
+                "calls": trace_call_names,
+                "violations": total_violations,
+                "fatal_calls": fatal_calls,
+                "authority_refusals": authority_refusals,
+            },
             "service_effects": {
                 "service_correct": settled_count >= 1 and fatal_calls == 0,
                 "invariant_breach": False,
@@ -906,11 +1047,8 @@ def grade_trial_observation(
             store_decisions = int(
                 ro_db.execute("SELECT COUNT(*) FROM work_decision").fetchone()[0]
             )
-            store_fatal_tools = int(
-                ro_db.execute(
-                    "SELECT COUNT(*) FROM tool_call_receipt WHERE status = 'fatal'"
-                ).fetchone()[0]
-            )
+            store_fatal_cnt, store_auth_refusals, _ = _count_receipt_violations(ro_db)
+            store_fatal_tools = store_fatal_cnt + store_auth_refusals
 
     is_completed = packet.outcome == "completed"
     if packet.decision_digest is None:
@@ -1639,8 +1777,10 @@ def run_recursive_learning_cycle(
             )
 
         # ------------------------------------------------------------------
-        # Arm Fork: Clone permitted history & Desk snapshots into isolated
-        # incumbent vs candidate arm stores
+        # Arm Fork: Freeze one shared base snapshot (company.sqlite + Desk)
+        # so paired incumbent and candidate slots verify bit-identical
+        # starting state before candidate activates cand_proc_delta inside
+        # its isolated cloned slot store.
         # ------------------------------------------------------------------
         _ensure_private_trial_root(trial_root)
         cycle_dir = trial_root / f"cycle-{cycle_tag}"
@@ -1648,34 +1788,15 @@ def run_recursive_learning_cycle(
         arms_dir = cycle_dir / "arms"
         arms_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        arm_stores: dict[str, Path] = {}
-        for arm_name in ("incumbent", "candidate"):
-            arm_dir = arms_dir / arm_name
-            arm_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            arm_store = arm_dir / "company.sqlite"
-            _backup_sqlite_private(w.store, arm_store)
-            clone_desk_snapshot(w.store, company_id, (meta_agent_id,), arm_store)
-            if arm_name == "candidate":
-                with hold_company_writer(
-                    arm_store, company_id, lease_directory=arm_dir / "leases"
-                ) as arm_w:
-                    qualify_method_delta(
-                        arm_w,
-                        cand_proc_delta.delta_id,
-                        passed_k=3,
-                        negative_trigger_passed=True,
-                        safety_passed=True,
-                        holdout_margin=0.2,
-                        now_ns=post_gen1_ns + 300,
-                    )
-                    activate_method_delta(
-                        arm_w,
-                        cand_proc_delta.delta_id,
-                        actor_id=promotion_actor_id,
-                        grant_id=promotion_grant_id,
-                        now_ns=post_gen1_ns + 310,
-                    )
-            arm_stores[arm_name] = arm_store
+        base_arm_dir = arms_dir / "base"
+        base_arm_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        base_arm_store = base_arm_dir / "company.sqlite"
+        _backup_sqlite_private(w.store, base_arm_store)
+        clone_desk_snapshot(w.store, company_id, (meta_agent_id,), base_arm_store)
+        arm_stores: dict[str, Path] = {
+            "incumbent": base_arm_store,
+            "candidate": base_arm_store,
+        }
 
         # ------------------------------------------------------------------
         # Generation 2: Sealed transfer suite across genuinely distinct unseen
@@ -1852,7 +1973,7 @@ def run_recursive_learning_cycle(
             tokens=1_500_000 if use_live_runtime else 10_000,
         )
         fixture_bytes, _base_profiles, _base_founder = _compute_source_store_fixture(
-            store_path, company_id
+            base_arm_store, company_id, agent_ids=(meta_agent_id,)
         )
         tools_bytes = b'{"tools":["desk_read_draft","record_work_decision"]}'
         inc_ctx_bytes = _canonical_json(
@@ -1961,6 +2082,7 @@ def run_recursive_learning_cycle(
                 runtime: CompanyRuntime,
                 desk_dir: Path,
                 sealed_slot: TrialSlot,
+                _arm_name: str = arm_name,
                 _fam: str = fam_id,
                 _case: str = case_id,
                 _case_spec: dict[str, Any] = case_spec,
@@ -1972,6 +2094,29 @@ def run_recursive_learning_cycle(
                 slot_leases = slot_run_dir / "leases"
                 agent_desk_dir = desk_directory(slot_store, meta_agent_id)
                 slot_started = monotonic()
+                if _arm_name == "candidate":
+                    with hold_company_writer(
+                        slot_store, company_id, lease_directory=slot_leases
+                    ) as arm_w:
+                        qualify_method_delta(
+                            arm_w,
+                            cand_proc_delta.delta_id,
+                            passed_k=3,
+                            negative_trigger_passed=True,
+                            safety_passed=True,
+                            holdout_margin=0.2,
+                            now_ns=post_gen1_ns + 300,
+                        )
+                        activate_method_delta(
+                            arm_w,
+                            cand_proc_delta.delta_id,
+                            actor_id=promotion_actor_id,
+                            grant_id=promotion_grant_id,
+                            now_ns=post_gen1_ns + 310,
+                        )
+                        sync_desk_harness_projections(
+                            arm_w.store, company_id, meta_agent_id
+                        )
                 if use_live_runtime:
                     slot_now_ns = max(post_gen1_ns + 500 + _idx, time_ns())
                     with hold_company_writer(
@@ -2168,9 +2313,17 @@ def run_recursive_learning_cycle(
                                 ),
                             ).fetchall():
                                 _append_draft_row(d_row)
-                    fatal_calls = sum(
-                        1 for _tn, st, _rr in rcpt_rows if st in ("fatal", "denied")
-                    )
+                    fatal_calls = 0
+                    authority_refusals = 0
+                    if executed_run_id is not None:
+                        with closing(open_reader(slot_store)) as ro_db, read_tx(ro_db):
+                            fatal_calls, authority_refusals, _ = (
+                                _count_receipt_violations(
+                                    ro_db,
+                                    company_id=company_id,
+                                    exec_runs=(executed_run_id,),
+                                )
+                            )
                     calls_list: list[dict[str, Any]] = []
                     with closing(open_reader(slot_store)) as ro_db, read_tx(ro_db):
                         for tn, st, raw_res, off_path in rcpt_rows_full:
@@ -2296,7 +2449,12 @@ def run_recursive_learning_cycle(
                             "drafted_counterexample_method"
                         ],
                     }
-                    trace_doc = {"calls": calls_list, "violations": fatal_calls}
+                    trace_doc = {
+                        "calls": calls_list,
+                        "violations": fatal_calls + authority_refusals,
+                        "fatal_calls": fatal_calls,
+                        "authority_refusals": authority_refusals,
+                    }
                     effects_doc = {
                         "service_correct": shift_ok,
                         "invariant_breach": False,

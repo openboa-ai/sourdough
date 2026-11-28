@@ -91,6 +91,16 @@ _PRIVATE_DESK_READ_TOOLS = frozenset(
         "skill_read",
     }
 )
+_PRIVATE_DESK_ALL_TOOLS = frozenset(
+    {
+        *_PRIVATE_DESK_READ_TOOLS,
+        "desk_save_draft",
+        "desk_delete_draft",
+        "desk_publish_selection",
+        "skill_draft_candidate",
+        "skill_record_invocation",
+    }
+)
 _PEER_INPUT_TOOLS = frozenset(
     {
         "read_messages",
@@ -116,14 +126,14 @@ _PRIVATE_DESK_RECEIPT_TOOLS = frozenset(
         "desk_delete_draft",
         "desk_read_offloaded_log",
         "desk_run_command",
+        "memory_search_episodes",
+        "memory_read_episode",
     }
 )
 _PRIVATE_RECEIPT_ERROR_TOOLS = frozenset(
     {
         *_PRIVATE_DESK_RECEIPT_TOOLS,
         "desk_publish_selection",
-        "memory_search_episodes",
-        "memory_read_episode",
         "skill_read",
         "skill_list_active",
         "skill_draft_candidate",
@@ -139,27 +149,123 @@ _SAFE_DESK_RECEIPT_FIELDS = (
     "timed_out",
     "quota_exceeded",
 )
+_NON_AUTHORITY_INPUT_MARKERS = (
+    "cursor is unavailable",
+    "arguments must be",
+    "do not match schema",
+    "must be a ",
+    "must be an ",
+    "invalid cursor",
+    "duplicate message",
+    "does not exist",
+    "revision changed",
+    "state version mismatch",
+    "trajectory loop detected",
+)
+_AUTHORITY_REFUSAL_MARKERS = (
+    "project discussion is unavailable",
+    "shared project is unavailable",
+    "shared asset is unavailable",
+    "handoff offer is unavailable",
+    "decision route is unavailable",
+    "tool is unavailable",
+    "unauthorized",
+    "not authorized",
+    "lacks '",
+    "lacks ",
+    "authority",
+    "grant",
+    "forbidden",
+    "permission",
+    "not permitted",
+    "not admitted",
+    "only the named recipient",
+    "only the owner",
+    "cannot read private desk",
+    "cannot access private desk",
+    "cannot write free-form peer",
+    "cannot read peer-authored",
+    "cannot access",
+    "cannot publish",
+    "cannot offer",
+    "outside the recipient",
+    "outside ",
+    "belongs to another",
+    "not a member",
+    "redaction",
+    "private desk",
+    "symlink",
+    "sandbox",
+    "spoofed",
+    "cross-agent",
+    "cross-company",
+    "unreadable",
+    "not readable",
+    "not writable",
+)
+
+
+def is_authority_refusal_message(
+    error_type: str | None, error_message: str | None
+) -> bool:
+    """Classify whether a tool refusal represents an authority/isolation breach vs input error."""
+    if error_type in (
+        "ExecutionTierRefused",
+        "AgentRuntimeRefused",
+        "RunFenced",
+        "LeaseLost",
+    ):
+        return True
+    if not error_message:
+        return False
+    msg = str(error_message)
+    if msg.startswith("redacted_private_authority_error:"):
+        return True
+    low = msg.lower()
+    if any(marker in low for marker in _NON_AUTHORITY_INPUT_MARKERS):
+        return False
+    return any(marker in low for marker in _AUTHORITY_REFUSAL_MARKERS)
 
 
 def _sanitize_receipt_result_json(
-    tool_name: str, result_digest: str, raw_result_json: str
+    tool_name: str,
+    result_digest: str,
+    raw_result_json: str,
+    *,
+    status: str = "ok",
 ) -> str:
-    """Keep private Desk filenames, draft bodies, and command outputs out of company.sqlite."""
-    if tool_name not in _PRIVATE_DESK_RECEIPT_TOOLS:
+    """Keep private Desk payloads and private-tool refusal details out of company.sqlite."""
+    is_private_desk = tool_name in _PRIVATE_DESK_RECEIPT_TOOLS
+    is_private_error_tool = (
+        tool_name in _PRIVATE_RECEIPT_ERROR_TOOLS or tool_name.startswith("desk_")
+    )
+    if not is_private_desk and not (is_private_error_tool and status != "ok"):
         return raw_result_json
-    safe_payload: dict[str, Any] = {
-        "redacted": "private_desk_payload",
-        "result_digest": result_digest,
-    }
     try:
         parsed = json.loads(raw_result_json)
     except (ValueError, TypeError):
         parsed = None
+    if is_private_desk:
+        safe_payload: dict[str, Any] = {
+            "redacted": "private_desk_payload",
+            "result_digest": result_digest,
+        }
+        if isinstance(parsed, Mapping):
+            for key in _SAFE_DESK_RECEIPT_FIELDS:
+                if key in parsed:
+                    safe_payload[key] = parsed[key]
+        return json.dumps(safe_payload, sort_keys=True, separators=(",", ":"))
+    safe_err: dict[str, Any] = {
+        "ok": False,
+        "redacted": "private_error_payload",
+        "result_digest": result_digest,
+    }
     if isinstance(parsed, Mapping):
-        for key in _SAFE_DESK_RECEIPT_FIELDS:
-            if key in parsed:
-                safe_payload[key] = parsed[key]
-    return json.dumps(safe_payload, sort_keys=True, separators=(",", ":"))
+        if isinstance(parsed.get("ok"), bool):
+            safe_err["ok"] = parsed["ok"]
+        if isinstance(parsed.get("error_type"), str):
+            safe_err["error_type"] = parsed["error_type"]
+    return json.dumps(safe_err, sort_keys=True, separators=(",", ":"))
 
 
 def _sanitize_receipt_error_message(
@@ -171,7 +277,12 @@ def _sanitize_receipt_error_message(
     if tool_name in _PRIVATE_RECEIPT_ERROR_TOOLS or tool_name.startswith("desk_"):
         err_kind = str(error_type or "Error")
         digest = sha256(str(raw_error_message).encode("utf-8")).hexdigest()[:12]
-        return f"redacted_private_error:{err_kind}:{digest}"
+        prefix = (
+            "redacted_private_authority_error"
+            if is_authority_refusal_message(error_type, raw_error_message)
+            else "redacted_private_error"
+        )
+        return f"{prefix}:{err_kind}:{digest}"
     return str(raw_error_message)
 
 
@@ -374,7 +485,13 @@ class ShiftRunner:
             limits=PRODUCTION_DESK_LIMITS,
         )
 
-        if include_core_desk_tools:
+        has_peer_collab_tools = bool(
+            set(base_handlers) & (_PEER_INPUT_TOOLS | _PEER_OUTBOUND_SINKS)
+        )
+        hydrate_passive_private_context = (
+            include_core_desk_tools and not has_peer_collab_tools
+        )
+        if hydrate_passive_private_context:
             _, drafts = resolve_desk(
                 ctx.writer,
                 claim,
@@ -394,7 +511,11 @@ class ShiftRunner:
             desk_manifest = ()
 
         with closing(open_reader(ctx.writer.store)) as db, read_tx(db):
-            recent_eps = list_recent_episodes(db, ctx.company_id, agent_id, limit=5)
+            recent_eps = (
+                list_recent_episodes(db, ctx.company_id, agent_id, limit=5)
+                if hydrate_passive_private_context
+                else ()
+            )
             prior_receipt_rows = db.execute(
                 """SELECT t.run_id, t.call_id, t.tool_name, t.arg_digest,
                           t.status, t.result_digest, t.result_json,
@@ -431,7 +552,9 @@ class ShiftRunner:
                 "result_digest": str(r_result_digest),
                 "recorded_at_ns": int(r_recorded_at_ns),
             }
-            is_private_receipt = str(r_tool_name) in _PRIVATE_DESK_RECEIPT_TOOLS
+            is_private_receipt = str(
+                r_tool_name
+            ) in _PRIVATE_RECEIPT_ERROR_TOOLS or str(r_tool_name).startswith("desk_")
             if r_offloaded_log_path is not None and (
                 include_core_desk_tools or not is_private_receipt
             ):
@@ -457,7 +580,7 @@ class ShiftRunner:
                 }
                 for ep in recent_eps
             )
-            if include_core_desk_tools
+            if hydrate_passive_private_context
             else ()
         )
 
@@ -607,7 +730,19 @@ class ShiftRunner:
             )
         )
 
-        flow_state = {"read_private_desk": False, "read_peer_input": False}
+        has_hydrated_private_context = (
+            bool(desk_manifest)
+            or bool(recent_episodes)
+            or any(m.get("audience_scope") == "one_agent" for m in active_methods)
+            or any(
+                str(r.get("tool_name")) in _PRIVATE_DESK_READ_TOOLS
+                for r in prior_tool_receipts
+            )
+        )
+        flow_state = {
+            "read_private_desk": has_hydrated_private_context,
+            "read_peer_input": False,
+        }
 
         def _wrap_handler(name: str, fn: ToolHandler, *, use_lock: bool) -> ToolHandler:
             def _wrapped(args: dict[str, Any]) -> dict[str, Any]:
@@ -616,10 +751,10 @@ class ShiftRunner:
                         "Cannot write free-form peer messages or requests in the same shift "
                         "after reading private Desk data; publish explicitly via desk_publish_selection"
                     )
-                if name in _PRIVATE_DESK_READ_TOOLS and flow_state["read_peer_input"]:
+                if name in _PRIVATE_DESK_ALL_TOOLS and flow_state["read_peer_input"]:
                     raise DutyRefused(
-                        "Cannot read private Desk data in the same shift after reading "
-                        "peer-authored messages, handoffs, or shared assets"
+                        "Cannot access private Desk drafts, publications, or skills in the same shift "
+                        "after reading peer-authored messages, handoffs, or shared assets"
                     )
                 if name in _PEER_INPUT_TOOLS and flow_state["read_private_desk"]:
                     raise DutyRefused(
@@ -658,6 +793,7 @@ class ShiftRunner:
                 tool_name,
                 str(receipt["result_digest"]),
                 str(receipt["result_json"]),
+                status=str(receipt["status"]),
             )
             stored_error_message = _sanitize_receipt_error_message(
                 tool_name,
