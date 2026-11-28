@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import time_ns
 from typing import Any, Literal, Protocol
+
+from ..secret_vault import (
+    CredentialRefused,
+    HostSecretVault,
+    InMemorySecretVault,
+    MaskedSecret as _CoreMaskedSecret,
+    parse_secret_handle as _core_parse_secret_handle,
+)
 
 ToolFlowClass = Literal[
     "neutral",
@@ -74,9 +80,6 @@ _FORBIDDEN_TOOL_ARG_KEYS = frozenset(
         "created_by_agent_id",
     }
 )
-_SECRET_HANDLE_RE = re.compile(
-    r"^(?P<scheme>keychain|envref):(?P<target>[A-Za-z0-9][A-Za-z0-9._:/-]{2,120})$"
-)
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
@@ -96,22 +99,21 @@ class AgentTransportInterrupted(Exception):
     """Provider HTTP/CLI transport failed mid-shift; already-committed receipts remain intact."""
 
 
-@dataclass(frozen=True)
-class MaskedSecret:
+@dataclass(frozen=True, repr=False)
+class MaskedSecret(_CoreMaskedSecret):
     """In-memory single API secret that masks itself in repr/str."""
 
-    value: str
-    handle_ref: str
-
     def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value.strip():
-            raise AgentRuntimeRefused("Resolved secret value is empty")
+        try:
+            super().__post_init__()
+        except CredentialRefused as error:
+            raise AgentRuntimeRefused(str(error)) from error
 
     def __repr__(self) -> str:
-        return f"MaskedSecret(handle_ref={self.handle_ref!r}, value='***')"
+        return super().__repr__()
 
     def __str__(self) -> str:
-        return self.__repr__()
+        return super().__str__()
 
 
 class SecretHandleResolver(Protocol):
@@ -119,74 +121,39 @@ class SecretHandleResolver(Protocol):
 
 
 def _parse_secret_handle(handle_ref: str) -> tuple[str, str]:
-    if not isinstance(handle_ref, str):
-        raise AgentRuntimeRefused("credential_handle_ref must be a string")
-    match = _SECRET_HANDLE_RE.fullmatch(handle_ref)
-    if match is None:
-        raise AgentRuntimeRefused(
-            "credential_handle_ref must be an opaque 'envref:...' or 'keychain:...' handle"
-        )
-    return match.group("scheme"), match.group("target")
+    try:
+        parsed = _core_parse_secret_handle(handle_ref)
+    except CredentialRefused as error:
+        raise AgentRuntimeRefused(str(error)) from error
+    return parsed.scheme, parsed.target
 
 
 class EnvSecretResolver:
     """Resolve `envref:<VAR>` from host environment or `keychain:<svc>/<acct>` via macOS Keychain."""
 
     def __init__(self, environ: dict[str, str] | None = None) -> None:
-        self._environ = os.environ if environ is None else environ
+        self._vault = HostSecretVault(environ)
 
     def resolve_secret(self, handle_ref: str) -> MaskedSecret:
-        scheme, target = _parse_secret_handle(handle_ref)
-        if scheme == "envref":
-            var_name = re.sub(r"[^A-Za-z0-9_]", "_", target).upper()
-            raw = self._environ.get(var_name, "").strip()
-            if not raw:
-                raise AgentRuntimeRefused(
-                    f"Host environment variable for '{handle_ref}' is not set"
-                )
-            return MaskedSecret(value=raw, handle_ref=handle_ref)
-        if "/" not in target:
-            raise AgentRuntimeRefused(
-                "Keychain handle must use 'keychain:<service>/<account>' format"
-            )
-        service, account = target.split("/", 1)
         try:
-            proc = subprocess.run(
-                [
-                    "/usr/bin/security",
-                    "find-generic-password",
-                    "-s",
-                    service,
-                    "-a",
-                    account,
-                    "-w",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise AgentRuntimeRefused("macOS Keychain lookup failed") from error
-        if proc.returncode != 0 or not proc.stdout.strip():
-            raise AgentRuntimeRefused(
-                f"macOS Keychain secret unavailable for '{service}'"
-            )
-        return MaskedSecret(value=proc.stdout.strip(), handle_ref=handle_ref)
+            resolved = self._vault.resolve_secret(handle_ref)
+        except CredentialRefused as error:
+            raise AgentRuntimeRefused(str(error)) from error
+        return MaskedSecret(value=resolved.value, handle_ref=resolved.handle_ref)
 
 
 class InMemorySecretResolver:
     """Test-only secret resolver mapping opaque handles to synthetic values."""
 
     def __init__(self, mapping: dict[str, str]) -> None:
-        self._mapping = dict(mapping)
+        self._vault = InMemorySecretVault(mapping)
 
     def resolve_secret(self, handle_ref: str) -> MaskedSecret:
-        _parse_secret_handle(handle_ref)
-        val = self._mapping.get(handle_ref)
-        if not val:
-            raise AgentRuntimeRefused(f"Secret handle '{handle_ref}' is not registered")
-        return MaskedSecret(value=val, handle_ref=handle_ref)
+        try:
+            resolved = self._vault.resolve_secret(handle_ref)
+        except CredentialRefused as error:
+            raise AgentRuntimeRefused(str(error)) from error
+        return MaskedSecret(value=resolved.value, handle_ref=resolved.handle_ref)
 
 
 @dataclass(frozen=True)

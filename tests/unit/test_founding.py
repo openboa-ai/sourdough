@@ -72,6 +72,9 @@ TABLES = (
     "decision_question",
     "restriction_cause",
     "agent_profile",
+    "connector_binding",
+    "connector_grant",
+    "connector_admission",
 )
 
 

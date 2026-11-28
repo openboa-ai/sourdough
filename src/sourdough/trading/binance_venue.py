@@ -52,6 +52,23 @@ BINANCE_ADAPTER_REVISION = "binance-rest-v1"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Block all HTTP 3xx redirects so X-MBX-APIKEY can never bounce to unpinned hosts."""
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        raise ExternalEnvironmentMismatch(
+            f"Binance venue HTTP redirect (status {code}) is prohibited for credential safety"
+        )
+
+
 def _fmt_decimal(value: Decimal) -> str:
     normalized = value.normalize()
     text = format(normalized, "f")
@@ -177,6 +194,10 @@ class BinanceVenueAdapter:
     def capabilities(self) -> VenueCapabilities:
         return self._capabilities
 
+    @property
+    def blocks_redirects(self) -> bool:
+        return True
+
     def client_order_id_for(self, action_id: str) -> str:
         if not isinstance(action_id, str) or not action_id.strip():
             raise ExternalVenueRefused("action_id is required")
@@ -222,15 +243,19 @@ class BinanceVenueAdapter:
                 "Accept": "application/json",
             },
         )
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        max_resp_bytes = 2 * 1024 * 1024
         try:
-            with urllib.request.urlopen(
-                req, timeout=self._config.timeout_seconds
-            ) as resp:
-                raw = resp.read()
+            with opener.open(req, timeout=self._config.timeout_seconds) as resp:
+                raw = resp.read(max_resp_bytes + 1)
+                if len(raw) > max_resp_bytes:
+                    raise ExternalOrderReplyUnknown(
+                        f"Venue response exceeded maximum allowed size ({max_resp_bytes} bytes); outcome unknown"
+                    )
                 return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as error:
             try:
-                body = error.read()
+                body = error.read(65_536)
             finally:
                 error.close()
             code, msg = _extract_binance_error(body)
