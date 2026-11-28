@@ -11,8 +11,8 @@ from .company import _connect
 from .company_assets import SharedAsset, shared_asset_for
 from .duty_run import (
     ASSESSMENT_REVIEW,
-    DutyClaim,
     DutyRefused,
+    ExecutionClaim,
     WorkRunClaim,
     has_turn_capacity,
 )
@@ -53,7 +53,7 @@ class HandoffOffer:
             raise DutyRefused("Invalid handoff offer")
 
 
-def _with_clock(claim: DutyClaim | WorkRunClaim, now: int) -> DutyClaim | WorkRunClaim:
+def _with_clock(claim: ExecutionClaim, now: int) -> ExecutionClaim:
     if isinstance(claim, WorkRunClaim) and claim.current_now_ns() is None:
         return replace(claim, _clock=now * _NS_PER_SECOND)
     return claim
@@ -61,7 +61,7 @@ def _with_clock(claim: DutyClaim | WorkRunClaim, now: int) -> DutyClaim | WorkRu
 
 def offer_handoff(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     offer: HandoffOffer,
     *,
     now: int,
@@ -143,7 +143,7 @@ def offer_handoff(
 
 
 def _authorized_recipient(
-    database: Connection, claim: DutyClaim | WorkRunClaim, purpose: str
+    database: Connection, claim: ExecutionClaim, purpose: str
 ) -> None:
     allowed = (
         (
@@ -172,7 +172,7 @@ def _authorized_recipient(
 
 
 def accepted_handoff(
-    database: Connection, claim: DutyClaim | WorkRunClaim, asset_id: str
+    database: Connection, claim: ExecutionClaim, asset_id: str
 ) -> dict[str, str] | None:
     row = database.execute(
         """SELECT offer_id,sender_id,expected_result FROM work_handoff
@@ -213,7 +213,7 @@ _READY_CANONICAL_OFFERS = """FROM work_handoff o
 
 def discover_handoffs(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     *,
     now: int,
@@ -254,7 +254,7 @@ def discover_handoffs(
 
 def accept_handoff(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     offer_id: str,
     *,
@@ -456,7 +456,7 @@ def accept_handoff(
 
 def decline_handoff(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     offer_id: str,
     *,
@@ -511,7 +511,7 @@ def decline_handoff(
 
 def withdraw_handoff(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     offer_id: str,
     *,
     now: int,

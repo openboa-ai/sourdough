@@ -31,7 +31,7 @@ from .agent_desk import (
     resolve_desk,
 )
 from .company import _connect
-from .duty_run import DutyClaim, DutyRefused, WorkRunClaim, employment_cutoff
+from .duty_run import DutyRefused, ExecutionClaim, WorkRunClaim, employment_cutoff
 from .runtime.work_kernel import WorkKernelRefused, assert_run_fencing
 from .writer_lease import WriterLease
 
@@ -212,7 +212,7 @@ def offload_large_output(
 
 
 def create_agent_session(
-    writer: WriterLease, claim: DutyClaim | WorkRunClaim, purpose: str
+    writer: WriterLease, claim: ExecutionClaim, purpose: str
 ) -> AgentSession:
     """Bind a server-side AgentSession from the authoritative Work kernel and grant state."""
     writer.verify_for(writer.store, claim.company_id)
@@ -758,7 +758,7 @@ class ScopedRun:
     def __init__(
         self,
         writer: WriterLease,
-        claim: DutyClaim | WorkRunClaim,
+        claim: ExecutionClaim,
         workflow: ScopedWorkflow,
         invoke: Callable[[str, dict], dict],
         *,
@@ -849,7 +849,7 @@ class ScopedRun:
                 ) from error
 
     @property
-    def claim(self) -> DutyClaim | WorkRunClaim:
+    def claim(self) -> ExecutionClaim:
         return self._claim
 
     @property

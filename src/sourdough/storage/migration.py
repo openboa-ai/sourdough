@@ -483,15 +483,235 @@ def _optional_mig_int(value: object, field: str) -> int | None:
     return _require_mig_int(value, field)
 
 
-def _migrate_trading_tables_impl(
+def _restore_staged_rows(
     connection: sqlite3.Connection,
-    active: frozenset[str],
+    table_name: str,
+    staging: str,
+    cols: list[str],
+) -> None:
+    if not cols:
+        return
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    connection.execute(
+        f"INSERT INTO {table_name} ({col_list}) SELECT {col_list} FROM {staging}"
+    )
+    connection.execute(f"DROP TABLE IF EXISTS {staging}")
+
+
+def _fold_legacy_paper_bindings(
+    connection: sqlite3.Connection,
+    binding_by_rev: dict[str, str],
+    binding_by_rev_account: dict[tuple[str, str], str],
+) -> None:
+    """Synthesize or link Gen 1 paper_binding and historical paper_binding_change rows."""
+    if not _has_table(connection, "paper_binding"):
+        return
+    pb_rows = connection.execute(
+        """SELECT revision, company_id, exposure_limit_minor_units, account_id,
+                  connector_revision, instrument_rules_digest, currency,
+                  starting_minor_units, environment, destination_id
+           FROM paper_binding
+           WHERE singleton = 1"""
+    ).fetchall()
+    for pb in pb_rows:
+        pb_rev = _require_mig_text(pb[0], "paper_binding.revision")
+        pb_cid = _require_mig_text(pb[1], "paper_binding.company_id")
+        pb_limit = _require_mig_int(pb[2], "paper_binding.exposure_limit_minor_units")
+        pb_acct = _require_mig_text(pb[3], "paper_binding.account_id")
+        pb_conn = _require_mig_text(pb[4], "paper_binding.connector_revision")
+        pb_rules = _require_mig_text(pb[5], "paper_binding.instrument_rules_digest")
+        pb_curr = _require_mig_text(pb[6], "paper_binding.currency")
+        pb_start = _require_mig_int(pb[7], "paper_binding.starting_minor_units")
+        pb_env = _require_mig_text(pb[8], "paper_binding.environment")
+        pb_dest = _require_mig_text(pb[9], "paper_binding.destination_id")
+        if pb_env != "paper" or pb_start <= 0 or pb_limit <= 0 or pb_limit > pb_start:
+            raise StorageRefused(
+                f"Invalid legacy paper_binding row for company '{pb_cid}'"
+            )
+        matched_row = connection.execute(
+            """SELECT binding_id, binding_revision
+               FROM execution_environment_binding
+               WHERE company_id = ? AND tier = 'company_paper'
+                 AND account_id = ? AND status = 'active'
+               LIMIT 1""",
+            (pb_cid, pb_acct),
+        ).fetchone()
+        if matched_row is not None:
+            bid = str(matched_row[0])
+            if str(matched_row[1]) == "1":
+                connection.execute(
+                    """UPDATE execution_environment_binding
+                       SET binding_revision = ?
+                       WHERE binding_id = ?""",
+                    (pb_rev, bid),
+                )
+            binding_by_rev[pb_rev] = bid
+            binding_by_rev_account[(pb_rev, pb_acct)] = bid
+        else:
+            bid = _deterministic_binding_id(pb_cid, pb_rev, pb_acct)
+            connection.execute(
+                """INSERT INTO execution_environment_binding (
+                       binding_id, company_id, tier, environment, owner_agent_id,
+                       account_id, destination_id, connector_revision,
+                       instrument_rules_digest, currency, starting_minor_units,
+                       exposure_limit_minor_units, fee_bps, slippage_bps,
+                       quote_source, credential_handle_ref, binding_revision,
+                       book_name, strategy_release_id, book_role,
+                       shadow_of_live_binding_id, nominated_question_id,
+                       status, created_at_ns, updated_at_ns
+                   ) VALUES (?, ?, 'company_paper', 'paper', NULL, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'legacy_paper_binding', NULL, ?, ?, NULL, 'active', NULL, NULL, 'active', 1, 1)""",
+                (
+                    bid,
+                    pb_cid,
+                    pb_acct,
+                    pb_dest,
+                    pb_conn,
+                    pb_rules,
+                    pb_curr,
+                    pb_start,
+                    pb_limit,
+                    pb_rev,
+                    pb_acct,
+                ),
+            )
+            binding_by_rev[pb_rev] = bid
+            binding_by_rev_account[(pb_rev, pb_acct)] = bid
+
+        if not _has_table(connection, "paper_binding_change"):
+            continue
+        referenced_revs: set[str] = set()
+        if _has_table(connection, "paper_order"):
+            referenced_revs.update(
+                r[0]
+                for r in connection.execute(
+                    "SELECT DISTINCT mandate_revision FROM paper_order"
+                ).fetchall()
+                if isinstance(r[0], str)
+            )
+        if _has_table(connection, "paper_valuation"):
+            referenced_revs.update(
+                r[0]
+                for r in connection.execute(
+                    "SELECT DISTINCT binding_revision FROM paper_valuation"
+                ).fetchall()
+                if isinstance(r[0], str)
+            )
+        for chg in connection.execute(
+            """SELECT previous_revision, old_terms, requested_at_ns, effective_at_ns
+               FROM paper_binding_change
+               WHERE effective_at_ns IS NOT NULL"""
+        ).fetchall():
+            prev_rev = _require_mig_text(
+                chg[0], "paper_binding_change.previous_revision"
+            )
+            if prev_rev not in referenced_revs or prev_rev in binding_by_rev:
+                continue
+            old_terms_raw = _require_mig_text(
+                chg[1], "paper_binding_change.old_terms", allow_empty=True
+            )
+            try:
+                old_terms = json.loads(old_terms_raw)
+            except json.JSONDecodeError:
+                old_terms = {}
+            if not isinstance(old_terms, dict):
+                old_terms = {}
+            old_acct = (
+                _optional_mig_text(
+                    old_terms.get("account_id"),
+                    "paper_binding_change.old_terms.account_id",
+                )
+                or pb_acct
+            )
+            old_dest = (
+                _optional_mig_text(
+                    old_terms.get("destination_id"),
+                    "paper_binding_change.old_terms.destination_id",
+                )
+                or pb_dest
+            )
+            old_conn = (
+                _optional_mig_text(
+                    old_terms.get("connector_revision"),
+                    "paper_binding_change.old_terms.connector_revision",
+                )
+                or pb_conn
+            )
+            old_rules = (
+                _optional_mig_text(
+                    old_terms.get("instrument_rules_digest"),
+                    "paper_binding_change.old_terms.instrument_rules_digest",
+                )
+                or pb_rules
+            )
+            old_curr = (
+                _optional_mig_text(
+                    old_terms.get("currency"),
+                    "paper_binding_change.old_terms.currency",
+                )
+                or pb_curr
+            )
+            raw_old_start = _optional_mig_int(
+                old_terms.get("starting_minor_units"),
+                "paper_binding_change.old_terms.starting_minor_units",
+            )
+            old_start = pb_start if raw_old_start is None else raw_old_start
+            raw_old_limit = _optional_mig_int(
+                old_terms.get("exposure_limit_minor_units"),
+                "paper_binding_change.old_terms.exposure_limit_minor_units",
+            )
+            old_limit = pb_limit if raw_old_limit is None else raw_old_limit
+            if old_start <= 0 or old_limit <= 0 or old_limit > old_start:
+                raise StorageRefused(
+                    f"Invalid historical paper_binding_change '{prev_rev}'"
+                )
+            hist_bid = _deterministic_binding_id(pb_cid, prev_rev, old_acct)
+            created_ns = _to_ns(
+                _require_mig_int(chg[2], "paper_binding_change.requested_at_ns")
+            )
+            updated_ns = max(
+                created_ns,
+                _to_ns(
+                    _require_mig_int(chg[3], "paper_binding_change.effective_at_ns")
+                ),
+            )
+            connection.execute(
+                """INSERT INTO execution_environment_binding (
+                       binding_id, company_id, tier, environment, owner_agent_id,
+                       account_id, destination_id, connector_revision,
+                       instrument_rules_digest, currency, starting_minor_units,
+                       exposure_limit_minor_units, fee_bps, slippage_bps,
+                       quote_source, credential_handle_ref, binding_revision,
+                       book_name, strategy_release_id, book_role,
+                       shadow_of_live_binding_id, nominated_question_id,
+                       status, created_at_ns, updated_at_ns
+                   ) VALUES (?, ?, 'company_paper', 'paper', NULL, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'legacy_paper_binding', NULL, ?, ?, NULL, 'retired', NULL, NULL, 'retired', ?, ?)
+                   ON CONFLICT (binding_id) DO NOTHING""",
+                (
+                    hist_bid,
+                    pb_cid,
+                    old_acct,
+                    old_dest,
+                    old_conn,
+                    old_rules,
+                    old_curr,
+                    old_start,
+                    old_limit,
+                    prev_rev,
+                    old_acct,
+                    created_ns,
+                    updated_ns,
+                ),
+            )
+            binding_by_rev[prev_rev] = hist_bid
+            binding_by_rev_account[(prev_rev, old_acct)] = hist_bid
+
+
+def _migrate_trading_bindings(
+    connection: sqlite3.Connection,
     table_ddl: dict[str, str],
     index_ddl: dict[str, tuple[str, ...]],
-) -> frozenset[str]:
-    # ------------------------------------------------------------------
-    # Step 3: Rebuild execution_environment_binding & fold company_paper_book / paper_binding
-    # ------------------------------------------------------------------
+) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+    """Rebuild execution_environment_binding and fold company_paper_book / paper_binding."""
     binding_staging, binding_cols = _stage_and_recreate_table(
         connection,
         "execution_environment_binding",
@@ -721,229 +941,23 @@ def _migrate_trading_tables_impl(
             existing_bindings.append((bid, cid, tier, acct_id, binding_rev))
         connection.execute(f"DROP TABLE IF EXISTS {binding_staging}")
 
-    # Synthesize / link Gen 1 paper_binding & historical paper_binding_change bindings
     binding_by_rev: dict[str, str] = {}
     binding_by_rev_account: dict[tuple[str, str], str] = {}
-    company_paper_binding_by_company: dict[str, str] = {}
-    for bid, cid, tier, acct, brev in existing_bindings:
+    for bid, _cid, tier, acct, brev in existing_bindings:
         if tier == "company_paper":
             binding_by_rev.setdefault(brev, bid)
             binding_by_rev_account.setdefault((brev, acct), bid)
-            company_paper_binding_by_company.setdefault(cid, bid)
 
-    if _has_table(connection, "paper_binding"):
-        pb_rows = connection.execute(
-            """SELECT revision, company_id, exposure_limit_minor_units, account_id,
-                      connector_revision, instrument_rules_digest, currency,
-                      starting_minor_units, environment, destination_id
-               FROM paper_binding
-               WHERE singleton = 1"""
-        ).fetchall()
-        for pb in pb_rows:
-            pb_rev = _require_mig_text(pb[0], "paper_binding.revision")
-            pb_cid = _require_mig_text(pb[1], "paper_binding.company_id")
-            pb_limit = _require_mig_int(
-                pb[2], "paper_binding.exposure_limit_minor_units"
-            )
-            pb_acct = _require_mig_text(pb[3], "paper_binding.account_id")
-            pb_conn = _require_mig_text(pb[4], "paper_binding.connector_revision")
-            pb_rules = _require_mig_text(pb[5], "paper_binding.instrument_rules_digest")
-            pb_curr = _require_mig_text(pb[6], "paper_binding.currency")
-            pb_start = _require_mig_int(pb[7], "paper_binding.starting_minor_units")
-            pb_env = _require_mig_text(pb[8], "paper_binding.environment")
-            pb_dest = _require_mig_text(pb[9], "paper_binding.destination_id")
-            if (
-                pb_env != "paper"
-                or pb_start <= 0
-                or pb_limit <= 0
-                or pb_limit > pb_start
-            ):
-                raise StorageRefused(
-                    f"Invalid legacy paper_binding row for company '{pb_cid}'"
-                )
-            matched_row = connection.execute(
-                """SELECT binding_id, binding_revision
-                   FROM execution_environment_binding
-                   WHERE company_id = ? AND tier = 'company_paper'
-                     AND account_id = ? AND status = 'active'
-                   LIMIT 1""",
-                (pb_cid, pb_acct),
-            ).fetchone()
-            if matched_row is not None:
-                bid = str(matched_row[0])
-                if str(matched_row[1]) == "1":
-                    connection.execute(
-                        """UPDATE execution_environment_binding
-                           SET binding_revision = ?
-                           WHERE binding_id = ?""",
-                        (pb_rev, bid),
-                    )
-                binding_by_rev[pb_rev] = bid
-                binding_by_rev_account[(pb_rev, pb_acct)] = bid
-                company_paper_binding_by_company.setdefault(pb_cid, bid)
-            else:
-                bid = _deterministic_binding_id(pb_cid, pb_rev, pb_acct)
-                connection.execute(
-                    """INSERT INTO execution_environment_binding (
-                           binding_id, company_id, tier, environment, owner_agent_id,
-                           account_id, destination_id, connector_revision,
-                           instrument_rules_digest, currency, starting_minor_units,
-                           exposure_limit_minor_units, fee_bps, slippage_bps,
-                           quote_source, credential_handle_ref, binding_revision,
-                           book_name, strategy_release_id, book_role,
-                           shadow_of_live_binding_id, nominated_question_id,
-                           status, created_at_ns, updated_at_ns
-                       ) VALUES (?, ?, 'company_paper', 'paper', NULL, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'legacy_paper_binding', NULL, ?, ?, NULL, 'active', NULL, NULL, 'active', 1, 1)""",
-                    (
-                        bid,
-                        pb_cid,
-                        pb_acct,
-                        pb_dest,
-                        pb_conn,
-                        pb_rules,
-                        pb_curr,
-                        pb_start,
-                        pb_limit,
-                        pb_rev,
-                        pb_acct,
-                    ),
-                )
-                binding_by_rev[pb_rev] = bid
-                binding_by_rev_account[(pb_rev, pb_acct)] = bid
-                company_paper_binding_by_company.setdefault(pb_cid, bid)
+    _fold_legacy_paper_bindings(connection, binding_by_rev, binding_by_rev_account)
+    return binding_by_rev, binding_by_rev_account
 
-            if _has_table(connection, "paper_binding_change"):
-                referenced_revs: set[str] = set()
-                if _has_table(connection, "paper_order"):
-                    referenced_revs.update(
-                        r[0]
-                        for r in connection.execute(
-                            "SELECT DISTINCT mandate_revision FROM paper_order"
-                        ).fetchall()
-                        if isinstance(r[0], str)
-                    )
-                if _has_table(connection, "paper_valuation"):
-                    referenced_revs.update(
-                        r[0]
-                        for r in connection.execute(
-                            "SELECT DISTINCT binding_revision FROM paper_valuation"
-                        ).fetchall()
-                        if isinstance(r[0], str)
-                    )
-                for chg in connection.execute(
-                    """SELECT previous_revision, old_terms, requested_at_ns, effective_at_ns
-                       FROM paper_binding_change
-                       WHERE effective_at_ns IS NOT NULL"""
-                ).fetchall():
-                    prev_rev = _require_mig_text(
-                        chg[0], "paper_binding_change.previous_revision"
-                    )
-                    if prev_rev not in referenced_revs or prev_rev in binding_by_rev:
-                        continue
-                    old_terms_raw = _require_mig_text(
-                        chg[1], "paper_binding_change.old_terms", allow_empty=True
-                    )
-                    try:
-                        old_terms = json.loads(old_terms_raw)
-                    except json.JSONDecodeError:
-                        old_terms = {}
-                    if not isinstance(old_terms, dict):
-                        old_terms = {}
-                    old_acct = (
-                        _optional_mig_text(
-                            old_terms.get("account_id"),
-                            "paper_binding_change.old_terms.account_id",
-                        )
-                        or pb_acct
-                    )
-                    old_dest = (
-                        _optional_mig_text(
-                            old_terms.get("destination_id"),
-                            "paper_binding_change.old_terms.destination_id",
-                        )
-                        or pb_dest
-                    )
-                    old_conn = (
-                        _optional_mig_text(
-                            old_terms.get("connector_revision"),
-                            "paper_binding_change.old_terms.connector_revision",
-                        )
-                        or pb_conn
-                    )
-                    old_rules = (
-                        _optional_mig_text(
-                            old_terms.get("instrument_rules_digest"),
-                            "paper_binding_change.old_terms.instrument_rules_digest",
-                        )
-                        or pb_rules
-                    )
-                    old_curr = (
-                        _optional_mig_text(
-                            old_terms.get("currency"),
-                            "paper_binding_change.old_terms.currency",
-                        )
-                        or pb_curr
-                    )
-                    raw_old_start = _optional_mig_int(
-                        old_terms.get("starting_minor_units"),
-                        "paper_binding_change.old_terms.starting_minor_units",
-                    )
-                    old_start = pb_start if raw_old_start is None else raw_old_start
-                    raw_old_limit = _optional_mig_int(
-                        old_terms.get("exposure_limit_minor_units"),
-                        "paper_binding_change.old_terms.exposure_limit_minor_units",
-                    )
-                    old_limit = pb_limit if raw_old_limit is None else raw_old_limit
-                    if old_start <= 0 or old_limit <= 0 or old_limit > old_start:
-                        raise StorageRefused(
-                            f"Invalid historical paper_binding_change '{prev_rev}'"
-                        )
-                    hist_bid = _deterministic_binding_id(pb_cid, prev_rev, old_acct)
-                    created_ns = _to_ns(
-                        _require_mig_int(chg[2], "paper_binding_change.requested_at_ns")
-                    )
-                    updated_ns = max(
-                        created_ns,
-                        _to_ns(
-                            _require_mig_int(
-                                chg[3], "paper_binding_change.effective_at_ns"
-                            )
-                        ),
-                    )
-                    connection.execute(
-                        """INSERT INTO execution_environment_binding (
-                               binding_id, company_id, tier, environment, owner_agent_id,
-                               account_id, destination_id, connector_revision,
-                               instrument_rules_digest, currency, starting_minor_units,
-                               exposure_limit_minor_units, fee_bps, slippage_bps,
-                               quote_source, credential_handle_ref, binding_revision,
-                               book_name, strategy_release_id, book_role,
-                               shadow_of_live_binding_id, nominated_question_id,
-                               status, created_at_ns, updated_at_ns
-                           ) VALUES (?, ?, 'company_paper', 'paper', NULL, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'legacy_paper_binding', NULL, ?, ?, NULL, 'retired', NULL, NULL, 'retired', ?, ?)
-                           ON CONFLICT (binding_id) DO NOTHING""",
-                        (
-                            hist_bid,
-                            pb_cid,
-                            old_acct,
-                            old_dest,
-                            old_conn,
-                            old_rules,
-                            old_curr,
-                            old_start,
-                            old_limit,
-                            prev_rev,
-                            old_acct,
-                            created_ns,
-                            updated_ns,
-                        ),
-                    )
-                    binding_by_rev[prev_rev] = hist_bid
-                    binding_by_rev_account[(prev_rev, old_acct)] = hist_bid
 
-    # ------------------------------------------------------------------
-    # Step 4.1: Unified trading_book_{order,fill,position,valuation}
-    # ------------------------------------------------------------------
+def _migrate_trading_orders_fills_positions(
+    connection: sqlite3.Connection,
+    table_ddl: dict[str, str],
+    index_ddl: dict[str, tuple[str, ...]],
+) -> set[str]:
+    """Rebuild unified trading_book_* tables and merge company_paper_* / agent_sandbox_* rows."""
     tb_order_staging, tb_order_cols = _stage_and_recreate_table(
         connection,
         "trading_book_order",
@@ -976,7 +990,7 @@ def _migrate_trading_tables_impl(
             for r in connection.execute("SELECT run_id FROM work_runs").fetchall()
         }
 
-    # 4.1a: Re-insert pre-existing trading_book_* rows
+    # Re-insert pre-existing trading_book_* rows
     if tb_order_cols:
         connection.row_factory = sqlite3.Row
         try:
@@ -1033,28 +1047,15 @@ def _migrate_trading_tables_impl(
             )
         connection.execute(f"DROP TABLE IF EXISTS {tb_order_staging}")
 
-    if tb_fill_cols:
-        col_list = ", ".join(f'"{c}"' for c in tb_fill_cols)
-        connection.execute(
-            f"INSERT INTO trading_book_fill ({col_list}) SELECT {col_list} FROM {tb_fill_staging}"
-        )
-        connection.execute(f"DROP TABLE IF EXISTS {tb_fill_staging}")
+    _restore_staged_rows(connection, "trading_book_fill", tb_fill_staging, tb_fill_cols)
+    _restore_staged_rows(
+        connection, "trading_book_position", tb_pos_staging, tb_pos_cols
+    )
+    _restore_staged_rows(
+        connection, "trading_book_valuation", tb_val_staging, tb_val_cols
+    )
 
-    if tb_pos_cols:
-        col_list = ", ".join(f'"{c}"' for c in tb_pos_cols)
-        connection.execute(
-            f"INSERT INTO trading_book_position ({col_list}) SELECT {col_list} FROM {tb_pos_staging}"
-        )
-        connection.execute(f"DROP TABLE IF EXISTS {tb_pos_staging}")
-
-    if tb_val_cols:
-        col_list = ", ".join(f'"{c}"' for c in tb_val_cols)
-        connection.execute(
-            f"INSERT INTO trading_book_valuation ({col_list}) SELECT {col_list} FROM {tb_val_staging}"
-        )
-        connection.execute(f"DROP TABLE IF EXISTS {tb_val_staging}")
-
-    # 4.1b: Merge company_paper_{order,fill,position} (deduplicating dual-writes)
+    # Merge company_paper_{order,fill,position} (deduplicating dual-writes)
     if _has_table(connection, "company_paper_order"):
         connection.execute(
             """INSERT INTO trading_book_order (
@@ -1108,7 +1109,7 @@ def _migrate_trading_tables_impl(
                ON CONFLICT (binding_id, instrument_id) DO NOTHING"""
         )
 
-    # 4.1c: Merge agent_sandbox_{order,fill,position} -> environment = 'agent_sandbox'
+    # Merge agent_sandbox_{order,fill,position} -> environment = 'agent_sandbox'
     if _has_table(connection, "agent_sandbox_order"):
         connection.execute(
             """INSERT INTO trading_book_order (
@@ -1162,423 +1163,421 @@ def _migrate_trading_tables_impl(
                ON CONFLICT (binding_id, instrument_id) DO NOTHING"""
         )
 
-    # 4.1d: Migrate Gen 1 paper_order / paper_fill / paper_fill_fee / paper_cancellation
-    if _has_table(connection, "paper_order"):
-        default_company_row = connection.execute(
-            "SELECT id FROM company WHERE singleton = 1"
-        ).fetchone()
-        if default_company_row is None:
-            raise StorageRefused("Cannot migrate paper_order without company row")
-        default_company_id = _require_mig_text(default_company_row[0], "company.id")
+    return valid_work_runs
 
-        has_duty_run = _has_table(connection, "duty_run")
-        has_paper_decision = _has_table(connection, "paper_decision")
-        has_paper_research_dec = _has_table(connection, "paper_research_decision")
-        has_review_quote = _has_table(connection, "paper_review_quote")
-        has_paper_fill = _has_table(connection, "paper_fill")
-        has_paper_fill_fee = _has_table(connection, "paper_fill_fee")
-        has_paper_cancel = _has_table(connection, "paper_cancellation")
-        has_pos_obs = _has_table(connection, "paper_position_observation")
 
-        gen1_orders = connection.execute(
-            """SELECT order_id, run_id, mandate_revision, account_id, action_id,
-                      instrument_rules_digest, quantity, limit_minor_units
-               FROM paper_order
-               ORDER BY rowid ASC"""
-        ).fetchall()
+def _migrate_legacy_paper_orders_and_fills(
+    connection: sqlite3.Connection,
+    *,
+    binding_by_rev: dict[str, str],
+    binding_by_rev_account: dict[tuple[str, str], str],
+    valid_work_runs: set[str],
+) -> None:
+    """Migrate Gen 1 paper_order, paper_fill, paper_fill_fee, and paper_cancellation rows."""
+    if not _has_table(connection, "paper_order"):
+        return
+    default_company_row = connection.execute(
+        "SELECT id FROM company WHERE singleton = 1"
+    ).fetchone()
+    if default_company_row is None:
+        raise StorageRefused("Cannot migrate paper_order without company row")
+    default_company_id = _require_mig_text(default_company_row[0], "company.id")
 
-        gen1_position_accum: dict[tuple[str, str], list[int]] = {}
-        # (binding_id, instrument_id) -> [qty, cost_sum, fee_sum, max_filled_ns]
+    has_duty_run = _has_table(connection, "duty_run")
+    has_paper_decision = _has_table(connection, "paper_decision")
+    has_paper_research_dec = _has_table(connection, "paper_research_decision")
+    has_review_quote = _has_table(connection, "paper_review_quote")
+    has_paper_fill = _has_table(connection, "paper_fill")
+    has_paper_fill_fee = _has_table(connection, "paper_fill_fee")
+    has_paper_cancel = _has_table(connection, "paper_cancellation")
+    has_pos_obs = _has_table(connection, "paper_position_observation")
 
-        for row in gen1_orders:
-            order_id = _require_mig_text(row[0], "paper_order.order_id")
-            legacy_run_id = _optional_mig_text(row[1], "paper_order.run_id")
-            mandate_rev = _require_mig_text(row[2], "paper_order.mandate_revision")
-            account_id = _require_mig_text(row[3], "paper_order.account_id")
-            action_id = _require_mig_text(row[4], "paper_order.action_id")
-            instrument_id = _require_mig_text(
-                row[5], "paper_order.instrument_rules_digest"
-            )
-            quantity = _require_mig_int(row[6], "paper_order.quantity")
-            limit_minor_units = _require_mig_int(
-                row[7], "paper_order.limit_minor_units"
-            )
+    gen1_orders = connection.execute(
+        """SELECT order_id, run_id, mandate_revision, account_id, action_id,
+                  instrument_rules_digest, quantity, limit_minor_units
+           FROM paper_order
+           ORDER BY rowid ASC"""
+    ).fetchall()
 
-            resolved_binding_id = binding_by_rev_account.get(
-                (mandate_rev, account_id)
-            ) or binding_by_rev.get(mandate_rev)
-            if resolved_binding_id is None:
-                # Try matching any company_paper binding for that account
-                matched = connection.execute(
-                    """SELECT binding_id FROM execution_environment_binding
-                       WHERE tier = 'company_paper' AND account_id = ?
-                       ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END
-                       LIMIT 1""",
-                    (account_id,),
-                ).fetchone()
-                if matched is not None:
-                    resolved_binding_id = str(matched[0])
-            if resolved_binding_id is None:
-                raise StorageRefused(
-                    f"Cannot resolve execution_environment_binding for paper_order '{order_id}'"
-                )
+    gen1_position_accum: dict[tuple[str, str], list[int]] = {}
+    # (binding_id, instrument_id) -> [qty, cost_sum, fee_sum, max_filled_ns]
 
-            bind_company_row = connection.execute(
-                "SELECT company_id FROM execution_environment_binding WHERE binding_id = ?",
-                (resolved_binding_id,),
+    for row in gen1_orders:
+        order_id = _require_mig_text(row[0], "paper_order.order_id")
+        legacy_run_id = _optional_mig_text(row[1], "paper_order.run_id")
+        mandate_rev = _require_mig_text(row[2], "paper_order.mandate_revision")
+        account_id = _require_mig_text(row[3], "paper_order.account_id")
+        action_id = _require_mig_text(row[4], "paper_order.action_id")
+        instrument_id = _require_mig_text(row[5], "paper_order.instrument_rules_digest")
+        quantity = _require_mig_int(row[6], "paper_order.quantity")
+        limit_minor_units = _require_mig_int(row[7], "paper_order.limit_minor_units")
+
+        resolved_binding_id = binding_by_rev_account.get(
+            (mandate_rev, account_id)
+        ) or binding_by_rev.get(mandate_rev)
+        if resolved_binding_id is None:
+            # Try matching any company_paper binding for that account
+            matched = connection.execute(
+                """SELECT binding_id FROM execution_environment_binding
+                   WHERE tier = 'company_paper' AND account_id = ?
+                   ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END
+                   LIMIT 1""",
+                (account_id,),
             ).fetchone()
-            company_id = (
-                _require_mig_text(
-                    bind_company_row[0], "execution_environment_binding.company_id"
+            if matched is not None:
+                resolved_binding_id = str(matched[0])
+        if resolved_binding_id is None:
+            raise StorageRefused(
+                f"Cannot resolve execution_environment_binding for paper_order '{order_id}'"
+            )
+
+        bind_company_row = connection.execute(
+            "SELECT company_id FROM execution_environment_binding WHERE binding_id = ?",
+            (resolved_binding_id,),
+        ).fetchone()
+        company_id = (
+            _require_mig_text(
+                bind_company_row[0], "execution_environment_binding.company_id"
+            )
+            if bind_company_row is not None
+            else default_company_id
+        )
+
+        actor_id = "system"
+        created_at_ns = 1
+        if legacy_run_id is not None and legacy_run_id in valid_work_runs:
+            wr = connection.execute(
+                "SELECT agent_id, created_at_ns FROM work_runs WHERE run_id = ?",
+                (legacy_run_id,),
+            ).fetchone()
+            if wr is not None:
+                actor_id = _require_mig_text(wr[0], "work_runs.agent_id")
+                created_at_ns = _to_ns(
+                    _require_mig_int(wr[1], "work_runs.created_at_ns")
                 )
-                if bind_company_row is not None
-                else default_company_id
-            )
+        elif legacy_run_id is not None and has_duty_run:
+            dr = connection.execute(
+                """SELECT d.agent_id
+                   FROM duty_run dr
+                   JOIN duty d ON d.id = dr.duty_id
+                   WHERE dr.run_id = ?""",
+                (legacy_run_id,),
+            ).fetchone()
+            if dr is not None:
+                actor_id = _require_mig_text(dr[0], "duty.agent_id")
 
-            actor_id = "system"
-            created_at_ns = 1
-            if legacy_run_id is not None and legacy_run_id in valid_work_runs:
-                wr = connection.execute(
-                    "SELECT agent_id, created_at_ns FROM work_runs WHERE run_id = ?",
-                    (legacy_run_id,),
-                ).fetchone()
-                if wr is not None:
-                    actor_id = _require_mig_text(wr[0], "work_runs.agent_id")
-                    created_at_ns = _to_ns(
-                        _require_mig_int(wr[1], "work_runs.created_at_ns")
-                    )
-            elif legacy_run_id is not None and has_duty_run:
-                dr = connection.execute(
-                    """SELECT d.agent_id
-                       FROM duty_run dr
-                       JOIN duty d ON d.id = dr.duty_id
-                       WHERE dr.run_id = ?""",
-                    (legacy_run_id,),
-                ).fetchone()
-                if dr is not None:
-                    actor_id = _require_mig_text(dr[0], "duty.agent_id")
+        decision_id: str | None = None
+        if legacy_run_id is not None and has_paper_decision:
+            dec = connection.execute(
+                "SELECT decision_id FROM paper_decision WHERE run_id = ? LIMIT 1",
+                (legacy_run_id,),
+            ).fetchone()
+            if dec is not None:
+                decision_id = _require_mig_text(dec[0], "paper_decision.decision_id")
+        if decision_id is None and legacy_run_id is not None and has_paper_research_dec:
+            rdec = connection.execute(
+                "SELECT decision_id FROM paper_research_decision WHERE run_id = ? LIMIT 1",
+                (legacy_run_id,),
+            ).fetchone()
+            if rdec is not None:
+                decision_id = _require_mig_text(
+                    rdec[0], "paper_research_decision.decision_id"
+                )
 
-            decision_id: str | None = None
-            if legacy_run_id is not None and has_paper_decision:
-                dec = connection.execute(
-                    "SELECT decision_id FROM paper_decision WHERE run_id = ? LIMIT 1",
-                    (legacy_run_id,),
-                ).fetchone()
-                if dec is not None:
-                    decision_id = _require_mig_text(
-                        dec[0], "paper_decision.decision_id"
-                    )
-            if (
-                decision_id is None
-                and legacy_run_id is not None
-                and has_paper_research_dec
-            ):
-                rdec = connection.execute(
-                    "SELECT decision_id FROM paper_research_decision WHERE run_id = ? LIMIT 1",
-                    (legacy_run_id,),
-                ).fetchone()
-                if rdec is not None:
-                    decision_id = _require_mig_text(
-                        rdec[0], "paper_research_decision.decision_id"
-                    )
+        market_price = limit_minor_units
+        quote_observed_at_ns = created_at_ns
+        quote_source = "legacy_paper_order"
+        if legacy_run_id is not None and has_review_quote:
+            qrow = connection.execute(
+                """SELECT quote_minor_units, observed_at, connector_revision
+                   FROM paper_review_quote
+                   WHERE run_id = ?""",
+                (legacy_run_id,),
+            ).fetchone()
+            if qrow is not None:
+                quote_minor = _optional_mig_int(
+                    qrow[0], "paper_review_quote.quote_minor_units"
+                )
+                if quote_minor is not None and quote_minor > 0:
+                    market_price = quote_minor
+                quote_observed_at_ns = _to_ns(
+                    _require_mig_int(qrow[1], "paper_review_quote.observed_at")
+                )
+                conn_rev = _optional_mig_text(
+                    qrow[2],
+                    "paper_review_quote.connector_revision",
+                    allow_empty=True,
+                )
+                if conn_rev is not None and conn_rev.strip():
+                    quote_source = conn_rev
 
-            market_price = limit_minor_units
-            quote_observed_at_ns = created_at_ns
-            quote_source = "legacy_paper_order"
-            if legacy_run_id is not None and has_review_quote:
-                qrow = connection.execute(
-                    """SELECT quote_minor_units, observed_at, connector_revision
-                       FROM paper_review_quote
-                       WHERE run_id = ?""",
-                    (legacy_run_id,),
-                ).fetchone()
-                if qrow is not None:
-                    quote_minor = _optional_mig_int(
-                        qrow[0], "paper_review_quote.quote_minor_units"
-                    )
-                    if quote_minor is not None and quote_minor > 0:
-                        market_price = quote_minor
-                    quote_observed_at_ns = _to_ns(
-                        _require_mig_int(qrow[1], "paper_review_quote.observed_at")
-                    )
-                    conn_rev = _optional_mig_text(
-                        qrow[2],
-                        "paper_review_quote.connector_revision",
-                        allow_empty=True,
-                    )
-                    if conn_rev is not None and conn_rev.strip():
-                        quote_source = conn_rev
+        fills_rows: list[tuple[str, int, int, int, int]] = []
+        filled_qty = 0
+        total_notional = 0
+        total_fee = 0
+        if has_paper_fill:
+            raw_fills = connection.execute(
+                "SELECT fill_id, quantity, price_minor_units FROM paper_fill WHERE order_id = ? ORDER BY rowid ASC",
+                (order_id,),
+            ).fetchall()
+            for frow in raw_fills:
+                fid = _require_mig_text(frow[0], "paper_fill.fill_id")
+                fqty = _require_mig_int(frow[1], "paper_fill.quantity")
+                fprice = _require_mig_int(frow[2], "paper_fill.price_minor_units")
+                ffee = 0
+                if has_paper_fill_fee:
+                    fee_row = connection.execute(
+                        "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id = ?",
+                        (fid,),
+                    ).fetchone()
+                    if fee_row is not None:
+                        ffee = _require_mig_int(
+                            fee_row[0], "paper_fill_fee.fee_minor_units"
+                        )
+                filled_at_ns = created_at_ns
+                if has_pos_obs:
+                    obs_row = connection.execute(
+                        "SELECT available_at FROM paper_position_observation WHERE fill_id = ?",
+                        (fid,),
+                    ).fetchone()
+                    if obs_row is not None:
+                        obs_at = _require_mig_int(
+                            obs_row[0], "paper_position_observation.available_at"
+                        )
+                        filled_at_ns = max(created_at_ns, _to_ns(obs_at))
+                fills_rows.append((fid, fqty, fprice, ffee, filled_at_ns))
+                filled_qty += fqty
+                total_notional += fqty * fprice
+                total_fee += ffee
 
-            fills_rows: list[tuple[str, int, int, int, int]] = []
-            filled_qty = 0
-            total_notional = 0
-            total_fee = 0
-            if has_paper_fill:
-                raw_fills = connection.execute(
-                    "SELECT fill_id, quantity, price_minor_units FROM paper_fill WHERE order_id = ? ORDER BY rowid ASC",
-                    (order_id,),
-                ).fetchall()
-                for frow in raw_fills:
-                    fid = _require_mig_text(frow[0], "paper_fill.fill_id")
-                    fqty = _require_mig_int(frow[1], "paper_fill.quantity")
-                    fprice = _require_mig_int(frow[2], "paper_fill.price_minor_units")
-                    ffee = 0
-                    if has_paper_fill_fee:
-                        fee_row = connection.execute(
-                            "SELECT fee_minor_units FROM paper_fill_fee WHERE fill_id = ?",
-                            (fid,),
-                        ).fetchone()
-                        if fee_row is not None:
-                            ffee = _require_mig_int(
-                                fee_row[0], "paper_fill_fee.fee_minor_units"
-                            )
-                    filled_at_ns = created_at_ns
-                    if has_pos_obs:
-                        obs_row = connection.execute(
-                            "SELECT available_at FROM paper_position_observation WHERE fill_id = ?",
-                            (fid,),
-                        ).fetchone()
-                        if obs_row is not None:
-                            obs_at = _require_mig_int(
-                                obs_row[0], "paper_position_observation.available_at"
-                            )
-                            filled_at_ns = max(created_at_ns, _to_ns(obs_at))
-                    fills_rows.append((fid, fqty, fprice, ffee, filled_at_ns))
-                    filled_qty += fqty
-                    total_notional += fqty * fprice
-                    total_fee += ffee
+        cancelled_at_ns: int | None = None
+        cancel_reason: str | None = None
+        if has_paper_cancel:
+            crow = connection.execute(
+                "SELECT available_at, outcome FROM paper_cancellation WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()
+            if crow is not None:
+                avail_at = _optional_mig_int(crow[0], "paper_cancellation.available_at")
+                cancelled_at_ns = max(
+                    created_at_ns,
+                    _to_ns(avail_at) if avail_at is not None else created_at_ns,
+                )
+                cancel_reason = _require_mig_text(crow[1], "paper_cancellation.outcome")
 
-            cancelled_at_ns: int | None = None
-            cancel_reason: str | None = None
-            if has_paper_cancel:
-                crow = connection.execute(
-                    "SELECT available_at, outcome FROM paper_cancellation WHERE order_id = ?",
-                    (order_id,),
-                ).fetchone()
-                if crow is not None:
-                    avail_at = _optional_mig_int(
-                        crow[0], "paper_cancellation.available_at"
-                    )
-                    cancelled_at_ns = max(
-                        created_at_ns,
-                        _to_ns(avail_at) if avail_at is not None else created_at_ns,
-                    )
-                    cancel_reason = _require_mig_text(
-                        crow[1], "paper_cancellation.outcome"
-                    )
+        if cancelled_at_ns is not None:
+            status = "cancelled"
+        elif filled_qty >= quantity:
+            status = "filled"
+        else:
+            status = "open"
 
-            if cancelled_at_ns is not None:
-                status = "cancelled"
-            elif filled_qty >= quantity:
-                status = "filled"
-            else:
-                status = "open"
+        avg_fill_price = (
+            max(1, total_notional // filled_qty) if filled_qty > 0 else None
+        )
+        max_fill_ns = max((f[4] for f in fills_rows), default=created_at_ns)
+        updated_at_ns = max(
+            created_at_ns, max_fill_ns, cancelled_at_ns or created_at_ns
+        )
+        safe_run_id = (
+            legacy_run_id
+            if legacy_run_id is not None and legacy_run_id in valid_work_runs
+            else None
+        )
 
-            avg_fill_price = (
-                max(1, total_notional // filled_qty) if filled_qty > 0 else None
-            )
-            max_fill_ns = max((f[4] for f in fills_rows), default=created_at_ns)
-            updated_at_ns = max(
-                created_at_ns, max_fill_ns, cancelled_at_ns or created_at_ns
-            )
-            safe_run_id = (
-                legacy_run_id
-                if legacy_run_id is not None and legacy_run_id in valid_work_runs
-                else None
-            )
+        connection.execute(
+            """INSERT INTO trading_book_order (
+                   order_id, binding_id, environment, company_id, actor_id,
+                   action_id, external_order_id, run_id, decision_id,
+                   mandate_revision, cancelled_at_ns, cancel_reason,
+                   instrument_id, side, quantity, limit_minor_units,
+                   market_price_minor_units, quote_observed_at_ns, quote_source,
+                   fee_bps, slippage_bps, status, filled_quantity,
+                   fill_price_minor_units, fee_minor_units, created_at_ns, updated_at_ns
+               ) VALUES (?, ?, 'paper', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)""",
+            (
+                order_id,
+                resolved_binding_id,
+                company_id,
+                actor_id,
+                action_id,
+                safe_run_id,
+                decision_id,
+                mandate_rev,
+                cancelled_at_ns,
+                cancel_reason,
+                instrument_id,
+                quantity,
+                limit_minor_units,
+                market_price,
+                quote_observed_at_ns,
+                quote_source,
+                status,
+                min(filled_qty, quantity),
+                avg_fill_price,
+                max(0, total_fee),
+                created_at_ns,
+                updated_at_ns,
+            ),
+        )
 
+        for fid, fqty, fprice, ffee, filled_at_ns in fills_rows:
             connection.execute(
-                """INSERT INTO trading_book_order (
-                       order_id, binding_id, environment, company_id, actor_id,
-                       action_id, external_order_id, run_id, decision_id,
-                       mandate_revision, cancelled_at_ns, cancel_reason,
-                       instrument_id, side, quantity, limit_minor_units,
-                       market_price_minor_units, quote_observed_at_ns, quote_source,
-                       fee_bps, slippage_bps, status, filled_quantity,
-                       fill_price_minor_units, fee_minor_units, created_at_ns, updated_at_ns
-                   ) VALUES (?, ?, 'paper', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO trading_book_fill (
+                       fill_id, order_id, binding_id, environment, company_id,
+                       actor_id, external_fill_id, instrument_id, side,
+                       quantity, price_minor_units, fee_minor_units,
+                       realized_pnl_minor_units, filled_at_ns
+                   ) VALUES (?, ?, ?, 'paper', ?, ?, NULL, ?, 'buy', ?, ?, ?, 0, ?)""",
                 (
+                    fid,
                     order_id,
                     resolved_binding_id,
                     company_id,
                     actor_id,
-                    action_id,
-                    safe_run_id,
-                    decision_id,
-                    mandate_rev,
-                    cancelled_at_ns,
-                    cancel_reason,
                     instrument_id,
-                    quantity,
-                    limit_minor_units,
-                    market_price,
-                    quote_observed_at_ns,
-                    quote_source,
-                    status,
-                    min(filled_qty, quantity),
-                    avg_fill_price,
-                    max(0, total_fee),
-                    created_at_ns,
-                    updated_at_ns,
+                    fqty,
+                    fprice,
+                    max(0, ffee),
+                    filled_at_ns,
                 ),
             )
+            key = (resolved_binding_id, instrument_id)
+            acc = gen1_position_accum.setdefault(key, [0, 0, 0, filled_at_ns])
+            acc[0] += fqty
+            acc[1] += fqty * fprice
+            acc[2] += max(0, ffee)
+            acc[3] = max(acc[3], filled_at_ns)
 
-            for fid, fqty, fprice, ffee, filled_at_ns in fills_rows:
-                connection.execute(
-                    """INSERT INTO trading_book_fill (
-                           fill_id, order_id, binding_id, environment, company_id,
-                           actor_id, external_fill_id, instrument_id, side,
-                           quantity, price_minor_units, fee_minor_units,
-                           realized_pnl_minor_units, filled_at_ns
-                       ) VALUES (?, ?, ?, 'paper', ?, ?, NULL, ?, 'buy', ?, ?, ?, 0, ?)""",
-                    (
-                        fid,
-                        order_id,
-                        resolved_binding_id,
-                        company_id,
-                        actor_id,
-                        instrument_id,
-                        fqty,
-                        fprice,
-                        max(0, ffee),
-                        filled_at_ns,
-                    ),
-                )
-                key = (resolved_binding_id, instrument_id)
-                acc = gen1_position_accum.setdefault(key, [0, 0, 0, filled_at_ns])
-                acc[0] += fqty
-                acc[1] += fqty * fprice
-                acc[2] += max(0, ffee)
-                acc[3] = max(acc[3], filled_at_ns)
+    for (bid, inst_id), (
+        pos_qty,
+        cost_sum,
+        fee_sum,
+        upd_ns,
+    ) in gen1_position_accum.items():
+        bind_company_row = connection.execute(
+            "SELECT company_id FROM execution_environment_binding WHERE binding_id = ?",
+            (bid,),
+        ).fetchone()
+        cid = (
+            str(bind_company_row[0])
+            if bind_company_row is not None
+            else default_company_id
+        )
+        avg_entry = cost_sum // pos_qty if pos_qty > 0 else 0
+        connection.execute(
+            """INSERT INTO trading_book_position (
+                   binding_id, environment, company_id, instrument_id,
+                   quantity, avg_entry_minor_units, mark_price_minor_units,
+                   realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
+               ) VALUES (?, 'paper', ?, ?, ?, ?, ?, 0, ?, ?)""",
+            (bid, cid, inst_id, pos_qty, avg_entry, avg_entry, fee_sum, upd_ns),
+        )
 
-        for (bid, inst_id), (
-            pos_qty,
-            cost_sum,
-            fee_sum,
-            upd_ns,
-        ) in gen1_position_accum.items():
-            bind_company_row = connection.execute(
-                "SELECT company_id FROM execution_environment_binding WHERE binding_id = ?",
-                (bid,),
+
+def _migrate_trading_valuations(
+    connection: sqlite3.Connection,
+    *,
+    binding_by_rev: dict[str, str],
+) -> None:
+    """Migrate Gen 1 paper_valuation rows into trading_book_valuation."""
+    if not _has_table(connection, "paper_valuation"):
+        return
+    val_rows = connection.execute(
+        """SELECT capture_id, binding_revision, policy, evidence,
+                  trading_nav_atoms, revision
+           FROM paper_valuation
+           ORDER BY rowid ASC"""
+    ).fetchall()
+    for vrow in val_rows:
+        capture_id = _require_mig_text(vrow[0], "paper_valuation.capture_id")
+        brev = _require_mig_text(vrow[1], "paper_valuation.binding_revision")
+        policy = _require_mig_text(vrow[2], "paper_valuation.policy")
+        evidence_raw = _require_mig_text(vrow[3], "paper_valuation.evidence")
+        nav_atoms = _require_mig_int(vrow[4], "paper_valuation.trading_nav_atoms")
+        rev = _require_mig_text(vrow[5], "paper_valuation.revision")
+
+        bid = binding_by_rev.get(brev)
+        if bid is None:
+            matched = connection.execute(
+                """SELECT binding_id FROM execution_environment_binding
+                   WHERE tier = 'company_paper'
+                   ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at_ns ASC
+                   LIMIT 1"""
             ).fetchone()
-            cid = (
-                str(bind_company_row[0])
-                if bind_company_row is not None
-                else default_company_id
+            if matched is not None:
+                bid = str(matched[0])
+        if bid is None:
+            raise StorageRefused(
+                f"Cannot resolve execution_environment_binding for paper_valuation '{capture_id}'"
             )
-            avg_entry = cost_sum // pos_qty if pos_qty > 0 else 0
-            connection.execute(
-                """INSERT INTO trading_book_position (
-                       binding_id, environment, company_id, instrument_id,
-                       quantity, avg_entry_minor_units, mark_price_minor_units,
-                       realized_pnl_minor_units, total_fees_minor_units, updated_at_ns
-                   ) VALUES (?, 'paper', ?, ?, ?, ?, ?, 0, ?, ?)""",
-                (bid, cid, inst_id, pos_qty, avg_entry, avg_entry, fee_sum, upd_ns),
-            )
+        cid_row = connection.execute(
+            "SELECT company_id FROM execution_environment_binding WHERE binding_id = ?",
+            (bid,),
+        ).fetchone()
+        assert cid_row is not None
+        cid = str(cid_row[0])
 
-    # 4.1e: Migrate Gen 1 paper_valuation -> trading_book_valuation
-    if _has_table(connection, "paper_valuation"):
-        val_rows = connection.execute(
-            """SELECT capture_id, binding_revision, policy, evidence,
-                      trading_nav_atoms, revision
-               FROM paper_valuation
-               ORDER BY rowid ASC"""
-        ).fetchall()
-        for vrow in val_rows:
-            capture_id = _require_mig_text(vrow[0], "paper_valuation.capture_id")
-            brev = _require_mig_text(vrow[1], "paper_valuation.binding_revision")
-            policy = _require_mig_text(vrow[2], "paper_valuation.policy")
-            evidence_raw = _require_mig_text(vrow[3], "paper_valuation.evidence")
-            nav_atoms = _require_mig_int(vrow[4], "paper_valuation.trading_nav_atoms")
-            rev = _require_mig_text(vrow[5], "paper_valuation.revision")
+        try:
+            ev = json.loads(evidence_raw)
+        except json.JSONDecodeError:
+            ev = {}
+        if not isinstance(ev, dict):
+            ev = {}
+        obs = ev.get("observation") if isinstance(ev.get("observation"), dict) else {}
+        bal = obs.get("balance") if isinstance(obs.get("balance"), dict) else {}
+        raw_cash = bal.get("cash_atoms")
+        cash_minor = (
+            raw_cash
+            if isinstance(raw_cash, int) and not isinstance(raw_cash, bool)
+            else nav_atoms
+        )
+        raw_obs_ns = obs.get("observed_ns")
+        recorded_ns = _to_ns(
+            raw_obs_ns
+            if isinstance(raw_obs_ns, int) and not isinstance(raw_obs_ns, bool)
+            else 1
+        )
+        gross_exposure = max(0, nav_atoms - cash_minor)
 
-            bid = binding_by_rev.get(brev)
-            if bid is None:
-                matched = connection.execute(
-                    """SELECT binding_id FROM execution_environment_binding
-                       WHERE tier = 'company_paper'
-                       ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at_ns ASC
-                       LIMIT 1"""
-                ).fetchone()
-                if matched is not None:
-                    bid = str(matched[0])
-            if bid is None:
-                raise StorageRefused(
-                    f"Cannot resolve execution_environment_binding for paper_valuation '{capture_id}'"
-                )
-            cid_row = connection.execute(
-                "SELECT company_id FROM execution_environment_binding WHERE binding_id = ?",
-                (bid,),
-            ).fetchone()
-            assert cid_row is not None
-            cid = str(cid_row[0])
+        connection.execute(
+            """INSERT INTO trading_book_valuation (
+                   valuation_id, binding_id, environment, company_id, label,
+                   nav_minor_units, cash_minor_units, gross_exposure_minor_units,
+                   realized_pnl_minor_units, unrealized_pnl_minor_units,
+                   total_fees_minor_units, source, binding_revision, policy,
+                   evidence_json, revision, recorded_at_ns
+               ) VALUES (?, ?, 'paper', ?, ?, ?, ?, ?, 0, 0, 0, 'paper_valuation', ?, ?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
+            (
+                capture_id,
+                bid,
+                cid,
+                policy,
+                nav_atoms,
+                cash_minor,
+                gross_exposure,
+                brev,
+                policy,
+                evidence_raw,
+                rev,
+                recorded_ns,
+            ),
+        )
 
-            try:
-                ev = json.loads(evidence_raw)
-            except json.JSONDecodeError:
-                ev = {}
-            if not isinstance(ev, dict):
-                ev = {}
-            obs = (
-                ev.get("observation") if isinstance(ev.get("observation"), dict) else {}
-            )
-            bal = obs.get("balance") if isinstance(obs.get("balance"), dict) else {}
-            raw_cash = bal.get("cash_atoms")
-            cash_minor = (
-                raw_cash
-                if isinstance(raw_cash, int) and not isinstance(raw_cash, bool)
-                else nav_atoms
-            )
-            raw_obs_ns = obs.get("observed_ns")
-            recorded_ns = _to_ns(
-                raw_obs_ns
-                if isinstance(raw_obs_ns, int) and not isinstance(raw_obs_ns, bool)
-                else 1
-            )
-            gross_exposure = max(0, nav_atoms - cash_minor)
 
-            connection.execute(
-                """INSERT INTO trading_book_valuation (
-                       valuation_id, binding_id, environment, company_id, label,
-                       nav_minor_units, cash_minor_units, gross_exposure_minor_units,
-                       realized_pnl_minor_units, unrealized_pnl_minor_units,
-                       total_fees_minor_units, source, binding_revision, policy,
-                       evidence_json, revision, recorded_at_ns
-                   ) VALUES (?, ?, 'paper', ?, ?, ?, ?, ?, 0, 0, 0, 'paper_valuation', ?, ?, ?, ?, ?)
-                   ON CONFLICT DO NOTHING""",
-                (
-                    capture_id,
-                    bid,
-                    cid,
-                    policy,
-                    nav_atoms,
-                    cash_minor,
-                    gross_exposure,
-                    brev,
-                    policy,
-                    evidence_raw,
-                    rev,
-                    recorded_ns,
-                ),
-            )
-
-    # ------------------------------------------------------------------
-    # Step 4.2: Ensure venue_qualification_receipt & environment_promotion_record
-    # ------------------------------------------------------------------
+def _migrate_trading_qualifications_and_renamed_tables(
+    connection: sqlite3.Connection,
+    table_ddl: dict[str, str],
+    index_ddl: dict[str, tuple[str, ...]],
+) -> None:
+    """Rebuild qualification/promotion tables and copy renamed paper_* -> trading_* tables."""
     for tbl in ("venue_qualification_receipt", "environment_promotion_record"):
         stg, cols = _stage_and_recreate_table(
             connection, tbl, table_ddl[tbl], index_ddl[tbl]
         )
-        if cols:
-            col_list = ", ".join(f'"{c}"' for c in cols)
-            connection.execute(
-                f"INSERT INTO {tbl} ({col_list}) SELECT {col_list} FROM {stg}"
-            )
-            connection.execute(f"DROP TABLE IF EXISTS {stg}")
+        _restore_staged_rows(connection, tbl, stg, cols)
 
-    # ------------------------------------------------------------------
-    # Step 4.3: 9 Renamed paper_* -> trading_* tables
-    # ------------------------------------------------------------------
     rename_pairs: tuple[tuple[str, str, str], ...] = (
         ("paper_live_migration_record", "trading_live_migration_record", "rowid ASC"),
         ("paper_operating_window", "trading_operating_window", "rowid ASC"),
@@ -1593,12 +1592,7 @@ def _migrate_trading_tables_impl(
         stg, existing_cols = _stage_and_recreate_table(
             connection, new_tbl, table_ddl[new_tbl], index_ddl[new_tbl]
         )
-        if existing_cols:
-            col_list = ", ".join(f'"{c}"' for c in existing_cols)
-            connection.execute(
-                f"INSERT INTO {new_tbl} ({col_list}) SELECT {col_list} FROM {stg}"
-            )
-            connection.execute(f"DROP TABLE IF EXISTS {stg}")
+        _restore_staged_rows(connection, new_tbl, stg, existing_cols)
         if _has_table(connection, old_tbl):
             old_cols = _table_columns(connection, old_tbl)
             col_list = ", ".join(f'"{c}"' for c in old_cols)
@@ -1606,19 +1600,20 @@ def _migrate_trading_tables_impl(
                 f"INSERT INTO {new_tbl} ({col_list}) SELECT {col_list} FROM {old_tbl} ORDER BY {order_by} ON CONFLICT DO NOTHING"
             )
 
-    # trading_fee_delivery (must verify against paper_fill_accounting_source & trading_book_fill)
+
+def _migrate_trading_fees_and_risk_state(
+    connection: sqlite3.Connection,
+    table_ddl: dict[str, str],
+    index_ddl: dict[str, tuple[str, ...]],
+) -> None:
+    """Rebuild trading_fee_delivery and fold active paper_risk_state into restriction_cause."""
     fee_stg, fee_cols = _stage_and_recreate_table(
         connection,
         "trading_fee_delivery",
         table_ddl["trading_fee_delivery"],
         index_ddl["trading_fee_delivery"],
     )
-    if fee_cols:
-        col_list = ", ".join(f'"{c}"' for c in fee_cols)
-        connection.execute(
-            f"INSERT INTO trading_fee_delivery ({col_list}) SELECT {col_list} FROM {fee_stg}"
-        )
-        connection.execute(f"DROP TABLE IF EXISTS {fee_stg}")
+    _restore_staged_rows(connection, "trading_fee_delivery", fee_stg, fee_cols)
     if _has_table(connection, "paper_fee_delivery"):
         has_acct_src = _has_table(connection, "paper_fill_accounting_source")
         fee_rows = connection.execute(
@@ -1654,9 +1649,6 @@ def _migrate_trading_tables_impl(
                 (fid, delivery_digest, acknowledged, journal_id),
             )
 
-    # ------------------------------------------------------------------
-    # Step 4.4: Active paper_risk_state -> restriction_cause
-    # ------------------------------------------------------------------
     if _has_table(connection, "paper_risk_state"):
         risk_rows = connection.execute(
             """SELECT company_id, effective_revision, last_command_id, updated_at_ns
@@ -1709,9 +1701,29 @@ def _migrate_trading_tables_impl(
                     ),
                 )
 
-    # ------------------------------------------------------------------
-    # Step 5: Drop all 34 retired / renamed source tables
-    # ------------------------------------------------------------------
+
+def _migrate_trading_tables_impl(
+    connection: sqlite3.Connection,
+    active: frozenset[str],
+    table_ddl: dict[str, str],
+    index_ddl: dict[str, tuple[str, ...]],
+) -> frozenset[str]:
+    binding_by_rev, binding_by_rev_account = _migrate_trading_bindings(
+        connection, table_ddl, index_ddl
+    )
+    valid_work_runs = _migrate_trading_orders_fills_positions(
+        connection, table_ddl, index_ddl
+    )
+    _migrate_legacy_paper_orders_and_fills(
+        connection,
+        binding_by_rev=binding_by_rev,
+        binding_by_rev_account=binding_by_rev_account,
+        valid_work_runs=valid_work_runs,
+    )
+    _migrate_trading_valuations(connection, binding_by_rev=binding_by_rev)
+    _migrate_trading_qualifications_and_renamed_tables(connection, table_ddl, index_ddl)
+    _migrate_trading_fees_and_risk_state(connection, table_ddl, index_ddl)
+
     for retired_table in RETIRED_TRADING_TABLES:
         connection.execute(f"DROP TABLE IF EXISTS {retired_table}")
 

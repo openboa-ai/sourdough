@@ -10,7 +10,7 @@ from .agent_desk import require_desk
 from .company import _connect
 from .company_assets import project_membership, shared_asset_for
 from .conversation_delivery import enqueue_deliveries
-from .duty_run import DutyClaim, DutyRefused, WorkRunClaim
+from .duty_run import DutyRefused, ExecutionClaim
 from .writer_lease import WriterLease
 
 
@@ -56,7 +56,7 @@ class Post:
 
 def _membership(
     database: Connection,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     project: str,
 ) -> tuple[str, tuple[str, ...]]:
@@ -72,7 +72,7 @@ def _membership(
 
 def append_message(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     post: Post,
     *,
@@ -148,7 +148,7 @@ def append_message(
 
 def read_messages(
     writer: WriterLease,
-    claim: DutyClaim | WorkRunClaim,
+    claim: ExecutionClaim,
     purpose: str,
     project_id: str,
     after: str,

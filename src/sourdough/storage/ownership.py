@@ -50,15 +50,38 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "company_restore_receipt": frozenset({"storage/checkpoint.py"}),
     "company_store_retired": frozenset({"storage/checkpoint.py"}),
     # Three-entity Work kernel tables
-    "work_items": frozenset({"runtime/work_kernel.py"}),
-    "work_runs": frozenset({"runtime/work_kernel.py"}),
-    "work_responsibilities": frozenset({"runtime/work_kernel.py"}),
-    "work_conditions": frozenset({"runtime/work_kernel.py"}),
-    "work_condition_occurrences": frozenset({"runtime/work_kernel.py"}),
-    "work_peer_requests": frozenset({"runtime/work_kernel.py"}),
-    "work_decision": frozenset({"runtime/work_kernel.py"}),
-    "work_event_cursor": frozenset({"runtime/work_kernel.py"}),
-    "work_discovery_state": frozenset({"runtime/work_kernel.py"}),
+    "work_items": frozenset(
+        {
+            "runtime/kernel/items.py",
+            "runtime/kernel/peer_auth.py",
+            "runtime/kernel/conditions.py",
+            "runtime/kernel/runs.py",
+        }
+    ),
+    "work_runs": frozenset({"runtime/kernel/items.py", "runtime/kernel/runs.py"}),
+    "work_responsibilities": frozenset(
+        {"runtime/kernel/responsibilities.py", "runtime/kernel/runs.py"}
+    ),
+    "work_conditions": frozenset(
+        {
+            "runtime/kernel/responsibilities.py",
+            "runtime/kernel/items.py",
+            "runtime/kernel/conditions.py",
+            "runtime/kernel/runs.py",
+        }
+    ),
+    "work_condition_occurrences": frozenset({"runtime/kernel/conditions.py"}),
+    "work_peer_requests": frozenset(
+        {
+            "runtime/kernel/peer_auth.py",
+            "runtime/kernel/items.py",
+            "runtime/kernel/runs.py",
+            "runtime/kernel/peer_requests.py",
+        }
+    ),
+    "work_decision": frozenset({"runtime/kernel/decisions.py"}),
+    "work_event_cursor": frozenset({"runtime/kernel/conditions.py"}),
+    "work_discovery_state": frozenset({"runtime/kernel/responsibilities.py"}),
     # Core company & staffing tables
     "company": frozenset({"company.py", "storage/checkpoint.py"}),
     "agent": frozenset({"company.py", "staffing.py"}),
@@ -90,7 +113,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     "duty": frozenset(
         {
             "company.py",
-            "duty_run.py",
+            "legacy_duty.py",
             "first_duty.py",
             "work.py",
             "abandoned_work.py",
@@ -105,7 +128,7 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     ),
     "duty_run": frozenset(
         {
-            "duty_run.py",
+            "legacy_duty.py",
             "first_duty.py",
             "abandoned_work.py",
             "onboarding.py",
@@ -126,9 +149,9 @@ DOMAIN_TABLE_OWNERS: dict[str, frozenset[str]] = {
     # Evidence review qualification, activation & method learning tables
     "review_qualification": frozenset({"review_qualification_store.py"}),
     "review_tool_activation": frozenset({"review_tool_activation.py"}),
-    "method_delta": frozenset({"method_learning.py"}),
-    "method_qualification": frozenset({"method_learning.py"}),
-    "method_activation": frozenset({"method_learning.py"}),
+    "method_delta": frozenset({"learning/lifecycle.py"}),
+    "method_qualification": frozenset({"learning/lifecycle.py"}),
+    "method_activation": frozenset({"learning/lifecycle.py"}),
     # Agent runtime tool receipts & episodic memory tables
     "tool_call_receipt": frozenset({"runtime/shift/receipts.py"}),
     "agent_episode": frozenset({"memory.py"}),
