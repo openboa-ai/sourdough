@@ -1295,6 +1295,21 @@ class ConnectorSubsystemTests(unittest.TestCase):
                             },
                         }
                     )
+                # Nonpositive max_output_tokens (0 or negative) MUST be rejected, never silently uncapped!
+                for bad_cap in (0, -5):
+                    with self.assertRaises(ConnectorRefused):
+                        handler(
+                            {
+                                "binding_id": "llm-pinned",
+                                "operation": "complete",
+                                "request_id": f"bad-cap-{bad_cap}",
+                                "payload": {
+                                    "model": "approved-model",
+                                    "input": "hi",
+                                    "max_output_tokens": bad_cap,
+                                },
+                            }
+                        )
 
     def test_overlapping_in_flight_read_retry_is_blocked_without_second_dispatch(
         self,
@@ -1353,6 +1368,18 @@ class ConnectorSubsystemTests(unittest.TestCase):
                             now_ns=now + 12,
                         )
                         overlapping_result.append(second)
+                        # Concurrent DISTINCT request_id under the same budget ceiling MUST ALSO be blocked
+                        # while the first budgeted request is still in_flight!
+                        with self.assertRaises(ConnectorBudgetExceeded):
+                            proxy.invoke(
+                                w,
+                                claim,
+                                binding_id=binding.binding_id,
+                                operation="fetch_doc",
+                                request_id="overlap-read-DISTINCT-2",
+                                payload={"doc": "b"},
+                                now_ns=now + 13,
+                            )
                     return ConnectorResponse(
                         status="observed",
                         payload={"request_id": req.request_id},

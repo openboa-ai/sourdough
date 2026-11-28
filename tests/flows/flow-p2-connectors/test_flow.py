@@ -413,11 +413,23 @@ class ConnectedFlow(unittest.TestCase):
                     reason="halt new external writes",
                     now_ns=now + 65,
                 )
+                # Attempting to substitute an unrelated symbol/order during recovery MUST be refused!
+                with self.assertRaises(ConnectorUnauthorized):
+                    proxy.reconcile_unknown_action(
+                        w,
+                        claim,
+                        idempotency_key=ord_idem,
+                        lookup_payload={
+                            "symbol": "ETHUSDT",
+                            "client_order_id": "other-order-999",
+                        },
+                        now_ns=now + 68,
+                    )
+                # Derived strictly from persisted admitted lookup_context (even without lookup_payload)!
                 reconciled = proxy.reconcile_unknown_action(
                     w,
                     claim,
                     idempotency_key=ord_idem,
-                    lookup_payload={"symbol": "BTCUSDT", "client_order_id": "ord-p2-1"},
                     now_ns=now + 70,
                 )
                 self.assertEqual(reconciled.status, "observed")

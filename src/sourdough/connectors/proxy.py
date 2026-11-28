@@ -59,6 +59,26 @@ from .registry import (
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _NS_PER_SECOND = 1_000_000_000
+_SAFE_LOOKUP_CONTEXT_KEYS: tuple[str, ...] = (
+    "symbol",
+    "client_order_id",
+    "action_id",
+    "order_id",
+)
+
+
+def _extract_lookup_context(
+    payload: Mapping[str, Any], request_id: str
+) -> dict[str, Any]:
+    """Extract immutable non-secret target identifiers used to bind recovery lookups."""
+    ctx: dict[str, Any] = {}
+    for key in _SAFE_LOOKUP_CONTEXT_KEYS:
+        val = payload.get(key)
+        if isinstance(val, (str, int)) and not isinstance(val, bool):
+            ctx[key] = val
+    if "client_order_id" not in ctx:
+        ctx["client_order_id"] = str(ctx.get("action_id") or request_id)
+    return ctx
 
 
 def _canonical_json(value: Any) -> str:
@@ -552,6 +572,20 @@ class ConnectorProxy:
 
                 prefix = f"{binding.binding_id}:r"
                 if binding.budget_ceiling_minor_units > 0:
+                    in_flight_binding = db.execute(
+                        """SELECT 1 FROM external_actions
+                           WHERE company_id = ?
+                             AND status = 'in_flight'
+                             AND idempotency_key != ?
+                             AND substr(connector, 1, ?) = ?
+                           LIMIT 1""",
+                        (company_id, idempotency_key, len(prefix), prefix),
+                    ).fetchone()
+                    if in_flight_binding is not None:
+                        raise ConnectorBudgetExceeded(
+                            f"Another budgeted request on connector binding '{binding.binding_id}' "
+                            "is currently in flight; await settlement before dispatching another"
+                        )
                     spent_binding = int(
                         db.execute(
                             """SELECT COALESCE(SUM(
@@ -570,6 +604,20 @@ class ConnectorProxy:
                             f"({binding.budget_ceiling_minor_units}) exhausted"
                         )
                 if grant.max_cost_minor_units > 0:
+                    in_flight_grant = db.execute(
+                        """SELECT 1 FROM external_actions
+                           WHERE company_id = ?
+                             AND status = 'in_flight'
+                             AND idempotency_key != ?
+                             AND json_extract(receipt_json, '$.grant_binding_id') = ?
+                           LIMIT 1""",
+                        (company_id, idempotency_key, grant.grant_binding_id),
+                    ).fetchone()
+                    if in_flight_grant is not None:
+                        raise ConnectorBudgetExceeded(
+                            f"Another budgeted request under connector grant '{grant.grant_binding_id}' "
+                            "is currently in flight; await settlement before dispatching another"
+                        )
                     spent_grant = int(
                         db.execute(
                             """SELECT COALESCE(SUM(
@@ -588,6 +636,7 @@ class ConnectorProxy:
                             f"({grant.max_cost_minor_units}) exhausted"
                         )
 
+                lookup_context = _extract_lookup_context(payload, request_id.strip())
                 settle_external_action(
                     db,
                     idempotency_key,
@@ -602,6 +651,7 @@ class ConnectorProxy:
                         "grant_binding_id": grant.grant_binding_id,
                         "admission_id": clean_admission,
                         "request_sha256": req_sha256,
+                        "lookup_context": lookup_context,
                     },
                     now_ns=ts,
                 )
@@ -708,6 +758,9 @@ class ConnectorProxy:
                             "grant_binding_id": grant.grant_binding_id,
                             "admission_id": clean_admission,
                             "request_sha256": req_sha256,
+                            "lookup_context": _extract_lookup_context(
+                                payload, request_id.strip()
+                            ),
                             "response_payload": {
                                 "idempotency_key": idempotency_key,
                                 "reason": "sender_fenced_before_dispatch",
@@ -820,6 +873,7 @@ class ConnectorProxy:
             if clean_response.status == "rejected"
             else "unknown"
         )
+        lookup_context = _extract_lookup_context(payload, request_id.strip())
         receipt_envelope = {
             "binding_id": binding.binding_id,
             "binding_revision": binding.revision,
@@ -830,6 +884,7 @@ class ConnectorProxy:
             "grant_binding_id": grant.grant_binding_id,
             "admission_id": clean_admission,
             "request_sha256": req_sha256,
+            "lookup_context": lookup_context,
             "source_ref": clean_response.source_ref,
             "cost_minor_units": clean_response.cost_minor_units,
             "usage": clean_response.usage,
@@ -1043,6 +1098,23 @@ class ConnectorProxy:
                 )
             adapter = self._adapters.get(binding.connector_kind)
             request_id = str(prior_meta.get("request_id") or idempotency_key)
+            raw_persisted_lookup = prior_meta.get("lookup_context")
+            persisted_lookup: dict[str, Any] = (
+                dict(raw_persisted_lookup)
+                if isinstance(raw_persisted_lookup, Mapping)
+                else {"client_order_id": request_id}
+            )
+            if lookup_payload is not None:
+                if not isinstance(lookup_payload, Mapping):
+                    raise ConnectorRefused("lookup_payload must be a mapping")
+                # Reject any caller-supplied substitution that contradicts or injects
+                # target identifiers outside the originally admitted action.
+                for k, v in lookup_payload.items():
+                    if k not in persisted_lookup or persisted_lookup[k] != v:
+                        raise ConnectorUnauthorized(
+                            f"Recovery lookup_payload cannot substitute field '{k}' "
+                            "outside the originally admitted action"
+                        )
 
         secret = _resolve_secret_for_binding(self._vault, binding, adapter)
         raw_secrets = secret.raw_values() if secret is not None else ()
@@ -1053,7 +1125,7 @@ class ConnectorProxy:
             operation=op_name,
             request_id=request_id,
             idempotency_key=idempotency_key,
-            payload=dict(lookup_payload or {}),
+            payload=persisted_lookup,
             environment=binding.environment,
             endpoint_url=clean_url,
             allowed_hosts=clean_hosts,

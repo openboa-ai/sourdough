@@ -45,7 +45,7 @@ LLM_COMPLETE_OP = OperationSpec(
             "model": {"type": "string"},
             "input": {"type": "string"},
             "instructions": {"type": "string"},
-            "max_output_tokens": {"type": "integer"},
+            "max_output_tokens": {"type": "integer", "minimum": 1},
             "api_style": {"type": "string", "enum": ["responses", "chat_completions"]},
         },
         "required": ["model", "input"],
@@ -255,6 +255,14 @@ class ScopedLlmInferenceConnector:
                 raise ConnectorRefused("complete requires a nonempty string 'model'")
             if not isinstance(prompt_input, str) or not prompt_input.strip():
                 raise ConnectorRefused("complete requires a nonempty string 'input'")
+            max_tok_raw = request.payload.get("max_output_tokens")
+            max_tok: int | None = None
+            if "max_output_tokens" in request.payload and max_tok_raw is not None:
+                if type(max_tok_raw) is not int or max_tok_raw <= 0:
+                    raise ConnectorRefused(
+                        "max_output_tokens must be a positive integer"
+                    )
+                max_tok = max_tok_raw
             api_style = str(request.payload.get("api_style") or "responses")
             if api_style == "chat_completions":
                 url = f"{base}/v1/chat/completions"
@@ -264,8 +272,7 @@ class ScopedLlmInferenceConnector:
                     messages.append({"role": "system", "content": instructions})
                 messages.append({"role": "user", "content": prompt_input})
                 body: dict[str, Any] = {"model": model.strip(), "messages": messages}
-                max_tok = request.payload.get("max_output_tokens")
-                if type(max_tok) is int and max_tok > 0:
+                if max_tok is not None:
                     body["max_tokens"] = max_tok
             elif api_style == "responses":
                 url = f"{base}/v1/responses"
@@ -273,8 +280,7 @@ class ScopedLlmInferenceConnector:
                 instructions = request.payload.get("instructions")
                 if isinstance(instructions, str) and instructions.strip():
                     body["instructions"] = instructions
-                max_tok = request.payload.get("max_output_tokens")
-                if type(max_tok) is int and max_tok > 0:
+                if max_tok is not None:
                     body["max_output_tokens"] = max_tok
             else:
                 raise ConnectorRefused(
